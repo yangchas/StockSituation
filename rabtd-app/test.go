@@ -1,4 +1,4 @@
-// consumer_amqp.go
+// consumer_amqp_simple.go
 package main
 
 import (
@@ -24,14 +24,12 @@ import (
 var (
     uri          = flag.String("uri", "amqp://admin:admin@localhost:5672/", "AMQP URI")
     queue        = flag.String("queue", "stream2", "AMQP queue name")
-    consumerTag  = flag.String("consumer-tag", "data-consumer", "AMQP consumer tag")
-    autoAck      = flag.Bool("auto_ack", false, "enable message auto-ack")
+    consumerTag  = flag.String("consumer-tag", "simple-consumer", "AMQP consumer tag")
     verbose      = flag.Bool("verbose", true, "enable verbose output of message data")
     ErrLog       = log.New(os.Stderr, "[ERROR] ", log.LstdFlags|log.Lmsgprefix)
     Log          = log.New(os.Stdout, "[INFO] ", log.LstdFlags|log.Lmsgprefix)
 )
 
-// MessageHeader 消息头部结构
 type MessageHeader struct {
     ProtoVersion  string `json:"proto_version"`
     Compression   string `json:"compression"`
@@ -50,16 +48,13 @@ type Consumer struct {
     channel     *amqp.Channel
     deliveries  <-chan amqp.Delivery
     done        chan bool
-    stopping    int32 // 原子操作，表示是否正在停止
-    reconnectMu int32 // 重连锁，防止重复重连
+    stopping    int32
 }
 
-func init() {
+func main5() {
     flag.Parse()
-}
-
-func main() {
-    Log.Printf("Starting consumer for queue: %s", *queue)
+    
+    Log.Printf("Starting simple consumer for queue: %s", *queue)
     
     consumer := &Consumer{
         uri:   *uri,
@@ -68,15 +63,12 @@ func main() {
         done:  make(chan bool),
     }
 
-    // 设置信号处理
     setupSignalHandler(consumer)
     
-    // 启动消费者
     if err := consumer.Run(); err != nil {
         ErrLog.Fatalf("Failed to start consumer: %s", err)
     }
 
-    // 等待完成信号
     <-consumer.done
     Log.Printf("Consumer stopped")
 }
@@ -92,14 +84,10 @@ func setupSignalHandler(consumer *Consumer) {
 }
 
 func (c *Consumer) Run() error {
-    // 连接RabbitMQ
     if err := c.connect(); err != nil {
         return err
     }
-
-    // 启动消息处理循环
     go c.handleMessages()
-
     return nil
 }
 
@@ -107,6 +95,8 @@ func (c *Consumer) connect() error {
     var err error
     
     Log.Printf("Connecting to RabbitMQ...")
+    
+    // 使用最简单的连接方式
     c.conn, err = amqp.Dial(c.uri)
     if err != nil {
         return fmt.Errorf("Failed to connect: %s", err)
@@ -139,16 +129,16 @@ func (c *Consumer) connect() error {
         return fmt.Errorf("Failed to declare queue: %s", err)
     }
 
-    // 开始消费
+    // 开始消费（启用自动确认）
     Log.Printf("Starting consumer with tag: %s", c.tag)
     c.deliveries, err = c.channel.Consume(
         c.queue, // queue
         c.tag,   // consumer
-        *autoAck,// autoAck
+        true,    // autoAck - 启用自动确认
         false,   // exclusive
         false,   // noLocal
         false,   // noWait
-        nil,     // args - 这里应该是nil，不是args
+        nil,     // args - 使用nil
     )
     if err != nil {
         c.channel.Close()
@@ -163,10 +153,10 @@ func (c *Consumer) connect() error {
 func (c *Consumer) handleMessages() {
     defer func() {
         if r := recover(); r != nil {
-            ErrLog.Printf("Recovered from panic in handleMessages: %v", r)
+            ErrLog.Printf("Recovered from panic: %v", r)
         }
-        // 只有在非主动停止的情况下才触发重连
         if atomic.LoadInt32(&c.stopping) == 0 {
+            Log.Printf("Connection lost, attempting to reconnect...")
             c.reconnect()
         } else {
             c.done <- true
@@ -175,59 +165,45 @@ func (c *Consumer) handleMessages() {
 
     messageCount := 0
     lastReport := time.Now()
+    batchCount := 0
 
     for d := range c.deliveries {
-        // 检查是否正在停止
         if atomic.LoadInt32(&c.stopping) == 1 {
             break
         }
 
         messageCount++
+        batchCount++
         
         // 定期报告处理进度
-        if time.Since(lastReport) > 30*time.Second {
-            Log.Printf("Processed %d messages", messageCount)
+        if time.Since(lastReport) > 10*time.Second {
+            Log.Printf("Processed %d messages (%d batches)", messageCount, batchCount)
             lastReport = time.Now()
-        }
-
-        if *verbose {
-            Log.Printf("Received message %d (%d bytes)", messageCount, len(d.Body))
-        }
-
-        // 处理消息
-        if err := c.processMessage(d); err != nil {
-            ErrLog.Printf("Failed to process message %d: %s", messageCount, err)
-            if !*autoAck {
-                // 处理失败，拒绝消息（不重新入队）
-                if err := d.Nack(false, false); err != nil {
-                    ErrLog.Printf("Failed to Nack message: %s", err)
-                    // Nack失败，连接可能已断开，退出循环触发重连
-                    break
-                }
-            }
-            continue
-        }
-
-        // 确认消息
-        if !*autoAck {
-            if err := d.Ack(false); err != nil {
-                ErrLog.Printf("Failed to Ack message: %s", err)
-                // Ack失败，连接可能已断开，退出循环触发重连
-                break
-            }
+            batchCount = 0
         }
 
         if *verbose && messageCount%100 == 0 {
+            Log.Printf("Received message %d (%d bytes)", messageCount, len(d.Body))
+        }
+
+        // 处理消息（简化错误处理）
+        if err := c.processMessage(d.Body); err != nil {
+            ErrLog.Printf("Failed to process message %d: %s", messageCount, err)
+            // 由于启用了自动确认，消息已被确认，我们只是记录错误
+            continue
+        }
+
+        if *verbose && messageCount%1000 == 0 {
             Log.Printf("Successfully processed %d messages", messageCount)
         }
     }
 
-    Log.Printf("Message channel closed, processed total %d messages", messageCount)
+    Log.Printf("Deliveries channel closed, processed total %d messages", messageCount)
 }
 
-func (c *Consumer) processMessage(d amqp.Delivery) error {
+func (c *Consumer) processMessage(body []byte) error {
     // 1. 解析消息格式
-    header, protoData, err := parseMessageFormat(d.Body)
+    header, protoData, err := parseMessageFormat(body)
     if err != nil {
         return fmt.Errorf("Parse message format failed: %w", err)
     }
@@ -262,7 +238,7 @@ func (c *Consumer) processMessage(d amqp.Delivery) error {
             Log.Printf("Batch %s: %d records, first: %s @ %.2f", 
                 db.BatchId, len(db.Records), db.Records[0].Symbol, db.Records[0].Lp)
         } else {
-            Log.Printf("Batch %s: %d records (empty)", db.BatchId, len(db.Records))
+            Log.Printf("Batch %s: %d records", db.BatchId, len(db.Records))
         }
     }
 
@@ -270,26 +246,19 @@ func (c *Consumer) processMessage(d amqp.Delivery) error {
 }
 
 func (c *Consumer) reconnect() {
-    // 使用原子操作防止重复重连
-    if !atomic.CompareAndSwapInt32(&c.reconnectMu, 0, 1) {
-        Log.Printf("Reconnection already in progress")
-        return
-    }
-    defer atomic.StoreInt32(&c.reconnectMu, 0)
-
     Log.Printf("Attempting to reconnect...")
     
     // 关闭现有连接
     c.cleanup()
     
     // 重连循环
-    for i := 0; i < 5; i++ {
-        Log.Printf("Reconnection attempt %d/5", i+1)
+    for i := 0; i < 10; i++ {
+        Log.Printf("Reconnection attempt %d/10", i+1)
         
         if err := c.connect(); err != nil {
             ErrLog.Printf("Reconnection failed: %s", err)
-            if i < 4 {
-                waitTime := time.Duration(i+1) * 5 * time.Second
+            if i < 9 {
+                waitTime := time.Duration(i+1) * 2 * time.Second
                 Log.Printf("Waiting %v before next attempt", waitTime)
                 time.Sleep(waitTime)
                 continue
@@ -308,16 +277,12 @@ func (c *Consumer) reconnect() {
 
 func (c *Consumer) cleanup() {
     if c.channel != nil {
-        if err := c.channel.Close(); err != nil {
-            Log.Printf("Error closing channel: %s", err)
-        }
+        c.channel.Close()
         c.channel = nil
     }
     
     if c.conn != nil {
-        if err := c.conn.Close(); err != nil {
-            Log.Printf("Error closing connection: %s", err)
-        }
+        c.conn.Close()
         c.conn = nil
     }
 }
