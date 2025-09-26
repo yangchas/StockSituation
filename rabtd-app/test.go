@@ -1,9 +1,10 @@
-// consumer_streadway_fixed.go
+// consumer_tdengine.go
 package main
 
 import (
     "bytes"
     "compress/zlib"
+    "database/sql"
     "encoding/binary"
     "encoding/json"
     "flag"
@@ -12,6 +13,8 @@ import (
     "log"
     "os"
     "os/signal"
+    // "strconv"
+    "strings"
     "sync/atomic"
     "syscall"
     "time"
@@ -19,12 +22,15 @@ import (
     amqp "github.com/streadway/amqp"
     pb "rabtd-app/dataservice"
     "google.golang.org/protobuf/proto"
+    _ "github.com/taosdata/driver-go/v3/taosSql"
 )
 
 var (
     uri          = flag.String("uri", "amqp://admin:admin@localhost:5672/", "AMQP URI")
     queue        = flag.String("queue", "stream2", "AMQP queue name")
-    consumerTag  = flag.String("consumer-tag", "streadway-consumer", "AMQP consumer tag")
+    consumerTag  = flag.String("consumer-tag", "tdengine-consumer", "AMQP consumer tag")
+    tdengineDSN  = flag.String("tdengine-dsn", "root:taosdata@tcp(localhost:6030)/", "TDengine DSN")
+    batchSize    = flag.Int("batch-size", 1000, "Batch size for TDengine insertion")
     verbose      = flag.Bool("verbose", true, "enable verbose output of message data")
     ErrLog       = log.New(os.Stderr, "[ERROR] ", log.LstdFlags|log.Lmsgprefix)
     Log          = log.New(os.Stdout, "[INFO] ", log.LstdFlags|log.Lmsgprefix)
@@ -39,19 +45,33 @@ type Consumer struct {
     deliveries  <-chan amqp.Delivery
     done        chan bool
     stopping    int32
-    reconnectMu int32 // 重连锁，防止重复重连
+    reconnectMu int32
+    
+    // TDengine 相关
+    db          *sql.DB
+    batchSize   int
+    recordChan  chan *pb.DataRecord
+    batchBuffer []*pb.DataRecord
 }
 
 func main() {
     flag.Parse()
     
-    Log.Printf("Starting consumer with streadway/amqp for queue: %s", *queue)
+    Log.Printf("Starting TDengine consumer for queue: %s", *queue)
     
     consumer := &Consumer{
-        uri:   *uri,
-        queue: *queue,
-        tag:   *consumerTag,
-        done:  make(chan bool),
+        uri:        *uri,
+        queue:      *queue,
+        tag:        *consumerTag,
+        done:       make(chan bool),
+        batchSize:  *batchSize,
+        recordChan: make(chan *pb.DataRecord, 10000), // 缓冲通道
+        batchBuffer: make([]*pb.DataRecord, 0, *batchSize),
+    }
+
+    // 初始化 TDengine
+    if err := consumer.initTDengine(); err != nil {
+        ErrLog.Fatalf("Failed to initialize TDengine: %s", err)
     }
 
     setupSignalHandler(consumer)
@@ -62,6 +82,238 @@ func main() {
 
     <-consumer.done
     Log.Printf("Consumer stopped")
+}
+
+func (c *Consumer) initTDengine() error {
+    var err error
+    
+    Log.Printf("Connecting to TDengine: %s", *tdengineDSN)
+    c.db, err = sql.Open("taosSql", *tdengineDSN)
+    if err != nil {
+        return fmt.Errorf("Failed to connect to TDengine: %s", err)
+    }
+
+    // 测试连接
+    if err := c.db.Ping(); err != nil {
+        return fmt.Errorf("Failed to ping TDengine: %s", err)
+    }
+
+    // 创建数据库和表
+    if err := c.createDatabaseAndTable(); err != nil {
+        return fmt.Errorf("Failed to create database and table: %s", err)
+    }
+
+    // 启动批量插入协程
+    go c.batchInsertWorker()
+
+    Log.Printf("TDengine initialized successfully")
+    return nil
+}
+
+func (c *Consumer) createDatabaseAndTable() error {
+    // 创建数据库
+    _, err := c.db.Exec("CREATE DATABASE IF NOT EXISTS market_data")
+    if err != nil {
+        return fmt.Errorf("Failed to create database: %s", err)
+    }
+
+    // 使用数据库
+    _, err = c.db.Exec("USE market_data")
+    if err != nil {
+        return fmt.Errorf("Failed to use database: %s", err)
+    }
+
+    // 创建超级表
+    createStableSQL := `
+    CREATE STABLE IF NOT EXISTS stock_data (
+        tss TIMESTAMP,
+        lp FLOAT,
+        o FLOAT,
+        h FLOAT,
+        l FLOAT,
+        lc FLOAT,
+        a FLOAT,
+        v BIGINT,
+        p BIGINT,
+        ap1 FLOAT,
+        ap2 FLOAT,
+        ap3 FLOAT,
+        ap4 FLOAT,
+        ap5 FLOAT,
+        bp1 FLOAT,
+        bp2 FLOAT,
+        bp3 FLOAT,
+        bp4 FLOAT,
+        bp5 FLOAT,
+        av1 BIGINT,
+        av2 BIGINT,
+        av3 BIGINT,
+        av4 BIGINT,
+        av5 BIGINT,
+        bv1 BIGINT,
+        bv2 BIGINT,
+        bv3 BIGINT,
+        bv4 BIGINT,
+        bv5 BIGINT
+    ) TAGS (symbol BINARY(20), exchange BINARY(10), market BINARY(10))
+    `
+    _, err = c.db.Exec(createStableSQL)
+    if err != nil {
+        return fmt.Errorf("Failed to create super table: %s", err)
+    }
+
+    Log.Printf("Database and table created successfully")
+    return nil
+}
+
+func (c *Consumer) batchInsertWorker() {
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case record, ok := <-c.recordChan:
+            if !ok {
+                // 通道关闭，插入剩余数据
+                if len(c.batchBuffer) > 0 {
+                    c.insertBatch(c.batchBuffer)
+                }
+                return
+            }
+            
+            c.batchBuffer = append(c.batchBuffer, record)
+            
+            // 达到批次大小时立即插入
+            if len(c.batchBuffer) >= c.batchSize {
+                c.insertBatch(c.batchBuffer)
+                c.batchBuffer = c.batchBuffer[:0] // 清空缓冲区
+            }
+            
+        case <-ticker.C:
+            // 定时插入，避免数据积压
+            if len(c.batchBuffer) > 0 {
+                c.insertBatch(c.batchBuffer)
+                c.batchBuffer = c.batchBuffer[:0]
+            }
+        }
+    }
+}
+
+func (c *Consumer) insertBatch(records []*pb.DataRecord) {
+    if len(records) == 0 {
+        return
+    }
+
+    startTime := time.Now()
+    
+    // 按 symbol 分组，为每个 symbol 创建子表并插入数据
+    recordsBySymbol := make(map[string][]*pb.DataRecord)
+    for _, record := range records {
+        symbol := record.GetSymbol()
+        recordsBySymbol[symbol] = append(recordsBySymbol[symbol], record)
+    }
+
+    totalInserted := 0
+    for symbol, symbolRecords := range recordsBySymbol {
+        if len(symbolRecords) == 0 {
+            continue
+        }
+
+        // 使用第一个记录获取 exchange 和 market
+        firstRecord := symbolRecords[0]
+        exchange := firstRecord.GetExchange()
+        market := firstRecord.GetMarket()
+        
+        // 创建子表（如果不存在）
+        tableName := "t_" + sanitizeSymbol(symbol)
+        createTableSQL := fmt.Sprintf(
+            "CREATE TABLE IF NOT EXISTS %s USING stock_data TAGS ('%s', '%s', '%s')",
+            tableName, symbol, exchange, market,
+        )
+        
+        _, err := c.db.Exec(createTableSQL)
+        if err != nil {
+            ErrLog.Printf("Failed to create table for symbol %s: %s", symbol, err)
+            continue
+        }
+
+        // 构建批量插入 SQL
+        var valueStrings []string
+        var valueArgs []interface{}
+        
+        for _, record := range symbolRecords {
+			times:=record.GetXTs()
+            valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            
+            valueArgs = append(valueArgs,
+                times, // 转换为 time.Time
+                record.GetLp(),
+                record.GetO(),
+                record.GetH(),
+                record.GetL(),
+                record.GetLc(),
+                record.GetA(),
+                record.GetV(),
+                record.GetP(),
+                record.GetAp1(),
+                record.GetAp2(),
+                record.GetAp3(),
+                record.GetAp4(),
+                record.GetAp5(),
+                record.GetBp1(),
+                record.GetBp2(),
+                record.GetBp3(),
+                record.GetBp4(),
+                record.GetBp5(),
+                record.GetAv1(),
+                record.GetAv2(),
+                record.GetAv3(),
+                record.GetAv4(),
+                record.GetAv5(),
+                record.GetBv1(),
+                record.GetBv2(),
+                record.GetBv3(),
+                record.GetBv4(),
+                record.GetBv5(),
+            )
+        }
+
+        insertSQL := fmt.Sprintf("INSERT INTO %s VALUES %s", 
+            tableName, strings.Join(valueStrings, ","))
+        // Log.Printf("%s",insertSQL)
+        _, err = c.db.Exec(insertSQL, valueArgs...)
+        if err != nil {
+            ErrLog.Printf("Failed to insert records for symbol %s: %s", symbol, err)
+            continue
+        }
+
+        totalInserted += len(symbolRecords)
+    }
+
+    if *verbose {
+        duration := time.Since(startTime)
+        Log.Printf("Inserted %d records in %v (%.2f records/sec)", 
+            totalInserted, duration, float64(totalInserted)/duration.Seconds())
+    }
+}
+
+// 清理 symbol，确保可以作为表名
+func sanitizeSymbol(symbol string) string {
+    // 移除或替换无效字符
+    sanitized := strings.Map(func(r rune) rune {
+        if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || 
+           (r >= '0' && r <= '9') || r == '_' {
+            return r
+        }
+        return '_'
+    }, symbol)
+    
+    // 确保不以数字开头
+    if len(sanitized) > 0 && sanitized[0] >= '0' && sanitized[0] <= '9' {
+        sanitized = "s_" + sanitized
+    }
+    
+    return sanitized
 }
 
 func setupSignalHandler(consumer *Consumer) {
@@ -98,7 +350,7 @@ func (c *Consumer) Run() error {
         c.cleanup()
         return fmt.Errorf("Failed to set QoS: %s", err)
     }
-args := amqp.Table{
+	args := amqp.Table{
         "x-max-length": int64(100000),
     }
     Log.Printf("Declaring queue: %s", c.queue)
@@ -114,7 +366,7 @@ args := amqp.Table{
     Log.Printf("Starting consumer with tag: %s", uniqueTag)
     c.deliveries, err = c.channel.Consume(
         c.queue,    // queue
-        uniqueTag,  // consumer - 使用唯一标签
+        uniqueTag,  // consumer
         true,       // autoAck
         false,      // exclusive
         false,      // noLocal
@@ -126,7 +378,7 @@ args := amqp.Table{
         return fmt.Errorf("Failed to start consumer: %s", err)
     }
 
-    // 启动连接监控（只启动一次）
+    // 启动连接监控
     go c.monitorConnection()
     
     // 启动消息处理
@@ -154,7 +406,6 @@ func (c *Consumer) monitorConnection() {
 }
 
 func (c *Consumer) safeReconnect() {
-    // 使用原子操作防止重复重连
     if !atomic.CompareAndSwapInt32(&c.reconnectMu, 0, 1) {
         Log.Printf("Reconnection already in progress, skipping...")
         return
@@ -162,11 +413,8 @@ func (c *Consumer) safeReconnect() {
     defer atomic.StoreInt32(&c.reconnectMu, 0)
 
     Log.Printf("Attempting to reconnect...")
-    
-    // 先清理资源
     c.cleanup()
     
-    // 重连循环
     for i := 0; i < 5; i++ {
         Log.Printf("Reconnection attempt %d/5", i+1)
         
@@ -194,7 +442,6 @@ func (c *Consumer) handleMessages() {
             ErrLog.Printf("Recovered from panic in handleMessages: %v", r)
         }
         
-        // 只有在非主动停止的情况下才触发重连
         if atomic.LoadInt32(&c.stopping) == 0 {
             Log.Printf("Message channel closed, will attempt to reconnect")
             c.safeReconnect()
@@ -204,6 +451,7 @@ func (c *Consumer) handleMessages() {
     }()
 
     messageCount := 0
+    recordCount := 0
     startTime := time.Now()
     lastReport := time.Now()
 
@@ -214,46 +462,48 @@ func (c *Consumer) handleMessages() {
 
         messageCount++
 
+        // 处理消息
+        recordsProcessed, err := c.processMessage(d.Body)
+        if err != nil {
+            ErrLog.Printf("Failed to process message %d: %s", messageCount, err)
+            continue
+        }
+
+        recordCount += recordsProcessed
+
         // 定期报告处理进度
         if time.Since(lastReport) > 10*time.Second {
             rate := float64(messageCount) / time.Since(startTime).Seconds()
-            Log.Printf("Processed %d messages (%.2f msg/sec)", messageCount, rate)
+            recordRate := float64(recordCount) / time.Since(startTime).Seconds()
+            Log.Printf("Processed %d messages, %d records (%.2f msg/sec, %.2f records/sec)", 
+                messageCount, recordCount, rate, recordRate)
             lastReport = time.Now()
         }
 
         if *verbose && messageCount%100 == 0 {
             Log.Printf("Received message %d (%d bytes)", messageCount, len(d.Body))
         }
-
-        // 处理消息
-        if err := c.processMessage(d.Body); err != nil {
-            ErrLog.Printf("Failed to process message %d: %s", messageCount, err)
-            continue
-        }
-
-        if *verbose && messageCount%1000 == 0 {
-            Log.Printf("Successfully processed %d messages", messageCount)
-        }
     }
 
-    Log.Printf("Deliveries channel closed, processed total %d messages", messageCount)
+    Log.Printf("Deliveries channel closed, processed total %d messages, %d records", 
+        messageCount, recordCount)
 }
 
-func (c *Consumer) processMessage(body []byte) error {
+func (c *Consumer) processMessage(body []byte) (int, error) {
     // 1. 解析消息格式
     header, protoData, err := parseMessageFormat(body)
     if err != nil {
-        return fmt.Errorf("Parse message format failed: %w", err)
+        return 0, fmt.Errorf("Parse message format failed: %w", err)
     }
 
-    if *verbose {
-        Log.Printf("Message header: %+v", header)
-    }
+    // if *verbose {
+    //     Log.Printf("Message header: %+v", header)
+    // }
 
     // 2. 反序列化 DataRequest
     var dr pb.DataRequest  
     if err := proto.Unmarshal(protoData, &dr); err != nil {  
-        return fmt.Errorf("Unmarshal DataRequest failed: %w", err)  
+        return 0, fmt.Errorf("Unmarshal DataRequest failed: %w", err)  
     }  
 
     // 3. 解压数据
@@ -262,39 +512,49 @@ func (c *Consumer) processMessage(body []byte) error {
     case "GZIP", "ZLIB":
         batchBytes, err = decompressZlib(dr.CompressedData)
         if err != nil {
-            return fmt.Errorf("Decompress failed: %w", err)
+            return 0, fmt.Errorf("Decompress failed: %w", err)
         }
     case "NONE", "":
         batchBytes = dr.CompressedData
     default:
-        return fmt.Errorf("Unsupported compression: %s", header.Compression)
+        return 0, fmt.Errorf("Unsupported compression: %s", header.Compression)
     }
 
     // 4. 反序列化 DataBatch
     var db pb.DataBatch
     if err := proto.Unmarshal(batchBytes, &db); err != nil {
-        return fmt.Errorf("Unmarshal DataBatch failed: %w", err)
+        return 0, fmt.Errorf("Unmarshal DataBatch failed: %w", err)
     }
     
-    // 5. 记录处理结果
+    // 5. 发送记录到 TDengine 插入队列
+    recordsProcessed := 0
+    for _, record := range db.Records {
+        select {
+        case c.recordChan <- record:
+            recordsProcessed++
+        default:
+            // 通道已满，等待一下
+            time.Sleep(100 * time.Millisecond)
+            select {
+            case c.recordChan <- record:
+                recordsProcessed++
+            case <-time.After(1 * time.Second):
+                ErrLog.Printf("Record channel full, dropping record")
+            }
+        }
+    }
+    
+    // 6. 记录处理结果
     if *verbose {
         if len(db.Records) > 0 {
             Log.Printf("Batch %s: %d records, first: %s @ %.2f", 
                 db.BatchId, len(db.Records), db.Records[0].Symbol, db.Records[0].Lp)
-            
-            // 偶尔显示更多详细信息
-            if len(db.Records) > 5{// && messageCount%1000 == 0 {
-                Log.Printf("Sample records from batch %s:", db.BatchId)
-                for i := 0; i < len(db.Records); i++ {//i < 3 && 
-                    Log.Printf("  Record %d: %s @ %.2f", i+1, db.Records[i].Symbol, db.Records[i].Lp)
-                }
-            }
         } else {
-            Log.Printf("Batch %s: %d records (empty)", db.BatchId, len(db.Records))
+            Log.Printf("Batch %s: %d records", db.BatchId, len(db.Records))
         }
     }
 
-    return nil
+    return recordsProcessed, nil
 }
 
 func (c *Consumer) cleanup() {
@@ -312,7 +572,20 @@ func (c *Consumer) cleanup() {
 func (c *Consumer) Stop() {
     Log.Printf("Stopping consumer...")
     atomic.StoreInt32(&c.stopping, 1)
+    
+    // 关闭记录通道，确保所有数据都被处理
+    close(c.recordChan)
+    
+    // 等待批量插入完成
+    time.Sleep(2 * time.Second)
+    
     c.cleanup()
+    
+    // 关闭数据库连接
+    if c.db != nil {
+        c.db.Close()
+    }
+    
     c.done <- true
 }
 
@@ -348,17 +621,14 @@ func parseMessageFormat(body []byte) (*MessageHeader, []byte, error) {
             len(body), 4+int(headerLen))
     }
 
- 
     headerJSON := body[4 : 4+headerLen]
     var header MessageHeader
-
     if err := json.Unmarshal(headerJSON, &header); err != nil {
         return nil, nil, fmt.Errorf("JSON header parse failed: %w, data: %s", err, string(headerJSON))
     }
 
     protoData := body[4+headerLen:]
-    // Log.Printf("header:%s",header)
-	// Log.Printf("protoData:%s",protoData)
+    
     return &header, protoData, nil
 }
 
@@ -370,4 +640,29 @@ type MessageHeader struct {
     OriginalSize  int    `json:"original_size"`
     CompressedSize int   `json:"compressed_size"`
     Timestamp     int64  `json:"timestamp"`
+}
+
+// 辅助函数：安全转换字符串
+func safeString(s string) string {
+    if s == "" {
+        return "unknown"
+    }
+    return s
+}
+
+// 辅助函数：安全转换整数
+func safeInt64(i int64) int64 {
+    if i < 0 {
+        return 0
+    }
+    return i
+}
+
+// 辅助函数：安全转换浮点数
+func safeFloat32(f float32) float32 {
+    // 检查是否为 NaN 或 Inf
+    if f != f { // NaN check
+        return 0.0
+    }
+    return f
 }
