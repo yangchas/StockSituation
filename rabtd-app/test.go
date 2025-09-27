@@ -296,7 +296,6 @@ func (c *Consumer) insertSymbolRecords(symbol string, records []*pb.DataRecord) 
     for _, record := range records {
         // 验证和处理时间戳
         timestamp := record.GetXTs()
-    
         valueStrings = append(valueStrings, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         
 
@@ -339,7 +338,7 @@ func (c *Consumer) insertSymbolRecords(symbol string, records []*pb.DataRecord) 
     }
 
     insertSQL := fmt.Sprintf("INSERT INTO %s VALUES %s", tableName, strings.Join(valueStrings, ","))
-    
+    // fmt.Println(valueArgs)
     _, err = c.db.Exec(insertSQL, valueArgs...)
     if err != nil {
         ErrLog.Printf("Failed to insert %d records for symbol %s: %s", validRecordCount, symbol, err)
@@ -474,7 +473,7 @@ func (c *Consumer) processMessage(body []byte) (int, int, error) {
     if *verbose && len(db.Records) > 0 {
         Log.Printf("Batch %s: %d records, inserted %d, dropped %d, first: %s @ %.2f", 
             db.BatchId, len(db.Records), recordsProcessed, dropped, 
-            db.Records[0].Symbol, db.Records[0].Lp)
+            db.Records[0].Symbol, db.Records[0].Lp,db.Records[0].XTs)
     }
 
     return recordsProcessed, dropped, nil
