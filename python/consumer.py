@@ -34,8 +34,9 @@ CONFIG = {
     'batch_size': 500,
     'worker_count': 4,
     'buffer_size': 50000,
-    'flush_timeout': 1.0,
-    'verbose': True
+    'flush_timeout': 3.0,
+    'verbose': True,
+    'shutdown_timeout': 30  # 优雅关闭超时时间（秒）
 }
 
 # 完成消息标记
@@ -183,7 +184,8 @@ class TDengineWriter:
                     values.append(value_str)
                 
                 insert_sql = f"INSERT INTO {table_name} VALUES {' '.join(values)}"
-                print(insert_sql)
+                if CONFIG['verbose']:
+                    self.log.debug(f"Executing SQL: {insert_sql}")
                 # 执行插入
                 self.conn.execute(insert_sql)
                 total_inserted += len(symbol_records)
@@ -264,7 +266,7 @@ def process_message(body):
         return [], 0
 
 
-def run_rabbitmq_consumer(task_queues: List[Queue]):
+def run_rabbitmq_consumer(task_queues: List[Queue], shutdown_event):
     """运行 RabbitMQ 消费者任务"""
     log = logging.getLogger("RabbitMQConsumer")
     connection = None
@@ -300,6 +302,11 @@ def run_rabbitmq_consumer(task_queues: List[Queue]):
         def callback(ch, method, properties, body):
             nonlocal message_count, record_count, last_report
             
+            # 检查是否应该关闭
+            if shutdown_event.is_set():
+                ch.stop()
+                return
+                
             message_count += 1
             
             try:
@@ -310,6 +317,16 @@ def run_rabbitmq_consumer(task_queues: List[Queue]):
                 for record in records:
                     # 根据符号哈希选择队列
                     queue_index = hash(record.symbol) % len(task_queues)
+                    
+                    # 如果队列已满，等待一段时间
+                    while task_queues[queue_index].full() and not shutdown_event.is_set():
+                        time.sleep(0.1)
+                    
+                    # 如果正在关闭，不再添加新消息
+                    if shutdown_event.is_set():
+                        log.info("Shutdown in progress, skipping new messages")
+                        break
+                        
                     task_queues[queue_index].put(record)
                 
                 # 定期报告
@@ -339,7 +356,12 @@ def run_rabbitmq_consumer(task_queues: List[Queue]):
         )
         
         log.info("RabbitMQ consumer started successfully")
-        channel.start_consuming()
+        
+        # 使用非阻塞方式消费，以便检查关闭事件
+        while not shutdown_event.is_set():
+            connection.process_data_events(time_limit=1)  # 处理1秒的数据事件
+            
+        log.info("RabbitMQ consumer stopping due to shutdown event")
         
     except KeyboardInterrupt:
         log.info("Consumer interrupted by user")
@@ -348,78 +370,173 @@ def run_rabbitmq_consumer(task_queues: List[Queue]):
         raise
     finally:
         # 发送完成消息
-        for queue in task_queues:
-            queue.put(_DONE_MESSAGE)
+        for i, queue in enumerate(task_queues):
+            try:
+                # 非阻塞方式发送完成消息
+                if not queue.full():
+                    queue.put_nowait(_DONE_MESSAGE)
+                    log.info(f"Sent DONE message to queue {i}")
+                else:
+                    log.warning(f"Queue {i} is full, cannot send DONE message")
+            except Exception as e:
+                log.error(f"Failed to send DONE message to queue {i}: {e}")
             
         # 关闭连接
         if channel and channel.is_open:
-            channel.close()
+            try:
+                channel.close()
+            except Exception as e:
+                log.error(f"Error closing channel: {e}")
         if connection and connection.is_open:
-            connection.close()
+            try:
+                connection.close()
+            except Exception as e:
+                log.error(f"Error closing connection: {e}")
         log.info("RabbitMQ consumer stopped")
 
 
-def run_write_task(task_id: int, queue: Queue, done_queue: Queue):
-    """运行写入任务"""
+def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event):
+    """运行写入任务 - 修复版本"""
     log = logging.getLogger(f"WriteTask-{task_id}")
     writer = TDengineWriter(task_id)
+    
+    # 在子进程中忽略 SIGINT 信号，让主进程统一处理
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     
     try:
         writer.connect()
         
         batch = []
         last_flush = time.time()
+        received_done = False
+        force_flush = False
         
         while True:
-            try:
-                # 检查是否应该刷新批次
-                current_time = time.time()
-                if batch and (len(batch) >= CONFIG['batch_size'] or 
-                             current_time - last_flush >= CONFIG['flush_timeout']):
+            # 检查是否应该退出
+            if shutdown_event.is_set() and received_done and len(batch) == 0:
+                # 检查队列是否真的空了
+                try:
+                    # 尝试获取一个消息，如果队列空了就退出
+                    record = queue.get_nowait()
+                    if record == _DONE_MESSAGE:
+                        # 再次收到 DONE 消息，忽略
+                        continue
+                    batch.append(record)
+                    # 有消息就继续处理
+                    continue
+                except Empty:
+                    # 队列真的空了，可以退出
+                    log.info("Queue is empty, exiting...")
+                    break
+            
+            # 强制刷新条件：批次大小、超时、关闭事件
+            current_time = time.time()
+            should_flush = (batch and (
+                len(batch) >= CONFIG['batch_size'] or 
+                current_time - last_flush >= CONFIG['flush_timeout'] or
+                force_flush or
+                (shutdown_event.is_set() and len(batch) > 0)
+            ))
+            
+            if should_flush:
+                try:
                     writer.insert_records(batch)
                     batch = []
                     last_flush = current_time
+                    force_flush = False
+                except Exception as e:
+                    log.error(f"Failed to insert batch: {e}")
+                    # 重新连接
+                    try:
+                        writer.close()
+                        writer.connect()
+                    except Exception as conn_error:
+                        log.error(f"Failed to reconnect: {conn_error}")
+                        time.sleep(1)
+            
+            # 从队列获取记录
+            try:
+                # 使用较短超时以便能够响应关闭事件
+                timeout = 0.1
+                if shutdown_event.is_set():
+                    timeout = 0.01  # 关闭时使用更短的超时
                 
-                # 从队列获取记录（带超时）
-                try:
-                    record = queue.get(timeout=0.1)
-                    if record == _DONE_MESSAGE:
-                        log.info("Received done message, finishing...")
-                        break
-                    batch.append(record)
-                except Empty:
+                record = queue.get(timeout=timeout)
+                if record == _DONE_MESSAGE:
+                    log.info("Received done message, will process remaining messages...")
+                    received_done = True
+                    force_flush = True  # 收到完成消息后强制刷新
                     continue
+                batch.append(record)
                     
-            except KeyboardInterrupt:
-                log.info("Write task interrupted")
-                break
+            except Empty:
+                # 如果没有消息但正在关闭，检查是否需要退出
+                if shutdown_event.is_set() and received_done:
+                    # 在关闭状态下，如果没有消息了，就退出
+                    if len(batch) == 0:
+                        log.info("No more messages, exiting...")
+                        break
+                    else:
+                        # 还有批次数据需要处理
+                        force_flush = True
+                continue
             except Exception as e:
-                log.error(f"Write task error: {e}")
-                # 重新连接
-                try:
-                    writer.close()
-                    writer.connect()
-                except Exception as conn_error:
-                    log.error(f"Failed to reconnect: {conn_error}")
-                    time.sleep(1)
+                log.error(f"Error getting from queue: {e}")
+                continue
         
-        # 处理剩余记录
+        # 最终强制处理剩余记录 - 这是最后的保障
+        final_batch_processed = 0
         if batch:
-            writer.insert_records(batch)
+            log.info(f"Final flush: Processing {len(batch)} remaining records in batch")
+            try:
+                writer.insert_records(batch)
+                final_batch_processed = len(batch)
+                batch = []
+            except Exception as e:
+                log.error(f"Failed to insert final batch: {e}")
+        
+        # 最后检查队列中是否还有剩余消息（双重保障）
+        remaining_messages = []
+        try:
+            while True:
+                record = queue.get_nowait()
+                if record != _DONE_MESSAGE:  # 跳过完成消息
+                    remaining_messages.append(record)
+        except Empty:
+            pass
+        
+        if remaining_messages:
+            log.info(f"Final queue drain: Processing {len(remaining_messages)} remaining records from queue")
+            try:
+                writer.insert_records(remaining_messages)
+                final_batch_processed += len(remaining_messages)
+            except Exception as e:
+                log.error(f"Failed to insert remaining queue messages: {e}")
+        
+        if final_batch_processed > 0:
+            log.info(f"Worker {task_id}: Successfully processed {final_batch_processed} final records during shutdown")
             
         done_queue.put(_DONE_MESSAGE)
         
     except Exception as e:
         log.error(f"Write task failed: {e}")
+        # 即使失败也要发送完成消息
+        try:
+            done_queue.put(_DONE_MESSAGE)
+        except:
+            pass
         raise
     finally:
         writer.close()
-        log.info("Write task finished")
+        log.info(f"Write task {task_id} finished")
 
 
-def run_monitor_process(done_queue: Queue):
+def run_monitor_process(done_queue: Queue, shutdown_event):
     """运行监控进程"""
     log = logging.getLogger("Monitor")
+    
+    # 在子进程中忽略 SIGINT 信号
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     
     try:
         conn = get_tdengine_connection()
@@ -436,38 +553,101 @@ def run_monitor_process(done_queue: Queue):
         
         last_count = get_record_count()
         last_time = time.time()
+        done_count = 0
         
-        while True:
+        while not (shutdown_event.is_set() and done_count >= CONFIG['worker_count']):
             # 检查是否所有写入任务都已完成
             try:
-                done_count = 0
                 while True:
                     done_queue.get_nowait()
                     done_count += 1
+                    log.info(f"Write task completed ({done_count}/{CONFIG['worker_count']})")
                     if done_count >= CONFIG['worker_count']:
                         log.info("All write tasks completed")
-                        return
+                        break
             except Empty:
                 pass
             
-            # 每10秒报告一次
-            time.sleep(60)
+            # 每10秒报告一次，但在关闭时更频繁检查
+            if shutdown_event.is_set():
+                time.sleep(1)  # 关闭时每秒检查一次
+            else:
+                time.sleep(10)
             
-            current_count = get_record_count()
-            current_time = time.time()
-            
-            if current_time > last_time:
-                speed = (current_count - last_count) / (current_time - last_time)
-                log.info(f"Total records: {current_count}, Speed: {speed:.2f} records/sec")
+            # 只有在有活动时才报告统计信息
+            if not shutdown_event.is_set() or done_count < CONFIG['worker_count']:
+                current_count = get_record_count()
+                current_time = time.time()
                 
-                last_count = current_count
-                last_time = current_time
+                if current_time > last_time:
+                    speed = (current_count - last_count) / (current_time - last_time)
+                    log.info(f"Total records: {current_count}, Speed: {speed:.2f} records/sec")
+                    
+                    last_count = current_count
+                    last_time = current_time
                 
     except Exception as e:
         log.error(f"Monitor error: {e}")
     finally:
         if 'conn' in locals():
             conn.close()
+        log.info("Monitor process finished")
+
+
+def check_remaining_messages(task_queues):
+    """检查并报告剩余未处理的消息"""
+    log = logging.getLogger("ShutdownChecker")
+    total_remaining = 0
+    
+    for i, queue in enumerate(task_queues):
+        queue_size = queue.qsize()
+        if queue_size > 0:
+            log.warning(f"Queue {i} has {queue_size} remaining messages")
+            total_remaining += queue_size
+    
+    if total_remaining > 0:
+        log.warning(f"Total {total_remaining} messages remaining in queues")
+    else:
+        log.info("All queues are empty")
+        
+    return total_remaining
+
+
+def force_process_remaining_messages(task_queues):
+    """强制处理剩余的消息"""
+    log = logging.getLogger("ForceProcessor")
+    total_processed = 0
+    
+    try:
+        writer = TDengineWriter(-1)  # 特殊ID用于强制处理
+        writer.connect()
+        
+        for i, queue in enumerate(task_queues):
+            messages = []
+            # 清空队列
+            try:
+                while True:
+                    record = queue.get_nowait()
+                    if record != _DONE_MESSAGE:  # 跳过完成消息
+                        messages.append(record)
+            except Empty:
+                pass
+            
+            if messages:
+                log.info(f"Force processing {len(messages)} messages from queue {i}")
+                try:
+                    processed = writer.insert_records(messages)
+                    total_processed += processed
+                    log.info(f"Force processed {processed} messages from queue {i}")
+                except Exception as e:
+                    log.error(f"Failed to force process messages from queue {i}: {e}")
+        
+        writer.close()
+        
+    except Exception as e:
+        log.error(f"Error in force processing: {e}")
+    
+    return total_processed
 
 
 def initialize_database():
@@ -505,10 +685,10 @@ def initialize_database():
             conn.close()
 
 
-def signal_handler(signum, frame):
+def signal_handler(signum, frame, shutdown_event):
     """信号处理函数"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    sys.exit(0)
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    shutdown_event.set()
 
 
 def main():
@@ -521,6 +701,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=CONFIG['batch_size'], help='Batch size')
     parser.add_argument('--workers', type=int, default=CONFIG['worker_count'], help='Number of workers')
     parser.add_argument('--buffer-size', type=int, default=CONFIG['buffer_size'], help='Buffer size')
+    parser.add_argument('--shutdown-timeout', type=int, default=CONFIG['shutdown_timeout'], help='Shutdown timeout in seconds')
     parser.add_argument('--verbose', action='store_true', default=CONFIG['verbose'], help='Verbose output')
     
     args = parser.parse_args()
@@ -532,12 +713,19 @@ def main():
         f"Starting TDengine consumer: "
         f"queue={CONFIG['queue_name']}, "
         f"workers={CONFIG['worker_count']}, "
-        f"batch_size={CONFIG['batch_size']}"
+        f"batch_size={CONFIG['batch_size']}, "
+        f"shutdown_timeout={CONFIG['shutdown_timeout']}"
     )
     
+    # 创建关闭事件
+    shutdown_event = multiprocessing.Event()
+    
     # 设置信号处理
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def handler(signum, frame):
+        signal_handler(signum, frame, shutdown_event)
+    
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
     
     # 初始化数据库
     initialize_database()
@@ -547,36 +735,75 @@ def main():
     done_queue = Queue()
     
     # 创建监控进程
-    monitor_process = Process(target=run_monitor_process, args=(done_queue,))
+    monitor_process = Process(target=run_monitor_process, args=(done_queue, shutdown_event))
     monitor_process.start()
     logger.info(f"Monitor process started with PID {monitor_process.pid}")
     
     # 创建写入进程
     write_processes = []
     for i in range(CONFIG['worker_count']):
-        p = Process(target=run_write_task, args=(i, task_queues[i], done_queue))
+        p = Process(target=run_write_task, args=(i, task_queues[i], done_queue, shutdown_event))
         p.start()
         write_processes.append(p)
         logger.info(f"Write task {i} started with PID {p.pid}")
     
     # 运行 RabbitMQ 消费者（在主进程中）
     try:
-        run_rabbitmq_consumer(task_queues)
+        run_rabbitmq_consumer(task_queues, shutdown_event)
     except Exception as e:
         logger.error(f"RabbitMQ consumer failed: {e}")
+        shutdown_event.set()
     finally:
-        # 等待所有进程完成
-        logger.info("Waiting for processes to finish...")
+        # 设置关闭事件，确保所有进程知道要关闭
+        shutdown_event.set()
         
-        for p in write_processes:
-            p.join(timeout=10)
-            if p.is_alive():
-                logger.warning(f"Process {p.pid} is still alive, terminating...")
+        # 等待所有进程完成，但有超时
+        logger.info(f"Waiting for processes to finish (timeout: {CONFIG['shutdown_timeout']}s)...")
+        
+        # 首先检查剩余消息
+        initial_remaining = check_remaining_messages(task_queues)
+        
+        # 等待写入进程完成
+        start_wait_time = time.time()
+        for i, p in enumerate(write_processes):
+            timeout_remaining = max(0, CONFIG['shutdown_timeout'] - (time.time() - start_wait_time))
+            if timeout_remaining > 0:
+                p.join(timeout=timeout_remaining)
+                if p.is_alive():
+                    logger.warning(f"Write process {i} (PID {p.pid}) did not finish in time, terminating...")
+                    p.terminate()
+            else:
+                logger.warning(f"No time remaining, terminating write process {i}")
                 p.terminate()
         
-        monitor_process.join(timeout=5)
-        if monitor_process.is_alive():
+        # 等待监控进程完成
+        timeout_remaining = max(0, CONFIG['shutdown_timeout'] - (time.time() - start_wait_time))
+        if timeout_remaining > 0:
+            monitor_process.join(timeout=timeout_remaining)
+            if monitor_process.is_alive():
+                logger.warning("Monitor process did not finish in time, terminating...")
+                monitor_process.terminate()
+        else:
             monitor_process.terminate()
+        
+        # 最终检查剩余消息
+        final_remaining = check_remaining_messages(task_queues)
+        
+        # 如果有剩余消息，强制处理
+        if final_remaining > 0:
+            logger.warning(f"Found {final_remaining} remaining messages, attempting force processing...")
+            forced_processed = force_process_remaining_messages(task_queues)
+            if forced_processed > 0:
+                logger.info(f"Successfully force processed {forced_processed} messages")
+            
+            # 最后再次检查
+            final_check = check_remaining_messages(task_queues)
+            if final_check > 0:
+                logger.error(f"WARNING: {final_check} messages were lost during shutdown!")
+            else:
+                logger.info("All messages successfully processed (including forced processing)")
+        else:
+            logger.info("All messages processed successfully")
         
         logger.info("All processes finished")
 
