@@ -31,15 +31,15 @@
 struct Config {
     std::string rabbitmq_host = "localhost";
     int rabbitmq_port = 5672;
-    std::string rabbitmq_user = "admin";
-    std::string rabbitmq_password = "admin";
+    std::string rabbitmq_user = "admin";  // RabbitMQ 默认用户
+    std::string rabbitmq_password = "admin";  // RabbitMQ 默认密码
     std::string rabbitmq_vhost = "/";
     std::string queue_name = "stream2";
     
-    int batch_size = 500;
-    int worker_count = 4;
-    int buffer_size = 50000;
-    double flush_timeout = 3.0;
+    int batch_size = 10;  // 减小批处理大小以便测试
+    int worker_count = 2;  // 减少工作线程数量
+    int buffer_size = 1000;
+    double flush_timeout = 1.0;  // 减少刷新超时
     bool verbose = true;
     int shutdown_timeout = 30;
     
@@ -132,6 +132,7 @@ public:
             freeReplyObject(reply);
         }
         
+        std::cout << "Connected to Redis successfully" << std::endl;
         return true;
     }
     
@@ -192,10 +193,14 @@ public:
         redis_ = std::make_unique<RedisClient>(config.redis_host, 
                                              config.redis_port, 
                                              config.redis_db);
-        redis_->connect();
     }
     
     bool detectVolatility(const StockData& data) override {
+        if (!redis_->connect()) {
+            std::cerr << "Failed to connect to Redis for volatility detection" << std::endl;
+            return false;
+        }
+        
         // 简化版异动检测：只检测价格变化
         if (data.close <= 0) return false;
         
@@ -232,6 +237,8 @@ public:
     }
     
     void cleanupOldData() override {
+        if (!redis_->connect()) return;
+        
         long long cutoff_time = getCurrentTimestamp() - 3600000; // 1小时前
         redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
     }
@@ -265,6 +272,7 @@ public:
     bool connect() {
         if (conn_) return true;
         
+        std::cout << "Connecting to TDengine at " << host_ << ":" << port_ << std::endl;
         conn_ = taos_connect(host_.c_str(), user_.c_str(), password_.c_str(), 
                            database_.c_str(), port_);
         
@@ -274,6 +282,7 @@ public:
             return false;
         }
         
+        std::cout << "Connected to TDengine successfully" << std::endl;
         return true;
     }
     
@@ -342,12 +351,12 @@ public:
                 ") TAGS (symbol BINARY(20), exchange BINARY(10), market BINARY(10))";
             
             connection_->execute(create_stable_sql);
+            std::cout << "Database and tables initialized successfully" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Failed to initialize database: " << e.what() << std::endl;
             return false;
         }
         
-        std::cout << "Connected to TDengine successfully" << std::endl;
         return true;
     }
     
@@ -358,8 +367,15 @@ public:
     }
     
     bool writeBatch(const std::vector<StockData>& records) override {
-        if (records.empty()) return true;
-        if (!connection_->get() && !connect()) return false;
+        if (records.empty()) {
+            std::cout << "No records to write" << std::endl;
+            return true;
+        }
+        
+        if (!connection_->get() && !connect()) {
+            std::cerr << "Failed to connect to TDengine for writing" << std::endl;
+            return false;
+        }
         
         // 按符号分组
         std::unordered_map<std::string, std::vector<const StockData*>> grouped;
@@ -532,21 +548,33 @@ public:
     
     bool connect() {
         conn_ = amqp_new_connection();
-        if (!conn_) return false;
+        if (!conn_) {
+            std::cerr << "Failed to create RabbitMQ connection" << std::endl;
+            return false;
+        }
         
         amqp_socket_t* socket = amqp_tcp_socket_new(conn_);
         if (!socket) {
+            std::cerr << "Failed to create RabbitMQ socket" << std::endl;
             amqp_destroy_connection(conn_);
             return false;
         }
         
+        std::cout << "Connecting to RabbitMQ at " << config_.rabbitmq_host << ":" << config_.rabbitmq_port << std::endl;
         if (amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port) != AMQP_STATUS_OK) {
+            std::cerr << "Failed to open RabbitMQ socket" << std::endl;
             amqp_destroy_connection(conn_);
             return false;
         }
         
-        amqp_login(conn_, config_.rabbitmq_vhost.c_str(), 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, 
+        amqp_rpc_reply_t login_reply = amqp_login(conn_, config_.rabbitmq_vhost.c_str(), 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, 
                   config_.rabbitmq_user.c_str(), config_.rabbitmq_password.c_str());
+        
+        if (login_reply.reply_type != AMQP_RESPONSE_NORMAL) {
+            std::cerr << "Failed to login to RabbitMQ" << std::endl;
+            amqp_destroy_connection(conn_);
+            return false;
+        }
         
         amqp_channel_open(conn_, 1);
         
@@ -554,6 +582,7 @@ public:
         amqp_queue_declare(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
                           0, 1, 0, 0, amqp_empty_table);
         
+        std::cout << "Connected to RabbitMQ successfully, queue: " << config_.queue_name << std::endl;
         return true;
     }
     
@@ -578,6 +607,8 @@ public:
         int message_count = 0;
         auto start_time = std::chrono::steady_clock::now();
         
+        std::cout << "Starting to consume messages from RabbitMQ..." << std::endl;
+        
         while (running_) {
             amqp_envelope_t envelope;
             amqp_maybe_release_buffers(conn_);
@@ -586,6 +617,7 @@ public:
             
             if (ret.reply_type != AMQP_RESPONSE_NORMAL) {
                 if (running_) {
+                    // 非致命错误，继续尝试
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
                 continue;
@@ -596,11 +628,16 @@ public:
             std::vector<char> body(body_start, body_start + envelope.message.body.len);
             
             if (!queue.push(std::move(body))) {
+                std::cerr << "Failed to push message to queue" << std::endl;
                 break;
             }
             
             amqp_destroy_envelope(&envelope);
             message_count++;
+            
+            if (config_.verbose && message_count % 10 == 0) {
+                std::cout << "Received " << message_count << " messages from RabbitMQ" << std::endl;
+            }
             
             // 定期报告
             auto now = std::chrono::steady_clock::now();
@@ -613,6 +650,8 @@ public:
                 message_count = 0;
             }
         }
+        
+        std::cout << "RabbitMQ consumer stopped" << std::endl;
     }
     
     void stop() {
@@ -627,9 +666,12 @@ private:
     std::unique_ptr<IVolatilityDetector> detector_;
     std::atomic<bool> running_{false};
     std::thread thread_;
+    int worker_id_;
+    static std::atomic<int> next_worker_id_;
     
 public:
     Worker(const Config& config) : config_(config) {
+        worker_id_ = next_worker_id_++;
         writer_ = std::make_unique<TDengineBatchWriter>(config);
         detector_ = std::make_unique<SimpleVolatilityDetector>(config);
     }
@@ -652,20 +694,26 @@ public:
     
 private:
     void run(ThreadSafeQueue& queue) {
+        std::cout << "Worker " << worker_id_ << " started" << std::endl;
+        
         if (!writer_->connect()) {
-            std::cerr << "Failed to connect to TDengine" << std::endl;
+            std::cerr << "Worker " << worker_id_ << ": Failed to connect to TDengine" << std::endl;
             return;
         }
         
         std::vector<StockData> batch;
         auto last_flush = std::chrono::steady_clock::now();
+        auto last_cleanup = std::chrono::steady_clock::now();
         
         // 简化的消息处理 - 实际应该解析protobuf
-        auto processMessage = [](const std::vector<char>& body, std::vector<StockData>& records) -> bool {
+        auto processMessage = [this](const std::vector<char>& body, std::vector<StockData>& records) -> bool {
             // 这里应该解析protobuf消息
             // 为演示目的，我们创建一些模拟数据
+            static int message_counter = 0;
+            message_counter++;
+            
             StockData data;
-            data.symbol = "TEST";
+            data.symbol = "TEST" + std::to_string(message_counter % 10);
             data.exchange = "SH";
             data.market = "A";
             data.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -675,8 +723,8 @@ private:
             data.high = 105.0;
             data.low = 95.0;
             data.close = 100.0;
-            data.volume = 1000000;
-            data.amount = 100000000;
+            data.volume = 1000000 + (rand() % 1000000);
+            data.amount = 100000000 + (rand() % 100000000);
             
             for (int i = 0; i < 5; i++) {
                 data.ask_prices[i] = data.last_price + i * 0.1;
@@ -686,12 +734,18 @@ private:
             }
             
             records.push_back(data);
+            
+            if (config_.verbose && message_counter % 10 == 0) {
+                std::cout << "Worker " << worker_id_ << ": Processed " << message_counter << " messages" << std::endl;
+            }
+            
             return true;
         };
         
         while (running_) {
             std::vector<char> message;
             if (!queue.pop(message)) {
+                // 队列已关闭
                 break;
             }
             
@@ -712,30 +766,36 @@ private:
                         }
                         
                         if (config_.verbose) {
-                            std::cout << "Inserted " << batch.size() << " records" << std::endl;
+                            std::cout << "Worker " << worker_id_ << ": Inserted " << batch.size() << " records" << std::endl;
                         }
+                    } else {
+                        std::cerr << "Worker " << worker_id_ << ": Failed to write batch" << std::endl;
                     }
                     batch.clear();
                 }
                 last_flush = now;
-                
-                // 定期清理异动池数据
-                static auto last_cleanup = now;
-                if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
-                    detector_->cleanupOldData();
-                    last_cleanup = now;
-                }
+            }
+            
+            // 定期清理异动池数据（每5分钟）
+            if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
+                detector_->cleanupOldData();
+                last_cleanup = now;
             }
         }
         
         // 处理剩余数据
         if (!batch.empty()) {
+            std::cout << "Worker " << worker_id_ << ": Processing final batch of " << batch.size() << " records" << std::endl;
             writer_->writeBatch(batch);
         }
         
         writer_->close();
+        std::cout << "Worker " << worker_id_ << " finished" << std::endl;
     }
 };
+
+// 静态成员初始化
+std::atomic<int> Worker::next_worker_id_{0};
 
 class ConsumerApplication {
 private:
@@ -778,6 +838,8 @@ public:
         if (consumer_thread.joinable()) {
             consumer_thread.join();
         }
+        
+        std::cout << "Application shutdown completed" << std::endl;
     }
     
 private:
@@ -785,14 +847,25 @@ private:
         std::cout << "Press Ctrl+C to stop..." << std::endl;
         
         // 设置信号处理
-        std::signal(SIGINT, [](int) { });
+        std::signal(SIGINT, [](int) { 
+            std::cout << "\nReceived shutdown signal" << std::endl;
+        });
         
         while (!shutdown_) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            
+            // 定期报告队列状态
+            static auto last_report = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
+                std::cout << "Queue size: " << queue_.size() << std::endl;
+                last_report = now;
+            }
         }
     }
     
     void shutdown() {
+        std::cout << "Initiating shutdown..." << std::endl;
         shutdown_ = true;
         rabbitmq_->stop();
         queue_.shutdown();
@@ -800,13 +873,13 @@ private:
         for (auto& worker : workers_) {
             worker->stop();
         }
-        
-        std::cout << "Application shutdown completed" << std::endl;
     }
 };
 
 // Main 函数
 int main() {
+    std::cout << "TDengine Consumer Application Starting..." << std::endl;
+    
     Config config;
     
     // 可以从环境变量加载配置
@@ -815,8 +888,13 @@ int main() {
         config.worker_count = std::atoi(env_workers);
     }
     
-    ConsumerApplication app(config);
-    app.run();
+    try {
+        ConsumerApplication app(config);
+        app.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Application error: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }
