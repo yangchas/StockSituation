@@ -31,15 +31,15 @@
 struct Config {
     std::string rabbitmq_host = "localhost";
     int rabbitmq_port = 5672;
-    std::string rabbitmq_user = "admin";  // RabbitMQ 默认用户
-    std::string rabbitmq_password = "admin";  // RabbitMQ 默认密码
+    std::string rabbitmq_user = "admin";
+    std::string rabbitmq_password = "admin";
     std::string rabbitmq_vhost = "/";
     std::string queue_name = "stream2";
     
-    int batch_size = 10;  // 减小批处理大小以便测试
-    int worker_count = 2;  // 减少工作线程数量
-    int buffer_size = 1000;
-    double flush_timeout = 1.0;  // 减少刷新超时
+    int batch_size = 100;
+    int worker_count = 4;
+    int buffer_size = 10000;
+    double flush_timeout = 1.0;
     bool verbose = true;
     int shutdown_timeout = 30;
     
@@ -84,6 +84,13 @@ struct StockData {
     double bid_volumes[5] = {0};
 };
 
+// 压缩类型枚举
+enum CompressionType {
+    COMPRESSION_NONE = 0,
+    COMPRESSION_GZIP = 1,
+    COMPRESSION_DEFLATE = 2
+};
+
 // 抽象接口类
 class IDataWriter {
 public:
@@ -100,6 +107,220 @@ public:
     virtual void cleanupOldData() = 0;
 };
 
+// 高效的消息处理器 - 完全不依赖 Protobuf
+class EfficientMessageProcessor {
+private:
+    Config config_;
+    
+public:
+    EfficientMessageProcessor(const Config& config) : config_(config) {}
+    
+    // 解析消息 - 假设消息格式为简单的二进制格式
+    bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) {
+        try {
+            if (body.size() < 8) { // 至少需要头部信息
+                if (config_.verbose) {
+                    std::cerr << "Message too small: " << body.size() << " bytes" << std::endl;
+                }
+                return false;
+            }
+            
+            // 解析消息头部
+            const char* data = body.data();
+            size_t offset = 0;
+            
+            // 假设头部格式: [4字节压缩类型][4字节记录数]
+            int32_t compression_type;
+            int32_t record_count;
+            
+            std::memcpy(&compression_type, data + offset, 4);
+            offset += 4;
+            std::memcpy(&record_count, data + offset, 4);
+            offset += 4;
+            
+            // 网络字节序转换（如果需要）
+            // compression_type = ntohl(compression_type);
+            // record_count = ntohl(record_count);
+            
+            if (record_count <= 0 || record_count > 10000) {
+                std::cerr << "Invalid record count: " << record_count << std::endl;
+                return false;
+            }
+            
+            // 获取压缩数据
+            const char* compressed_data = data + offset;
+            size_t compressed_size = body.size() - offset;
+            
+            std::vector<char> decompressed_data;
+            const char* batch_data = nullptr;
+            size_t batch_size = 0;
+            
+            // 处理压缩
+            switch (compression_type) {
+                case COMPRESSION_NONE:
+                    batch_data = compressed_data;
+                    batch_size = compressed_size;
+                    break;
+                    
+                case COMPRESSION_GZIP:
+                case COMPRESSION_DEFLATE:
+                    if (!decompressData(compressed_data, compressed_size, decompressed_data, 
+                                       compression_type == COMPRESSION_GZIP)) {
+                        std::cerr << "Failed to decompress data" << std::endl;
+                        return false;
+                    }
+                    batch_data = decompressed_data.data();
+                    batch_size = decompressed_data.size();
+                    break;
+                    
+                default:
+                    std::cerr << "Unknown compression type: " << compression_type << std::endl;
+                    return false;
+            }
+            
+            // 解析数据批次
+            return parseDataBatch(batch_data, batch_size, record_count, records);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing message: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+private:
+    // 高效解压缩
+    bool decompressData(const char* compressed, size_t compressed_size, 
+                       std::vector<char>& decompressed, bool is_gzip) {
+        if (compressed_size == 0) return false;
+        
+        z_stream strm;
+        strm.zalloc = Z_NULL;
+        strm.zfree = Z_NULL;
+        strm.opaque = Z_NULL;
+        strm.avail_in = compressed_size;
+        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed));
+        
+        // 设置解压格式
+        int window_bits = is_gzip ? (MAX_WBITS + 16) : MAX_WBITS;
+        
+        if (inflateInit2(&strm, window_bits) != Z_OK) {
+            return false;
+        }
+        
+        // 预分配缓冲区
+        decompressed.reserve(compressed_size * 3);
+        
+        const size_t CHUNK_SIZE = 65536;
+        std::vector<char> buffer(CHUNK_SIZE);
+        int ret;
+        
+        do {
+            strm.avail_out = buffer.size();
+            strm.next_out = reinterpret_cast<Bytef*>(buffer.data());
+            
+            ret = inflate(&strm, Z_NO_FLUSH);
+            
+            if (ret != Z_OK && ret != Z_STREAM_END) {
+                inflateEnd(&strm);
+                return false;
+            }
+            
+            size_t have = buffer.size() - strm.avail_out;
+            decompressed.insert(decompressed.end(), buffer.begin(), buffer.begin() + have);
+            
+        } while (ret != Z_STREAM_END);
+        
+        inflateEnd(&strm);
+        return true;
+    }
+    
+    // 解析数据批次 - 假设为固定格式的二进制数据
+    bool parseDataBatch(const char* batch_data, size_t batch_size, int record_count, 
+                       std::vector<StockData>& records) {
+        if (batch_size == 0 || record_count == 0) {
+            return false;
+        }
+        
+        // 假设每条记录固定大小（根据您的数据结构调整）
+        const size_t RECORD_SIZE = 256; // 估算大小，根据实际调整
+        
+        // 检查数据大小是否足够
+        if (batch_size < record_count * 50) { // 最小检查，每条记录至少50字节
+            std::cerr << "Batch size too small for " << record_count << " records" << std::endl;
+            return false;
+        }
+        
+        records.reserve(record_count);
+        size_t offset = 0;
+        
+        for (int i = 0; i < record_count && offset < batch_size; i++) {
+            StockData data;
+            
+            // 解析符号（假设前20字节）
+            if (offset + 20 > batch_size) break;
+            data.symbol = std::string(batch_data + offset, 20);
+            data.symbol.erase(data.symbol.find_last_not_of(' ') + 1); // 去除尾部空格
+            offset += 20;
+            
+            // 解析时间戳（8字节）
+            if (offset + 8 > batch_size) break;
+            std::memcpy(&data.timestamp, batch_data + offset, 8);
+            offset += 8;
+            
+            // 解析价格数据（各4字节）
+            if (offset + 20 > batch_size) break;
+            std::memcpy(&data.last_price, batch_data + offset, 4); offset += 4;
+            std::memcpy(&data.open, batch_data + offset, 4); offset += 4;
+            std::memcpy(&data.high, batch_data + offset, 4); offset += 4;
+            std::memcpy(&data.low, batch_data + offset, 4); offset += 4;
+            std::memcpy(&data.close, batch_data + offset, 4); offset += 4;
+            
+            // 解析成交量和成交额（各8字节）
+            if (offset + 16 > batch_size) break;
+            std::memcpy(&data.volume, batch_data + offset, 8); offset += 8;
+            std::memcpy(&data.amount, batch_data + offset, 8); offset += 8;
+            
+            // 设置默认值
+            data.exchange = "SH";
+            data.market = "A";
+            
+            // 解析五档行情（如果数据中包含）
+            // 买价
+            for (int j = 0; j < 5 && offset + 4 <= batch_size; j++) {
+                std::memcpy(&data.ask_prices[j], batch_data + offset, 4);
+                offset += 4;
+            }
+            // 卖价
+            for (int j = 0; j < 5 && offset + 4 <= batch_size; j++) {
+                std::memcpy(&data.bid_prices[j], batch_data + offset, 4);
+                offset += 4;
+            }
+            // 买量
+            for (int j = 0; j < 5 && offset + 8 <= batch_size; j++) {
+                std::memcpy(&data.ask_volumes[j], batch_data + offset, 8);
+                offset += 8;
+            }
+            // 卖量
+            for (int j = 0; j < 5 && offset + 8 <= batch_size; j++) {
+                std::memcpy(&data.bid_volumes[j], batch_data + offset, 8);
+                offset += 8;
+            }
+            
+            // 如果数据有效，添加到结果
+            if (!data.symbol.empty() && data.timestamp > 0) {
+                records.push_back(std::move(data));
+            }
+        }
+        
+        if (config_.verbose && !records.empty()) {
+            std::cout << "Processed " << records.size() << " records from binary message" << std::endl;
+        }
+        
+        return !records.empty();
+    }
+};
+
+// Redis客户端
 class RedisClient {
 private:
     redisContext* context_ = nullptr;
@@ -132,7 +353,6 @@ public:
             freeReplyObject(reply);
         }
         
-        std::cout << "Connected to Redis successfully" << std::endl;
         return true;
     }
     
@@ -201,7 +421,6 @@ public:
             return false;
         }
         
-        // 简化版异动检测：只检测价格变化
         if (data.close <= 0) return false;
         
         double price_change = std::abs(data.last_price - data.close) / data.close;
@@ -239,7 +458,7 @@ public:
     void cleanupOldData() override {
         if (!redis_->connect()) return;
         
-        long long cutoff_time = getCurrentTimestamp() - 3600000; // 1小时前
+        long long cutoff_time = getCurrentTimestamp() - 3600000;
         redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
     }
     
@@ -251,6 +470,7 @@ private:
     }
 };
 
+// TDengine连接和写入器
 class TDengineConnection {
 private:
     TAOS* conn_ = nullptr;
@@ -335,7 +555,6 @@ public:
             return false;
         }
         
-        // 创建数据库和超级表
         try {
             connection_->execute("CREATE DATABASE IF NOT EXISTS " + config_.tdengine_database);
             connection_->execute("USE " + config_.tdengine_database);
@@ -368,7 +587,6 @@ public:
     
     bool writeBatch(const std::vector<StockData>& records) override {
         if (records.empty()) {
-            std::cout << "No records to write" << std::endl;
             return true;
         }
         
@@ -377,7 +595,6 @@ public:
             return false;
         }
         
-        // 按符号分组
         std::unordered_map<std::string, std::vector<const StockData*>> grouped;
         for (const auto& record : records) {
             grouped[record.symbol].push_back(&record);
@@ -494,6 +711,7 @@ private:
     }
 };
 
+// 线程安全队列
 class ThreadSafeQueue {
 private:
     std::queue<std::vector<char>> queue_;
@@ -533,6 +751,7 @@ public:
     }
 };
 
+// RabbitMQ消费者
 class RabbitMQConsumer {
 private:
     Config config_;
@@ -578,7 +797,6 @@ public:
         
         amqp_channel_open(conn_, 1);
         
-        // 声明队列
         amqp_queue_declare(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
                           0, 1, 0, 0, amqp_empty_table);
         
@@ -595,75 +813,104 @@ public:
     }
     
     void consume(ThreadSafeQueue& queue) {
-        if (!conn_ && !connect()) {
-            std::cerr << "Failed to connect to RabbitMQ" << std::endl;
-            return;
-        }
+    if (!conn_ && !connect()) {
+        std::cerr << "Failed to connect to RabbitMQ" << std::endl;
+        return;
+    }
+    
+    // 检查队列状态
+    amqp_queue_declare_ok_t* declare_ok = amqp_queue_declare(
+        conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+        0, 1, 0, 0, amqp_empty_table
+    );
+    
+    if (declare_ok == NULL) {
+        std::cerr << "Failed to declare queue" << std::endl;
+        return;
+    }
+    
+    std::cout << "Queue '" << config_.queue_name << "' has " 
+              << declare_ok->message_count << " messages ready and " 
+              << declare_ok->consumer_count << " consumers" << std::endl;
+    
+    amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                      amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+    
+    running_ = true;
+    int message_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    
+    std::cout << "Starting to consume messages from RabbitMQ..." << std::endl;
+    
+    while (running_) {
+        amqp_envelope_t envelope;
+        amqp_maybe_release_buffers(conn_);
         
-        amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                          amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+        std::cout << "Waiting for message..." << std::endl;
         
-        running_ = true;
-        int message_count = 0;
-        auto start_time = std::chrono::steady_clock::now();
+        amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, nullptr, 0);
         
-        std::cout << "Starting to consume messages from RabbitMQ..." << std::endl;
-        
-        while (running_) {
-            amqp_envelope_t envelope;
-            amqp_maybe_release_buffers(conn_);
-            
-            amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, nullptr, 0);
-            
-            if (ret.reply_type != AMQP_RESPONSE_NORMAL) {
-                if (running_) {
-                    // 非致命错误，继续尝试
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                continue;
-            }
-            
-            // 修复指针算术问题
+        if (ret.reply_type == AMQP_RESPONSE_NORMAL) {
+            // 成功收到消息
             char* body_start = static_cast<char*>(envelope.message.body.bytes);
             std::vector<char> body(body_start, body_start + envelope.message.body.len);
             
+            std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
+            
             if (!queue.push(std::move(body))) {
                 std::cerr << "Failed to push message to queue" << std::endl;
+                amqp_destroy_envelope(&envelope);
                 break;
             }
             
             amqp_destroy_envelope(&envelope);
             message_count++;
             
-            if (config_.verbose && message_count % 10 == 0) {
-                std::cout << "Received " << message_count << " messages from RabbitMQ" << std::endl;
+            if (config_.verbose) {
+                std::cout << "Successfully processed message " << message_count << std::endl;
             }
             
-            // 定期报告
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-            if (elapsed >= 10) {
-                double msg_rate = static_cast<double>(message_count) / elapsed;
-                std::cout << "Processed " << message_count << " messages (" 
-                         << msg_rate << " msg/sec)" << std::endl;
-                start_time = now;
-                message_count = 0;
+        } else {
+            // 处理错误
+            if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
+                std::cout << "Library exception: " << amqp_error_string2(ret.library_error) << std::endl;
+            } else if (ret.reply_type == AMQP_RESPONSE_SERVER_EXCEPTION) {
+                std::cout << "Server exception: " << (ret.reply.decoded ? "decoded" : "not decoded") << std::endl;
             }
+            
+            if (running_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            continue;
         }
         
-        std::cout << "RabbitMQ consumer stopped" << std::endl;
+        // 定期报告
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed >= 10) {
+            double msg_rate = static_cast<double>(message_count) / elapsed;
+            std::cout << "Processed " << message_count << " messages (" 
+                     << msg_rate << " msg/sec)" << std::endl;
+            start_time = now;
+            message_count = 0;
+        }
     }
+    
+    std::cout << "RabbitMQ consumer stopped" << std::endl;
+}
     
     void stop() {
         running_ = false;
     }
 };
 
+// Worker类使用高效的消息处理器
 class Worker {
 private:
     Config config_;
     std::unique_ptr<IDataWriter> writer_;
     std::unique_ptr<IVolatilityDetector> detector_;
+    std::unique_ptr<EfficientMessageProcessor> message_processor_;
     std::atomic<bool> running_{false};
     std::thread thread_;
     int worker_id_;
@@ -674,6 +921,7 @@ public:
         worker_id_ = next_worker_id_++;
         writer_ = std::make_unique<TDengineBatchWriter>(config);
         detector_ = std::make_unique<SimpleVolatilityDetector>(config);
+        message_processor_ = std::make_unique<EfficientMessageProcessor>(config);
     }
     
     ~Worker() {
@@ -705,53 +953,22 @@ private:
         auto last_flush = std::chrono::steady_clock::now();
         auto last_cleanup = std::chrono::steady_clock::now();
         
-        // 简化的消息处理 - 实际应该解析protobuf
-        auto processMessage = [this](const std::vector<char>& body, std::vector<StockData>& records) -> bool {
-            // 这里应该解析protobuf消息
-            // 为演示目的，我们创建一些模拟数据
-            static int message_counter = 0;
-            message_counter++;
-            
-            StockData data;
-            data.symbol = "TEST" + std::to_string(message_counter % 10);
-            data.exchange = "SH";
-            data.market = "A";
-            data.timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            data.last_price = 100.0 + (rand() % 100) / 10.0;
-            data.open = 100.0;
-            data.high = 105.0;
-            data.low = 95.0;
-            data.close = 100.0;
-            data.volume = 1000000 + (rand() % 1000000);
-            data.amount = 100000000 + (rand() % 100000000);
-            
-            for (int i = 0; i < 5; i++) {
-                data.ask_prices[i] = data.last_price + i * 0.1;
-                data.bid_prices[i] = data.last_price - i * 0.1;
-                data.ask_volumes[i] = 1000 * (i + 1);
-                data.bid_volumes[i] = 1000 * (i + 1);
-            }
-            
-            records.push_back(data);
-            
-            if (config_.verbose && message_counter % 10 == 0) {
-                std::cout << "Worker " << worker_id_ << ": Processed " << message_counter << " messages" << std::endl;
-            }
-            
-            return true;
-        };
+        int processed_messages = 0;
+        int processed_records = 0;
         
         while (running_) {
             std::vector<char> message;
             if (!queue.pop(message)) {
-                // 队列已关闭
                 break;
             }
             
             std::vector<StockData> records;
-            if (processMessage(message, records)) {
+            if (message_processor_->processMessage(message, records)) {
+                processed_messages++;
+                processed_records += records.size();
                 batch.insert(batch.end(), records.begin(), records.end());
+            } else {
+                std::cerr << "Worker " << worker_id_ << ": Failed to process message" << std::endl;
             }
             
             auto now = std::chrono::steady_clock::now();
@@ -760,7 +977,6 @@ private:
             if (batch.size() >= config_.batch_size || elapsed >= config_.flush_timeout) {
                 if (!batch.empty()) {
                     if (writer_->writeBatch(batch)) {
-                        // 异动检测
                         for (const auto& record : batch) {
                             detector_->detectVolatility(record);
                         }
@@ -776,25 +992,29 @@ private:
                 last_flush = now;
             }
             
-            // 定期清理异动池数据（每5分钟）
+            if (processed_messages % 100 == 0 && processed_messages > 0) {
+                std::cout << "Worker " << worker_id_ << ": Processed " << processed_messages 
+                         << " messages, " << processed_records << " records" << std::endl;
+            }
+            
             if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
                 detector_->cleanupOldData();
                 last_cleanup = now;
             }
         }
         
-        // 处理剩余数据
         if (!batch.empty()) {
             std::cout << "Worker " << worker_id_ << ": Processing final batch of " << batch.size() << " records" << std::endl;
             writer_->writeBatch(batch);
         }
         
+        std::cout << "Worker " << worker_id_ << " finished. Total: " 
+                  << processed_messages << " messages, " << processed_records << " records" << std::endl;
+        
         writer_->close();
-        std::cout << "Worker " << worker_id_ << " finished" << std::endl;
     }
 };
 
-// 静态成员初始化
 std::atomic<int> Worker::next_worker_id_{0};
 
 class ConsumerApplication {
@@ -809,7 +1029,6 @@ public:
     ConsumerApplication(const Config& config) : config_(config) {
         rabbitmq_ = std::make_unique<RabbitMQConsumer>(config);
         
-        // 创建工作线程
         for (int i = 0; i < config.worker_count; ++i) {
             workers_.push_back(std::make_unique<Worker>(config));
         }
@@ -819,20 +1038,16 @@ public:
         std::cout << "Starting TDengine consumer with " 
                   << config_.worker_count << " workers" << std::endl;
         
-        // 启动工作线程
         for (auto& worker : workers_) {
             worker->start(queue_);
         }
         
-        // 启动RabbitMQ消费者
         std::thread consumer_thread([this]() {
             rabbitmq_->consume(queue_);
         });
         
-        // 等待关闭信号
         waitForShutdown();
         
-        // 停止服务
         shutdown();
         
         if (consumer_thread.joinable()) {
@@ -846,7 +1061,6 @@ private:
     void waitForShutdown() {
         std::cout << "Press Ctrl+C to stop..." << std::endl;
         
-        // 设置信号处理
         std::signal(SIGINT, [](int) { 
             std::cout << "\nReceived shutdown signal" << std::endl;
         });
@@ -854,7 +1068,6 @@ private:
         while (!shutdown_) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             
-            // 定期报告队列状态
             static auto last_report = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
@@ -876,13 +1089,11 @@ private:
     }
 };
 
-// Main 函数
 int main() {
     std::cout << "TDengine Consumer Application Starting..." << std::endl;
     
     Config config;
     
-    // 可以从环境变量加载配置
     const char* env_workers = std::getenv("WORKER_COUNT");
     if (env_workers) {
         config.worker_count = std::atoi(env_workers);
