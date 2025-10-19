@@ -59,6 +59,12 @@ struct Config {
     std::string tdengine_user = "root";
     std::string tdengine_password = "taosdata";
     std::string tdengine_database = "market_data";
+    
+    // 新增背压控制配置
+    size_t max_queue_memory = 100 * 1024 * 1024; // 100MB内存限制
+    int flow_control_timeout_ms = 1000; // 入队超时时间
+    int max_pending_batches = 5; // 最大待处理批次
+    bool enable_message_ack = true; // 启用消息确认
 };
 
 // 单例配置管理器
@@ -159,50 +165,80 @@ public:
     virtual ~IMessageConsumer() = default;
     virtual bool connect() = 0;
     virtual void disconnect() = 0;
-    virtual void consume(std::function<void(std::vector<char>&&)> callback) = 0;
+    virtual void consume(std::function<void(std::vector<char>&&, std::function<void(bool)>)> callback) = 0;
     virtual void stop() = 0;
 };
 
 // ==================== 工具类 ====================
 
-// 线程安全队列
-template<typename T>
-class ThreadSafeQueue {
+// 背压控制队列
+class BackPressureQueue {
 private:
-    std::queue<T> queue_;
+    std::queue<std::vector<char>> queue_;
     mutable std::mutex mutex_;
-    std::condition_variable cond_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
     std::atomic<bool> shutdown_{false};
+    std::atomic<size_t> current_memory_{0};
+    size_t max_memory_;
+    int timeout_ms_;
     
 public:
-    bool push(T&& item) {
-        std::lock_guard<std::mutex> lock(mutex_);
+    BackPressureQueue(size_t max_memory, int timeout_ms = 1000) 
+        : max_memory_(max_memory), timeout_ms_(timeout_ms) {}
+    
+    bool push(std::vector<char>&& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (shutdown_) return false;
+        
+        size_t item_size = item.size();
+        
+        // 等待队列有足够空间
+        if (!not_full_.wait_for(lock, std::chrono::milliseconds(timeout_ms_),
+            [this, item_size]() { 
+                return shutdown_ || (current_memory_ + item_size <= max_memory_); 
+            })) {
+            return false; // 超时，拒绝消息
+        }
+        
         if (shutdown_) return false;
         
         queue_.push(std::move(item));
-        cond_.notify_one();
+        current_memory_ += item_size;
+        not_empty_.notify_one();
         return true;
     }
     
-    bool pop(T& item) {
+    bool pop(std::vector<char>& item) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cond_.wait(lock, [this]() { return !queue_.empty() || shutdown_; });
+        not_empty_.wait(lock, [this]() { return !queue_.empty() || shutdown_; });
         
         if (shutdown_ && queue_.empty()) return false;
         
         item = std::move(queue_.front());
         queue_.pop();
+        current_memory_ -= item.size();
+        not_full_.notify_one();
         return true;
     }
     
     void shutdown() {
         shutdown_ = true;
-        cond_.notify_all();
+        not_empty_.notify_all();
+        not_full_.notify_all();
     }
     
     size_t size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.size();
+    }
+    
+    size_t memory_usage() const {
+        return current_memory_;
+    }
+    
+    double memory_ratio() const {
+        return static_cast<double>(current_memory_) / max_memory_;
     }
 };
 
@@ -738,9 +774,9 @@ public:
             
             if (success) {
                 redis_->expire(config_.volatile_pool_key, config_.volatile_expire);
-                if (config_.verbose) {
-                    std::cout << "Detected volatility for symbol: " << data.symbol << std::endl;
-                }
+                // if (config_.verbose) {
+                //     std::cout << "Detected volatility for symbol: " << data.symbol << std::endl;
+                // }
             }
             
             return success;
@@ -975,9 +1011,9 @@ private:
         
         try {
             connection_->execute(sql.str());
-            if (config_.verbose) {
-                std::cout << "Inserted " << records.size() << " records for symbol: " << symbol << std::endl;
-            }
+            // if (config_.verbose) {
+            //     std::cout << "Inserted " << records.size() << " records for symbol: " << symbol << std::endl;
+            // }
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Failed to insert records: " << e.what() << std::endl;
@@ -986,8 +1022,7 @@ private:
     }
 };
 
-// RabbitMQ消费者
-// RabbitMQ消费者 - 恢复原来的连接逻辑
+// RabbitMQ消费者 - 支持消息确认
 class RabbitMQConsumer : public IMessageConsumer {
 private:
     const Config& config_;
@@ -1052,7 +1087,7 @@ private:
             amqp_queue_declare_ok_t* declare_ok = amqp_queue_declare(
                 conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
                 0,  // passive: 创建队列
-                0,  // durable: 非持久化
+                1,  // durable: 持久化
                 0,  // exclusive: 非独占
                 0,  // auto_delete: 不自动删除
                 amqp_empty_table
@@ -1132,7 +1167,7 @@ public:
         }
     }
     
-    void consume(std::function<void(std::vector<char>&&)> callback) override {
+    void consume(std::function<void(std::vector<char>&&, std::function<void(bool)>)> callback) override {
         std::cout << "进入消费" << std::endl;
         
         if (!conn_ && !connect()) {
@@ -1151,9 +1186,12 @@ public:
             
             std::cout << "进入消费 2222 - 队列准备完成" << std::endl;
             
-            // 开始消费
+            // 设置QoS，限制未确认消息数量
+            amqp_basic_qos(conn_, 1, 0, config_.max_pending_batches, 0);
+            
+            // 开始消费，手动确认
             amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                              amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+                              amqp_empty_bytes, 0, 0, 1, amqp_empty_table);
             
             amqp_rpc_reply_t consume_reply = amqp_get_rpc_reply(conn_);
             checkAmqpError(consume_reply, "Start consuming");
@@ -1179,9 +1217,24 @@ public:
                     char* body_start = static_cast<char*>(envelope.message.body.bytes);
                     std::vector<char> body(body_start, body_start + envelope.message.body.len);
                     
-                    std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
+                    std::cout << "Received message, size: " << body.size() << " bytes, delivery_tag: " << envelope.delivery_tag << std::endl;
                     
-                    callback(std::move(body));
+                    // 创建确认回调
+                    auto ack_callback = [this, delivery_tag = envelope.delivery_tag](bool success) {
+                        if (success) {
+                            // 确认消息
+                            amqp_basic_ack(conn_, 1, delivery_tag, 0);
+                            if (config_.verbose) {
+                                std::cout << "Message acknowledged: " << delivery_tag << std::endl;
+                            }
+                        } else {
+                            // 拒绝消息并重新入队
+                            amqp_basic_reject(conn_, 1, delivery_tag, true);
+                            std::cerr << "Message rejected and requeued: " << delivery_tag << std::endl;
+                        }
+                    };
+                    
+                    callback(std::move(body), ack_callback);
                     
                     amqp_destroy_envelope(&envelope);
                     message_count++;
@@ -1230,6 +1283,7 @@ public:
         running_ = false;
     }
 };
+
 // ==================== 工厂类 ====================
 
 // 抽象工厂
@@ -1297,7 +1351,7 @@ public:
         stop();
     }
     
-    void start(ThreadSafeQueue<std::vector<char>>& queue) {
+    void start(BackPressureQueue& queue) {
         running_ = true;
         thread_ = std::thread([this, &queue]() { run(queue); });
     }
@@ -1310,7 +1364,7 @@ public:
     }
     
 private:
-    void run(ThreadSafeQueue<std::vector<char>>& queue) {
+    void run(BackPressureQueue& queue) {
         std::cout << "Worker " << worker_id_ << " started" << std::endl;
         
         // 连接TDengine
@@ -1428,11 +1482,12 @@ private:
     std::unique_ptr<ComponentFactory> factory_;
     std::unique_ptr<IMessageConsumer> consumer_;
     std::vector<std::unique_ptr<Worker>> workers_;
-    ThreadSafeQueue<std::vector<char>> queue_;
+    BackPressureQueue queue_;
     
 public:
     ProcessingPipeline(std::unique_ptr<ComponentFactory> factory, const Config& config)
-        : config_(config), factory_(std::move(factory)) {
+        : config_(config), factory_(std::move(factory)),
+          queue_(config.max_queue_memory, config.flow_control_timeout_ms) {
         
         consumer_ = factory_->createMessageConsumer();
         
@@ -1464,12 +1519,25 @@ public:
         // 再启动RabbitMQ消费者
         std::thread consumer_thread([this]() {
             std::cout << "RabbitMQ consumer thread started" << std::endl;
-            consumer_->consume([this](std::vector<char>&& message) {
+            consumer_->consume([this](std::vector<char>&& message, std::function<void(bool)> ack_callback) {
                 bool pushed = queue_.push(std::move(message));
-                if (config_.verbose && pushed) {
-                    std::cout << "Message pushed to queue, current size: " << queue_.size() << std::endl;
-                } else if (!pushed) {
-                    std::cerr << "Failed to push message to queue (shutdown in progress)" << std::endl;
+                
+                if (pushed) {
+                    // 消息成功入队，立即确认
+                    if (config_.enable_message_ack) {
+                        ack_callback(true);
+                    }
+                    if (config_.verbose) {
+                        std::cout << "Message pushed to queue, current size: " << queue_.size() 
+                                 << ", memory usage: " << (queue_.memory_ratio() * 100) << "%" << std::endl;
+                    }
+                } else {
+                    // 队列满，拒绝消息（会重新入队）
+                    std::cerr << "Queue full, rejecting message (memory usage: " 
+                             << (queue_.memory_ratio() * 100) << "%)" << std::endl;
+                    if (config_.enable_message_ack) {
+                        ack_callback(false);
+                    }
                 }
             });
         });
@@ -1490,6 +1558,10 @@ public:
     
     size_t getQueueSize() const {
         return queue_.size();
+    }
+    
+    double getMemoryUsageRatio() const {
+        return queue_.memory_ratio();
     }
 };
 
@@ -1545,7 +1617,8 @@ private:
             
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
-                std::cout << "Queue size: " << pipeline_->getQueueSize() << std::endl;
+                std::cout << "Queue status - Size: " << pipeline_->getQueueSize() 
+                         << ", Memory usage: " << (pipeline_->getMemoryUsageRatio() * 100) << "%" << std::endl;
                 last_report = now;
             }
         }
