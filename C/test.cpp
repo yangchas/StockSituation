@@ -253,10 +253,12 @@ public:
     
     bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) override {
         try {
+            std::cout<<"processMessage"<<std::endl;
             // 1. 解析消息格式（与Python版本相同）
             MessageHeader header;
             std::vector<char> proto_data;
             if (!parseMessageFormat(body, header, proto_data)) {
+                std::cerr << "Failed to parse message format" << std::endl;
                 return false;
             }
             
@@ -313,6 +315,8 @@ public:
 private:
     // 解析消息格式（与Python版本相同）
     bool parseMessageFormat(const std::vector<char>& body, MessageHeader& header, std::vector<char>& proto_data) {
+        std::cout<<"解析消息格式"<<std::endl;
+
         if (body.size() < 4) {
             std::cerr << "Message too small: " << body.size() << " bytes" << std::endl;
             return false;
@@ -435,6 +439,7 @@ private:
     
     // 从JSON字符串中提取字符串字段
     std::string extractJsonFieldString(const std::string& json, const std::string& field) {
+        std::cout<<"extractJsonFieldString"<<std::endl;
         std::string search_pattern1 = "\"" + field + "\":";
         std::string search_pattern2 = field + ":";
         
@@ -469,6 +474,7 @@ private:
     
     // 解压缩 zlib 数据（与Python版本相同）
     bool decompressZlib(const std::string& compressed, std::vector<char>& decompressed) {
+        std::cout<<"decompressZlib"<<std::endl;
         if (compressed.empty()) {
             return false;
         }
@@ -515,9 +521,15 @@ private:
     // 将 DataBatch 转换为 StockData
     bool convertDataBatchToStockData(const dataservice::DataBatch& data_batch, std::vector<StockData>& records) {
         int record_count = data_batch.records_size();
-        
+        std::cout<<" DataBatch 转换为 StockData"<<std::endl;
         if (config_.verbose) {
             std::cout << "Converting DataBatch with " << record_count << " records" << std::endl;
+        }
+        
+        // 添加空数据检查
+        if (record_count == 0) {
+            std::cout << "Warning: DataBatch contains 0 records" << std::endl;
+            return false;
         }
         
         records.reserve(record_count);
@@ -579,7 +591,12 @@ private:
                 }
             }
         }
-        std::cout << records[0].symbol<< std::endl;
+        
+        // 修改这里的输出，只在有记录时输出
+        // if (!records.empty()) {
+            std::cout << "First record symbol: " << records[0].symbol << std::endl;
+        // }
+        
         if (config_.verbose) {
             std::cout << "Successfully converted " << successfully_converted << " records" << std::endl;
         }
@@ -595,6 +612,7 @@ private:
                ((netlong & 0xFF000000) >> 24);
     }
 };
+
 // Redis客户端
 class RedisClient {
 private:
@@ -969,6 +987,7 @@ private:
 };
 
 // RabbitMQ消费者
+// RabbitMQ消费者 - 恢复原来的连接逻辑
 class RabbitMQConsumer : public IMessageConsumer {
 private:
     const Config& config_;
@@ -990,14 +1009,12 @@ private:
                 case AMQP_RESPONSE_SERVER_EXCEPTION:
                     if (reply.reply.id == AMQP_CHANNEL_CLOSE_METHOD) {
                         amqp_channel_close_t *close = (amqp_channel_close_t *)reply.reply.decoded;
-                        // 修复：正确转换 amqp_bytes_t 到 std::string
                         std::string reply_text(static_cast<const char*>(close->reply_text.bytes), close->reply_text.len);
                         error_msg += std::string("channel closed by server: ") + 
                                    reply_text +
                                    " (code: " + std::to_string(close->reply_code) + ")";
                     } else if (reply.reply.id == AMQP_CONNECTION_CLOSE_METHOD) {
                         amqp_connection_close_t *close = (amqp_connection_close_t *)reply.reply.decoded;
-                        // 修复：正确转换 amqp_bytes_t 到 std::string
                         std::string reply_text(static_cast<const char*>(close->reply_text.bytes), close->reply_text.len);
                         error_msg += std::string("connection closed by server: ") + 
                                    reply_text +
@@ -1021,7 +1038,7 @@ private:
             amqp_queue_declare_ok_t* passive_declare = amqp_queue_declare(
                 conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
                 1,  // passive: 只检查队列是否存在，不创建
-                0, 0, 0, amqp_empty_table  // 修复：移除多余的参数
+                0, 0, 0, amqp_empty_table
             );
             
             amqp_rpc_reply_t passive_reply = amqp_get_rpc_reply(conn_);
@@ -1061,6 +1078,8 @@ public:
     }
     
     bool connect() override {
+        std::cout << "Connecting to RabbitMQ at " << config_.rabbitmq_host << ":" << config_.rabbitmq_port << std::endl;
+        
         conn_ = amqp_new_connection();
         if (!conn_) {
             std::cerr << "Failed to create RabbitMQ connection" << std::endl;
@@ -1074,8 +1093,6 @@ public:
             conn_ = nullptr;
             return false;
         }
-        
-        std::cout << "Connecting to RabbitMQ at " << config_.rabbitmq_host << ":" << config_.rabbitmq_port << std::endl;
         
         int status = amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port);
         if (status != AMQP_STATUS_OK) {
@@ -1162,16 +1179,16 @@ public:
                     char* body_start = static_cast<char*>(envelope.message.body.bytes);
                     std::vector<char> body(body_start, body_start + envelope.message.body.len);
                     
-                    // std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
+                    std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
                     
                     callback(std::move(body));
                     
                     amqp_destroy_envelope(&envelope);
                     message_count++;
                     
-                    // if (config_.verbose) {
-                    //     std::cout << "Successfully processed message " << message_count << std::endl;
-                    // }
+                    if (config_.verbose) {
+                        std::cout << "Successfully processed message " << message_count << std::endl;
+                    }
                     
                 } else if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && 
                           ret.library_error == AMQP_STATUS_TIMEOUT) {
@@ -1296,10 +1313,12 @@ private:
     void run(ThreadSafeQueue<std::vector<char>>& queue) {
         std::cout << "Worker " << worker_id_ << " started" << std::endl;
         
+        // 连接TDengine
         if (!writer_->connect()) {
             std::cerr << "Worker " << worker_id_ << ": Failed to connect to TDengine" << std::endl;
             return;
         }
+        std::cout << "Worker " << worker_id_ << ": TDengine connected successfully" << std::endl;
         
         std::vector<StockData> batch;
         auto last_flush = std::chrono::steady_clock::now();
@@ -1307,12 +1326,21 @@ private:
         
         int processed_messages = 0;
         int processed_records = 0;
+        int failed_messages = 0;
+        
+        std::cout << "Worker " << worker_id_ << ": Starting message processing loop "<<running_ << std::endl;
         
         while (running_) {
             std::vector<char> message;
 
             if (!queue.pop(message)) {
+                std::cout << "Worker " << worker_id_ << ": Queue shutdown, exiting" << std::endl;
                 break;
+            }
+            
+            // 添加消息接收日志
+            if (config_.verbose) {
+                std::cout << "Worker " << worker_id_ << ": Received message, size: " << message.size() << " bytes" << std::endl;
             }
             
             std::vector<StockData> records;
@@ -1320,49 +1348,72 @@ private:
                 processed_messages++;
                 processed_records += records.size();
                 batch.insert(batch.end(), records.begin(), records.end());
+                
+                if (config_.verbose && !records.empty()) {
+                    std::cout << "Worker " << worker_id_ << ": Successfully processed " << records.size() 
+                             << " records from message. First symbol: " << records[0].symbol << std::endl;
+                }
             } else {
                 std::cerr << "Worker " << worker_id_ << ": Failed to process message" << std::endl;
+                failed_messages++;
             }
             
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_flush).count();
             
+            // 批次处理逻辑
             if (batch.size() >= config_.batch_size || elapsed >= config_.flush_timeout) {
                 if (!batch.empty()) {
+                    std::cout << "Worker " << worker_id_ << ": Flushing batch of " << batch.size() << " records" << std::endl;
+                    
                     if (writer_->writeBatch(batch)) {
-                        for (const auto& record : batch) {
-                            detector_->detectVolatility(record);
-                        }
+                        std::cout << "Worker " << worker_id_ << ": Successfully inserted " << batch.size() << " records to TDengine" << std::endl;
                         
-                        if (config_.verbose) {
-                            std::cout << "Worker " << worker_id_ << ": Inserted " << batch.size() << " records" << std::endl;
+                        // 异动检测
+                        int volatility_detected = 0;
+                        for (const auto& record : batch) {
+                            if (detector_->detectVolatility(record)) {
+                                volatility_detected++;
+                            }
+                        }
+                        if (volatility_detected > 0) {
+                            std::cout << "Worker " << worker_id_ << ": Detected volatility in " << volatility_detected << " records" << std::endl;
                         }
                     } else {
-                        std::cerr << "Worker " << worker_id_ << ": Failed to write batch" << std::endl;
+                        std::cerr << "Worker " << worker_id_ << ": Failed to write batch to TDengine" << std::endl;
                     }
                     batch.clear();
                 }
                 last_flush = now;
             }
             
-            if (processed_messages % 100 == 0 && processed_messages > 0) {
-                std::cout << "Worker " << worker_id_ << ": Processed " << processed_messages 
-                         << " messages, " << processed_records << " records" << std::endl;
+            // 进度报告
+            if (processed_messages % 10 == 0 && processed_messages > 0) {
+                std::cout << "Worker " << worker_id_ << ": Progress - " << processed_messages 
+                         << " messages, " << processed_records << " records, " 
+                         << failed_messages << " failed" << std::endl;
             }
             
+            // 清理旧数据
             if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
                 detector_->cleanupOldData();
                 last_cleanup = now;
             }
         }
         
+        // 处理剩余批次
         if (!batch.empty()) {
             std::cout << "Worker " << worker_id_ << ": Processing final batch of " << batch.size() << " records" << std::endl;
-            writer_->writeBatch(batch);
+            if (writer_->writeBatch(batch)) {
+                std::cout << "Worker " << worker_id_ << ": Final batch inserted successfully" << std::endl;
+            } else {
+                std::cerr << "Worker " << worker_id_ << ": Failed to insert final batch" << std::endl;
+            }
         }
         
         std::cout << "Worker " << worker_id_ << " finished. Total: " 
-                  << processed_messages << " messages, " << processed_records << " records" << std::endl;
+                  << processed_messages << " messages, " << processed_records << " records, "
+                  << failed_messages << " failed" << std::endl;
         
         writer_->close();
     }
@@ -1399,17 +1450,32 @@ public:
         std::cout << "Starting processing pipeline with " 
                   << config_.worker_count << " workers" << std::endl;
         
+        // 先启动Worker线程
         for (auto& worker : workers_) {
             worker->start(queue_);
         }
         
+        // 等待Worker线程初始化完成
+        std::cout << "Waiting for workers to initialize..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        std::cout << "All workers started, starting RabbitMQ consumer..." << std::endl;
+        
+        // 再启动RabbitMQ消费者
         std::thread consumer_thread([this]() {
+            std::cout << "RabbitMQ consumer thread started" << std::endl;
             consumer_->consume([this](std::vector<char>&& message) {
-                queue_.push(std::move(message));
+                bool pushed = queue_.push(std::move(message));
+                if (config_.verbose && pushed) {
+                    std::cout << "Message pushed to queue, current size: " << queue_.size() << std::endl;
+                } else if (!pushed) {
+                    std::cerr << "Failed to push message to queue (shutdown in progress)" << std::endl;
+                }
             });
         });
         
         consumer_thread.detach();
+        std::cout << "Processing pipeline fully started" << std::endl;
     }
     
     void stop() {
