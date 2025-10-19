@@ -11,21 +11,21 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
-#include <sys/time.h>
-#include <zlib.h>
-#include <hiredis/hiredis.h>
-#include <taos.h>
-
-// 添加缺失的头文件
+#include <functional>
 #include <sstream>
 #include <iomanip>
 #include <csignal>
 #include <cstdlib>
-#include <functional>
-
-// 使用新的 RabbitMQ-C 头文件
+#include <cctype>
+// 第三方库头文件
+#include <sys/time.h>
+#include <zlib.h>
+#include <hiredis/hiredis.h>
+#include <taos.h>
 #include <rabbitmq-c/amqp.h>
 #include <rabbitmq-c/tcp_socket.h>
+
+// ==================== 配置管理 ====================
 
 // 配置结构
 struct Config {
@@ -43,27 +43,63 @@ struct Config {
     bool verbose = true;
     int shutdown_timeout = 30;
     
-    // Redis配置
     std::string redis_host = "localhost";
     int redis_port = 6379;
     int redis_db = 0;
     
-    // 异动池配置
     std::string volatile_pool_key = "stock:volatile_pool";
     int volatile_expire = 300;
     
-    // 异动检测阈值
     double price_change_threshold = 0.02;
     double volume_ratio_threshold = 3.0;
     double min_amount_threshold = 1000000;
     
-    // TDengine配置
     std::string tdengine_host = "localhost";
     int tdengine_port = 6030;
     std::string tdengine_user = "root";
     std::string tdengine_password = "taosdata";
     std::string tdengine_database = "market_data";
 };
+
+// 单例配置管理器
+class ConfigManager {
+private:
+    static std::unique_ptr<ConfigManager> instance_;
+    static std::mutex mutex_;
+    Config config_;
+
+    ConfigManager() {
+        loadFromEnvironment();
+    }
+
+    void loadFromEnvironment() {
+        const char* env_workers = std::getenv("WORKER_COUNT");
+        if (env_workers) {
+            config_.worker_count = std::atoi(env_workers);
+        }
+        // 可以添加更多环境变量配置
+    }
+
+public:
+    ConfigManager(const ConfigManager&) = delete;
+    ConfigManager& operator=(const ConfigManager&) = delete;
+
+    static ConfigManager& getInstance() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!instance_) {
+            instance_ = std::unique_ptr<ConfigManager>(new ConfigManager());
+        }
+        return *instance_;
+    }
+
+    const Config& getConfig() const { return config_; }
+    void updateConfig(const Config& newConfig) { config_ = newConfig; }
+};
+
+std::unique_ptr<ConfigManager> ConfigManager::instance_ = nullptr;
+std::mutex ConfigManager::mutex_;
+
+// ==================== 数据模型 ====================
 
 // 股票数据结构
 struct StockData {
@@ -91,7 +127,9 @@ enum CompressionType {
     COMPRESSION_DEFLATE = 2
 };
 
-// 抽象接口类
+// ==================== 抽象接口 ====================
+
+// 数据写入器接口
 class IDataWriter {
 public:
     virtual ~IDataWriter() = default;
@@ -100,6 +138,7 @@ public:
     virtual bool writeBatch(const std::vector<StockData>& records) = 0;
 };
 
+// 异动检测器接口
 class IVolatilityDetector {
 public:
     virtual ~IVolatilityDetector() = default;
@@ -107,79 +146,163 @@ public:
     virtual void cleanupOldData() = 0;
 };
 
-// 高效的消息处理器 - 完全不依赖 Protobuf
-class EfficientMessageProcessor {
+// 消息处理器接口
+class IMessageProcessor {
+public:
+    virtual ~IMessageProcessor() = default;
+    virtual bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) = 0;
+};
+
+// 消息消费者接口
+class IMessageConsumer {
+public:
+    virtual ~IMessageConsumer() = default;
+    virtual bool connect() = 0;
+    virtual void disconnect() = 0;
+    virtual void consume(std::function<void(std::vector<char>&&)> callback) = 0;
+    virtual void stop() = 0;
+};
+
+// ==================== 工具类 ====================
+
+// 线程安全队列
+template<typename T>
+class ThreadSafeQueue {
 private:
-    Config config_;
+    std::queue<T> queue_;
+    mutable std::mutex mutex_;
+    std::condition_variable cond_;
+    std::atomic<bool> shutdown_{false};
+    
+public:
+    bool push(T&& item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_) return false;
+        
+        queue_.push(std::move(item));
+        cond_.notify_one();
+        return true;
+    }
+    
+    bool pop(T& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_.wait(lock, [this]() { return !queue_.empty() || shutdown_; });
+        
+        if (shutdown_ && queue_.empty()) return false;
+        
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+    
+    void shutdown() {
+        shutdown_ = true;
+        cond_.notify_all();
+    }
+    
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+};
+
+// 时间工具类
+class TimeUtils {
+public:
+    static long long getCurrentTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+    }
+    
+    static std::string formatTimestamp(long long timestamp) {
+        auto time = std::chrono::system_clock::from_time_t(timestamp / 1000);
+        auto ms = timestamp % 1000;
+        
+        auto tt = std::chrono::system_clock::to_time_t(time);
+        std::tm tm = *std::localtime(&tt);
+        
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "." << std::setfill('0') 
+            << std::setw(3) << ms;
+        return oss.str();
+    }
+};
+
+// ==================== 具体实现类 ====================
+#include "schema.pb.h"  // 包含生成的 protobuf 头文件
+
+// 高效消息处理器 - 使用 protobuf 库
+class EfficientMessageProcessor : public IMessageProcessor {
+private:
+    const Config& config_;
+    
+    // 消息头部结构
+    struct MessageHeader {
+        std::string proto_version;
+        std::string compression;
+        std::string batch_id;
+        int32_t record_count;
+        int32_t original_size;
+        int32_t compressed_size;
+        int64_t timestamp;
+    };
     
 public:
     EfficientMessageProcessor(const Config& config) : config_(config) {}
     
-    // 解析消息 - 假设消息格式为简单的二进制格式
-    bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) {
+    bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) override {
         try {
-            if (body.size() < 8) { // 至少需要头部信息
-                if (config_.verbose) {
-                    std::cerr << "Message too small: " << body.size() << " bytes" << std::endl;
-                }
+            // 1. 解析消息格式（与Python版本相同）
+            MessageHeader header;
+            std::vector<char> proto_data;
+            if (!parseMessageFormat(body, header, proto_data)) {
                 return false;
             }
             
-            // 解析消息头部
-            const char* data = body.data();
-            size_t offset = 0;
+            if (config_.verbose) {
+                std::cout << "Header: compression=" << header.compression 
+                          << ", records=" << header.record_count 
+                          << ", original_size=" << header.original_size
+                          << ", compressed_size=" << header.compressed_size << std::endl;
+            }
             
-            // 假设头部格式: [4字节压缩类型][4字节记录数]
-            int32_t compression_type;
-            int32_t record_count;
-            
-            std::memcpy(&compression_type, data + offset, 4);
-            offset += 4;
-            std::memcpy(&record_count, data + offset, 4);
-            offset += 4;
-            
-            // 网络字节序转换（如果需要）
-            // compression_type = ntohl(compression_type);
-            // record_count = ntohl(record_count);
-            
-            if (record_count <= 0 || record_count > 10000) {
-                std::cerr << "Invalid record count: " << record_count << std::endl;
+            // 2. 使用 protobuf 解析 DataRequest
+            dataservice::DataRequest data_request;
+            if (!data_request.ParseFromArray(proto_data.data(), proto_data.size())) {
+                std::cerr << "Failed to parse DataRequest from protobuf" << std::endl;
                 return false;
             }
             
-            // 获取压缩数据
-            const char* compressed_data = data + offset;
-            size_t compressed_size = body.size() - offset;
-            
-            std::vector<char> decompressed_data;
-            const char* batch_data = nullptr;
-            size_t batch_size = 0;
-            
-            // 处理压缩
-            switch (compression_type) {
-                case COMPRESSION_NONE:
-                    batch_data = compressed_data;
-                    batch_size = compressed_size;
-                    break;
-                    
-                case COMPRESSION_GZIP:
-                case COMPRESSION_DEFLATE:
-                    if (!decompressData(compressed_data, compressed_size, decompressed_data, 
-                                       compression_type == COMPRESSION_GZIP)) {
-                        std::cerr << "Failed to decompress data" << std::endl;
-                        return false;
-                    }
-                    batch_data = decompressed_data.data();
-                    batch_size = decompressed_data.size();
-                    break;
-                    
-                default:
-                    std::cerr << "Unknown compression type: " << compression_type << std::endl;
+            // 3. 解压缩数据
+            std::vector<char> batch_bytes;
+            if (header.compression == "GZIP" || header.compression == "ZLIB") {
+                const std::string& compressed_data = data_request.compressed_data();
+                if (!decompressZlib(compressed_data, batch_bytes)) {
+                    std::cerr << "Failed to decompress data" << std::endl;
                     return false;
+                }
+            } else if (header.compression == "NONE" || header.compression.empty()) {
+                const std::string& compressed_data = data_request.compressed_data();
+                batch_bytes.assign(compressed_data.begin(), compressed_data.end());
+            } else {
+                std::cerr << "Unsupported compression: " << header.compression << std::endl;
+                return false;
             }
             
-            // 解析数据批次
-            return parseDataBatch(batch_data, batch_size, record_count, records);
+            if (config_.verbose) {
+                std::cout << "Decompressed data: " << batch_bytes.size() << " bytes" << std::endl;
+            }
+            
+            // 4. 使用 protobuf 解析 DataBatch
+            dataservice::DataBatch data_batch;
+            if (!data_batch.ParseFromArray(batch_bytes.data(), batch_bytes.size())) {
+                std::cerr << "Failed to parse DataBatch from protobuf" << std::endl;
+                return false;
+            }
+            
+            // 5. 转换记录到 StockData
+            return convertDataBatchToStockData(data_batch, records);
             
         } catch (const std::exception& e) {
             std::cerr << "Error processing message: " << e.what() << std::endl;
@@ -188,31 +311,185 @@ public:
     }
     
 private:
-    // 高效解压缩
-    bool decompressData(const char* compressed, size_t compressed_size, 
-                       std::vector<char>& decompressed, bool is_gzip) {
-        if (compressed_size == 0) return false;
+    // 解析消息格式（与Python版本相同）
+    bool parseMessageFormat(const std::vector<char>& body, MessageHeader& header, std::vector<char>& proto_data) {
+        if (body.size() < 4) {
+            std::cerr << "Message too small: " << body.size() << " bytes" << std::endl;
+            return false;
+        }
+        
+        // 读取头部长度（大端）
+        uint32_t header_len;
+        std::memcpy(&header_len, body.data(), 4);
+        header_len = ntohl(header_len);
+        
+        if (body.size() < 4 + header_len) {
+            std::cerr << "Message too short for header: have " << body.size() 
+                      << ", need " << (4 + header_len) << std::endl;
+            return false;
+        }
+        
+        // 解析 JSON 头部
+        std::string header_json(body.data() + 4, header_len);
+        if (!parseJsonHeader(header_json, header)) {
+            std::cerr << "Failed to parse JSON header" << std::endl;
+            return false;
+        }
+        
+        // 剩余的是 protobuf 数据
+        size_t proto_offset = 4 + header_len;
+        proto_data.assign(body.begin() + proto_offset, body.end());
+        
+        return true;
+    }
+    
+    // 解析JSON头部
+    bool parseJsonHeader(const std::string& json_str, MessageHeader& header) {
+        try {
+            header.record_count = extractJsonFieldInt(json_str, "record_count");
+            header.compression = extractJsonFieldString(json_str, "compression");
+            header.original_size = extractJsonFieldInt(json_str, "original_size");
+            header.compressed_size = extractJsonFieldInt(json_str, "compressed_size");
+            header.timestamp = extractJsonFieldLong(json_str, "timestamp");
+            header.batch_id = extractJsonFieldString(json_str, "batch_id");
+            header.proto_version = extractJsonFieldString(json_str, "proto_version");
+            
+            if (header.record_count <= 0 || header.record_count > 100000) {
+                std::cerr << "Invalid record count from header: " << header.record_count << std::endl;
+                return false;
+            }
+            
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to parse JSON header: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    // 从JSON字符串中提取整数字段
+    int32_t extractJsonFieldInt(const std::string& json, const std::string& field) {
+        std::string search_pattern1 = "\"" + field + "\":";
+        std::string search_pattern2 = field + ":";
+        
+        size_t pos = json.find(search_pattern1);
+        if (pos == std::string::npos) {
+            pos = json.find(search_pattern2);
+        }
+        
+        if (pos == std::string::npos) {
+            return 0;
+        }
+        
+        pos += search_pattern1.length();
+        
+        while (pos < json.length() && std::isspace(json[pos])) {
+            pos++;
+        }
+        
+        if (pos >= json.length() || !std::isdigit(json[pos])) {
+            return 0;
+        }
+        
+        size_t end_pos = pos;
+        while (end_pos < json.length() && (std::isdigit(json[end_pos]) || json[end_pos] == '-')) {
+            end_pos++;
+        }
+        
+        std::string num_str = json.substr(pos, end_pos - pos);
+        return std::stoi(num_str);
+    }
+    
+    // 从JSON字符串中提取长整数字段
+    int64_t extractJsonFieldLong(const std::string& json, const std::string& field) {
+        std::string search_pattern1 = "\"" + field + "\":";
+        std::string search_pattern2 = field + ":";
+        
+        size_t pos = json.find(search_pattern1);
+        if (pos == std::string::npos) {
+            pos = json.find(search_pattern2);
+        }
+        
+        if (pos == std::string::npos) {
+            return 0;
+        }
+        
+        pos += search_pattern1.length();
+        
+        while (pos < json.length() && std::isspace(json[pos])) {
+            pos++;
+        }
+        
+        if (pos >= json.length() || !std::isdigit(json[pos])) {
+            return 0;
+        }
+        
+        size_t end_pos = pos;
+        while (end_pos < json.length() && (std::isdigit(json[end_pos]) || json[end_pos] == '-')) {
+            end_pos++;
+        }
+        
+        std::string num_str = json.substr(pos, end_pos - pos);
+        return std::stoll(num_str);
+    }
+    
+    // 从JSON字符串中提取字符串字段
+    std::string extractJsonFieldString(const std::string& json, const std::string& field) {
+        std::string search_pattern1 = "\"" + field + "\":";
+        std::string search_pattern2 = field + ":";
+        
+        size_t pos = json.find(search_pattern1);
+        if (pos == std::string::npos) {
+            pos = json.find(search_pattern2);
+        }
+        
+        if (pos == std::string::npos) {
+            return "";
+        }
+        
+        pos += search_pattern1.length();
+        
+        while (pos < json.length() && std::isspace(json[pos])) {
+            pos++;
+        }
+        
+        if (pos >= json.length() || json[pos] != '"') {
+            return "";
+        }
+        
+        pos++;
+        
+        size_t end_pos = json.find('"', pos);
+        if (end_pos == std::string::npos) {
+            return "";
+        }
+        
+        return json.substr(pos, end_pos - pos);
+    }
+    
+    // 解压缩 zlib 数据（与Python版本相同）
+    bool decompressZlib(const std::string& compressed, std::vector<char>& decompressed) {
+        if (compressed.empty()) {
+            return false;
+        }
         
         z_stream strm;
         strm.zalloc = Z_NULL;
         strm.zfree = Z_NULL;
         strm.opaque = Z_NULL;
-        strm.avail_in = compressed_size;
-        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed));
+        strm.avail_in = compressed.size();
+        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
         
-        // 设置解压格式
-        int window_bits = is_gzip ? (MAX_WBITS + 16) : MAX_WBITS;
-        
-        if (inflateInit2(&strm, window_bits) != Z_OK) {
+        // 使用自动检测窗口大小
+        int ret = inflateInit2(&strm, MAX_WBITS | 32); // 自动检测GZIP/ZLIB
+        if (ret != Z_OK) {
+            std::cerr << "inflateInit2 failed: " << ret << std::endl;
             return false;
         }
         
-        // 预分配缓冲区
-        decompressed.reserve(compressed_size * 3);
-        
+        decompressed.reserve(compressed.size() * 4);
         const size_t CHUNK_SIZE = 65536;
         std::vector<char> buffer(CHUNK_SIZE);
-        int ret;
         
         do {
             strm.avail_out = buffer.size();
@@ -221,6 +498,7 @@ private:
             ret = inflate(&strm, Z_NO_FLUSH);
             
             if (ret != Z_OK && ret != Z_STREAM_END) {
+                std::cerr << "inflate failed: " << ret << " - " << (strm.msg ? strm.msg : "no message") << std::endl;
                 inflateEnd(&strm);
                 return false;
             }
@@ -234,92 +512,89 @@ private:
         return true;
     }
     
-    // 解析数据批次 - 假设为固定格式的二进制数据
-    bool parseDataBatch(const char* batch_data, size_t batch_size, int record_count, 
-                       std::vector<StockData>& records) {
-        if (batch_size == 0 || record_count == 0) {
-            return false;
-        }
+    // 将 DataBatch 转换为 StockData
+    bool convertDataBatchToStockData(const dataservice::DataBatch& data_batch, std::vector<StockData>& records) {
+        int record_count = data_batch.records_size();
         
-        // 假设每条记录固定大小（根据您的数据结构调整）
-        const size_t RECORD_SIZE = 256; // 估算大小，根据实际调整
-        
-        // 检查数据大小是否足够
-        if (batch_size < record_count * 50) { // 最小检查，每条记录至少50字节
-            std::cerr << "Batch size too small for " << record_count << " records" << std::endl;
-            return false;
+        if (config_.verbose) {
+            std::cout << "Converting DataBatch with " << record_count << " records" << std::endl;
         }
         
         records.reserve(record_count);
-        size_t offset = 0;
+        int successfully_converted = 0;
         
-        for (int i = 0; i < record_count && offset < batch_size; i++) {
-            StockData data;
+        for (int i = 0; i < record_count; i++) {
+            const dataservice::DataRecord& proto_record = data_batch.records(i);
+            StockData stock_data;
             
-            // 解析符号（假设前20字节）
-            if (offset + 20 > batch_size) break;
-            data.symbol = std::string(batch_data + offset, 20);
-            data.symbol.erase(data.symbol.find_last_not_of(' ') + 1); // 去除尾部空格
-            offset += 20;
+            // 转换字段
+            stock_data.symbol = proto_record.symbol();
+            stock_data.exchange = proto_record.exchange();
+            stock_data.market = proto_record.market();
+            stock_data.timestamp = proto_record.tss();
+            stock_data.last_price = proto_record.lp();
+            stock_data.open = proto_record.o();
+            stock_data.high = proto_record.h();
+            stock_data.low = proto_record.l();
+            stock_data.close = proto_record.lc();
+            stock_data.amount = proto_record.a();
+            stock_data.volume = proto_record.v();
             
-            // 解析时间戳（8字节）
-            if (offset + 8 > batch_size) break;
-            std::memcpy(&data.timestamp, batch_data + offset, 8);
-            offset += 8;
+            // 五档买价
+            stock_data.ask_prices[0] = proto_record.ap1();
+            stock_data.ask_prices[1] = proto_record.ap2();
+            stock_data.ask_prices[2] = proto_record.ap3();
+            stock_data.ask_prices[3] = proto_record.ap4();
+            stock_data.ask_prices[4] = proto_record.ap5();
             
-            // 解析价格数据（各4字节）
-            if (offset + 20 > batch_size) break;
-            std::memcpy(&data.last_price, batch_data + offset, 4); offset += 4;
-            std::memcpy(&data.open, batch_data + offset, 4); offset += 4;
-            std::memcpy(&data.high, batch_data + offset, 4); offset += 4;
-            std::memcpy(&data.low, batch_data + offset, 4); offset += 4;
-            std::memcpy(&data.close, batch_data + offset, 4); offset += 4;
+            // 五档卖价
+            stock_data.bid_prices[0] = proto_record.bp1();
+            stock_data.bid_prices[1] = proto_record.bp2();
+            stock_data.bid_prices[2] = proto_record.bp3();
+            stock_data.bid_prices[3] = proto_record.bp4();
+            stock_data.bid_prices[4] = proto_record.bp5();
             
-            // 解析成交量和成交额（各8字节）
-            if (offset + 16 > batch_size) break;
-            std::memcpy(&data.volume, batch_data + offset, 8); offset += 8;
-            std::memcpy(&data.amount, batch_data + offset, 8); offset += 8;
+            // 五档买量
+            stock_data.ask_volumes[0] = proto_record.av1();
+            stock_data.ask_volumes[1] = proto_record.av2();
+            stock_data.ask_volumes[2] = proto_record.av3();
+            stock_data.ask_volumes[3] = proto_record.av4();
+            stock_data.ask_volumes[4] = proto_record.av5();
             
-            // 设置默认值
-            data.exchange = "SH";
-            data.market = "A";
+            // 五档卖量
+            stock_data.bid_volumes[0] = proto_record.bv1();
+            stock_data.bid_volumes[1] = proto_record.bv2();
+            stock_data.bid_volumes[2] = proto_record.bv3();
+            stock_data.bid_volumes[3] = proto_record.bv4();
+            stock_data.bid_volumes[4] = proto_record.bv5();
             
-            // 解析五档行情（如果数据中包含）
-            // 买价
-            for (int j = 0; j < 5 && offset + 4 <= batch_size; j++) {
-                std::memcpy(&data.ask_prices[j], batch_data + offset, 4);
-                offset += 4;
-            }
-            // 卖价
-            for (int j = 0; j < 5 && offset + 4 <= batch_size; j++) {
-                std::memcpy(&data.bid_prices[j], batch_data + offset, 4);
-                offset += 4;
-            }
-            // 买量
-            for (int j = 0; j < 5 && offset + 8 <= batch_size; j++) {
-                std::memcpy(&data.ask_volumes[j], batch_data + offset, 8);
-                offset += 8;
-            }
-            // 卖量
-            for (int j = 0; j < 5 && offset + 8 <= batch_size; j++) {
-                std::memcpy(&data.bid_volumes[j], batch_data + offset, 8);
-                offset += 8;
-            }
-            
-            // 如果数据有效，添加到结果
-            if (!data.symbol.empty() && data.timestamp > 0) {
-                records.push_back(std::move(data));
+            // 验证数据有效性
+            if (!stock_data.symbol.empty() && stock_data.timestamp > 0) {
+                records.push_back(std::move(stock_data));
+                successfully_converted++;
+            } else {
+                if (config_.verbose) {
+                    std::cout << "Skipping invalid record " << i << ": symbol='" << stock_data.symbol 
+                              << "' timestamp=" << stock_data.timestamp << std::endl;
+                }
             }
         }
-        
-        if (config_.verbose && !records.empty()) {
-            std::cout << "Processed " << records.size() << " records from binary message" << std::endl;
+        std::cout << records[0].symbol<< std::endl;
+        if (config_.verbose) {
+            std::cout << "Successfully converted " << successfully_converted << " records" << std::endl;
         }
         
-        return !records.empty();
+        return successfully_converted > 0;
+    }
+    
+    // 网络字节序转换
+    uint32_t ntohl(uint32_t netlong) {
+        return ((netlong & 0xFF) << 24) |
+               ((netlong & 0xFF00) << 8) |
+               ((netlong & 0xFF0000) >> 8) |
+               ((netlong & 0xFF000000) >> 24);
     }
 };
-
 // Redis客户端
 class RedisClient {
 private:
@@ -403,10 +678,11 @@ public:
     }
 };
 
+// 简单异动检测器
 class SimpleVolatilityDetector : public IVolatilityDetector {
 private:
     std::unique_ptr<RedisClient> redis_;
-    Config config_;
+    const Config& config_;
     
 public:
     SimpleVolatilityDetector(const Config& config) : config_(config) {
@@ -435,11 +711,11 @@ public:
                 << ",\"volume\":" << data.volume
                 << ",\"amount\":" << data.amount
                 << ",\"reason\":\"price_change\""
-                << ",\"detect_time\":" << getCurrentTimestamp()
+                << ",\"detect_time\":" << TimeUtils::getCurrentTimestamp()
                 << ",\"is_trial_period\":true}";
             
             bool success = redis_->zadd(config_.volatile_pool_key, 
-                                      getCurrentTimestamp(), 
+                                      TimeUtils::getCurrentTimestamp(), 
                                       oss.str());
             
             if (success) {
@@ -458,19 +734,12 @@ public:
     void cleanupOldData() override {
         if (!redis_->connect()) return;
         
-        long long cutoff_time = getCurrentTimestamp() - 3600000;
+        long long cutoff_time = TimeUtils::getCurrentTimestamp() - 3600000;
         redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
-    }
-    
-private:
-    long long getCurrentTimestamp() {
-        auto now = std::chrono::system_clock::now();
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-            now.time_since_epoch()).count();
     }
 };
 
-// TDengine连接和写入器
+// TDengine连接
 class TDengineConnection {
 private:
     TAOS* conn_ = nullptr;
@@ -532,10 +801,11 @@ public:
     }
 };
 
+// TDengine批量写入器
 class TDengineBatchWriter : public IDataWriter {
 private:
     std::unique_ptr<TDengineConnection> connection_;
-    Config config_;
+    const Config& config_;
     
 public:
     TDengineBatchWriter(const Config& config) : config_(config) {
@@ -629,19 +899,6 @@ private:
         return sanitized;
     }
     
-    std::string formatTimestamp(long long timestamp) {
-        auto time = std::chrono::system_clock::from_time_t(timestamp / 1000);
-        auto ms = timestamp % 1000;
-        
-        auto tt = std::chrono::system_clock::to_time_t(time);
-        std::tm tm = *std::localtime(&tt);
-        
-        std::ostringstream oss;
-        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "." << std::setfill('0') 
-            << std::setw(3) << ms;
-        return oss.str();
-    }
-    
     bool createTableIfNotExists(const std::string& symbol, 
                                const std::string& exchange, 
                                const std::string& market) {
@@ -677,7 +934,7 @@ private:
             const auto& record = *records[i];
             if (i > 0) sql << ", ";
             
-            sql << "('" << formatTimestamp(record.timestamp) << "', "
+            sql << "('" << TimeUtils::formatTimestamp(record.timestamp) << "', "
                 << record.last_price << ", " << record.open << ", " 
                 << record.high << ", " << record.low << ", " << record.close << ", "
                 << record.amount << ", " << static_cast<long long>(record.volume) << ", 0, "
@@ -711,52 +968,90 @@ private:
     }
 };
 
-// 线程安全队列
-class ThreadSafeQueue {
-private:
-    std::queue<std::vector<char>> queue_;
-    mutable std::mutex mutex_;
-    std::condition_variable cond_;
-    std::atomic<bool> shutdown_{false};
-    
-public:
-    bool push(std::vector<char>&& item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (shutdown_) return false;
-        
-        queue_.push(std::move(item));
-        cond_.notify_one();
-        return true;
-    }
-    
-    bool pop(std::vector<char>& item) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cond_.wait(lock, [this]() { return !queue_.empty() || shutdown_; });
-        
-        if (shutdown_ && queue_.empty()) return false;
-        
-        item = std::move(queue_.front());
-        queue_.pop();
-        return true;
-    }
-    
-    void shutdown() {
-        shutdown_ = true;
-        cond_.notify_all();
-    }
-    
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.size();
-    }
-};
-
 // RabbitMQ消费者
-class RabbitMQConsumer {
+class RabbitMQConsumer : public IMessageConsumer {
 private:
-    Config config_;
+    const Config& config_;
     amqp_connection_state_t conn_ = nullptr;
     std::atomic<bool> running_{false};
+    
+    // 辅助函数：检查AMQP错误
+    void checkAmqpError(amqp_rpc_reply_t reply, const std::string& context) {
+        if (reply.reply_type != AMQP_RESPONSE_NORMAL) {
+            std::string error_msg = context + " failed: ";
+            
+            switch (reply.reply_type) {
+                case AMQP_RESPONSE_NONE:
+                    error_msg += "missing RPC reply type";
+                    break;
+                case AMQP_RESPONSE_LIBRARY_EXCEPTION:
+                    error_msg += std::string("library exception: ") + amqp_error_string2(reply.library_error);
+                    break;
+                case AMQP_RESPONSE_SERVER_EXCEPTION:
+                    if (reply.reply.id == AMQP_CHANNEL_CLOSE_METHOD) {
+                        amqp_channel_close_t *close = (amqp_channel_close_t *)reply.reply.decoded;
+                        // 修复：正确转换 amqp_bytes_t 到 std::string
+                        std::string reply_text(static_cast<const char*>(close->reply_text.bytes), close->reply_text.len);
+                        error_msg += std::string("channel closed by server: ") + 
+                                   reply_text +
+                                   " (code: " + std::to_string(close->reply_code) + ")";
+                    } else if (reply.reply.id == AMQP_CONNECTION_CLOSE_METHOD) {
+                        amqp_connection_close_t *close = (amqp_connection_close_t *)reply.reply.decoded;
+                        // 修复：正确转换 amqp_bytes_t 到 std::string
+                        std::string reply_text(static_cast<const char*>(close->reply_text.bytes), close->reply_text.len);
+                        error_msg += std::string("connection closed by server: ") + 
+                                   reply_text +
+                                   " (code: " + std::to_string(close->reply_code) + ")";
+                    } else {
+                        error_msg += "unknown server exception";
+                    }
+                    break;
+            }
+            
+            throw std::runtime_error(error_msg);
+        }
+    }
+    
+    // 尝试声明队列，如果失败则尝试使用被动声明（检查队列是否存在）
+    bool declareQueue() {
+        try {
+            std::cout << "尝试声明队列: " << config_.queue_name << std::endl;
+            
+            // 首先尝试被动声明，检查队列是否存在
+            amqp_queue_declare_ok_t* passive_declare = amqp_queue_declare(
+                conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                1,  // passive: 只检查队列是否存在，不创建
+                0, 0, 0, amqp_empty_table  // 修复：移除多余的参数
+            );
+            
+            amqp_rpc_reply_t passive_reply = amqp_get_rpc_reply(conn_);
+            if (passive_reply.reply_type == AMQP_RESPONSE_NORMAL) {
+                std::cout << "队列已存在，使用现有队列" << std::endl;
+                return true;
+            }
+            
+            // 如果队列不存在，则创建队列
+            std::cout << "队列不存在，创建新队列" << std::endl;
+            amqp_queue_declare_ok_t* declare_ok = amqp_queue_declare(
+                conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                0,  // passive: 创建队列
+                0,  // durable: 非持久化
+                0,  // exclusive: 非独占
+                0,  // auto_delete: 不自动删除
+                amqp_empty_table
+            );
+            
+            amqp_rpc_reply_t declare_reply = amqp_get_rpc_reply(conn_);
+            checkAmqpError(declare_reply, "Declare queue");
+            
+            std::cout << "队列创建成功: " << config_.queue_name << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "队列声明失败: " << e.what() << std::endl;
+            return false;
+        }
+    }
     
 public:
     RabbitMQConsumer(const Config& config) : config_(config) {}
@@ -765,7 +1060,7 @@ public:
         disconnect();
     }
     
-    bool connect() {
+    bool connect() override {
         conn_ = amqp_new_connection();
         if (!conn_) {
             std::cerr << "Failed to create RabbitMQ connection" << std::endl;
@@ -776,159 +1071,216 @@ public:
         if (!socket) {
             std::cerr << "Failed to create RabbitMQ socket" << std::endl;
             amqp_destroy_connection(conn_);
+            conn_ = nullptr;
             return false;
         }
         
         std::cout << "Connecting to RabbitMQ at " << config_.rabbitmq_host << ":" << config_.rabbitmq_port << std::endl;
-        if (amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port) != AMQP_STATUS_OK) {
-            std::cerr << "Failed to open RabbitMQ socket" << std::endl;
+        
+        int status = amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port);
+        if (status != AMQP_STATUS_OK) {
+            std::cerr << "Failed to open RabbitMQ socket: " << amqp_error_string2(status) << std::endl;
             amqp_destroy_connection(conn_);
+            conn_ = nullptr;
             return false;
         }
         
-        amqp_rpc_reply_t login_reply = amqp_login(conn_, config_.rabbitmq_vhost.c_str(), 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, 
-                  config_.rabbitmq_user.c_str(), config_.rabbitmq_password.c_str());
+        amqp_rpc_reply_t login_reply = amqp_login(conn_, config_.rabbitmq_vhost.c_str(), 
+                                                0, 131072, 0, AMQP_SASL_METHOD_PLAIN, 
+                                                config_.rabbitmq_user.c_str(), config_.rabbitmq_password.c_str());
         
-        if (login_reply.reply_type != AMQP_RESPONSE_NORMAL) {
-            std::cerr << "Failed to login to RabbitMQ" << std::endl;
-            amqp_destroy_connection(conn_);
-            return false;
-        }
+        checkAmqpError(login_reply, "Login");
         
+        // 打开通道
         amqp_channel_open(conn_, 1);
+        amqp_rpc_reply_t channel_reply = amqp_get_rpc_reply(conn_);
+        checkAmqpError(channel_reply, "Open channel");
         
-        amqp_queue_declare(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                          0, 1, 0, 0, amqp_empty_table);
-        
-        std::cout << "Connected to RabbitMQ successfully, queue: " << config_.queue_name << std::endl;
+        std::cout << "Connected to RabbitMQ successfully" << std::endl;
         return true;
     }
     
-    void disconnect() {
+    void disconnect() override {
         if (conn_) {
-            amqp_connection_close(conn_, AMQP_REPLY_SUCCESS);
+            try {
+                // 关闭通道
+                amqp_channel_close(conn_, 1, AMQP_REPLY_SUCCESS);
+                // 关闭连接
+                amqp_connection_close(conn_, AMQP_REPLY_SUCCESS);
+            } catch (...) {
+                // 忽略关闭时的异常
+            }
             amqp_destroy_connection(conn_);
             conn_ = nullptr;
         }
     }
     
-    void consume(ThreadSafeQueue& queue) {
-    if (!conn_ && !connect()) {
-        std::cerr << "Failed to connect to RabbitMQ" << std::endl;
-        return;
-    }
-    
-    // 检查队列状态
-    amqp_queue_declare_ok_t* declare_ok = amqp_queue_declare(
-        conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-        0, 1, 0, 0, amqp_empty_table
-    );
-    
-    if (declare_ok == NULL) {
-        std::cerr << "Failed to declare queue" << std::endl;
-        return;
-    }
-    
-    std::cout << "Queue '" << config_.queue_name << "' has " 
-              << declare_ok->message_count << " messages ready and " 
-              << declare_ok->consumer_count << " consumers" << std::endl;
-    
-    amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                      amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
-    
-    running_ = true;
-    int message_count = 0;
-    auto start_time = std::chrono::steady_clock::now();
-    
-    std::cout << "Starting to consume messages from RabbitMQ..." << std::endl;
-    
-    while (running_) {
-        amqp_envelope_t envelope;
-        amqp_maybe_release_buffers(conn_);
+    void consume(std::function<void(std::vector<char>&&)> callback) override {
+        std::cout << "进入消费" << std::endl;
         
-        std::cout << "Waiting for message..." << std::endl;
-        
-        amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, nullptr, 0);
-        
-        if (ret.reply_type == AMQP_RESPONSE_NORMAL) {
-            // 成功收到消息
-            char* body_start = static_cast<char*>(envelope.message.body.bytes);
-            std::vector<char> body(body_start, body_start + envelope.message.body.len);
-            
-            std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
-            
-            if (!queue.push(std::move(body))) {
-                std::cerr << "Failed to push message to queue" << std::endl;
-                amqp_destroy_envelope(&envelope);
-                break;
-            }
-            
-            amqp_destroy_envelope(&envelope);
-            message_count++;
-            
-            if (config_.verbose) {
-                std::cout << "Successfully processed message " << message_count << std::endl;
-            }
-            
-        } else {
-            // 处理错误
-            if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
-                std::cout << "Library exception: " << amqp_error_string2(ret.library_error) << std::endl;
-            } else if (ret.reply_type == AMQP_RESPONSE_SERVER_EXCEPTION) {
-                std::cout << "Server exception: " << (ret.reply.decoded ? "decoded" : "not decoded") << std::endl;
-            }
-            
-            if (running_) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            }
-            continue;
+        if (!conn_ && !connect()) {
+            std::cerr << "Failed to connect to RabbitMQ" << std::endl;
+            return;
         }
         
-        // 定期报告
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-        if (elapsed >= 10) {
-            double msg_rate = static_cast<double>(message_count) / elapsed;
-            std::cout << "Processed " << message_count << " messages (" 
-                     << msg_rate << " msg/sec)" << std::endl;
-            start_time = now;
-            message_count = 0;
+        std::cout << "进入消费 11111" << std::endl;
+        
+        try {
+            // 声明或检查队列
+            if (!declareQueue()) {
+                std::cerr << "Failed to declare queue" << std::endl;
+                return;
+            }
+            
+            std::cout << "进入消费 2222 - 队列准备完成" << std::endl;
+            
+            // 开始消费
+            amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                              amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+            
+            amqp_rpc_reply_t consume_reply = amqp_get_rpc_reply(conn_);
+            checkAmqpError(consume_reply, "Start consuming");
+            
+            std::cout << "进入消费 333333 - 开始等待消息" << std::endl;
+            
+            running_ = true;
+            int message_count = 0;
+            auto start_time = std::chrono::steady_clock::now();
+            
+            while (running_) {
+                amqp_envelope_t envelope;
+                amqp_maybe_release_buffers(conn_);
+                
+                // 设置超时，避免无限等待
+                struct timeval timeout;
+                timeout.tv_sec = 1;  // 1秒超时
+                timeout.tv_usec = 0;
+                
+                amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, &timeout, 0);
+                
+                if (ret.reply_type == AMQP_RESPONSE_NORMAL) {
+                    char* body_start = static_cast<char*>(envelope.message.body.bytes);
+                    std::vector<char> body(body_start, body_start + envelope.message.body.len);
+                    
+                    // std::cout << "Received message, size: " << body.size() << " bytes" << std::endl;
+                    
+                    callback(std::move(body));
+                    
+                    amqp_destroy_envelope(&envelope);
+                    message_count++;
+                    
+                    // if (config_.verbose) {
+                    //     std::cout << "Successfully processed message " << message_count << std::endl;
+                    // }
+                    
+                } else if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && 
+                          ret.library_error == AMQP_STATUS_TIMEOUT) {
+                    // 超时是正常的，继续循环
+                    continue;
+                } else {
+                    // 其他错误
+                    if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
+                        std::cout << "Library exception: " << amqp_error_string2(ret.library_error) << std::endl;
+                    } else if (ret.reply_type == AMQP_RESPONSE_SERVER_EXCEPTION) {
+                        std::cout << "Server exception occurred" << std::endl;
+                    }
+                    
+                    if (running_) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                    }
+                    continue;
+                }
+                
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+                if (elapsed >= 10) {
+                    double msg_rate = static_cast<double>(message_count) / elapsed;
+                    std::cout << "Processed " << message_count << " messages (" 
+                             << msg_rate << " msg/sec)" << std::endl;
+                    start_time = now;
+                    message_count = 0;
+                }
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Exception in consume: " << e.what() << std::endl;
         }
+        
+        std::cout << "RabbitMQ consumer stopped" << std::endl;
     }
     
-    std::cout << "RabbitMQ consumer stopped" << std::endl;
-}
-    
-    void stop() {
+    void stop() override {
         running_ = false;
     }
 };
+// ==================== 工厂类 ====================
 
-// Worker类使用高效的消息处理器
+// 抽象工厂
+class ComponentFactory {
+public:
+    virtual ~ComponentFactory() = default;
+    virtual std::unique_ptr<IDataWriter> createDataWriter() = 0;
+    virtual std::unique_ptr<IVolatilityDetector> createVolatilityDetector() = 0;
+    virtual std::unique_ptr<IMessageProcessor> createMessageProcessor() = 0;
+    virtual std::unique_ptr<IMessageConsumer> createMessageConsumer() = 0;
+};
+
+// 具体工厂
+class StockDataFactory : public ComponentFactory {
+private:
+    const Config& config_;
+    
+public:
+    StockDataFactory(const Config& config) : config_(config) {}
+    
+    std::unique_ptr<IDataWriter> createDataWriter() override {
+        return std::make_unique<TDengineBatchWriter>(config_);
+    }
+    
+    std::unique_ptr<IVolatilityDetector> createVolatilityDetector() override {
+        return std::make_unique<SimpleVolatilityDetector>(config_);
+    }
+    
+    std::unique_ptr<IMessageProcessor> createMessageProcessor() override {
+        return std::make_unique<EfficientMessageProcessor>(config_);
+    }
+    
+    std::unique_ptr<IMessageConsumer> createMessageConsumer() override {
+        return std::make_unique<RabbitMQConsumer>(config_);
+    }
+};
+
+// ==================== Worker和工作管道 ====================
+
+// Worker类
 class Worker {
 private:
-    Config config_;
+    const Config& config_;
     std::unique_ptr<IDataWriter> writer_;
     std::unique_ptr<IVolatilityDetector> detector_;
-    std::unique_ptr<EfficientMessageProcessor> message_processor_;
+    std::unique_ptr<IMessageProcessor> message_processor_;
     std::atomic<bool> running_{false};
     std::thread thread_;
     int worker_id_;
     static std::atomic<int> next_worker_id_;
     
 public:
-    Worker(const Config& config) : config_(config) {
+    Worker(std::unique_ptr<IDataWriter> writer,
+           std::unique_ptr<IVolatilityDetector> detector,
+           std::unique_ptr<IMessageProcessor> processor,
+           const Config& config)
+        : config_(config), 
+          writer_(std::move(writer)),
+          detector_(std::move(detector)),
+          message_processor_(std::move(processor)) {
         worker_id_ = next_worker_id_++;
-        writer_ = std::make_unique<TDengineBatchWriter>(config);
-        detector_ = std::make_unique<SimpleVolatilityDetector>(config);
-        message_processor_ = std::make_unique<EfficientMessageProcessor>(config);
     }
     
     ~Worker() {
         stop();
     }
     
-    void start(ThreadSafeQueue& queue) {
+    void start(ThreadSafeQueue<std::vector<char>>& queue) {
         running_ = true;
         thread_ = std::thread([this, &queue]() { run(queue); });
     }
@@ -941,7 +1293,7 @@ public:
     }
     
 private:
-    void run(ThreadSafeQueue& queue) {
+    void run(ThreadSafeQueue<std::vector<char>>& queue) {
         std::cout << "Worker " << worker_id_ << " started" << std::endl;
         
         if (!writer_->connect()) {
@@ -958,6 +1310,7 @@ private:
         
         while (running_) {
             std::vector<char> message;
+
             if (!queue.pop(message)) {
                 break;
             }
@@ -1017,25 +1370,33 @@ private:
 
 std::atomic<int> Worker::next_worker_id_{0};
 
-class ConsumerApplication {
+// 工作管道
+class ProcessingPipeline {
 private:
-    Config config_;
-    std::unique_ptr<RabbitMQConsumer> rabbitmq_;
+    const Config& config_;
+    std::unique_ptr<ComponentFactory> factory_;
+    std::unique_ptr<IMessageConsumer> consumer_;
     std::vector<std::unique_ptr<Worker>> workers_;
-    ThreadSafeQueue queue_;
-    std::atomic<bool> shutdown_{false};
+    ThreadSafeQueue<std::vector<char>> queue_;
     
 public:
-    ConsumerApplication(const Config& config) : config_(config) {
-        rabbitmq_ = std::make_unique<RabbitMQConsumer>(config);
+    ProcessingPipeline(std::unique_ptr<ComponentFactory> factory, const Config& config)
+        : config_(config), factory_(std::move(factory)) {
+        
+        consumer_ = factory_->createMessageConsumer();
         
         for (int i = 0; i < config.worker_count; ++i) {
-            workers_.push_back(std::make_unique<Worker>(config));
+            workers_.push_back(std::make_unique<Worker>(
+                factory_->createDataWriter(),
+                factory_->createVolatilityDetector(),
+                factory_->createMessageProcessor(),
+                config_
+            ));
         }
     }
     
-    void run() {
-        std::cout << "Starting TDengine consumer with " 
+    void start() {
+        std::cout << "Starting processing pipeline with " 
                   << config_.worker_count << " workers" << std::endl;
         
         for (auto& worker : workers_) {
@@ -1043,64 +1404,110 @@ public:
         }
         
         std::thread consumer_thread([this]() {
-            rabbitmq_->consume(queue_);
+            consumer_->consume([this](std::vector<char>&& message) {
+                queue_.push(std::move(message));
+            });
         });
         
-        waitForShutdown();
-        
-        shutdown();
-        
-        if (consumer_thread.joinable()) {
-            consumer_thread.join();
-        }
-        
-        std::cout << "Application shutdown completed" << std::endl;
+        consumer_thread.detach();
     }
     
-private:
-    void waitForShutdown() {
-        std::cout << "Press Ctrl+C to stop..." << std::endl;
-        
-        std::signal(SIGINT, [](int) { 
-            std::cout << "\nReceived shutdown signal" << std::endl;
-        });
-        
-        while (!shutdown_) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            
-            static auto last_report = std::chrono::steady_clock::now();
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
-                std::cout << "Queue size: " << queue_.size() << std::endl;
-                last_report = now;
-            }
-        }
-    }
-    
-    void shutdown() {
-        std::cout << "Initiating shutdown..." << std::endl;
-        shutdown_ = true;
-        rabbitmq_->stop();
+    void stop() {
+        std::cout << "Stopping processing pipeline..." << std::endl;
+        consumer_->stop();
         queue_.shutdown();
         
         for (auto& worker : workers_) {
             worker->stop();
         }
     }
+    
+    size_t getQueueSize() const {
+        return queue_.size();
+    }
 };
 
-int main() {
-    std::cout << "TDengine Consumer Application Starting..." << std::endl;
+// ==================== 应用主类 ====================
+
+class ConsumerApplication {
+private:
+    Config config_;
+    std::unique_ptr<ProcessingPipeline> pipeline_;
+    std::atomic<bool> shutdown_{false};
+    static std::atomic<bool> signal_received_;
     
-    Config config;
-    
-    const char* env_workers = std::getenv("WORKER_COUNT");
-    if (env_workers) {
-        config.worker_count = std::atoi(env_workers);
+public:
+    ConsumerApplication(const Config& config) : config_(config) {
+        auto factory = std::make_unique<StockDataFactory>(config);
+        pipeline_ = std::make_unique<ProcessingPipeline>(std::move(factory), config);
+        
+        // 设置信号处理
+        setupSignalHandlers();
     }
     
+    void run() {
+        std::cout << "TDengine Consumer Application Starting..." << std::endl;
+        
+        pipeline_->start();
+        
+        waitForShutdown();
+        
+        shutdown();
+        
+        std::cout << "Application shutdown completed" << std::endl;
+    }
+    
+private:
+    static void signalHandler(int signal) {
+        std::cout << "\nReceived shutdown signal (" << signal << ")" << std::endl;
+        signal_received_ = true;
+    }
+    
+    void setupSignalHandlers() {
+        signal_received_ = false;
+        signal(SIGINT, signalHandler);
+        signal(SIGTERM, signalHandler);
+    }
+    
+    void waitForShutdown() {
+        std::cout << "Press Ctrl+C to stop..." << std::endl;
+        
+        auto last_report = std::chrono::steady_clock::now();
+        
+        while (!shutdown_ && !signal_received_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 更短的等待时间
+            
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
+                std::cout << "Queue size: " << pipeline_->getQueueSize() << std::endl;
+                last_report = now;
+            }
+        }
+        
+        // 如果收到信号，设置关闭标志
+        if (signal_received_) {
+            shutdown_ = true;
+        }
+    }
+    
+    void shutdown() {
+        std::cout << "Initiating shutdown..." << std::endl;
+        pipeline_->stop();
+        
+        // 等待一段时间让管道完全停止
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+};
+
+// 静态成员定义
+std::atomic<bool> ConsumerApplication::signal_received_{false};
+
+// ==================== 主函数 ====================
+
+int main() {
     try {
-        ConsumerApplication app(config);
+        auto& configManager = ConfigManager::getInstance();
+        ConsumerApplication app(configManager.getConfig());
         app.run();
     } catch (const std::exception& e) {
         std::cerr << "Application error: " << e.what() << std::endl;
