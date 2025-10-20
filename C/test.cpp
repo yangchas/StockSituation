@@ -65,6 +65,11 @@ struct Config {
     int flow_control_timeout_ms = 1000; // 入队超时时间
     int max_pending_batches = 5; // 最大待处理批次
     bool enable_message_ack = true; // 启用消息确认
+
+    // 降速配置
+    int processing_delay_ms = 500;           // 每条消息后延迟20ms
+    int batch_processing_delay_ms = 500;    // 每批处理后延迟100ms  
+    bool enable_rate_limiting = true;       // 启用速率限制
 };
 
 // 单例配置管理器
@@ -289,7 +294,7 @@ public:
     
     bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) override {
         try {
-            std::cout<<"processMessage"<<std::endl;
+            // std::cout<<"processMessage"<<std::endl;
             // 1. 解析消息格式（与Python版本相同）
             MessageHeader header;
             std::vector<char> proto_data;
@@ -298,12 +303,12 @@ public:
                 return false;
             }
             
-            if (config_.verbose) {
-                std::cout << "Header: compression=" << header.compression 
-                          << ", records=" << header.record_count 
-                          << ", original_size=" << header.original_size
-                          << ", compressed_size=" << header.compressed_size << std::endl;
-            }
+            // if (config_.verbose) {
+            //     std::cout << "Header: compression=" << header.compression 
+            //               << ", records=" << header.record_count 
+            //               << ", original_size=" << header.original_size
+            //               << ", compressed_size=" << header.compressed_size << std::endl;
+            // }
             
             // 2. 使用 protobuf 解析 DataRequest
             dataservice::DataRequest data_request;
@@ -328,9 +333,9 @@ public:
                 return false;
             }
             
-            if (config_.verbose) {
-                std::cout << "Decompressed data: " << batch_bytes.size() << " bytes" << std::endl;
-            }
+            // if (config_.verbose) {
+            //     std::cout << "Decompressed data: " << batch_bytes.size() << " bytes" << std::endl;
+            // }
             
             // 4. 使用 protobuf 解析 DataBatch
             dataservice::DataBatch data_batch;
@@ -351,7 +356,7 @@ public:
 private:
     // 解析消息格式（与Python版本相同）
     bool parseMessageFormat(const std::vector<char>& body, MessageHeader& header, std::vector<char>& proto_data) {
-        std::cout<<"解析消息格式"<<std::endl;
+        // std::cout<<"解析消息格式"<<std::endl;
 
         if (body.size() < 4) {
             std::cerr << "Message too small: " << body.size() << " bytes" << std::endl;
@@ -425,6 +430,7 @@ private:
         
         while (pos < json.length() && std::isspace(json[pos])) {
             pos++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         
         if (pos >= json.length() || !std::isdigit(json[pos])) {
@@ -434,6 +440,7 @@ private:
         size_t end_pos = pos;
         while (end_pos < json.length() && (std::isdigit(json[end_pos]) || json[end_pos] == '-')) {
             end_pos++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         
         std::string num_str = json.substr(pos, end_pos - pos);
@@ -475,7 +482,7 @@ private:
     
     // 从JSON字符串中提取字符串字段
     std::string extractJsonFieldString(const std::string& json, const std::string& field) {
-        std::cout<<"extractJsonFieldString"<<std::endl;
+        // std::cout<<"extractJsonFieldString"<<std::endl;
         std::string search_pattern1 = "\"" + field + "\":";
         std::string search_pattern2 = field + ":";
         
@@ -510,7 +517,7 @@ private:
     
     // 解压缩 zlib 数据（与Python版本相同）
     bool decompressZlib(const std::string& compressed, std::vector<char>& decompressed) {
-        std::cout<<"decompressZlib"<<std::endl;
+        // std::cout<<"decompressZlib"<<std::endl;
         if (compressed.empty()) {
             return false;
         }
@@ -547,7 +554,9 @@ private:
             
             size_t have = buffer.size() - strm.avail_out;
             decompressed.insert(decompressed.end(), buffer.begin(), buffer.begin() + have);
-            
+            if (config_.enable_rate_limiting) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
+            }
         } while (ret != Z_STREAM_END);
         
         inflateEnd(&strm);
@@ -557,10 +566,10 @@ private:
     // 将 DataBatch 转换为 StockData
     bool convertDataBatchToStockData(const dataservice::DataBatch& data_batch, std::vector<StockData>& records) {
         int record_count = data_batch.records_size();
-        std::cout<<" DataBatch 转换为 StockData"<<std::endl;
-        if (config_.verbose) {
-            std::cout << "Converting DataBatch with " << record_count << " records" << std::endl;
-        }
+        // std::cout<<" DataBatch 转换为 StockData"<<std::endl;
+        // if (config_.verbose) {
+        //     std::cout << "Converting DataBatch with " << record_count << " records" << std::endl;
+        // }
         
         // 添加空数据检查
         if (record_count == 0) {
@@ -630,12 +639,12 @@ private:
         
         // 修改这里的输出，只在有记录时输出
         // if (!records.empty()) {
-            std::cout << "First record symbol: " << records[0].symbol << std::endl;
+            // std::cout << "First record symbol: " << records[0].symbol << std::endl;
         // }
         
-        if (config_.verbose) {
-            std::cout << "Successfully converted " << successfully_converted << " records" << std::endl;
-        }
+        // if (config_.verbose) {
+        //     std::cout << "Successfully converted " << successfully_converted << " records" << std::endl;
+        // }
         
         return successfully_converted > 0;
     }
@@ -930,6 +939,9 @@ public:
                 std::cerr << "Failed to insert records for symbol: " << symbol << std::endl;
                 all_success = false;
             }
+            if (config_.enable_rate_limiting) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.01)));
+            }
         }
         
         return all_success;
@@ -1007,6 +1019,9 @@ private:
                 << static_cast<long long>(record.bid_volumes[2]) << ", "
                 << static_cast<long long>(record.bid_volumes[3]) << ", "
                 << static_cast<long long>(record.bid_volumes[4]) << ")";
+            if (config_.enable_rate_limiting) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.01)));
+            }
         }
         
         try {
@@ -1168,14 +1183,14 @@ public:
     }
     
     void consume(std::function<void(std::vector<char>&&, std::function<void(bool)>)> callback) override {
-        std::cout << "进入消费" << std::endl;
+        // std::cout << "进入消费" << std::endl;
         
         if (!conn_ && !connect()) {
             std::cerr << "Failed to connect to RabbitMQ" << std::endl;
             return;
         }
         
-        std::cout << "进入消费 11111" << std::endl;
+        // std::cout << "进入消费 11111" << std::endl;
         
         try {
             // 声明或检查队列
@@ -1184,7 +1199,7 @@ public:
                 return;
             }
             
-            std::cout << "进入消费 2222 - 队列准备完成" << std::endl;
+            // std::cout << "进入消费 2222 - 队列准备完成" << std::endl;
             
             // 设置QoS，限制未确认消息数量
             amqp_basic_qos(conn_, 1, 0, config_.max_pending_batches, 0);
@@ -1196,7 +1211,7 @@ public:
             amqp_rpc_reply_t consume_reply = amqp_get_rpc_reply(conn_);
             checkAmqpError(consume_reply, "Start consuming");
             
-            std::cout << "进入消费 333333 - 开始等待消息" << std::endl;
+            // std::cout << "进入消费 333333 - 开始等待消息" << std::endl;
             
             running_ = true;
             int message_count = 0;
@@ -1217,16 +1232,16 @@ public:
                     char* body_start = static_cast<char*>(envelope.message.body.bytes);
                     std::vector<char> body(body_start, body_start + envelope.message.body.len);
                     
-                    std::cout << "Received message, size: " << body.size() << " bytes, delivery_tag: " << envelope.delivery_tag << std::endl;
+                    // std::cout << "Received message, size: " << body.size() << " bytes, delivery_tag: " << envelope.delivery_tag << std::endl;
                     
                     // 创建确认回调
                     auto ack_callback = [this, delivery_tag = envelope.delivery_tag](bool success) {
                         if (success) {
                             // 确认消息
                             amqp_basic_ack(conn_, 1, delivery_tag, 0);
-                            if (config_.verbose) {
-                                std::cout << "Message acknowledged: " << delivery_tag << std::endl;
-                            }
+                            // if (config_.verbose) {
+                            //     std::cout << "Message acknowledged: " << delivery_tag << std::endl;
+                            // }
                         } else {
                             // 拒绝消息并重新入队
                             amqp_basic_reject(conn_, 1, delivery_tag, true);
@@ -1239,9 +1254,9 @@ public:
                     amqp_destroy_envelope(&envelope);
                     message_count++;
                     
-                    if (config_.verbose) {
-                        std::cout << "Successfully processed message " << message_count << std::endl;
-                    }
+                    // if (config_.verbose) {
+                    //     std::cout << "Successfully processed message " << message_count << std::endl;
+                    // }
                     
                 } else if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && 
                           ret.library_error == AMQP_STATUS_TIMEOUT) {
@@ -1269,6 +1284,9 @@ public:
                              << msg_rate << " msg/sec)" << std::endl;
                     start_time = now;
                     message_count = 0;
+                }
+                if (config_.enable_rate_limiting) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
                 }
             }
             
@@ -1334,7 +1352,24 @@ private:
     std::thread thread_;
     int worker_id_;
     static std::atomic<int> next_worker_id_;
+     // 添加CPU使用率监控
+    std::chrono::steady_clock::time_point last_cpu_check_;
+    int processed_since_last_check_ = 0;
     
+    // 动态调整延迟
+    int calculateDynamicDelay() {
+        // 简单的动态调整：队列越大，延迟越小（加速处理）
+        // 队列越小，延迟越大（降速）
+        // double queue_load_factor = getQueueLoadFactor(); // 需要实现这个方法
+        
+        // if (queue_load_factor > 0.8) {
+        //     return 1; // 高负载时最小延迟
+        // } else if (queue_load_factor > 0.5) {
+        //     return config_.processing_delay_ms / 2;
+        // } else {
+            return config_.processing_delay_ms; // 正常延迟
+        // }
+    }
 public:
     Worker(std::unique_ptr<IDataWriter> writer,
            std::unique_ptr<IVolatilityDetector> detector,
@@ -1365,7 +1400,7 @@ public:
     
 private:
     void run(BackPressureQueue& queue) {
-        std::cout << "Worker " << worker_id_ << " started" << std::endl;
+        // std::cout << "Worker " << worker_id_ << " started" << std::endl;
         
         // 连接TDengine
         if (!writer_->connect()) {
@@ -1393,9 +1428,9 @@ private:
             }
             
             // 添加消息接收日志
-            if (config_.verbose) {
-                std::cout << "Worker " << worker_id_ << ": Received message, size: " << message.size() << " bytes" << std::endl;
-            }
+            // if (config_.verbose) {
+            //     std::cout << "Worker " << worker_id_ << ": Received message, size: " << message.size() << " bytes" << std::endl;
+            // }
             
             std::vector<StockData> records;
             if (message_processor_->processMessage(message, records)) {
@@ -1403,22 +1438,28 @@ private:
                 processed_records += records.size();
                 batch.insert(batch.end(), records.begin(), records.end());
                 
-                if (config_.verbose && !records.empty()) {
-                    std::cout << "Worker " << worker_id_ << ": Successfully processed " << records.size() 
-                             << " records from message. First symbol: " << records[0].symbol << std::endl;
-                }
+                // if (config_.verbose && !records.empty()) {
+                //     std::cout << "Worker " << worker_id_ << ": Successfully processed " << records.size() 
+                //              << " records from message. First symbol: " << records[0].symbol << std::endl;
+                // }
             } else {
                 std::cerr << "Worker " << worker_id_ << ": Failed to process message" << std::endl;
                 failed_messages++;
             }
-            
+             // ========== 新增：处理延迟控制 ==========
+            if (config_.enable_rate_limiting) {
+                int delay_ms = calculateDynamicDelay();
+                if (delay_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                }
+            }
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_flush).count();
             
             // 批次处理逻辑
             if (batch.size() >= config_.batch_size || elapsed >= config_.flush_timeout) {
                 if (!batch.empty()) {
-                    std::cout << "Worker " << worker_id_ << ": Flushing batch of " << batch.size() << " records" << std::endl;
+                    // std::cout << "Worker " << worker_id_ << ": Flushing batch of " << batch.size() << " records" << std::endl;
                     
                     if (writer_->writeBatch(batch)) {
                         std::cout << "Worker " << worker_id_ << ": Successfully inserted " << batch.size() << " records to TDengine" << std::endl;
@@ -1437,6 +1478,10 @@ private:
                         std::cerr << "Worker " << worker_id_ << ": Failed to write batch to TDengine" << std::endl;
                     }
                     batch.clear();
+                     // ========== 新增：批次处理后的额外延迟 ==========
+                    if (config_.enable_rate_limiting && config_.batch_processing_delay_ms > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(config_.batch_processing_delay_ms));
+                    }
                 }
                 last_flush = now;
             }
@@ -1457,7 +1502,7 @@ private:
         
         // 处理剩余批次
         if (!batch.empty()) {
-            std::cout << "Worker " << worker_id_ << ": Processing final batch of " << batch.size() << " records" << std::endl;
+            // std::cout << "Worker " << worker_id_ << ": Processing final batch of " << batch.size() << " records" << std::endl;
             if (writer_->writeBatch(batch)) {
                 std::cout << "Worker " << worker_id_ << ": Final batch inserted successfully" << std::endl;
             } else {
@@ -1527,10 +1572,10 @@ public:
                     if (config_.enable_message_ack) {
                         ack_callback(true);
                     }
-                    if (config_.verbose) {
-                        std::cout << "Message pushed to queue, current size: " << queue_.size() 
-                                 << ", memory usage: " << (queue_.memory_ratio() * 100) << "%" << std::endl;
-                    }
+                    // if (config_.verbose) {
+                    //     std::cout << "Message pushed to queue, current size: " << queue_.size() 
+                    //              << ", memory usage: " << (queue_.memory_ratio() * 100) << "%" << std::endl;
+                    // }
                 } else {
                     // 队列满，拒绝消息（会重新入队）
                     std::cerr << "Queue full, rejecting message (memory usage: " 
@@ -1613,8 +1658,10 @@ private:
         auto last_report = std::chrono::steady_clock::now();
         
         while (!shutdown_ && !signal_received_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 更短的等待时间
-            
+            if (config_.enable_rate_limiting) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing_delay_ms*10));
+            }
+        
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
                 std::cout << "Queue status - Size: " << pipeline_->getQueueSize() 
