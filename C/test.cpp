@@ -36,12 +36,8 @@ struct Config {
     std::string rabbitmq_vhost = "/";
     std::string queue_name = "stream2";
     
-    int batch_size = 100;
-    int worker_count = 4;
-    int buffer_size = 10000;
-    double flush_timeout = 1.0;
-    bool verbose = true;
-    int shutdown_timeout = 30;
+    int batch_size = 2;  // 改为1，单条处理
+    int worker_count = 1; // 只需要1个worker
     
     std::string redis_host = "localhost";
     int redis_port = 6379;
@@ -54,22 +50,19 @@ struct Config {
     double volume_ratio_threshold = 3.0;
     double min_amount_threshold = 1000000;
     
-    std::string tdengine_host = "localhost";
+    std::string tdengine_host = "chaos";
     int tdengine_port = 6030;
     std::string tdengine_user = "root";
     std::string tdengine_password = "taosdata";
     std::string tdengine_database = "market_data";
     
-    // 新增背压控制配置
-    size_t max_queue_memory = 100 * 1024 * 1024; // 100MB内存限制
-    int flow_control_timeout_ms = 1000; // 入队超时时间
-    int max_pending_batches = 5; // 最大待处理批次
-    bool enable_message_ack = true; // 启用消息确认
-
-    // 降速配置
-    int processing_delay_ms = 500;           // 每条消息后延迟20ms
-    int batch_processing_delay_ms = 500;    // 每批处理后延迟100ms  
+    // 串行处理相关配置
+    int processing_delay_ms = 10;           // 每条消息处理后的延迟
     bool enable_rate_limiting = true;       // 启用速率限制
+    bool enable_message_ack = true;         // 启用消息确认
+    int max_pending_messages = 2;           // 最大待处理消息数
+    int shutdown_timeout = 30;
+    bool verbose = true;
 };
 
 // 单例配置管理器
@@ -175,86 +168,6 @@ public:
 };
 
 // ==================== 工具类 ====================
-
-// 背压控制队列
-class BackPressureQueue {
-private:
-    std::queue<std::vector<char>> queue_;
-    mutable std::mutex mutex_;
-    std::condition_variable not_empty_;
-    std::condition_variable not_full_;
-    std::atomic<bool> shutdown_{false};
-    std::atomic<size_t> current_memory_{0};
-    size_t max_memory_;
-    int timeout_ms_;
-    
-public:
-    BackPressureQueue(size_t max_memory, int timeout_ms = 1000) 
-        : max_memory_(max_memory), timeout_ms_(timeout_ms) {}
-    
-    bool push(std::vector<char>&& item) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (shutdown_) return false;
-        
-        size_t item_size = item.size();
-        
-        // 等待队列有足够空间
-        if (!not_full_.wait_for(lock, std::chrono::milliseconds(timeout_ms_),
-            [this, item_size]() { 
-                return shutdown_ || (current_memory_ + item_size <= max_memory_); 
-            })) {
-            return false; // 超时，拒绝消息
-        }
-        
-        if (shutdown_) return false;
-        
-        queue_.push(std::move(item));
-        current_memory_ += item_size;
-        not_empty_.notify_one();
-        return true;
-    }
-    
-    bool pop(std::vector<char>& item) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        not_empty_.wait(lock, [this]() { return !queue_.empty() || shutdown_; });
-        
-        if (shutdown_ && queue_.empty()) return false;
-        
-        // 使用swap来避免拷贝，同时立即释放队列中的内存
-        item.swap(queue_.front());
-        queue_.pop();
-        
-        // 确保内存计数准确
-        size_t item_size = item.capacity(); // 使用容量而不是size来准确计算内存
-        if (current_memory_ >= item_size) {
-            current_memory_ -= item_size;
-        } else {
-            current_memory_ = 0; // 防止下溢
-        }
-        
-        not_full_.notify_one();
-        return true;
-    }
-    
-    void shutdown() {
-        shutdown_ = true;
-        not_empty_.notify_all();
-        not_full_.notify_all();
-    }
-    
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.size();
-    }
-    
-    size_t memory_usage() const {
-        return current_memory_;
-    }
-    
-    double memory_ratio() const {
-        return static_cast<double>(current_memory_) / max_memory_;
-    }
-};
 
 // 时间工具类
 class TimeUtils {
@@ -561,9 +474,6 @@ private:
         buffer.reserve(CHUNK_SIZE);
         
         do {
-            if (config_.enable_rate_limiting) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
-            }
             buffer.resize(CHUNK_SIZE);
             strm.avail_out = buffer.size();
             strm.next_out = reinterpret_cast<Bytef*>(buffer.data());
@@ -837,7 +747,7 @@ public:
         
         std::cout << "Connecting to TDengine at " << host_ << ":" << port_ << std::endl;
         conn_ = taos_connect(host_.c_str(), user_.c_str(), password_.c_str(), 
-                           database_.c_str(), port_);
+                          NULL, port_);
         
         if (!conn_) {
             const char* err_str = taos_errstr(NULL);
@@ -950,9 +860,6 @@ public:
                 std::cerr << "Failed to insert records for symbol: " << symbol << std::endl;
                 all_success = false;
             }
-            if (config_.enable_rate_limiting) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
-            }
         }
         
         return all_success;
@@ -1033,19 +940,20 @@ private:
             if (config_.enable_rate_limiting) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.01)));
             }
+
         }
         
         try {
             connection_->execute(sql.str());
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Failed to insert records: " << e.what()<<" SQL: "<<sql.str() << std::endl;
+            std::cerr << "Failed to insert records: " << e.what() << " SQL: " << sql.str() << std::endl;
             return false;
         }
     }
 };
 
-// RabbitMQ消费者 - 支持消息确认
+// RabbitMQ消费者 - 串行处理版本
 class RabbitMQConsumer : public IMessageConsumer {
 private:
     const Config& config_;
@@ -1203,8 +1111,8 @@ public:
                 return;
             }
             
-            // 设置QoS，限制未确认消息数量
-            amqp_basic_qos(conn_, 1, 0, config_.max_pending_batches, 0);
+            // 设置QoS，每次只取一条消息
+            amqp_basic_qos(conn_, 1, 0, config_.max_pending_messages, 0);
             
             // 开始消费，手动确认
             amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
@@ -1218,9 +1126,6 @@ public:
             auto start_time = std::chrono::steady_clock::now();
             
             while (running_) {
-                if (config_.enable_rate_limiting) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
-                }
                 amqp_envelope_t envelope;
                 amqp_maybe_release_buffers(conn_);
                 
@@ -1232,13 +1137,10 @@ public:
                 amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, &timeout, 0);
                 
                 if (ret.reply_type == AMQP_RESPONSE_NORMAL) {
-                    // 立即处理消息并释放信封内存
+                    // 处理单条消息
                     std::vector<char> body;
                     body.resize(envelope.message.body.len);
                     std::memcpy(body.data(), envelope.message.body.bytes, envelope.message.body.len);
-                    
-                    // 立即释放信封内存
-                    amqp_destroy_envelope(&envelope);
                     
                     // 创建确认回调
                     auto ack_callback = [this, delivery_tag = envelope.delivery_tag](bool success) {
@@ -1252,12 +1154,18 @@ public:
                         }
                     };
                     
+                    // 处理消息 - 这里会阻塞直到处理完成
                     callback(std::move(body), ack_callback);
                     
-                    // 强制body释放内存（如果callback没有移动）
-                    std::vector<char>().swap(body);
+                    // 立即释放信封内存
+                    amqp_destroy_envelope(&envelope);
                     
                     message_count++;
+                    
+                    // 处理完成后才继续下一条
+                    if (config_.enable_rate_limiting) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing_delay_ms));
+                    }
                     
                 } else if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION && 
                           ret.library_error == AMQP_STATUS_TIMEOUT) {
@@ -1277,6 +1185,7 @@ public:
                     continue;
                 }
                 
+                // 进度报告
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
                 if (elapsed >= 30) {
@@ -1285,9 +1194,6 @@ public:
                              << msg_rate << " msg/sec)" << std::endl;
                     start_time = now;
                     message_count = 0;
-                }
-                if (config_.enable_rate_limiting) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms)));
                 }
             }
             
@@ -1340,274 +1246,121 @@ public:
     }
 };
 
-// ==================== Worker和工作管道 ====================
+// ==================== 工作管道 ====================
 
-// Worker类
-class Worker {
-private:
-    const Config& config_;
-    std::unique_ptr<IDataWriter> writer_;
-    std::unique_ptr<IVolatilityDetector> detector_;
-    std::unique_ptr<IMessageProcessor> message_processor_;
-    std::atomic<bool> running_{false};
-    std::thread thread_;
-    int worker_id_;
-    static std::atomic<int> next_worker_id_;
-    
-    // 动态调整延迟
-    int calculateDynamicDelay() {
-        return config_.processing_delay_ms;
-    }
-    
-public:
-    Worker(std::unique_ptr<IDataWriter> writer,
-           std::unique_ptr<IVolatilityDetector> detector,
-           std::unique_ptr<IMessageProcessor> processor,
-           const Config& config)
-        : config_(config), 
-          writer_(std::move(writer)),
-          detector_(std::move(detector)),
-          message_processor_(std::move(processor)) {
-        worker_id_ = next_worker_id_++;
-    }
-    
-    ~Worker() {
-        stop();
-    }
-    
-    void start(BackPressureQueue& queue) {
-        running_ = true;
-        thread_ = std::thread([this, &queue]() { run(queue); });
-    }
-    
-    void stop() {
-        running_ = false;
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-    }
-    
-private:
-    void run(BackPressureQueue& queue) {
-        // 连接TDengine
-        if (!writer_->connect()) {
-            std::cerr << "Worker " << worker_id_ << ": Failed to connect to TDengine" << std::endl;
-            return;
-        }
-        std::cout << "Worker " << worker_id_ << ": TDengine connected successfully" << std::endl;
-        
-        std::vector<StockData> batch;
-        batch.reserve(config_.batch_size); // 预分配空间
-        
-        auto last_flush = std::chrono::steady_clock::now();
-        auto last_cleanup = std::chrono::steady_clock::now();
-        auto last_memory_cleanup = std::chrono::steady_clock::now();
-        
-        int processed_messages = 0;
-        int processed_records = 0;
-        int failed_messages = 0;
-        
-        std::cout << "Worker " << worker_id_ << ": Starting message processing loop" << std::endl;
-        
-        while (running_) {
-            std::vector<char> message;
-            if (config_.enable_rate_limiting) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
-            }
-            if (!queue.pop(message)) {
-                std::cout << "Worker " << worker_id_ << ": Queue shutdown, exiting" << std::endl;
-                break;
-            }
-            
-            // 使用局部作用域限制records的生命周期
-            {
-                std::vector<StockData> records;
-                if (message_processor_->processMessage(message, records)) {
-                    processed_messages++;
-                    processed_records += records.size();
-                    batch.insert(batch.end(), 
-                               std::make_move_iterator(records.begin()),
-                               std::make_move_iterator(records.end()));
-                    
-                    // 立即释放已移动的records
-                    std::vector<StockData>().swap(records);
-                } else {
-                    std::cerr << "Worker " << worker_id_ << ": Failed to process message" << std::endl;
-                    failed_messages++;
-                }
-            } // records 在这里被销毁
-            
-            // 及时释放已处理的消息内存
-            std::vector<char>().swap(message);
-            
-            // ========== 新增：处理延迟控制 ==========
-            if (config_.enable_rate_limiting) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(int(config_.processing_delay_ms*0.1)));
-            }
-            
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_flush).count();
-            
-            // 批次处理逻辑
-            if (batch.size() >= config_.batch_size || elapsed >= config_.flush_timeout) {
-                if (!batch.empty()) {
-                    if (writer_->writeBatch(batch)) {
-                        std::cout << "Worker " << worker_id_ << ": Successfully inserted " << batch.size() << " records to TDengine" << std::endl;
-                        
-                        // 异动检测
-                        int volatility_detected = 0;
-                        for (const auto& record : batch) {
-                            if (detector_->detectVolatility(record)) {
-                                volatility_detected++;
-                            }
-                        }
-                        if (volatility_detected > 0) {
-                            std::cout << "Worker " << worker_id_ << ": Detected volatility in " << volatility_detected << " records" << std::endl;
-                        }
-                    } else {
-                        std::cerr << "Worker " << worker_id_ << ": Failed to write batch to TDengine" << std::endl;
-                    }
-                    
-                    // 清空批次但保留容量
-                    batch.clear();
-                    
-                    // ========== 新增：批次处理后的额外延迟 ==========
-                    if (config_.enable_rate_limiting && config_.batch_processing_delay_ms > 0) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(config_.batch_processing_delay_ms));
-                    }
-                }
-                last_flush = now;
-            }
-            
-            // 每5分钟强制清理一次内存
-            if (std::chrono::duration_cast<std::chrono::minutes>(now - last_memory_cleanup).count() >= 5) {
-                // 收缩batch向量的容量
-                if (batch.capacity() > batch.size() * 2) {
-                    std::vector<StockData>(batch).swap(batch);
-                }
-                
-                last_memory_cleanup = now;
-            }
-            
-            // 进度报告
-            if (processed_messages % 10 == 0 && processed_messages > 0) {
-                std::cout << "Worker " << worker_id_ << ": Progress - " << processed_messages 
-                         << " messages, " << processed_records << " records, " 
-                         << failed_messages << " failed" << std::endl;
-            }
-            
-            // 清理旧数据
-            if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
-                detector_->cleanupOldData();
-                last_cleanup = now;
-            }
-        }
-        
-        // 处理剩余批次
-        if (!batch.empty()) {
-            if (writer_->writeBatch(batch)) {
-                std::cout << "Worker " << worker_id_ << ": Final batch inserted successfully" << std::endl;
-            } else {
-                std::cerr << "Worker " << worker_id_ << ": Failed to insert final batch" << std::endl;
-            }
-        }
-        
-        // 工作循环结束后释放所有资源
-        std::vector<StockData>().swap(batch);
-        
-        std::cout << "Worker " << worker_id_ << " finished. Total: " 
-                  << processed_messages << " messages, " << processed_records << " records, "
-                  << failed_messages << " failed" << std::endl;
-        
-        writer_->close();
-    }
-};
-
-std::atomic<int> Worker::next_worker_id_{0};
-
-// 工作管道
+// 串行处理管道
 class ProcessingPipeline {
 private:
     const Config& config_;
     std::unique_ptr<ComponentFactory> factory_;
     std::unique_ptr<IMessageConsumer> consumer_;
-    std::vector<std::unique_ptr<Worker>> workers_;
-    BackPressureQueue queue_;
+    std::unique_ptr<IDataWriter> writer_;
+    std::unique_ptr<IVolatilityDetector> detector_;
+    std::unique_ptr<IMessageProcessor> message_processor_;
+    std::atomic<bool> running_{false};
+    std::thread consumer_thread_;
     
 public:
     ProcessingPipeline(std::unique_ptr<ComponentFactory> factory, const Config& config)
-        : config_(config), factory_(std::move(factory)),
-          queue_(config.max_queue_memory, config.flow_control_timeout_ms) {
+        : config_(config), factory_(std::move(factory)) {
         
         consumer_ = factory_->createMessageConsumer();
-        
-        for (int i = 0; i < config.worker_count; ++i) {
-            workers_.push_back(std::make_unique<Worker>(
-                factory_->createDataWriter(),
-                factory_->createVolatilityDetector(),
-                factory_->createMessageProcessor(),
-                config_
-            ));
-        }
+        writer_ = factory_->createDataWriter();
+        detector_ = factory_->createVolatilityDetector();
+        message_processor_ = factory_->createMessageProcessor();
     }
     
     void start() {
-        std::cout << "Starting processing pipeline with " 
-                  << config_.worker_count << " workers" << std::endl;
+        std::cout << "Starting serial processing pipeline" << std::endl;
         
-        // 先启动Worker线程
-        for (auto& worker : workers_) {
-            worker->start(queue_);
+        // 先连接TDengine
+        if (!writer_->connect()) {
+            std::cerr << "Failed to connect to TDengine" << std::endl;
+            return;
         }
         
-        // 等待Worker线程初始化完成
-        std::cout << "Waiting for workers to initialize..." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        
-        std::cout << "All workers started, starting RabbitMQ consumer..." << std::endl;
-        
-        // 再启动RabbitMQ消费者
-        std::thread consumer_thread([this]() {
-            std::cout << "RabbitMQ consumer thread started" << std::endl;
+        running_ = true;
+        consumer_thread_ = std::thread([this]() {
+            std::cout << "Starting RabbitMQ consumer with serial processing..." << std::endl;
+            
             consumer_->consume([this](std::vector<char>&& message, std::function<void(bool)> ack_callback) {
-                bool pushed = queue_.push(std::move(message));
-                
-                if (pushed) {
-                    // 消息成功入队，立即确认
-                    if (config_.enable_message_ack) {
-                        ack_callback(true);
-                    }
-                } else {
-                    // 队列满，拒绝消息（会重新入队）
-                    std::cerr << "Queue full, rejecting message (memory usage: " 
-                             << (queue_.memory_ratio() * 100) << "%)" << std::endl;
-                    if (config_.enable_message_ack) {
-                        ack_callback(false);
-                    }
+                if (!running_) {
+                    ack_callback(false); // 如果正在关闭，拒绝消息
+                    return;
                 }
+                
+                bool success = processSingleMessage(std::move(message));
+                ack_callback(success);
             });
         });
         
-        consumer_thread.detach();
-        std::cout << "Processing pipeline fully started" << std::endl;
+        std::cout << "Serial processing pipeline started" << std::endl;
     }
     
     void stop() {
         std::cout << "Stopping processing pipeline..." << std::endl;
+        running_ = false;
         consumer_->stop();
-        queue_.shutdown();
         
-        for (auto& worker : workers_) {
-            worker->stop();
+        if (consumer_thread_.joinable()) {
+            consumer_thread_.join();
         }
+        
+        writer_->close();
     }
     
-    size_t getQueueSize() const {
-        return queue_.size();
-    }
-    
-    double getMemoryUsageRatio() const {
-        return queue_.memory_ratio();
+private:
+    bool processSingleMessage(std::vector<char>&& message) {
+        try {
+            std::vector<StockData> records;
+            
+            // 解析消息
+            if (!message_processor_->processMessage(message, records)) {
+                std::cerr << "Failed to process message" << std::endl;
+                return false;
+            }
+            
+            // 立即释放消息内存
+            std::vector<char>().swap(message);
+            
+            if (records.empty()) {
+                std::cout << "No records extracted from message" << std::endl;
+                return true; // 空记录不算失败
+            }
+            
+            // 写入TDengine
+            if (!writer_->writeBatch(records)) {
+                std::cerr << "Failed to write records to TDengine" << std::endl;
+                return false;
+            }
+            
+            std::cout << "Successfully inserted " << records.size() << " records to TDengine" << std::endl;
+            
+            // 异动检测
+            int volatility_detected = 0;
+            for (const auto& record : records) {
+                if (detector_->detectVolatility(record)) {
+                    volatility_detected++;
+                }
+            }
+            
+            if (volatility_detected > 0) {
+                std::cout << "Detected volatility in " << volatility_detected << " records" << std::endl;
+            }
+            
+            // 定期清理旧数据（每处理100条消息清理一次）
+            static int cleanup_counter = 0;
+            if (++cleanup_counter >= 100) {
+                detector_->cleanupOldData();
+                cleanup_counter = 0;
+            }
+            
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Exception processing single message: " << e.what() << std::endl;
+            return false;
+        }
     }
 };
 
@@ -1656,17 +1409,15 @@ private:
     void waitForShutdown() {
         std::cout << "Press Ctrl+C to stop..." << std::endl;
         
-        auto last_report = std::chrono::steady_clock::now();
-        
         while (!shutdown_ && !signal_received_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
-                std::cout << "Queue status - Size: " << pipeline_->getQueueSize() 
-                         << ", Memory usage: " << (pipeline_->getMemoryUsageRatio() * 100) << "%" << std::endl;
-                last_report = now;
-            }
+            // auto now = std::chrono::steady_clock::now();
+            // if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
+            //     std::cout << "Queue status - Size: " << pipeline_->getQueueSize() 
+            //              << ", Memory usage: " << (pipeline_->getMemoryUsageRatio() * 100) << "%" << std::endl;
+            //     last_report = now;
+            // }
         }
         
         // 如果收到信号，设置关闭标志
