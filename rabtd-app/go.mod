@@ -16,5 +16,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rabbitmq/rabbitmq-stream-go-client v1.6.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
+	github.com/streadway/amqp v1.1.0 // indirect
 	google.golang.org/protobuf v1.36.9 // indirect
 )

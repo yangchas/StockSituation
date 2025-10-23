@@ -11,9 +11,11 @@ import signal
 import argparse
 from multiprocessing import Process, Queue
 from queue import Empty
-from typing import List
+from typing import List, Dict, Any
+from datetime import datetime, time as dt_time
 import pika
 import taos
+import redis
 
 # 导入生成的 protobuf 模块
 import schema_pb2
@@ -36,12 +38,25 @@ CONFIG = {
     'buffer_size': 50000,
     'flush_timeout': 3.0,
     'verbose': True,
-    'shutdown_timeout': 30  # 优雅关闭超时时间（秒）
+    'shutdown_timeout': 30,
+    
+    # Redis配置
+    'redis_host': 'localhost',
+    'redis_port': 6379,
+    'redis_db': 0,
+    
+    # 异动池配置
+    'volatile_pool_key': 'stock:volatile_pool',
+    'volatile_expire': 300,  # 异动池数据过期时间(秒)
+    
+    # 异动检测阈值
+    'price_change_threshold': 0.02,  # 价格变化阈值2%
+    'volume_ratio_threshold': 3.0,   # 量比阈值
+    'min_amount_threshold': 1000000, # 最小成交额阈值100万
 }
 
 # 完成消息标记
 _DONE_MESSAGE = '__DONE__'
-
 
 class MessageHeader:
     def __init__(self, proto_version, compression, batch_id, record_count, original_size, compressed_size, timestamp):
@@ -65,13 +80,143 @@ class MessageHeader:
             timestamp=data.get('timestamp', 0)
         )
 
+class VolatilityDetector:
+    """异动检测器"""
+    
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.volatile_pool_key = CONFIG['volatile_pool_key']
+        self.price_threshold = CONFIG['price_change_threshold']
+        self.volume_threshold = CONFIG['volume_ratio_threshold']
+        self.amount_threshold = CONFIG['min_amount_threshold']
+        
+        # 缓存最近的价格和成交量
+        self.price_cache = {}
+        self.volume_cache = {}
+        self.last_update_time = {}
+    
+    def is_auction_time(self, timestamp: int) -> bool:
+        """检查是否为竞价时间"""
+        dt = datetime.fromtimestamp(timestamp / 1000)
+        current_time = dt.time()
+        return True
+        return dt_time(9, 15) <= current_time <= dt_time(9, 25)
+    
+    def detect_volatility(self, symbol: str, tick_data: Dict[str, Any]) -> bool:
+        """检测股票异动 - 简化逻辑：只检测大单和涨跌幅"""
+        timestamp = tick_data['timestamp']
+        
+        # 只在竞价时间段检测
+        if not self.is_auction_time(timestamp):
+            return False
+        
+        current_price = tick_data.get('last_price', 0)
+        previous_close = tick_data.get('close', 0)  # lc是昨日收盘价
+        
+        # # 缓存昨日收盘价
+        # if symbol not in self.previous_close_cache and previous_close > 0:
+        #     self.previous_close_cache[symbol] = previous_close
+        
+        # 检测大单
+        has_large_order = self._detect_large_orders(symbol, tick_data)
+        
+        # 检测涨跌幅（基于昨日收盘价）
+        # has_price_change = self._detect_price_change(symbol, current_price)
+        price_change = abs(current_price - previous_close) / previous_close
+        has_price_change= price_change >= self.price_threshold
+        # 只要满足大单或涨跌幅条件就加入异动池
+        is_volatile = has_large_order or has_price_change
+        
+        if is_volatile:
+            dt = datetime.fromtimestamp(timestamp / 1000)
+            reason = "大单" if has_large_order else "涨跌幅"
+            logger.info(f"{dt.strftime('%H:%M:%S')} 检测到异动: {symbol}, 原因: {reason}")
+            self._add_to_volatile_pool(symbol, tick_data, reason)
+        
+        return is_volatile
+    
+    def _detect_large_orders(self, symbol: str, tick_data: Dict[str, Any]) -> bool:
+        """检测大单"""
+        try:
+            # 检查买一档大单
+            bid_price_1 = tick_data.get('bid_prices', [0])[0] if len(tick_data.get('bid_prices', [])) > 0 else 0
+            bid_volume_1 = tick_data.get('bid_volumes', [0])[0] if len(tick_data.get('bid_volumes', [])) > 0 else 0
+            
+            # 检查卖一档大单
+            ask_price_1 = tick_data.get('ask_prices', [0])[0] if len(tick_data.get('ask_prices', [])) > 0 else 0
+            ask_volume_1 = tick_data.get('ask_volumes', [0])[0] if len(tick_data.get('ask_volumes', [])) > 0 else 0
+            
+            # 计算大单金额
+            bid_order_value = bid_price_1 * bid_volume_1 * 100  # 转换为元
+            ask_order_value = ask_price_1 * ask_volume_1 * 100  # 转换为元
+            
+            # 检测是否有大单
+            has_large_bid = bid_order_value >= self.large_order_threshold
+            has_large_ask = ask_order_value >= self.large_order_threshold
+            
+            return has_large_bid or has_large_ask
+            
+        except Exception as e:
+            logger.error(f"检测大单失败 {symbol}: {e}")
+            return False
+    
+    def _detect_price_change(self, symbol: str, current_price: float) -> bool:
+        """检测涨跌幅"""
+        try:
+            if symbol not in self.previous_close_cache:
+                return False
+            
+            previous_close = self.previous_close_cache[symbol]
+            if previous_close <= 0:
+                return False
+            
+            # 计算涨跌幅
+            price_change = abs(current_price - previous_close) / previous_close
+            
+            return price_change >= self.price_threshold
+            
+        except Exception as e:
+            logger.error(f"检测涨跌幅失败 {symbol}: {e}")
+            return False
+    
+    def _add_to_volatile_pool(self, symbol: str, tick_data: Dict[str, Any], reason: str):
+        """添加到异动池"""
+        try:
+            volatile_data = {
+                'symbol': symbol,
+                'timestamp': tick_data['timestamp'],
+                'price': tick_data.get('last_price', 0),
+                'volume': tick_data.get('volume', 0),
+                'amount': tick_data.get('amount', 0),
+                'reason': reason,
+                'detect_time': int(time.time() * 1000),
+                'is_trial_period': self.is_trial_period(tick_data['timestamp'])
+            }
+            
+            # 使用Redis有序集合，按检测时间排序
+            self.redis.zadd(
+                self.volatile_pool_key,
+                {json.dumps(volatile_data): volatile_data['detect_time']}
+            )
+            
+            # 设置过期时间
+            self.redis.expire(self.volatile_pool_key, CONFIG['volatile_expire'])
+            
+        except Exception as e:
+            logger.error(f"添加到异动池失败 {symbol}: {e}")
+    
+    def cleanup_old_data(self):
+        """清理过期数据"""
+        try:
+            # 移除过期数据
+            cutoff_time = int(time.time() * 1000) - 3600 * 1000
+            self.redis.zremrangebyscore(self.volatile_pool_key, 0, cutoff_time)
+        except Exception as e:
+            logger.error(f"清理异动池数据失败: {e}")
 
 def get_tdengine_connection():
-    """
-    获取 TDengine 连接
-    """
+    """获取 TDengine 连接"""
     try:
-        # 从环境变量获取配置，或使用默认值
         host = os.environ.get("TDENGINE_HOST", "localhost")
         port = int(os.environ.get("TDENGINE_PORT", "6030"))
         user = os.environ.get("TDENGINE_USER", "root")
@@ -79,8 +224,6 @@ def get_tdengine_connection():
         database = os.environ.get("TDENGINE_DATABASE", "market_data")
         
         conn = taos.connect(host=host, port=port, user=user, password=password)
-        
-        # 设置数据库
         conn.execute(f"USE {database}")
         
         return conn
@@ -89,15 +232,33 @@ def get_tdengine_connection():
         raise
 
 
-class TDengineWriter:
-    """
-    TDengine 写入器
-    """
+class TDengineWriterWithVolatility:
+    """TDengine写入器 + 异动检测"""
+    
     def __init__(self, worker_id):
         self.worker_id = worker_id
         self.conn = None
+        self.redis_client = None
+        self.volatility_detector = None
         self.log = logging.getLogger(f"TDengineWriter-{worker_id}")
         
+        # 初始化Redis连接
+        self._init_redis()
+    
+    def _init_redis(self):
+        """初始化Redis连接"""
+        try:
+            self.redis_client = redis.Redis(
+                host=CONFIG['redis_host'],
+                port=CONFIG['redis_port'],
+                db=CONFIG['redis_db'],
+                decode_responses=True
+            )
+            self.volatility_detector = VolatilityDetector(self.redis_client)
+            self.log.info("Redis连接和异动检测器初始化成功")
+        except Exception as e:
+            self.log.error(f"Redis初始化失败: {e}")
+    
     def connect(self):
         """连接 TDengine"""
         if self.conn is None:
@@ -109,7 +270,9 @@ class TDengineWriter:
         if self.conn:
             self.conn.close()
             self.conn = None
-            self.log.info("TDengine connection closed")
+        if self.redis_client:
+            self.redis_client.close()
+        self.log.info("连接已关闭")
     
     def create_table_if_not_exists(self, symbol, exchange, market):
         """创建子表（如果不存在）"""
@@ -133,15 +296,35 @@ class TDengineWriter:
         """清理符号名称"""
         import re
         sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', symbol)
-        
-        # 如果以数字开头，添加前缀
         if sanitized and sanitized[0].isdigit():
             sanitized = 's_' + sanitized
-            
         return sanitized
     
+    def format_timestamp(self, timestamp):
+        """格式化时间戳为 TDengine 接受的格式"""
+        dt = datetime.fromtimestamp(timestamp / 1000)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    def protobuf_to_dict(self, record):
+        """将protobuf记录转换为字典"""
+        return {
+            'symbol': record.symbol,
+            'timestamp': record.tss,
+            'last_price': record.lp or 0,
+            'open': record.o or 0,
+            'high': record.h or 0,
+            'low': record.l or 0,
+            'close': record.lc or 0,
+            'volume': record.v or 0,
+            'amount': record.a or 0,
+            'ask_prices': [record.ap1, record.ap2, record.ap3, record.ap4, record.ap5],
+            'bid_prices': [record.bp1, record.bp2, record.bp3, record.bp4, record.bp5],
+            'ask_volumes': [record.av1, record.av2, record.av3, record.av4, record.av5],
+            'bid_volumes': [record.bv1, record.bv2, record.bv3, record.bv4, record.bv5]
+        }
+    
     def insert_records(self, records):
-        """插入记录到 TDengine"""
+        """插入记录到 TDengine 并进行异动检测"""
         if not records:
             return 0
         
@@ -165,12 +348,14 @@ class TDengineWriter:
                 first_record = symbol_records[0]
                 exchange = first_record.exchange or ""
                 market = first_record.market or ""
+                
                 # 创建表
                 table_name = self.create_table_if_not_exists(symbol, exchange, market)
+                
                 # 构建插入 SQL
                 values = []
+                
                 for record in symbol_records:
-                    # 转换时间戳
                     ts_str = self.format_timestamp(record.tss)
                     
                     value_str = (
@@ -182,11 +367,14 @@ class TDengineWriter:
                         f"{record.bv1 or 0}, {record.bv2 or 0}, {record.bv3 or 0}, {record.bv4 or 0}, {record.bv5 or 0})"
                     )
                     values.append(value_str)
+                    
+                    # 异动检测 - 使用简化版检测器
+                    if self.volatility_detector:
+                        tick_data = self.protobuf_to_dict(record)
+                        self.volatility_detector.detect_volatility(symbol, tick_data)
                 
-                insert_sql = f"INSERT INTO {table_name} VALUES {' '.join(values)}"
-                if CONFIG['verbose']:
-                    self.log.debug(f"Executing SQL: {insert_sql}")
                 # 执行插入
+                insert_sql = f"INSERT INTO {table_name} VALUES {' '.join(values)}"
                 self.conn.execute(insert_sql)
                 total_inserted += len(symbol_records)
                 
@@ -195,19 +383,12 @@ class TDengineWriter:
                     
             except Exception as e:
                 self.log.error(f"Failed to insert records for symbol {symbol}: {e}")
-                # 继续处理其他符号
         
-        if total_inserted > 2 and CONFIG['verbose']:
+        if total_inserted > 1 and CONFIG['verbose']:
             duration = time.time() - start_time
             self.log.info(f"Worker {self.worker_id}: Inserted {total_inserted} records in {duration:.3f}s")
         
         return total_inserted
-    
-    def format_timestamp(self, timestamp):
-        """格式化时间戳为 TDengine 接受的格式"""
-        from datetime import datetime
-        dt = datetime.fromtimestamp(timestamp / 1000)  # 假设是毫秒时间戳
-        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # 保留毫秒
 
 
 def parse_message_format(body):
@@ -215,39 +396,31 @@ def parse_message_format(body):
     if len(body) < 4:
         raise ValueError(f"Message body too short: {len(body)} bytes")
     
-    # 读取头部长度（大端）
     header_len = struct.unpack('>I', body[:4])[0]
     
     if len(body) < 4 + header_len:
         raise ValueError(f"Message body too short for header: have {len(body)}, need {4 + header_len}")
     
-    # 解析 JSON 头部
     header_json = body[4:4+header_len].decode('utf-8')
     header_data = json.loads(header_json)
     header = MessageHeader.from_dict(header_data)
     
-    # 剩余的是 protobuf 数据
     proto_data = body[4+header_len:]
     
     return header, proto_data
-
 
 def decompress_zlib(data):
     """解压缩 zlib 数据"""
     return zlib.decompress(data)
 
-
 def process_message(body):
     """处理单个消息"""
     try:
-        # 解析消息格式
         header, proto_data = parse_message_format(body)
         
-        # 解析 DataRequest
         data_request = schema_pb2.DataRequest()
         data_request.ParseFromString(proto_data)
         
-        # 解压缩数据
         if header.compression in ['GZIP', 'ZLIB']:
             batch_bytes = decompress_zlib(data_request.compressed_data)
         elif header.compression in ['NONE', '']:
@@ -255,7 +428,6 @@ def process_message(body):
         else:
             raise ValueError(f"Unsupported compression: {header.compression}")
         
-        # 解析 DataBatch
         data_batch = schema_pb2.DataBatch()
         data_batch.ParseFromString(batch_bytes)
         
@@ -264,7 +436,6 @@ def process_message(body):
     except Exception as e:
         logger.error(f"Failed to process message: {e}")
         return [], 0
-
 
 def run_rabbitmq_consumer(task_queues: List[Queue], shutdown_event):
     """运行 RabbitMQ 消费者任务"""
@@ -394,13 +565,12 @@ def run_rabbitmq_consumer(task_queues: List[Queue], shutdown_event):
                 log.error(f"Error closing connection: {e}")
         log.info("RabbitMQ consumer stopped")
 
-
 def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event):
-    """运行写入任务 - 修复版本"""
+    """运行写入任务 - 包含异动检测"""
     log = logging.getLogger(f"WriteTask-{task_id}")
-    writer = TDengineWriter(task_id)
+    writer = TDengineWriterWithVolatility(task_id)
     
-    # 在子进程中忽略 SIGINT 信号，让主进程统一处理
+    # 在子进程中忽略 SIGINT 信号
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     
     try:
@@ -414,22 +584,17 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
         while True:
             # 检查是否应该退出
             if shutdown_event.is_set() and received_done and len(batch) == 0:
-                # 检查队列是否真的空了
                 try:
-                    # 尝试获取一个消息，如果队列空了就退出
                     record = queue.get_nowait()
                     if record == _DONE_MESSAGE:
-                        # 再次收到 DONE 消息，忽略
                         continue
                     batch.append(record)
-                    # 有消息就继续处理
                     continue
                 except Empty:
-                    # 队列真的空了，可以退出
                     log.info("Queue is empty, exiting...")
                     break
             
-            # 强制刷新条件：批次大小、超时、关闭事件
+            # 强制刷新条件
             current_time = time.time()
             should_flush = (batch and (
                 len(batch) >= CONFIG['batch_size'] or 
@@ -444,9 +609,13 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
                     batch = []
                     last_flush = current_time
                     force_flush = False
+                    
+                    # 定期清理异动池旧数据
+                    if writer.volatility_detector and current_time % 300 < 1:  # 每5分钟清理一次
+                        writer.volatility_detector.cleanup_old_data()
+                        
                 except Exception as e:
                     log.error(f"Failed to insert batch: {e}")
-                    # 重新连接
                     try:
                         writer.close()
                         writer.connect()
@@ -456,35 +625,31 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
             
             # 从队列获取记录
             try:
-                # 使用较短超时以便能够响应关闭事件
                 timeout = 0.1
                 if shutdown_event.is_set():
-                    timeout = 0.01  # 关闭时使用更短的超时
+                    timeout = 1
                 
                 record = queue.get(timeout=timeout)
                 if record == _DONE_MESSAGE:
                     log.info("Received done message, will process remaining messages...")
                     received_done = True
-                    force_flush = True  # 收到完成消息后强制刷新
+                    force_flush = True
                     continue
                 batch.append(record)
                     
             except Empty:
-                # 如果没有消息但正在关闭，检查是否需要退出
                 if shutdown_event.is_set() and received_done:
-                    # 在关闭状态下，如果没有消息了，就退出
                     if len(batch) == 0:
                         log.info("No more messages, exiting...")
                         break
                     else:
-                        # 还有批次数据需要处理
                         force_flush = True
                 continue
             except Exception as e:
                 log.error(f"Error getting from queue: {e}")
                 continue
         
-        # 最终强制处理剩余记录 - 这是最后的保障
+        # 最终强制处理剩余记录
         final_batch_processed = 0
         if batch:
             log.info(f"Final flush: Processing {len(batch)} remaining records in batch")
@@ -495,12 +660,12 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
             except Exception as e:
                 log.error(f"Failed to insert final batch: {e}")
         
-        # 最后检查队列中是否还有剩余消息（双重保障）
+        # 最后检查队列中是否还有剩余消息
         remaining_messages = []
         try:
             while True:
                 record = queue.get_nowait()
-                if record != _DONE_MESSAGE:  # 跳过完成消息
+                if record != _DONE_MESSAGE:
                     remaining_messages.append(record)
         except Empty:
             pass
@@ -520,7 +685,6 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
         
     except Exception as e:
         log.error(f"Write task failed: {e}")
-        # 即使失败也要发送完成消息
         try:
             done_queue.put(_DONE_MESSAGE)
         except:
@@ -529,7 +693,6 @@ def run_write_task(task_id: int, queue: Queue, done_queue: Queue, shutdown_event
     finally:
         writer.close()
         log.info(f"Write task {task_id} finished")
-
 
 def run_monitor_process(done_queue: Queue, shutdown_event):
     """运行监控进程"""
@@ -593,7 +756,6 @@ def run_monitor_process(done_queue: Queue, shutdown_event):
             conn.close()
         log.info("Monitor process finished")
 
-
 def check_remaining_messages(task_queues):
     """检查并报告剩余未处理的消息"""
     log = logging.getLogger("ShutdownChecker")
@@ -612,14 +774,13 @@ def check_remaining_messages(task_queues):
         
     return total_remaining
 
-
 def force_process_remaining_messages(task_queues):
     """强制处理剩余的消息"""
     log = logging.getLogger("ForceProcessor")
     total_processed = 0
     
     try:
-        writer = TDengineWriter(-1)  # 特殊ID用于强制处理
+        writer = TDengineWriterWithVolatility(-1)  # 特殊ID用于强制处理
         writer.connect()
         
         for i, queue in enumerate(task_queues):
@@ -648,7 +809,6 @@ def force_process_remaining_messages(task_queues):
         log.error(f"Error in force processing: {e}")
     
     return total_processed
-
 
 def initialize_database():
     """初始化数据库和表"""
@@ -684,17 +844,15 @@ def initialize_database():
         if 'conn' in locals():
             conn.close()
 
-
 def signal_handler(signum, frame, shutdown_event):
     """信号处理函数"""
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
     shutdown_event.set()
 
-
 def main():
     """主函数"""
     # 解析命令行参数
-    parser = argparse.ArgumentParser(description='TDengine RabbitMQ Consumer')
+    parser = argparse.ArgumentParser(description='TDengine RabbitMQ Consumer with Volatility Detection')
     parser.add_argument('--uri', default=CONFIG['rabbitmq_uri'], help='RabbitMQ URI')
     parser.add_argument('--queue', default=CONFIG['queue_name'], help='RabbitMQ queue name')
     parser.add_argument('--consumer-tag', default=CONFIG['consumer_tag'], help='Consumer tag')
@@ -703,6 +861,9 @@ def main():
     parser.add_argument('--buffer-size', type=int, default=CONFIG['buffer_size'], help='Buffer size')
     parser.add_argument('--shutdown-timeout', type=int, default=CONFIG['shutdown_timeout'], help='Shutdown timeout in seconds')
     parser.add_argument('--verbose', action='store_true', default=CONFIG['verbose'], help='Verbose output')
+    parser.add_argument('--redis-host', default=CONFIG['redis_host'], help='Redis host')
+    parser.add_argument('--redis-port', type=int, default=CONFIG['redis_port'], help='Redis port')
+    parser.add_argument('--redis-db', type=int, default=CONFIG['redis_db'], help='Redis database')
     
     args = parser.parse_args()
     
@@ -710,11 +871,10 @@ def main():
     CONFIG.update(vars(args))
     
     logger.info(
-        f"Starting TDengine consumer: "
+        f"Starting TDengine consumer with volatility detection: "
         f"queue={CONFIG['queue_name']}, "
         f"workers={CONFIG['worker_count']}, "
-        f"batch_size={CONFIG['batch_size']}, "
-        f"shutdown_timeout={CONFIG['shutdown_timeout']}"
+        f"redis={CONFIG['redis_host']}:{CONFIG['redis_port']}"
     )
     
     # 创建关闭事件
@@ -806,7 +966,6 @@ def main():
             logger.info("All messages processed successfully")
         
         logger.info("All processes finished")
-
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')

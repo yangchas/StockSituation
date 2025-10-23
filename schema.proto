@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package main;
+option go_package = ".;main"; // 添加这一行
+service DataService {
+  rpc SendDataStream (stream DataRequest) returns (DataResponse) {}
+  rpc SendData (DataRequest) returns (DataResponse) {}
+}
+
+message DataRecord {
+  int64 ts = 1;
+  string device_id = 2;
+  float temperature = 3;
+  float humidity = 4;
+  float pressure = 5;
+  float voltage = 6;
+}
+
+message DataBatch {
+  string batch_id = 1;
+  repeated DataRecord records = 2;
+  int64 sent_at = 3;
+}
+
+message DataRequest {
+  CompressionType compression = 1;
+  bytes compressed_data = 2;
+}
+
+message DataResponse {
+  bool success = 1;
+  string message = 2;
+  int32 processed_count = 3;
+}
+
+enum CompressionType {
+  NONE = 0;
+  GZIP = 1;
+  DEFLATE = 2;
+}

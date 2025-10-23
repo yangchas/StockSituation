@@ -1,4 +1,3 @@
-// main.go
 package main
 
 import (
@@ -8,10 +7,25 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	// "time"
+	"time"
 )
 
-func main1() {
+// 全局配置
+const (
+	streamHost     = "localhost"
+	streamPort     = 5552
+	streamUser     = "admin"
+	streamPassword = "admin"
+	streamName     = "hello-nodejs-stream"
+
+	targetDatabase = "test_db"
+	superTableName = "sensors"
+	batchSize      = 5000
+	batchTimeout   = 1 * time.Second
+	numConsumers   = 4
+)
+
+func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -23,7 +37,7 @@ func main1() {
 	defer tdConn.Close()
 
 	// 创建消息通道
-	// messageChannel := make(chan StreamMessage, batchSize*2)	
+	messageChannel := make(chan []byte, batchSize*2)
 
 	var wg sync.WaitGroup
 
@@ -31,7 +45,7 @@ func main1() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// startBatchProcessor(ctx, messageChannel, tdConn)
+		startBatchProcessor(ctx, messageChannel, tdConn)
 	}()
 
 	// 启动多个 Stream 消费者
@@ -39,7 +53,7 @@ func main1() {
 		wg.Add(1)
 		go func(consumerID int) {
 			defer wg.Done()
-			// startStreamConsumer(ctx, consumerID, messageChannel)
+			startStreamConsumer(ctx, consumerID, messageChannel)
 		}(i)
 	}
 
@@ -51,7 +65,7 @@ func main1() {
 	log.Println("Shutdown signal received...")
 
 	// 优雅关闭
-	// close(messageChannel)
+	close(messageChannel)
 	wg.Wait()
 
 	log.Println("Application stopped gracefully.")

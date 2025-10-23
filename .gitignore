@@ -1,0 +1,223 @@
+# 通用操作系统文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE/编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# ===========================================
+# C/C++ 构建产物
+# ===========================================
+*.o
+*.obj
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# 编译目录
+build/
+Debug/
+Release/
+x64/
+x86/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# ===========================================
+# Go 语言
+# ===========================================
+# 二进制可执行文件
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试二进制文件
+*.test
+
+# 输出目录
+/dist/
+/bin/
+
+# Go 工作区文件
+go.work
+go.work.sum
+
+# 依赖包目录（第三方依赖）
+go/amqp091-go-1.10.0/
+go/driver-go-3.7.4/
+
+# ===========================================
+# Node.js
+# ===========================================
+# 依赖目录
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# 运行时文件
+.npm
+.eslintcache
+
+# 可选 npm 缓存目录
+.npm
+
+# ===========================================
+# Python
+# ===========================================
+# 字节码编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 分发 / 打包
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# 安装器日志
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 单元测试 / 覆盖率报告
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# 翻译文件
+*.mo
+*.pot
+
+# Django:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask:
+instance/
+.webassets-cache
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# ===========================================
+# Protocol Buffer 生成的文件
+# ===========================================
+# 生成的 Protocol Buffer 文件
+*.pb.go
+*.pb.cc
+*.pb.h
+schema_pb.js
+schema_pb2.py
+schema_pb2_grpc.py
+
+# 备份文件
+*_bak
+*.bak
+*.backup
+
+# ===========================================
+# 项目特定文件
+# ===========================================
+# 二进制可执行文件
+rabtd-app/app
+
+# 测试文件（如果不需要提交）
+test.go
+test1.go
+test.cpp
+test_con.cpp
+testTD.cpp
+
+# 环境配置文件（包含敏感信息）
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 压缩文件
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# ===========================================
+# 其他
+# ===========================================
+# 覆盖率报告
+coverage/
+
+# 依赖锁定文件（根据项目需要决定是否忽略）
+# go.sum
+# package-lock.json

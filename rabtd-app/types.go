@@ -9,17 +9,17 @@ type StreamMessage struct {
     Offset   int64
 }
 
-// 全局配置
+// // 全局配置
 const (
-    streamHost     = "chao"
+    streamHost     = "localhost"
     streamPort     = 5552
     streamUser     = "admin"
     streamPassword = "admin"
-    streamName     = "hello-nodejs-stream"
+    streamName     = "stream8"
 	tdEngineDSN      = "root:taosdata@tcp(localhost:6030)/"
     targetDatabase = "test_db"
     superTableName = "sensors"
-    batchSize      = 10
-    batchTimeoutSec = 1
-    numConsumers   = 4
+    // batchSize      = 20
+    batchTimeoutSec = 3
+    numConsumers   = 1
 )

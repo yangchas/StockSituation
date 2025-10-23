@@ -1,0 +1,17 @@
+{
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.0",
+    "amqplib": "^0.10.9",
+    "rabbitmq-stream-js-client": "^0.6.2"
+  },
+  "name": "test",
+  "version": "1.0.0",
+  "main": "receive.js",
+  "scripts": {
+    "send": "node send.js",
+    "receive": "node receive.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}
