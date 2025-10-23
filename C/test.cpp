@@ -17,6 +17,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <cctype>
+#include <fstream>
+#include <unordered_map>
+
 // 第三方库头文件
 #include <sys/time.h>
 #include <zlib.h>
@@ -42,6 +45,10 @@ struct Config {
     
     std::string volatile_pool_key = "stock:volatile_pool";
     int volatile_expire = 300;
+    // 时间窗口配置
+    int minute1_window_ms = 60000;    // 1分钟窗口
+    int minute5_window_ms = 300000;   // 5分钟窗口
+    int max_history_ticks = 1000;     // 最大历史tick数量
     
     double price_change_threshold = 0.02;
     double volume_ratio_threshold = 3.0;
@@ -123,7 +130,15 @@ struct StockData {
     double ask_volumes[5] = {0};
     double bid_volumes[5] = {0};
 };
-
+// 时间窗口统计数据
+struct TimeWindowStats {
+    double volume_1min = 0.0;
+    double amount_1min = 0.0;
+    double change_1min = 0.0;
+    double change_5min = 0.0;
+    double volume_5min = 0.0;
+    double amount_5min = 0.0;
+};
 // 带确认的消息结构
 struct PendingMessage {
     std::vector<char> data;
@@ -205,9 +220,109 @@ public:
         localtime_r(&tt, &tm);  // 使用线程安全版本
         
         std::ostringstream oss;
-        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "." << std::setfill('0') 
-            << std::setw(3) << ms;
+        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");// << "." << std::setfill('0') 
+            //<< std::setw(3) << ms;
         return oss.str();
+    }
+};
+
+// ==================== 股票名称映射器 ====================
+
+class StockNameMapper {
+private:
+    std::unordered_map<std::string, std::string> code_to_name_;
+    std::string csv_file_path_;
+    std::mutex mutex_;
+    bool loaded_ = false;
+
+public:
+    StockNameMapper(const std::string& csv_file_path = "stock.csv") 
+        : csv_file_path_(csv_file_path) {
+        loadStockNames();
+    }
+
+    bool loadStockNames() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        std::ifstream file(csv_file_path_);
+        if (!file.is_open()) {
+            std::cerr << "无法打开股票名称文件: " << csv_file_path_ << std::endl;
+            return false;
+        }
+
+        std::string line;
+        // 跳过标题行
+        std::getline(file, line);
+        
+        int loaded_count = 0;
+        while (std::getline(file, line)) {
+            // 解析CSV行
+            size_t comma_pos = line.find(',');
+            if (comma_pos == std::string::npos) {
+                continue;
+            }
+            
+            std::string code = line.substr(0, comma_pos);
+            std::string name = line.substr(comma_pos + 1);
+            
+            // 清理字符串
+            code.erase(0, code.find_first_not_of(" \t"));
+            code.erase(code.find_last_not_of(" \t") + 1);
+            name.erase(0, name.find_first_not_of(" \t"));
+            name.erase(name.find_last_not_of(" \t") + 1);
+            
+            // 移除代码中的市场后缀，只保留6位数字
+            size_t dot_pos = code.find('.');
+            if (dot_pos != std::string::npos) {
+                code = code.substr(0, dot_pos);
+            }
+            
+            if (code.length() == 6) {
+                code_to_name_[code] = name;
+                loaded_count++;
+            }
+        }
+        
+        file.close();
+        loaded_ = true;
+        
+        std::cout << "成功加载 " << loaded_count << " 只股票名称" << std::endl;
+        return true;
+    }
+
+    std::string getStockName(const std::string& code) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // 如果代码包含市场后缀，先移除
+        std::string clean_code = code;
+        size_t dot_pos = code.find('.');
+        if (dot_pos != std::string::npos) {
+            clean_code = code.substr(0, dot_pos);
+        }
+        
+        auto it = code_to_name_.find(clean_code);
+        if (it != code_to_name_.end()) {
+            return it->second;
+        }
+        
+        // 如果没有找到，返回原始代码
+        return code;
+    }
+
+    std::string getStockDisplayName(const std::string& code) {
+        std::string name = getStockName(code);
+        if (name != code) {
+            return name + "(" + code + ")";
+        }
+        return code;
+    }
+
+    bool isLoaded() const {
+        return loaded_;
+    }
+
+    void reload() {
+        loadStockNames();
     }
 };
 
@@ -644,137 +759,199 @@ class SimpleVolatilityDetector : public IVolatilityDetector {
 private:
     std::unique_ptr<RedisClient> redis_;
     const Config& config_;
+    std::unique_ptr<StockNameMapper> stock_mapper_;
+    // 存储每个股票的历史tick数据
+    struct StockHistory {
+        std::deque<StockData> ticks;  // 使用deque存储历史tick
+        StockData last_tick;          // 上一个tick数据
+         // 新增：异动状态跟踪
+        std::string last_volatility_reason;
+        long long last_volatility_time = 0;
+        bool is_in_volatility_state = false;
+        double last_volatility_strength=0.;
+    };
     
-    // 存储每个股票的上一个tick数据
-    std::unordered_map<std::string, StockData> previous_ticks_;
+    std::unordered_map<std::string, StockHistory> stock_history_;
     std::mutex data_mutex_;
     
     // 服务器时间延迟统计
     std::atomic<long long> max_server_timestamp_{0};
     std::atomic<long long> total_delay_{0};
     std::atomic<int> delay_count_{0};
-    
+
+      // 异动冷却时间配置（毫秒）
+    const long long VOLATILITY_COOLDOWN_MS = 30000; // 30秒冷却时间
+    const long long CONTINUOUS_COOLDOWN_MS = 5000;  // 连续异动5秒冷却
 public:
     SimpleVolatilityDetector(const Config& config) : config_(config) {
         redis_ = std::make_unique<RedisClient>(config.redis_host, 
                                              config.redis_port, 
                                              config.redis_db);
+        stock_mapper_ = std::make_unique<StockNameMapper>();
+        if (!stock_mapper_->isLoaded()) {
+            std::cerr << "警告: 股票名称映射加载失败，将显示股票代码" << std::endl;
+        }
     }
     
     bool detectVolatility(const StockData& data) override {
-        if (!redis_->connect()) {
-            std::cerr << "Failed to connect to Redis" << std::endl;
-            return false;
-        }
-        
+        if (!redis_->connect()) return false;
         if (data.close <= 0||data.last_price>1600) return false;
         if(data.ask_volumes[0]==0 &&data.bid_volumes[0]==0) return false;
         // 更新服务器最大时间戳
         updateServerTimestamp(data.timestamp);
         
+        // 检查冷却时间
+        if (!shouldTriggerVolatility(data.symbol, data.timestamp)) {
+            return false;
+        }
         // 获取上一个tick数据
         StockData prev_data;
         bool has_previous = getPreviousTick(data.symbol, prev_data);
+        // 更新历史数据
+        updateStockHistory(data);
+        if (!has_previous) return false;
         
-        // 计算价格变化
+        /*----------瞬时指标--------*/
+        // 成交量
+        double new_volume = 0.0;
+        // 成交金额
+        double new_amount = 0.0;
+        if (prev_data.volume > 0 && prev_data.amount > 0) {
+            new_volume = data.volume - prev_data.volume;
+            new_amount = data.amount - prev_data.amount;
+        }
+        // 涨幅
         double price_change = std::abs(data.last_price - data.close) / data.close;
-        
-        // 计算瞬时成交量和成交金额变化
-        double instant_volume = 0.0;
-        double instant_amount = 0.0;
+        // if(price_change>0.04){
+        //     std::cout<<data.symbol<<" "<<data.volume<<" "<<prev_data.volume<< " " <<data.amount<<" "<<prev_data.amount<<" "<<data.timestamp<<" "<<prev_data.timestamp<<std::endl;
+        // }
+        TimeWindowStats stats = (calculateTimeWindowStats(data));
+        /*-----1分钟-----指标--------*/
+        // 成交金额
+        //stats.amount_1min
+        // stats.volume_1min
+        /*-----5分钟-----指标--------*/
+        // stats.amount_5min
+        // stats.volume_5min
         double volume_ratio = 1.0;
         double amount_ratio = 1.0;
-        
-        if (has_previous && prev_data.volume > 0 && prev_data.amount > 0) {
-            instant_volume = data.volume - prev_data.volume;
-            instant_amount = data.amount - prev_data.amount;
-            
-            // 计算成交量比率（避免除零）
-            if (prev_data.volume > 0) {
-                volume_ratio = instant_volume / prev_data.volume;
-            }
-            if (prev_data.amount > 0) {
-                amount_ratio = instant_amount / prev_data.amount;
-            }
-        }
-        
-        // 检测异动条件
+
         bool is_volatile = false;
         std::string reason;
-        
-        // if (price_change >= config_.price_change_threshold && 
-        //     data.amount >= config_.min_amount_threshold) {
-        //     is_volatile = true;
-        //     reason = "price_change";
-        // }
-        // else 
-        if (has_previous && volume_ratio >= config_.volume_ratio_threshold &&
-                instant_amount >= config_.min_amount_threshold) {
-            is_volatile = true;
-            reason = "volume_surge";
-        }
-        else if (has_previous && amount_ratio >= config_.volume_ratio_threshold &&
-                instant_amount >= config_.min_amount_threshold) {
+        double volatility_strength = 0.0; // 异动强度，用于去重判断
+        //成交金额>100w 1分钟涨幅>1 5分钟涨幅>3 5分钟成交量>500w  量比>
+        if (new_amount>100*10000 || stats.amount_5min>1000*10000)
+        {
             is_volatile = true;
             reason = "amount_surge";
+            volatility_strength = stats.amount_5min;
+        }
+        if (std::abs(price_change)>0.02 && stats.change_1min>0.01 &&stats.change_5min>0.03)
+        {
+            if (!is_volatile || isSignificantChange(data.symbol, "price_change", price_change)) {
+                is_volatile = true;
+                reason = "price_change";
+                volatility_strength = price_change;
+            }
         }
         
+       
         if (is_volatile) {
-            // 使用固定大小的缓冲区构建JSON，避免动态内存分配
-            char buffer[1024];
+            // 更新异动状态
+            updateVolatilityState(data.symbol, reason, data.timestamp, volatility_strength);
+            char buffer[2048];  // 增加缓冲区大小以容纳更多字段
             int len = snprintf(buffer, sizeof(buffer), 
                 "{\"symbol\":\"%s\",\"timestamp\":%lld,\"price\":%.2f,\"volume\":%.2f,"
-                "\"amount\":%.2f,\"instant_volume\":%.2f,\"instant_amount\":%.2f,"
-                "\"volume_ratio\":%.2f,\"amount_ratio\":%.2f,\"price_change\":%.4f,"
-                "\"reason\":\"%s\",\"detect_time\":%lld,\"is_trial_period\":true}",
+                "\"amount\":%.2f,\"new_volume\":%.2f,\"new_amount\":%.2f,"
+                "\"price_change\":%.4f,"
+                "\"reason\":\"%s\",\"detect_time\":%lld,\"is_trial_period\":true,"
+                "\"change_1min\":%.2f,\"amount_1min\":%.2f,\"change_5min\":%.2f,\"amount_5min\":%.2f}",
                 data.symbol.c_str(), data.timestamp, data.last_price, data.volume,
-                data.amount, instant_volume, instant_amount, volume_ratio, amount_ratio,
-                price_change, reason.c_str(), TimeUtils::getCurrentTimestamp());
+                data.amount, new_volume, new_amount, 
+                price_change, reason.c_str(), TimeUtils::getCurrentTimestamp(),
+                stats.change_1min, stats.amount_1min, stats.change_5min, stats.amount_5min);
             
             if (len < 0 || len >= static_cast<int>(sizeof(buffer))) {
-                return false;  // 缓冲区不足
+                return false;
             }
             
             bool success = redis_->zadd(config_.volatile_pool_key, 
                                       TimeUtils::getCurrentTimestamp(), 
                                       std::string(buffer, len));
-            std::cout<<"异动:"<<reason<<" "<<buffer<<"|"<< data.high<<"|"<<data.ask_volumes[0]<<"|"<<data.bid_volumes[0]<<std::endl;
+            std::cout<< \
+            TimeUtils::formatTimestamp(data.timestamp) << "|" << reason<< \
+            "||" << (stock_mapper_->getStockDisplayName(data.symbol)) << \
+            " 价格："<< data.last_price << \
+            " 涨幅: "<< int(price_change*10000)*0.01 << \
+            " 成交额："<< int(new_amount*0.0001) << \
+            " 1分金额:"<< int(stats.amount_1min*0.0001) << \
+            "万 1分涨幅:"<< int(stats.change_1min*10000)*0.01 << \
+            " 5分金额:"<< int(stats.amount_5min*0.0001) << \
+            "万 5分涨幅:"<< int(stats.change_5min*10000)*0.01 <<std::endl;
+            
             if (success) {
                 redis_->expire(config_.volatile_pool_key, config_.volatile_expire);
             }
 
             return success;
+        } else {
+            // 如果没有检测到异动，重置状态
+            resetVolatilityState(data.symbol);
         }
-        
-        // 更新当前tick为上一个tick
-        updatePreviousTick(data);
         
         return false;
     }
     
-    // 获取服务器时间延迟
+    // 计算时间窗口统计数据
+    TimeWindowStats calculateTimeWindowStats(const StockData& current_data) {
+        TimeWindowStats stats;
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        
+        auto it = stock_history_.find(current_data.symbol);
+        if (it == stock_history_.end()) {
+            return stats;  // 返回空的统计数据
+        }
+        
+        const auto& history = it->second;
+        long long current_time = current_data.timestamp;
+        
+        // 计算1分钟和5分钟前的时间点
+        long long time_1min_ago = current_time - config_.minute1_window_ms;
+        long long time_5min_ago = current_time - config_.minute5_window_ms;
+        
+        // 查找时间窗口内的起始tick
+        const StockData* tick_1min_ago = findTickAtTime(history.ticks, time_1min_ago);
+        const StockData* tick_5min_ago = findTickAtTime(history.ticks, time_5min_ago);
+        
+        // 计算1分钟窗口内的成交量和成交金额
+        if (tick_1min_ago) {
+            stats.volume_1min = current_data.volume - tick_1min_ago->volume;
+            stats.change_1min = (current_data.last_price - tick_1min_ago->last_price)/tick_1min_ago->last_price;
+            stats.amount_1min = current_data.amount - tick_1min_ago->amount;
+        }
+        
+        // 计算5分钟窗口内的成交量和成交金额
+        if (tick_5min_ago) {
+            stats.volume_5min = current_data.volume - tick_5min_ago->volume;
+            stats.change_5min = (current_data.last_price - tick_5min_ago->last_price)/tick_5min_ago->last_price;
+            stats.amount_5min = current_data.amount - tick_5min_ago->amount;
+        }
+        
+        return stats;
+    }
+    
     long long getServerDelay() const {
         long long current_time = TimeUtils::getCurrentTimestamp();
         long long max_server_time = max_server_timestamp_.load();
-        
-        if (max_server_time > 0) {
-            return current_time - max_server_time;
-        }
-        return 0;
+        return (max_server_time > 0) ? current_time - max_server_time : 0;
     }
     
-    // 获取平均延迟
     double getAverageDelay() const {
         int count = delay_count_.load();
         long long total = total_delay_.load();
-        
-        if (count > 0) {
-            return static_cast<double>(total) / count;
-        }
-        return 0.0;
+        return (count > 0) ? static_cast<double>(total) / count : 0.0;
     }
     
-    // 重置延迟统计
     void resetDelayStats() {
         total_delay_.store(0);
         delay_count_.store(0);
@@ -786,20 +963,95 @@ public:
         long long cutoff_time = TimeUtils::getCurrentTimestamp() - 3600000;
         redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
         
-        // 清理过时的上一个tick数据（超过5分钟）
-        cleanupOldPreviousTicks();
+        // 清理过时的历史数据
+        cleanupOldHistoryData();
     }
     
 private:
+// 检查是否应该触发异动（冷却时间机制）
+    bool shouldTriggerVolatility(const std::string& symbol, long long current_time) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        auto it = stock_history_.find(symbol);
+        if (it == stock_history_.end()) {
+            return true;
+        }
+        
+        auto& history = it->second;
+        
+        // 如果不在异动状态，直接返回true
+        if (!history.is_in_volatility_state) {
+            return true;
+        }
+        
+        // 检查冷却时间
+        long long time_since_last_volatility = current_time - history.last_volatility_time;
+        
+        // 不同类型的异动有不同的冷却时间
+        if (history.last_volatility_reason == "price_change") {
+            // 价格异动需要更长的冷却时间，避免连续触发
+            return time_since_last_volatility > VOLATILITY_COOLDOWN_MS;
+        } else {
+            // 其他异动类型
+            return time_since_last_volatility > CONTINUOUS_COOLDOWN_MS;
+        }
+    }
+    
+    // 检查是否是显著变化（避免微小波动重复触发）
+    bool isSignificantChange(const std::string& symbol, const std::string& reason, double current_strength) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        auto it = stock_history_.find(symbol);
+        if (it == stock_history_.end()) {
+            return true;
+        }
+        
+        auto& history = it->second;
+        
+        // 如果是不同类型的异动，总是触发
+        if (history.last_volatility_reason != reason) {
+            return true;
+        }
+        
+        // 对于价格异动，检查变化是否足够大
+        if (reason == "price_change") {
+            // 只有当价格变化比上次大10%时才认为是显著变化
+            double last_strength = history.last_volatility_strength;
+            return std::abs(current_strength - last_strength) > (last_strength * 0.1);
+        }
+        
+        // 其他类型默认触发
+        return true;
+    }
+    
+    // 更新异动状态
+    void updateVolatilityState(const std::string& symbol, const std::string& reason, 
+                              long long timestamp, double strength) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        auto& history = stock_history_[symbol];
+        history.last_volatility_reason = reason;
+        history.last_volatility_time = timestamp;
+        history.is_in_volatility_state = true;
+        history.last_volatility_strength = strength;
+    }
+    
+    // 重置异动状态
+    void resetVolatilityState(const std::string& symbol) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        auto it = stock_history_.find(symbol);
+        if (it != stock_history_.end()) {
+            // 只有在足够长时间没有异动后才重置状态
+            long long current_time = TimeUtils::getCurrentTimestamp();
+            if (current_time - it->second.last_volatility_time > VOLATILITY_COOLDOWN_MS * 2) {
+                it->second.is_in_volatility_state = false;
+                it->second.last_volatility_strength = 0.0;
+            }
+        }
+    }
     void updateServerTimestamp(long long timestamp) {
         long long current_max = max_server_timestamp_.load();
         if (timestamp > current_max) {
             max_server_timestamp_.store(timestamp);
-            
-            // 计算延迟并统计
             long long current_time = TimeUtils::getCurrentTimestamp();
             long long delay = current_time - timestamp;
-            
             total_delay_.fetch_add(delay);
             delay_count_.fetch_add(1);
         }
@@ -807,36 +1059,66 @@ private:
     
     bool getPreviousTick(const std::string& symbol, StockData& prev_data) {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        auto it = previous_ticks_.find(symbol);
-        if (it != previous_ticks_.end()) {
-            prev_data = it->second;
+        auto it = stock_history_.find(symbol);
+        if (it != stock_history_.end() && it->second.last_tick.timestamp > 0) {
+            prev_data = it->second.last_tick;
             return true;
         }
         return false;
     }
     
-    void updatePreviousTick(const StockData& current_data) {
+    void updateStockHistory(const StockData& current_data) {
         std::lock_guard<std::mutex> lock(data_mutex_);
-        // 限制map大小，防止内存无限增长
-        if (previous_ticks_.size() > 10000) {
-            // 简单的LRU策略：清除最早的一些条目
-            auto it = previous_ticks_.begin();
-            for (size_t i = 0; i < 1000 && it != previous_ticks_.end(); ++i) {
-                it = previous_ticks_.erase(it);
-            }
+        auto& history = stock_history_[current_data.symbol];
+        
+        // 更新上一个tick
+        history.last_tick = current_data;
+        
+        // 添加当前tick到历史队列
+        history.ticks.push_back(current_data);
+        
+        // 限制历史数据大小
+        if (history.ticks.size() > config_.max_history_ticks) {
+            history.ticks.pop_front();
         }
-        previous_ticks_[current_data.symbol] = current_data;
+        
+        // 清理过时的tick数据（超过5分钟）
+        cleanupOldTicks(history.ticks, current_data.timestamp);
     }
     
-    void cleanupOldPreviousTicks() {
+    const StockData* findTickAtTime(const std::deque<StockData>& ticks, long long target_time) {
+        // 二分查找最接近目标时间的tick
+        if (ticks.empty()) {
+            return nullptr;
+        }
+        
+        // 简单线性搜索（因为数据量不大）
+        for (auto it = ticks.rbegin(); it != ticks.rend(); ++it) {
+            if (it->timestamp <= target_time) {
+                return &(*it);
+            }
+        }
+        
+        return &ticks.front();  // 返回最早的tick
+    }
+    
+    void cleanupOldTicks(std::deque<StockData>& ticks, long long current_time) {
+        long long cutoff_time = current_time - config_.minute5_window_ms - 60000; // 多保留1分钟
+        
+        while (!ticks.empty() && ticks.front().timestamp < cutoff_time) {
+            ticks.pop_front();
+        }
+    }
+    
+    void cleanupOldHistoryData() {
         std::lock_guard<std::mutex> lock(data_mutex_);
         long long current_time = TimeUtils::getCurrentTimestamp();
-        long long cutoff_time = current_time - 300000; // 5分钟
+        long long cutoff_time = current_time - 3600000; // 1小时
         
-        auto it = previous_ticks_.begin();
-        while (it != previous_ticks_.end()) {
-            if (it->second.timestamp < cutoff_time) {
-                it = previous_ticks_.erase(it);
+        auto it = stock_history_.begin();
+        while (it != stock_history_.end()) {
+            if (it->second.last_tick.timestamp < cutoff_time) {
+                it = stock_history_.erase(it);
             } else {
                 ++it;
             }
@@ -983,31 +1265,84 @@ public:
     }
     
 private:
-    bool insertBatch(const std::vector<StockData>& batch) {
-        if (batch.empty()) {
+    // bool insertBatch(const std::vector<StockData>& batch) {
+    //     if (batch.empty()) {
+    //         return true;
+    //     }
+        
+    //     // 小批次插入，避免内存分配过大
+    //     const size_t BATCH_SIZE = 10;
+        
+    //     for (size_t start = 0; start < batch.size(); start += BATCH_SIZE) {
+    //         size_t end = std::min(start + BATCH_SIZE, batch.size());
+    //         std::vector<StockData> sub_batch(batch.begin() + start, batch.begin() + end);
+            
+    //         if (!insertSingleBatch(sub_batch)) {
+    //             return false;
+    //         }
+            
+    //         // 小批次之间短暂延迟
+    //         if (end < batch.size()) {
+    //             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    //         }
+    //     }
+        
+    //     return true;
+    // }
+bool insertBatch(const std::vector<StockData>& batch) {
+        std::ostringstream sql;
+        sql << "INSERT INTO stock_data(tbname, ts, symbol, exchange, market, "
+            << "lp, o, h, l, lc, a, v, p, "
+            << "ap1, ap2, ap3, ap4, ap5, "
+            << "bp1, bp2, bp3, bp4, bp5, "
+            << "av1, av2, av3, av4, av5, "
+            << "bv1, bv2, bv3, bv4, bv5) VALUES ";
+        
+        for (size_t i = 0; i < batch.size(); ++i) {
+            const auto& record = batch[i];
+            if (i > 0) sql << ", ";
+            
+            std::string tbname = "t_s_" + sanitizeSymbol(record.symbol);
+            std::string escaped_symbol = escapeSingleQuote(record.symbol);
+            std::string escaped_exchange = escapeSingleQuote(record.exchange);
+            std::string escaped_market = escapeSingleQuote(record.market);
+            
+            sql << "('" << tbname << "', '" 
+                << TimeUtils::formatTimestamp(record.timestamp) << "', '"
+                << escaped_symbol << "', '" << escaped_exchange << "', '" << escaped_market << "', "
+                << record.last_price << ", " << record.open << ", " 
+                << record.high << ", " << record.low << ", " << record.close << ", "
+                << record.amount << ", " << static_cast<long long>(record.volume) << ", 0, "
+                << record.ask_prices[0] << ", " << record.ask_prices[1] << ", "
+                << record.ask_prices[2] << ", " << record.ask_prices[3] << ", "
+                << record.ask_prices[4] << ", " << record.bid_prices[0] << ", "
+                << record.bid_prices[1] << ", " << record.bid_prices[2] << ", "
+                << record.bid_prices[3] << ", " << record.bid_prices[4] << ", "
+                << static_cast<long long>(record.ask_volumes[0]) << ", "
+                << static_cast<long long>(record.ask_volumes[1]) << ", "
+                << static_cast<long long>(record.ask_volumes[2]) << ", "
+                << static_cast<long long>(record.ask_volumes[3]) << ", "
+                << static_cast<long long>(record.ask_volumes[4]) << ", "
+                << static_cast<long long>(record.bid_volumes[0]) << ", "
+                << static_cast<long long>(record.bid_volumes[1]) << ", "
+                << static_cast<long long>(record.bid_volumes[2]) << ", "
+                << static_cast<long long>(record.bid_volumes[3]) << ", "
+                << static_cast<long long>(record.bid_volumes[4]) << ")";
+        }
+        // if (config_.verbose) {
+        //     std::cout << "to sql" << std::endl;
+        // }
+        try {
+            connection_->execute(sql.str());
+            // if (config_.verbose) {
+            //     std::cout << "end sql" << std::endl;
+            // }
             return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to insert batch: " << e.what() << std::endl;
+            return false;
         }
-        
-        // 小批次插入，避免内存分配过大
-        const size_t BATCH_SIZE = 10;
-        
-        for (size_t start = 0; start < batch.size(); start += BATCH_SIZE) {
-            size_t end = std::min(start + BATCH_SIZE, batch.size());
-            std::vector<StockData> sub_batch(batch.begin() + start, batch.begin() + end);
-            
-            if (!insertSingleBatch(sub_batch)) {
-                return false;
-            }
-            
-            // 小批次之间短暂延迟
-            if (end < batch.size()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-        }
-        
-        return true;
     }
-
     bool insertSingleBatch(const std::vector<StockData>& batch) {
         if (batch.empty()) {
             return true;
@@ -1509,7 +1844,10 @@ public:
                     // if (active_detection_threads < MAX_DETECTION_THREADS) {
                     //     active_detection_threads++;
                     //     std::thread([this, batch_copy = all_records]() mutable {
+                    
                             for (const auto& record : all_records) {
+                                // 计算时间窗口统计数据
+                                
                                 detector_->detectVolatility(record);
                             }
                     //         active_detection_threads--;
@@ -1541,10 +1879,10 @@ public:
                 long long current_delay = dynamic_cast<SimpleVolatilityDetector*>(detector_.get())->getServerDelay();
                 // double avg_delay = dynamic_cast<SimpleVolatilityDetector*>(detector_.get())->getAverageDelay();
                 
-                std::cout << "进度: " << total_messages << " 条消息, " 
+                std::cout << "处理: " << total_messages << " 条消息, " 
                          << total_records << " 条记录, " 
-                         << failed_messages << " 条失败, 速度: " << total_messages/config_.report_time << " 每秒, "
-                         << "服务器延迟: " << (int(current_delay*0.001)>60?"历史数据":std::to_string(int(current_delay*0.001))) << "s, "
+                         << failed_messages << " 条失败，" << total_messages/config_.report_time << " 条消息每秒, "
+                         << "延迟: " << (int(current_delay*0.001)>60*60*12?"历史数据":std::to_string(int(current_delay*0.001))) << "s, "
                         //  << "平均延迟: " << int(avg_delay*0.001) << "s" 
                          << std::endl;
                 
