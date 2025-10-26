@@ -73,7 +73,7 @@ struct Config {
     // 串行处理相关配置
     int processing_delay_ms = 100;           // 每条消息处理后的延迟
     bool enable_rate_limiting = true;       // 启用速率限制
-    int report_time = 5;                    //报告输出间隔
+    int report_time = 10;                    //报告输出间隔
 };
 
 // 单例配置管理器
@@ -883,13 +883,13 @@ public:
     
     // 判断当前是否在竞价时间段
     bool isAuctionPeriod(long long timestamp) {
-        std::string time_str = TimeUtils::formatTimestamp(timestamp);
+        std::string time_str = TimeUtils::formatTimestamp(timestamp).substr(11,19);
         return time_str >= "09:15:00" && time_str <= "09:25:00";
     }
     
     // 判断是否在试盘阶段（可撤单）
     bool isTrialPeriod(long long timestamp) {
-        std::string time_str = TimeUtils::formatTimestamp(timestamp);
+        std::string time_str = TimeUtils::formatTimestamp(timestamp).substr(11,19);
         return time_str >= "09:15:00" && time_str < "09:20:00";
     }
     
@@ -1180,7 +1180,7 @@ private:
                     
                     // 只记录高级别大单
                     if (order_value > 1000000 * 5) {  // 500万元以上
-                        std::cout << TimeUtils::formatTimestamp(timestamp) << "|"
+                        std::cout << TimeUtils::formatTimestamp(timestamp) << "|大单|"
                                  << stock_mapper_->getStockDisplayName(symbol) 
                                  << " 涨幅：" << metrics.auction_metrics.price_change * 100 << "% "
                                  << "卖单大单: " << delta_av1 << "股, "
@@ -1295,7 +1295,7 @@ private:
                     std::abs(auction_metrics.cumulative_net_flow) > 2000000 || 
                     std::abs(auction_metrics.cumulative_price_change) > 0.08) {
                     std::cout << TimeUtils::formatTimestamp(timestamp) << "|"
-                             << "竞价异动(" << metrics.volatility_level << "): " 
+                             << "异动" << metrics.volatility_level << ": " 
                              << stock_mapper_->getStockDisplayName(symbol) 
                              << " - " << reason << "  涨幅：" 
                              << metrics.auction_metrics.price_change * 100 << "%" << std::endl;
@@ -1375,31 +1375,36 @@ private:
     }
     
     void checkKeyTimepoints(long long timestamp) {
-        std::string current_time = TimeUtils::formatTimestamp(timestamp);
+        std::string current_time = TimeUtils::formatTimestamp(timestamp).substr(11,8);
         
         // 检查是否已经输出过总结
         if (!last_summary_time_.empty() && 
-            (current_time < last_summary_time_ || 
-             std::abs(TimeUtils::getSecond(current_time) - TimeUtils::getSecond(last_summary_time_)) < 10)) {
+            (//current_time < last_summary_time_ || 
+            //  std::abs(TimeUtils::getSecond(current_time) - TimeUtils::getSecond(last_summary_time_)) < 10)
+            std::abs(
+            (std::stoi(current_time.substr(3, 2)) * 60 + std::stoi(current_time.substr(6, 2))) -
+            (std::stoi(last_summary_time_.substr(3, 2)) * 60 + std::stoi(last_summary_time_.substr(6, 2))))< 10
+            )) {
             return;
         }
-        
+      
         // 试盘结束时间（9:20）
-        if (current_time.find("09:20:") == 0) {
+        if (current_time > "09:20:00" && current_time <= "09:20:09") {
             outputMarketSummary("试盘结束总结", current_time);
             last_summary_time_ = current_time;
         }
         // 竞价接近结束时间（9:24）
-        else if (current_time.find("09:24:") == 0) {
+        else if (current_time >= "09:24:00" && current_time <= "09:24:09") {
+            std::cout<<current_time<<std::endl;
             outputMarketSummary("竞价接近结束总结", current_time);
             last_summary_time_ = current_time;
         }
         // 竞价结束时间（9:25）
-        else if (current_time >= "09:25:00") {
+        else if (current_time >= "09:25:00" && current_time <= "09:25:09") {
             outputMarketSummary("竞价结束总结", current_time);
             last_summary_time_ = current_time;
-            // 竞价结束清理数据
-            cleanupAfterAuction();
+            // // 竞价结束清理数据
+            // cleanupAfterAuction();
         }
     }
     
@@ -1420,16 +1425,60 @@ private:
             std::cout << "涨停股票:" << std::endl;
             for (const auto& symbol : limit_up_stocks_) {
                 if (stock_auction_metrics_.find(symbol) != stock_auction_metrics_.end()) {
+                    
                     const auto& metrics = stock_auction_metrics_[symbol];
-                    std::cout << "  " << stock_mapper_->getStockDisplayName(symbol) 
-                             << ": 涨跌幅 " << metrics.auction_metrics.price_change * 100 << "%, "
-                             << "委买金额 " << metrics.auction_metrics.bid_amount / 10000 << "万元" << std::endl;
+                    if(metrics.auction_metrics.is_limit_up)
+                        std::cout << "  " << stock_mapper_->getStockDisplayName(symbol) 
+                             << ": 涨幅: " << metrics.auction_metrics.price_change * 100 << "%, "
+                             << "|委买金额: " << metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|金额:"<< metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|大单:"<< metrics.auction_metrics.net_large_order_flow / 10000 << "万元"
+                              <<"|量比:"<< metrics.auction_metrics.match_volume_ratio
+                              <<"|撤单:"<< metrics.auction_metrics.withdrawal_impact
+                             << std::endl;
                 }
             }
         }
         
         std::cout << "=" << std::string(78, '=') << "=" << std::endl;
+         // 输出异动股票数量
+        if (!volatile_stocks_.empty()) {
+            std::cout << "异动股票数量:" << std::endl;
+            for (const auto& symbol : volatile_stocks_) {
+                if (stock_auction_metrics_.find(symbol) != stock_auction_metrics_.end()) {
+                    const auto& metrics = stock_auction_metrics_[symbol];
+                     std::cout << "  " << stock_mapper_->getStockDisplayName(symbol) 
+                             << ": 涨幅: " << metrics.auction_metrics.price_change * 100 << "%, "
+                             << "|委买金额: " << metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|金额:"<< metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|大单:"<< metrics.auction_metrics.net_large_order_flow / 10000 << "万元"
+                              <<"|量比:"<< metrics.auction_metrics.match_volume_ratio
+                              <<"|撤单:"<< metrics.auction_metrics.withdrawal_impact
+                             << std::endl;
+                }
+            }
+        }
         
+        std::cout << "=" << std::string(78, '=') << "=" << std::endl;
+         // 输出抢筹模式股票
+        if (!accumulation_stocks_.empty()) {
+            std::cout << "抢筹模式:" << std::endl;
+            for (const auto& symbol : accumulation_stocks_) {
+                if (stock_auction_metrics_.find(symbol) != stock_auction_metrics_.end()) {
+                    const auto& metrics = stock_auction_metrics_[symbol];
+                     std::cout << "  " << stock_mapper_->getStockDisplayName(symbol) 
+                             << ": 涨幅: " << metrics.auction_metrics.price_change * 100 << "%, "
+                             << "|委买金额: " << metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|金额:"<< metrics.auction_metrics.bid_amount / 10000 << "万元"
+                              <<"|大单:"<< metrics.auction_metrics.net_large_order_flow / 10000 << "万元"
+                              <<"|量比:"<< metrics.auction_metrics.match_volume_ratio
+                              <<"|撤单:"<< metrics.auction_metrics.withdrawal_impact
+                             << std::endl;
+                }
+            }
+        }
+        
+        std::cout << "=" << std::string(78, '=') << "=" << std::endl;
         // 更新市场总结
         updateMarketSummary();
     }
@@ -1533,7 +1582,7 @@ public:
         if(data.ask_volumes[0]==0 &&data.bid_volumes[0]==0) return false;
         // 更新服务器最大时间戳
         updateServerTimestamp(data.timestamp);
-        
+        // std::cout<<"检查是否在竞价时间段"<<auction_analyzer_->isAuctionPeriod(data.timestamp)<<data.timestamp <<std::endl;
         // 首先检查是否在竞价时间段
         if (auction_analyzer_->isAuctionPeriod(data.timestamp)) {
             // 使用竞价分析
@@ -1581,7 +1630,7 @@ public:
         std::string reason;
         double volatility_strength = 0.0; // 异动强度，用于去重判断
         //成交金额>100w 1分钟涨幅>1 5分钟涨幅>3 5分钟成交量>500w  量比>
-        if (new_amount>100*10000 || stats.amount_5min>1000*10000)
+        if (new_amount>100*10000 && stats.amount_5min>1000*10000 && stats.change_1min>0.01)
         {
             is_volatile = true;
             reason = "amount_surge";
@@ -1625,7 +1674,7 @@ public:
             " 价格："<< data.last_price << \
             " 涨幅: "<< int(price_change*10000)*0.01 << \
             " 成交额："<< int(new_amount*0.0001) << \
-            " 1分金额:"<< int(stats.amount_1min*0.0001) << \
+            "万 1分金额:"<< int(stats.amount_1min*0.0001) << \
             "万 1分涨幅:"<< int(stats.change_1min*10000)*0.01 << \
             " 5分金额:"<< int(stats.amount_5min*0.0001) << \
             "万 5分涨幅:"<< int(stats.change_5min*10000)*0.01 <<std::endl;
