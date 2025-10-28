@@ -321,20 +321,35 @@ public:
     }
 };
 
-// ==================== 股票名称映射器 ====================
-
+// ==================== 股票名称映射器（使用静态局部变量） ====================
 class StockNameMapper {
 private:
     std::unordered_map<std::string, std::string> code_to_name_;
-    std::string csv_file_path_;
+    std::string csv_file_path_="stock.csv";
     std::mutex mutex_;
     bool loaded_ = false;
 
-public:
-    StockNameMapper(const std::string& csv_file_path = "stock.csv") 
-        : csv_file_path_(csv_file_path) {
+    // 私有构造函数
+    StockNameMapper(){
         loadStockNames();
     }
+
+    // 防止拷贝和赋值
+    StockNameMapper(const StockNameMapper&) = delete;
+    StockNameMapper& operator=(const StockNameMapper&) = delete;
+
+public:
+    // 获取单例实例 - 使用静态局部变量（C++11保证线程安全）
+    static StockNameMapper& getInstance() {
+        static StockNameMapper instance;
+        return instance;
+    }
+    
+    // // 带配置的获取实例方法
+    // static StockNameMapper& getInstance(const Config& config) {
+    //     static StockNameMapper instance(config.stock_map_file);
+    //     return instance;
+    // }
 
     bool loadStockNames() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -418,6 +433,11 @@ public:
 
     void reload() {
         loadStockNames();
+    }
+    
+    // 获取已加载的股票数量
+    size_t getLoadedCount() const {
+        return code_to_name_.size();
     }
 };
 
@@ -594,7 +614,31 @@ public:
         return res;
     }
 };
+class StringBuffer {
+private:
+    thread_local static std::string buffer_;
+    thread_local static std::ostringstream oss_;
+    
+public:
+    static std::string& getString() {
+        buffer_.clear();
+        return buffer_;
+    }
+    
+    static std::ostringstream& getStream() {
+        oss_.str("");  // 清空内容
+        oss_.clear();  // 清除错误状态
+        return oss_;
+    }
+    
+    static std::string getStringFromStream() {
+        return oss_.str();
+    }
+};
 
+// 线程局部变量定义
+thread_local std::string StringBuffer::buffer_;
+thread_local std::ostringstream StringBuffer::oss_;
 // ==================== 优化的TDengine批量写入器 ====================
 
 class OptimizedTDengineWriter : public IDataWriter {
@@ -673,7 +717,7 @@ public:
     
 private:
     bool insertBatch(const std::vector<StockData>& batch) {
-        std::ostringstream sql;
+        auto& sql = StringBuffer::getStream();
         sql << "INSERT INTO stock_data(tbname, ts, symbol, "
             << "lp, o, h, l, lc, a, v, p, "
             << "ap1, ap2, ap3, ap4, ap5, "
@@ -723,8 +767,8 @@ private:
     }
     
     std::string sanitizeSymbol(const std::string& symbol) {
-        std::string sanitized;
-        sanitized.reserve(symbol.size());
+        auto& sanitized = StringBuffer::getString();
+        // sanitized.reserve(symbol.size());
         for (char c : symbol) {
             if (std::isalnum(c) || c == '_') {
                 sanitized += c;
@@ -736,7 +780,8 @@ private:
     }
     
     std::string escapeSingleQuote(const std::string& str) {
-        std::string escaped;
+        auto& escaped = StringBuffer::getString();
+        // std::string escaped;
         escaped.reserve(str.size() * 2);  // 预分配足够空间
         for (char c : str) {
             if (c == '\'') {
@@ -766,15 +811,15 @@ private:
     std::unordered_map<std::string, StockTickState> stock_states_;
     std::mutex state_mutex_;
     double large_order_threshold_;
-    std::unique_ptr<StockNameMapper> stock_mapper_;
+    StockNameMapper& stock_mapper_;
     // 移除 TDengineConnection 成员，改为在需要时创建连接
     const Config& config_;
      std::unique_ptr<TDengineConnection> tdengine_conn;
 public:
     // 修改构造函数，接受 Config 引用
     TickAnalysisEngine(const Config& config, double threshold = 500000) 
-        : config_(config), large_order_threshold_(threshold) { 
-        stock_mapper_ = std::make_unique<StockNameMapper>(); 
+        : config_(config), large_order_threshold_(threshold), stock_mapper_(StockNameMapper::getInstance())
+    { 
     }
     
     // 处理tick数据，计算扩展字段
@@ -1081,7 +1126,7 @@ StockData parseTDRowToStockData(TAOS_ROW row, int num_fields, TAOS_FIELD* fields
             // 大单日志
             if (global_logger && std::abs(current_tick.large_net) > large_order_threshold_ * 4) {
                 std::string direction = current_tick.large_net > 0 ? "买入" : "卖出";
-                global_logger->infoWithTickTime("大单|" + stock_mapper_->getStockDisplayName(current_tick.symbol) 
+                global_logger->infoWithTickTime("大单|" + stock_mapper_.getStockDisplayName(current_tick.symbol) 
                 +"|瞬时:"+std::to_string(int(current_tick.inst_amt*0.0001))+"万"
                 +"|涨幅:"+std::to_string(std::round((current_tick.last_price-current_tick.close)*10000/current_tick.close)/100)+ "|" + direction + "|" 
                 + std::to_string(int(current_tick.large_net / 10000)) + "万元 |净额: "+std::to_string(int(state.cumulative_large_net / 10000)) + "万元",
@@ -1581,17 +1626,18 @@ private:
     AuctionMarketSummary market_summary_;
     std::string last_summary_time_;
     
-    std::unique_ptr<StockNameMapper> stock_mapper_;
+    StockNameMapper& stock_mapper_;
     std::mutex data_mutex_;
     
     // 关键时间点
     const std::string TRIAL_END = "09:20:00";
     const std::string AUCTION_NEAR_END = "09:24:00";
     const std::string AUCTION_END = "09:25:00";
+    int report_time = 0;//报告输出次数
     
 public:
-    AuctionAnalyzer() {
-        stock_mapper_ = std::make_unique<StockNameMapper>();
+    AuctionAnalyzer():stock_mapper_(StockNameMapper::getInstance()) {
+        
     }
     
     // 判断当前是否在竞价时间段
@@ -1667,7 +1713,7 @@ public:
     void cleanupOldData() {
         std::lock_guard<std::mutex> lock(data_mutex_);
         long long current_time = TimeUtils::getCurrentTimestamp();
-        long long cutoff_time = current_time - 3600000; // 1小时前
+        long long cutoff_time = current_time - 600000; // 1小时前
         
         auto it = stock_auction_metrics_.begin();
         while (it != stock_auction_metrics_.end()) {
@@ -1717,7 +1763,7 @@ public:
                     const auto& metrics = it->second;
                     double bid_amount = metrics.auction_metrics.bid_amount;
                     double match_amount = metrics.auction_volume * 100; // 估算成交金额
-                    report << "  " << stock_mapper_->getStockDisplayName(symbol) 
+                    report << "  " << stock_mapper_.getStockDisplayName(symbol) 
                            << " 涨幅:" << (metrics.auction_metrics.price_change * 100) << "%"
                            << " 封单:" << std::to_string(int(bid_amount / 10000)) << "万"
                            << " 成交:" << std::to_string(int(match_amount / 10000)) << "万"
@@ -1731,7 +1777,7 @@ public:
         int count = 0;
         for (const auto& item : summary.large_net_ranking) {
             if (count++ >= 20) break;
-            report << "  " << stock_mapper_->getStockDisplayName(item.first) 
+            report << "  " << stock_mapper_.getStockDisplayName(item.first) 
                    << " " << std::to_string(int(item.second / 10000)) << "万元\n";
         }
         
@@ -1740,7 +1786,7 @@ public:
         count = 0;
         for (const auto& item : summary.amount_ranking) {
             if (count++ >= 20) break;
-            report << "  " << stock_mapper_->getStockDisplayName(item.first) 
+            report << "  " << stock_mapper_.getStockDisplayName(item.first) 
                    << " " << std::to_string(int(item.second / 10000)) << "万元\n";
         }
         
@@ -1842,7 +1888,7 @@ private:
                 limit_up_stocks_.push_back(data.symbol);
                 if (global_logger) {
                     global_logger->warnWithTickTime(TimeUtils::formatTimestamp(data.timestamp) + "|" 
-                         + stock_mapper_->getStockDisplayName(data.symbol) 
+                         + stock_mapper_.getStockDisplayName(data.symbol) 
                          + " 已涨停，涨停价: " + std::to_string(limit_up_price) 
                          + "，委买金额: " + std::to_string(int(total_bid_amount / 10000)) + "万元",
                          data.timestamp);
@@ -1917,7 +1963,7 @@ private:
                 accumulation_stocks_.push_back(symbol);
                 if (global_logger) {
                     global_logger->warnWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                         + stock_mapper_->getStockDisplayName(symbol) + " 出现抢筹模式: "
+                         + stock_mapper_.getStockDisplayName(symbol) + " 出现抢筹模式: "
                          + "委买增加 " + std::to_string(int((bid_amounts.back() - bid_amounts.front()) / 10000)) + "万, "
                          + "价格上涨 " + std::to_string(price_increase * 100) + "%",
                          timestamp);
@@ -1964,7 +2010,7 @@ private:
                     if (withdrawal_value > 10000 * 100) {  // 50万元以上
                         if (global_logger) {
                             global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_->getStockDisplayName(symbol) 
+                                     + stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + std::to_string(metrics.auction_metrics.price_change * 100) + "% "
                                      + "卖单撤单: " + std::to_string(std::abs(delta_av1)) + "股, "
                                      + "价格: " + std::to_string(curr_data.ask_prices[0]) + ", "
@@ -1988,7 +2034,7 @@ private:
                     if (withdrawal_value > 100 * 10000) {  // 50万元以上
                         if (global_logger) {
                             global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_->getStockDisplayName(symbol) 
+                                     + stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + std::to_string(metrics.auction_metrics.price_change * 100) + "% "
                                      + "买单撤单: " + std::to_string(std::abs(delta_bv1)) + "股, "
                                      + "价格: " + std::to_string(curr_data.bid_prices[0]) + ", "
@@ -2022,7 +2068,7 @@ private:
                     if (order_value > 1000000 * 5) {  // 500万元以上
                         if (global_logger) {
                             global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|大单|"
-                                     + stock_mapper_->getStockDisplayName(symbol) 
+                                     + stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + std::to_string(metrics.auction_metrics.price_change * 100) + "% "
                                      + "卖单大单: " + std::to_string(delta_av1) + "股, "
                                      + "价格: " + std::to_string(curr_data.ask_prices[0]) + ", "
@@ -2048,7 +2094,7 @@ private:
                     if (order_value > 1000000 * 5) {  // 500万元以上
                         if (global_logger) {
                             global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_->getStockDisplayName(symbol) 
+                                     + stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + std::to_string(metrics.auction_metrics.price_change * 100) + "% "
                                      + "买单大单: " + std::to_string(delta_bv1) + "股, "
                                      + "价格: " + std::to_string(curr_data.bid_prices[0]) + ", "
@@ -2141,7 +2187,7 @@ private:
                     if (global_logger) {
                         global_logger->warnWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
                                  + "异动" + metrics.volatility_level + ": " 
-                                 + stock_mapper_->getStockDisplayName(symbol) 
+                                 + stock_mapper_.getStockDisplayName(symbol) 
                                  + " - " + reason + "  涨幅：" 
                                  + std::to_string(metrics.auction_metrics.price_change * 100) + "%",timestamp);
                     }
@@ -2244,23 +2290,36 @@ private:
       
         // 试盘结束时间（9:20）
         if (current_time > "09:20:00" && current_time <= "09:20:09") {
-            // std::cout<<"试盘结束时间（9"<<std::endl;
-            generateEnhancedAuctionReport("试盘结束总结 " , timestamp);
-            last_summary_time_ = current_time;
+            report_time++;
+            if(report_time>2500){
+                // std::cout<<"试盘结束时间（9"<<std::endl;
+                generateEnhancedAuctionReport("试盘结束总结 " , timestamp);
+                last_summary_time_ = current_time;
+            }
+            report_time=0;
         }
         // 竞价接近结束时间（9:24）
         else if (current_time >= "09:24:00" && current_time <= "09:24:09") {
-            // std::cout<<"竞价接近结束时间（9"<<std::endl;
-            generateEnhancedAuctionReport("竞价接近结束总结 " , timestamp);
-            last_summary_time_ = current_time;
+            report_time++;
+            if(report_time>2500){
+                // std::cout<<"竞价接近结束时间（9"<<std::endl;
+                generateEnhancedAuctionReport("竞价接近结束总结 " , timestamp);
+                last_summary_time_ = current_time;
+            }
+            report_time=0;
+        
         }
         // 竞价结束时间（9:25）
-        else if (current_time = "09:25:00" && current_time <= "09:25:09") {
-            // std::cout<<"竞价结束时间（9"<<std::endl;
-            generateEnhancedAuctionReport("竞价结束总结 ", timestamp);
-            last_summary_time_ = current_time;
-            // // 竞价结束清理数据
-            // cleanupAfterAuction();
+        else if (current_time == "09:25:00" && current_time <= "09:25:09") {
+            report_time++;
+            if(report_time>2500){
+                // std::cout<<"竞价结束时间（9"<<std::endl;
+                generateEnhancedAuctionReport("竞价结束总结 ", timestamp);
+                last_summary_time_ = current_time;
+                // // 竞价结束清理数据
+                // cleanupAfterAuction();
+            }
+            report_time=0;
         }
 
     }
@@ -2588,7 +2647,7 @@ private:
     std::unique_ptr<AuctionAnalyzer> auction_analyzer_;
     std::unique_ptr<Logger> logger_;
     std::unique_ptr<RedisClient> redis_;
-    std::unique_ptr<StockNameMapper> stock_mapper_;
+    StockNameMapper& stock_mapper_;
     
     // 异动检测相关数据结构
     struct StockHistory {
@@ -2616,14 +2675,15 @@ public:
         : config_(config), 
           writer_(std::move(writer)),
           message_processor_(std::move(processor)),
-          consumer_(std::move(consumer)) {
+          consumer_(std::move(consumer)),
+          stock_mapper_(StockNameMapper::getInstance()) {
         
         // 初始化新增组件
         tick_engine_ = std::make_unique<TickAnalysisEngine>(config_);
         auction_analyzer_ = std::make_unique<AuctionAnalyzer>();
         logger_ = std::make_unique<Logger>(config.log_file_path, config.log_level, config.enable_file_log);
         redis_ = std::make_unique<RedisClient>(config.redis_host, config.redis_port, config.redis_db);
-        stock_mapper_ = std::make_unique<StockNameMapper>();
+        
         
         // 设置全局日志 - 修复：使用原始指针赋值
         global_logger = logger_.get();
@@ -2888,7 +2948,7 @@ private:
                 // 计算封单金额
                 double bid_amount = (data.bid_volumes[0] + data.bid_volumes[1]) * data.last_price * 100;
                 
-                logger_->infoWithTickTime("涨停|" + stock_mapper_->getStockDisplayName(data.symbol) + 
+                logger_->infoWithTickTime("涨停|" + stock_mapper_.getStockDisplayName(data.symbol) + 
                     "|价格:" + std::to_string(data.last_price) + "|封单金额:" +
                              std::to_string(int(bid_amount / 10000))+ "万元|瞬时成交额: "+
                              std::to_string(int(data.inst_amt*0.0001))+"万",
@@ -2905,7 +2965,7 @@ private:
                 // 计算封单金额
                 double ask_amount = (data.ask_volumes[0] + data.ask_volumes[1]) * data.last_price * 100;
                 
-                logger_->infoWithTickTime("跌停|" + stock_mapper_->getStockDisplayName(data.symbol) + 
+                logger_->infoWithTickTime("跌停|" + stock_mapper_.getStockDisplayName(data.symbol) + 
                     "|价格:" + std::to_string(data.last_price) + "|封单金额:" +
                              std::to_string(int(ask_amount / 10000))+ "万元|瞬时成交额: "+
                              std::to_string(int(data.inst_amt*0.0001))+"万",
@@ -2932,8 +2992,8 @@ private:
     }
     void logVolatility(const StockData& data, std::string& reason, 
                       double strength, const TimeWindowStats& stats, const std::string& change) {
-        std::string display_name = stock_mapper_->getStockDisplayName(data.symbol);
-
+        std::string display_name = stock_mapper_.getStockDisplayName(data.symbol);
+         auto& log_msg = StringBuffer::getStream();
         if(reason=="Top")
         {
             reason= "\033[31m" + reason+"|" + display_name+ "\033[0m";
@@ -2953,7 +3013,7 @@ private:
         if (price_change > 10) price_change=price_change*0.49;
         display = getGradientColor(price_change)+display+"\033[0m";
 
-        std::ostringstream log_msg;
+        // std::ostringstream log_msg;
         log_msg << "异动|" << reason 
                 << "|价格:" << data.last_price << display
                 // << "|涨幅:" << (std::round((data.last_price - data.close) / data.close*10000) * 0.01) << "%"
@@ -2970,6 +3030,7 @@ private:
     // 修复：添加strength参数
     void storeVolatilityToRedis(const StockData& data, const std::string& reason, 
                                double strength, const TimeWindowStats& stats) {
+        // auto& buffer = StringBuffer::getString();
         char buffer[2048];
         int len = snprintf(buffer, sizeof(buffer), 
             "{\"symbol\":\"%s\",\"timestamp\":%lld,\"price\":%.2f,"
