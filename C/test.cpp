@@ -145,7 +145,47 @@ struct StockData {
     double inst_amt = 0.0;        // 瞬时成交额  
     double large_net = 0.0;       // 大单净额(累计)
 };
+// 简化的历史tick数据，只保留必要的字段
+struct SimpleTickData {
+    long long timestamp = 0;
+    double last_price = 0;
+    double volume = 0;
+    double amount = 0;
+    double bid_volumes[2] = {0};  // 只需要买一和买二
+    double ask_volumes[2] = {0};  // 只需要卖一和卖二
+    double bid_prices[2] = {0};   // 只需要买一和买二价格
+    double ask_prices[2] = {0};   // 只需要卖一和卖二价格
+    double close = 0;
+    double inst_vol = 0.0;        // 瞬时成交量
+    double inst_amt = 0.0;        // 瞬时成交额  
+    double large_net = 0.0;       // 大单净额(累计)
 
+    // 从完整StockData转换
+    static SimpleTickData fromStockData(const StockData& data) {
+        SimpleTickData simplified;
+        simplified.timestamp = data.timestamp;
+        simplified.last_price = data.last_price;
+        simplified.volume = data.volume;
+        simplified.amount = data.amount;
+        simplified.close = data.close;
+        simplified.inst_amt = data.inst_amt;
+        simplified.inst_vol = data.inst_vol;
+        simplified.large_net = data.large_net;
+        
+        // 只复制前两个档位
+        simplified.bid_volumes[0] = data.bid_volumes[0];
+        simplified.bid_volumes[1] = data.bid_volumes[1];
+        simplified.ask_volumes[0] = data.ask_volumes[0];
+        simplified.ask_volumes[1] = data.ask_volumes[1];
+        simplified.bid_prices[0] = data.bid_prices[0];
+        simplified.bid_prices[1] = data.bid_prices[1];
+        simplified.ask_prices[0] = data.ask_prices[0];
+        simplified.ask_prices[1] = data.ask_prices[1];
+        
+        return simplified;
+    }
+    
+};
 // 时间窗口统计数据
 struct TimeWindowStats {
     double volume_1min = 0.0;//1分量
@@ -192,7 +232,9 @@ struct AuctionMetrics {
     double cumulative_net_flow = 0.0;    // 累计大单净流入
     double cumulative_price_change = 0.0; // 累计涨跌幅
     double bid_amount = 0.0;             // 委买金额
+    double ask_amount = 0.0;             // 委卖金额
     bool is_limit_up = false;            // 是否涨停
+    bool is_limit_down = false;            // 是否跌停
 };
 
 // 股票竞价指标数据结构
@@ -201,13 +243,13 @@ struct StockAuctionMetrics {
     std::deque<double> av1_history;  // 卖一量历史
     std::deque<double> bv1_history;  // 买一量历史
     double auction_volume = 0.0;
-    double total_bid_amount = 0.0;
+    double total_bid_amount = 0.0;// 优化: 只存bid_amount
     long long last_analysis_time = 0;
     double volatility_score = 0.0;
     long long added_time = 0;
     std::string volatility_level = "none";
     AuctionMetrics auction_metrics;
-    StockData prev_tick_data;
+    SimpleTickData prev_tick_data;
     
     // 历史数据大小限制
     static const int HISTORY_SIZE = 300;
@@ -224,6 +266,7 @@ struct AccumulationDataPoint {
     long long timestamp = 0;
     double price = 0.0;
     double bid_amount = 0.0;
+    double ask_amount = 0.0;
     double last_close = 0.0;
 };
 
@@ -231,10 +274,11 @@ struct AccumulationDataPoint {
 struct AuctionMarketSummary {
     std::vector<std::pair<std::string, double>> top_gainers;
     std::vector<std::pair<std::string, double>> top_losers;
-    std::vector<std::pair<std::string, double>> top_net_inflow;
-    std::vector<std::pair<std::string, double>> top_net_outflow;
-    std::vector<std::pair<std::string, double>> top_auction_volume;
-    std::vector<std::string> limit_up_stocks;
+    std::vector<std::pair<std::string, double>> top_net_inflow;// 净入前20
+    std::vector<std::pair<std::string, double>> top_net_outflow; // 净出前20
+    std::vector<std::pair<std::string, double>> top_auction_volume;//竞价
+    std::vector<std::string> limit_up_stocks;//涨停
+    std::vector<std::string> limit_down_stocks;//跌停
     std::vector<std::string> accumulation_stocks;
     double total_net_flow = 0.0;
 };
@@ -475,7 +519,22 @@ public:
     void setFileLevel(int level) {
         file_level_ = level;
     }
-    
+    static std::string f2s(double value) {
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(2) << value;
+        std::string str = oss.str();
+        // 移除多余0
+        size_t dot_pos = str.find('.');
+        if (dot_pos != std::string::npos) {
+            str.erase(str.find_last_not_of('0') + 1, std::string::npos);
+            if (str.back() == '.') str.pop_back();
+        }
+        return str;
+    }
+   
+    static std::string amountToWan(double amount) {
+        return std::to_string(static_cast<int>(amount / 10000));
+    }
     // 核心日志方法 - 保持现有逻辑，但分别控制输出
     void logWithTimestamp(int level, const std::string& message, long long timestamp) {
         std::lock_guard<std::mutex> lock(log_mutex_);
@@ -798,7 +857,7 @@ private:
 class TickAnalysisEngine {
 private:
     struct StockTickState {
-        StockData prev_tick;
+        SimpleTickData prev_tick;
         double cumulative_large_net = 0.0; // 累计大单净额
         bool has_previous = false;
         long long last_update = 0;
@@ -847,7 +906,7 @@ public:
             // 计算瞬时成交量/额
             current_tick.inst_vol = current_tick.volume - state.prev_tick.volume;
             current_tick.inst_amt = current_tick.amount - state.prev_tick.amount;
-            
+            current_tick.large_net = state.prev_tick.large_net;
             // 计算大单净额
             calculateLargeOrder(current_tick, state);
         } else {
@@ -863,7 +922,7 @@ public:
         }
         
         // 更新状态
-        state.prev_tick = current_tick;
+        state.prev_tick = SimpleTickData::fromStockData(current_tick);
         state.has_previous = true;
         state.last_update = current_tick.timestamp;
     }
@@ -894,138 +953,138 @@ public:
     }
     
 private:
-    bool tryLoadPreviousTickFromTDengine(const StockData& current_tick, StockTickState& state) {
-    try {
-        // 直接创建TDengineConnection对象
-        TDengineConnection tdengine_conn(
-            config_.tdengine_host, config_.tdengine_user, 
-            config_.tdengine_password, config_.tdengine_database, 
-            config_.tdengine_port
-        );
+//     bool tryLoadPreviousTickFromTDengine(const StockData& current_tick, StockTickState& state) {
+//     try {
+//         // 直接创建TDengineConnection对象
+//         TDengineConnection tdengine_conn(
+//             config_.tdengine_host, config_.tdengine_user, 
+//             config_.tdengine_password, config_.tdengine_database, 
+//             config_.tdengine_port
+//         );
         
-        if (!tdengine_conn.connect()) {
-            if (global_logger) {
-                global_logger->warn("TDengine connection failed, cannot load previous tick for " + current_tick.symbol);
-            }
-            return false;
-        }
+//         if (!tdengine_conn.connect()) {
+//             if (global_logger) {
+//                 global_logger->warn("TDengine connection failed, cannot load previous tick for " + current_tick.symbol);
+//             }
+//             return false;
+//         }
         
-        // 计算时间范围：当前时间往前10秒
-        long long start_time = current_tick.timestamp - 10000; // 10秒前
-        std::string start_time_str = TimeUtils::formatTimestamp(start_time);
-        std::string current_time_str = TimeUtils::formatTimestamp(current_tick.timestamp);
+//         // 计算时间范围：当前时间往前10秒
+//         long long start_time = current_tick.timestamp - 10000; // 10秒前
+//         std::string start_time_str = TimeUtils::formatTimestamp(start_time);
+//         std::string current_time_str = TimeUtils::formatTimestamp(current_tick.timestamp);
         
-        // 构建SQL查询：查询所有symbol在时间范围内的最新tick，每个symbol取时间最大的
-        std::string sql = 
-            "SELECT symbol, ts, lp, o, h, l, lc, a, v, "
-            "ap1, ap2, ap3, ap4, ap5, "
-            "bp1, bp2, bp3, bp4, bp5, "
-            "av1, av2, av3, av4, av5, "
-            "bv1, bv2, bv3, bv4, bv5, "
-            "inst_vol, inst_amt, large_net "
-            "FROM stock_data "
-            "WHERE ts >= '" + start_time_str + "' AND ts < '" + current_time_str + "' "
-            "ORDER BY ts DESC";
+//         // 构建SQL查询：查询所有symbol在时间范围内的最新tick，每个symbol取时间最大的
+//         std::string sql = 
+//             "SELECT symbol, ts, lp, o, h, l, lc, a, v, "
+//             "ap1, ap2, ap3, ap4, ap5, "
+//             "bp1, bp2, bp3, bp4, bp5, "
+//             "av1, av2, av3, av4, av5, "
+//             "bv1, bv2, bv3, bv4, bv5, "
+//             "inst_vol, inst_amt, large_net "
+//             "FROM stock_data "
+//             "WHERE ts >= '" + start_time_str + "' AND ts < '" + current_time_str + "' "
+//             "ORDER BY ts DESC";
         
-        TAOS_RES* res = tdengine_conn.query(sql);
+//         TAOS_RES* res = tdengine_conn.query(sql);
         
-        // 检查查询结果是否为空
-        if (!res) {
-            if (global_logger) {
-                global_logger->warn("TDengine query returned null result for " + current_tick.symbol);
-            }
-            return false;
-        }
+//         // 检查查询结果是否为空
+//         if (!res) {
+//             if (global_logger) {
+//                 global_logger->warn("TDengine query returned null result for " + current_tick.symbol);
+//             }
+//             return false;
+//         }
         
-        int num_fields = taos_num_fields(res);
-        if (num_fields <= 0) {
-            if (global_logger) {
-                global_logger->warn("TDengine query returned no fields for " + current_tick.symbol);
-            }
-            taos_free_result(res);
-            return false;
-        }
+//         int num_fields = taos_num_fields(res);
+//         if (num_fields <= 0) {
+//             if (global_logger) {
+//                 global_logger->warn("TDengine query returned no fields for " + current_tick.symbol);
+//             }
+//             taos_free_result(res);
+//             return false;
+//         }
         
-        std::cout << "获取到:" << num_fields << " sql:" << sql << std::endl;
+//         std::cout << "获取到:" << num_fields << " sql:" << sql << std::endl;
         
-        // 获取字段信息
-        TAOS_FIELD* fields = taos_fetch_fields(res);
-        if (!fields) {
-            if (global_logger) {
-                global_logger->warn("Failed to fetch fields from TDengine result for " + current_tick.symbol);
-            }
-            taos_free_result(res);
-            return false;
-        }
+//         // 获取字段信息
+//         TAOS_FIELD* fields = taos_fetch_fields(res);
+//         if (!fields) {
+//             if (global_logger) {
+//                 global_logger->warn("Failed to fetch fields from TDengine result for " + current_tick.symbol);
+//             }
+//             taos_free_result(res);
+//             return false;
+//         }
         
-        // 处理查询结果：按照symbol分组，每个symbol取时间最大的记录
-        std::unordered_map<std::string, StockData> latest_ticks;
-        TAOS_ROW row;
-        int row_count = 0;
+//         // 处理查询结果：按照symbol分组，每个symbol取时间最大的记录
+//         std::unordered_map<std::string, StockData> latest_ticks;
+//         TAOS_ROW row;
+//         int row_count = 0;
         
-        while ((row = taos_fetch_row(res))) {
-            row_count++;
+//         while ((row = taos_fetch_row(res))) {
+//             row_count++;
             
-            // 检查row是否为空
-            if (!row) {
-                continue;
-            }
+//             // 检查row是否为空
+//             if (!row) {
+//                 continue;
+//             }
             
-            StockData tick = parseTDRowToStockData(row, num_fields, fields);
-            if (tick.symbol.empty() || tick.timestamp == 0) {
-                continue;
-            }
+//             StockData tick = parseTDRowToStockData(row, num_fields, fields);
+//             if (tick.symbol.empty() || tick.timestamp == 0) {
+//                 continue;
+//             }
             
-            // 如果这个symbol还没有记录，或者当前记录时间更晚，则更新
-            auto it = latest_ticks.find(tick.symbol);
-            if (it == latest_ticks.end() || tick.timestamp > it->second.timestamp) {
-                latest_ticks[tick.symbol] = tick;
-            }
-        }
+//             // 如果这个symbol还没有记录，或者当前记录时间更晚，则更新
+//             auto it = latest_ticks.find(tick.symbol);
+//             if (it == latest_ticks.end() || tick.timestamp > it->second.timestamp) {
+//                 latest_ticks[tick.symbol] = tick;
+//             }
+//         }
         
-        taos_free_result(res);
+//         taos_free_result(res);
         
-        if (global_logger) {
-            global_logger->warn("TDengine query returned " + std::to_string(row_count) + " rows, " +
-                               std::to_string(latest_ticks.size()) + " unique symbols for " + current_tick.symbol);
-        }
+//         if (global_logger) {
+//             global_logger->warn("TDengine query returned " + std::to_string(row_count) + " rows, " +
+//                                std::to_string(latest_ticks.size()) + " unique symbols for " + current_tick.symbol);
+//         }
         
-        // 查找当前symbol的前一个tick
-        auto it = latest_ticks.find(current_tick.symbol);
-        if (it != latest_ticks.end()) {
-            // 检查时间差是否在10秒内
-            long long time_diff = current_tick.timestamp - it->second.timestamp;
-            if (time_diff <= 10000) { // 10秒内
-                state.prev_tick = it->second;
-                state.has_previous = true;
+//         // 查找当前symbol的前一个tick
+//         auto it = latest_ticks.find(current_tick.symbol);
+//         if (it != latest_ticks.end()) {
+//             // 检查时间差是否在10秒内
+//             long long time_diff = current_tick.timestamp - it->second.timestamp;
+//             if (time_diff <= 10000) { // 10秒内
+//                 state.prev_tick = it->second;
+//                 state.has_previous = true;
                 
-                if (global_logger) {
-                    global_logger->warn("Found previous tick for " + current_tick.symbol + 
-                                      " at " + TimeUtils::formatTimestamp(state.prev_tick.timestamp) +
-                                      ", time diff: " + std::to_string(time_diff) + "ms");
-                }
-                return true;
-            } else {
-                if (global_logger) {
-                    global_logger->warn("Found previous tick for " + current_tick.symbol + 
-                                       " but time diff too large: " + std::to_string(time_diff) + "ms");
-                }
-            }
-        }
+//                 if (global_logger) {
+//                     global_logger->warn("Found previous tick for " + current_tick.symbol + 
+//                                       " at " + TimeUtils::formatTimestamp(state.prev_tick.timestamp) +
+//                                       ", time diff: " + std::to_string(time_diff) + "ms");
+//                 }
+//                 return true;
+//             } else {
+//                 if (global_logger) {
+//                     global_logger->warn("Found previous tick for " + current_tick.symbol + 
+//                                        " but time diff too large: " + std::to_string(time_diff) + "ms");
+//                 }
+//             }
+//         }
         
-        if (global_logger) {
-            global_logger->warn("No previous tick found in TDengine for " + current_tick.symbol + 
-                               " within 10 seconds");
-        }
-        return false;
+//         if (global_logger) {
+//             global_logger->warn("No previous tick found in TDengine for " + current_tick.symbol + 
+//                                " within 10 seconds");
+//         }
+//         return false;
         
-    } catch (const std::exception& e) {
-        if (global_logger) {
-            global_logger->error("Exception in tryLoadPreviousTickFromTDengine: " + std::string(e.what()));
-        }
-        return false;
-    }
-}
+//     } catch (const std::exception& e) {
+//         if (global_logger) {
+//             global_logger->error("Exception in tryLoadPreviousTickFromTDengine: " + std::string(e.what()));
+//         }
+//         return false;
+//     }
+// }
 
 // 修改后的解析函数，添加字段信息参数
 StockData parseTDRowToStockData(TAOS_ROW row, int num_fields, TAOS_FIELD* fields) {
@@ -1147,13 +1206,13 @@ StockData parseTDRowToStockData(TAOS_ROW row, int num_fields, TAOS_FIELD* fields
         }
         
         // 20分时检查撤单情况
-        if (time_str >= "09:20:00" && time_str <= "09:20:01") {
+        if (time_str >= "09:19:00" && time_str <= "09:20:01") {
             double current_bid = (current_tick.bid_volumes[0] + current_tick.bid_volumes[1]) * current_tick.last_price * 100;
             double bid_withdrawal = state.pre_20_bid_amount - current_bid;
             
             if (bid_withdrawal > large_order_threshold_) {
                 if (global_logger) {
-                    global_logger->warnWithTickTime("撤单预警|" + current_tick.symbol + "|委买撤单:" + 
+                    global_logger->warnWithTickTime("撤单预警|" + stock_mapper_.getStockDisplayName(current_tick.symbol) + "|委买撤单:" + 
                                    std::to_string(int(bid_withdrawal / 10000)) + "万元",current_tick.timestamp);
                 }
             }
@@ -1199,18 +1258,18 @@ public:
             std::vector<char> batch_bytes;
             {
                 std::vector<char> decompressed;
-                if (header.compression == "GZIP" || header.compression == "ZLIB") {
+                // if (header.compression == "GZIP" || header.compression == "ZLIB") {
                     const std::string& compressed_data = data_request.compressed_data();
                     if (!decompressZlib(compressed_data, decompressed)) {
                         return false;
                     }
                     batch_bytes = std::move(decompressed);
-                } else if (header.compression == "NONE" || header.compression.empty()) {
-                    const std::string& compressed_data = data_request.compressed_data();
-                    batch_bytes.assign(compressed_data.begin(), compressed_data.end());
-                } else {
-                    return false;
-                }
+                // } else if (header.compression == "NONE" || header.compression.empty()) {
+                //     const std::string& compressed_data = data_request.compressed_data();
+                //     batch_bytes.assign(compressed_data.begin(), compressed_data.end());
+                // } else {
+                //     return false;
+                // }
             }
             
             dataservice::DataBatch data_batch;
@@ -1622,6 +1681,7 @@ private:
     std::vector<std::string> volatile_stocks_;
     std::vector<std::string> accumulation_stocks_;
     std::vector<std::string> limit_up_stocks_;
+    std::vector<std::string> limit_down_stocks_;
     
     AuctionMarketSummary market_summary_;
     std::string last_summary_time_;
@@ -1633,13 +1693,13 @@ private:
     const std::string TRIAL_END = "09:20:00";
     const std::string AUCTION_NEAR_END = "09:24:00";
     const std::string AUCTION_END = "09:25:00";
-    int report_time = 0;//报告输出次数
+    static int report_time;//报告输出次数
     
 public:
     AuctionAnalyzer():stock_mapper_(StockNameMapper::getInstance()) {
         
     }
-    
+
     // 判断当前是否在竞价时间段
     bool isAuctionPeriod(long long timestamp) {
         std::string time_str = TimeUtils::formatTimestamp(timestamp).substr(11,19);
@@ -1654,9 +1714,9 @@ public:
     
     // 处理股票tick数据
     void processTickData(const StockData& data) {
-        if (!isAuctionPeriod(data.timestamp)) {
-            return;
-        }
+        // if (!isAuctionPeriod(data.timestamp)) {
+        //     return;
+        // }
         
         std::lock_guard<std::mutex> lock(data_mutex_);
         const std::string& symbol = data.symbol;
@@ -1771,7 +1831,24 @@ public:
                 }
             }
         }
-        
+        // 跌停股票统计
+        report << "跌停数量: " << summary.limit_down_stocks.size() << "\n";
+        if (!summary.limit_down_stocks.empty()) {
+            report << "跌停股票详情:\n";
+            for (const auto& symbol : summary.limit_down_stocks) {
+                auto it = stock_auction_metrics_.find(symbol);
+                if (it != stock_auction_metrics_.end()) {
+                    const auto& metrics = it->second;
+                    double ask_amount = metrics.auction_metrics.ask_amount;
+                    double match_amount = metrics.auction_volume * 100; // 估算成交金额
+                    report << "  " << stock_mapper_.getStockDisplayName(symbol) 
+                           << " 跌幅:" << (metrics.auction_metrics.price_change * 100) << "%"
+                           << " 封单:" << std::to_string(int(ask_amount / 10000)) << "万"
+                           << " 成交:" << std::to_string(int(match_amount / 10000)) << "万"
+                           << " 大单:" << std::to_string(int(metrics.auction_metrics.net_large_order_flow / 10000)) << "万\n";
+                }
+            }
+        }
         // 大单净额排名
         report << "大单净额排名(前20):\n";
         int count = 0;
@@ -1804,6 +1881,7 @@ private:
         int high_open_count = 0;  // 高开>3%
         int low_open_count = 0;   // 低开<-3%
         std::vector<std::string> limit_up_stocks;
+        std::vector<std::string> limit_down_stocks;
         std::vector<std::pair<std::string, double>> large_net_ranking;
         std::vector<std::pair<std::string, double>> amount_ranking;
     };
@@ -1828,7 +1906,10 @@ private:
             if (metrics.auction_metrics.is_limit_up) {
                 summary.limit_up_stocks.push_back(symbol);
             }
-            
+             // 跌停统计
+            if (metrics.auction_metrics.is_limit_down) {
+                summary.limit_down_stocks.push_back(symbol);
+            }
             // 大单净额排名
             large_nets.emplace_back(symbol, metrics.auction_metrics.net_large_order_flow);
             
@@ -1875,9 +1956,13 @@ private:
             
             // 检查是否涨停
             double limit_up_price = std::round(last_close * 1.1 * 100) / 100;
+            // 检查是否跌停
+            double limit_down_price = std::round(last_close * 0.9 * 100) / 100;
+
             std::string symbol_prefix = data.symbol.substr(0, 2);
             if (symbol_prefix == "30" || symbol_prefix == "68") {
                 limit_up_price = std::round(last_close * 1.2 * 100) / 100;
+                limit_down_price = std::round(last_close * 0.8 * 100) / 100;
             }
             
             auction_metrics.is_limit_up = std::abs(current_price - limit_up_price) < 0.01;
@@ -1895,6 +1980,21 @@ private:
                 }
             }
             
+            auction_metrics.is_limit_down = std::abs(current_price - limit_down_price) < 0.01;
+            double total_ask_amout = (data.ask_volumes[0] + data.ask_volumes[1]) * current_price * 100;
+            if (auction_metrics.is_limit_down && 
+                std::find(limit_down_stocks_.begin(), limit_down_stocks_.end(), data.symbol) == limit_down_stocks_.end() &&
+                total_bid_amount < total_ask_amout) {
+                limit_down_stocks_.push_back(data.symbol);
+                if (global_logger) {
+                    global_logger->warnWithTickTime(TimeUtils::formatTimestamp(data.timestamp) + "|" 
+                         + stock_mapper_.getStockDisplayName(data.symbol) 
+                         + " 已跌停，跌停价: " + std::to_string(limit_down_price) 
+                         + "，委卖金额: " + std::to_string(int(total_ask_amout / 10000)) + "万元",
+                         data.timestamp);
+                }
+            }
+
             // 更新累计涨跌幅
             if (metrics.price_history.size() > 1 && metrics.price_history.front() > 0) {
                 double first_price = metrics.price_history.front();
@@ -1974,11 +2074,11 @@ private:
     
     void analyzeOrderFlow(const std::string& symbol, const StockData& curr_data, 
                          StockAuctionMetrics& metrics, long long timestamp) {
-        StockData& prev_data = metrics.prev_tick_data;
+        SimpleTickData& prev_data = metrics.prev_tick_data;
         
         // 如果是第一条数据，只存储不分析
         if (prev_data.timestamp == 0) {
-            prev_data = curr_data;
+            prev_data = SimpleTickData::fromStockData(curr_data);
             return;
         }
         
@@ -1991,11 +2091,11 @@ private:
         }
         
         // 更新前一个tick数据
-        prev_data = curr_data;
+        prev_data = SimpleTickData::fromStockData(curr_data);
     }
     
     void analyzeWithdrawals(const std::string& symbol, const StockData& curr_data,
-                           const StockData& prev_data, StockAuctionMetrics& metrics, 
+                           const SimpleTickData& prev_data, StockAuctionMetrics& metrics, 
                            long long timestamp) {
         // 检查卖单撤单：同一价格下，av1减少
         if (curr_data.ask_prices[0] == prev_data.ask_prices[0]) {
@@ -2047,7 +2147,7 @@ private:
     }
     
     void analyzeLargeOrders(const std::string& symbol, const StockData& curr_data,
-                          const StockData& prev_data, StockAuctionMetrics& metrics,
+                          const SimpleTickData& prev_data, StockAuctionMetrics& metrics,
                           long long timestamp) {
         // 计算匹配量变化
         double delta_av1 = curr_data.ask_volumes[0] - prev_data.ask_volumes[0];
@@ -2185,7 +2285,7 @@ private:
                     std::abs(auction_metrics.cumulative_net_flow) > 2000000 || 
                     std::abs(auction_metrics.cumulative_price_change) > 0.08) {
                     if (global_logger) {
-                        global_logger->warnWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
+                        global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
                                  + "异动" + metrics.volatility_level + ": " 
                                  + stock_mapper_.getStockDisplayName(symbol) 
                                  + " - " + reason + "  涨幅：" 
@@ -2290,35 +2390,34 @@ private:
       
         // 试盘结束时间（9:20）
         if (current_time > "09:20:00" && current_time <= "09:20:09") {
-            report_time++;
-            if(report_time>2500){
-                // std::cout<<"试盘结束时间（9"<<std::endl;
-                generateEnhancedAuctionReport("试盘结束总结 " , timestamp);
-                last_summary_time_ = current_time;
-            }
+        // if (current_time > "14:55:00" && current_time <= "14:55:09") {
+            report_time=report_time+1;
+            if(report_time<2000)  return;
+
+            generateEnhancedAuctionReport("试盘结束总结 " , timestamp);
+            last_summary_time_ = current_time;
             report_time=0;
         }
         // 竞价接近结束时间（9:24）
         else if (current_time >= "09:24:00" && current_time <= "09:24:09") {
-            report_time++;
-            if(report_time>2500){
-                // std::cout<<"竞价接近结束时间（9"<<std::endl;
-                generateEnhancedAuctionReport("竞价接近结束总结 " , timestamp);
-                last_summary_time_ = current_time;
-            }
+            report_time=report_time+1;
+            if(report_time<4000)  return;
+            // std::cout<<"竞价接近结束时间（9"<<std::endl;
+            generateEnhancedAuctionReport("竞价接近结束总结 " , timestamp);
+            last_summary_time_ = current_time;
             report_time=0;
         
         }
         // 竞价结束时间（9:25）
         else if (current_time == "09:25:00" && current_time <= "09:25:09") {
-            report_time++;
-            if(report_time>2500){
-                // std::cout<<"竞价结束时间（9"<<std::endl;
-                generateEnhancedAuctionReport("竞价结束总结 ", timestamp);
-                last_summary_time_ = current_time;
-                // // 竞价结束清理数据
-                // cleanupAfterAuction();
-            }
+            report_time=report_time+1;
+            if(report_time<4000)  return;
+            // std::cout<<"竞价结束时间（9"<<std::endl;
+            generateEnhancedAuctionReport("竞价结束总结 ", timestamp);
+            last_summary_time_ = current_time;
+            // // 竞价结束清理数据
+            // cleanupAfterAuction();
+
             report_time=0;
         }
 
@@ -2361,6 +2460,7 @@ private:
         stock_auction_metrics_.clear();
         accumulation_stocks_.clear();
         limit_up_stocks_.clear();
+        limit_down_stocks_.clear();
         post_20_data_.clear();
         last_summary_time_.clear();
         if (global_logger) {
@@ -2368,7 +2468,7 @@ private:
         }
     }
 };
-
+int AuctionAnalyzer::report_time = 0;
 
 
 // ==================== 基于多线程版本修复的单线程RabbitMQ消费者 ====================
@@ -2651,8 +2751,8 @@ private:
     
     // 异动检测相关数据结构
     struct StockHistory {
-        std::deque<StockData> ticks;
-        StockData last_tick;
+        std::deque<SimpleTickData> ticks;
+        SimpleTickData last_tick;
         bool is_limit_up = false;
         bool is_limit_down = false;
         long long last_limit_time = 0;
@@ -2877,10 +2977,12 @@ private:
         double strength = 0.0;
         // 涨幅
         double price_change = std::abs(data.last_price - data.close) / data.close;
+
         // 涨停检测
-        if (checkLimitUp(data) && data.inst_amt>300*10000) {
+        double limit = checkLimitUp(data);
+        if (limit>0 && data.inst_amt>300*10000) {
             is_volatile = true;
-            reason = "Top";
+            reason = "Top|封单:"+f2s(limit/10000);
             strength = 10.0;
             if(price_change<0) reason = "Low";
         }
@@ -2927,7 +3029,7 @@ private:
         }
     }
     
-    bool checkLimitUp(const StockData& data) {
+    float checkLimitUp(const StockData& data) {
         double limit_up_price = std::round(data.close * 1.1 * 100) / 100;
         double limit_down_price = std::round(data.close * 0.9 * 100) / 100;
         std::string symbol_prefix = data.symbol.substr(0, 2);
@@ -2941,40 +3043,42 @@ private:
         if (is_limit_up) {
             std::lock_guard<std::mutex> lock(data_mutex_);
             auto& history = stock_history_[data.symbol];
+            // 计算封单金额
+            double bid_amount = (data.bid_volumes[0] + data.bid_volumes[1]) * data.last_price * 100;
             if (!history.is_limit_up) {
                 history.is_limit_up = true;
                 history.last_limit_time = data.timestamp;
-                
-                // 计算封单金额
-                double bid_amount = (data.bid_volumes[0] + data.bid_volumes[1]) * data.last_price * 100;
                 
                 logger_->infoWithTickTime("涨停|" + stock_mapper_.getStockDisplayName(data.symbol) + 
                     "|价格:" + std::to_string(data.last_price) + "|封单金额:" +
                              std::to_string(int(bid_amount / 10000))+ "万元|瞬时成交额: "+
                              std::to_string(int(data.inst_amt*0.0001))+"万",
                              data.timestamp);
+                return bid_amount;
             }
+            
         }else if (is_limit_down)
         {
             std::lock_guard<std::mutex> lock(data_mutex_);
             auto& history = stock_history_[data.symbol];
+            // 计算封单金额
+            double ask_amount = (data.ask_volumes[0] + data.ask_volumes[1]) * data.last_price * 100;
             if (!history.is_limit_down) {
                 history.is_limit_down = true;
                 history.last_limit_time = data.timestamp;
-                
-                // 计算封单金额
-                double ask_amount = (data.ask_volumes[0] + data.ask_volumes[1]) * data.last_price * 100;
+                           
                 
                 logger_->infoWithTickTime("跌停|" + stock_mapper_.getStockDisplayName(data.symbol) + 
                     "|价格:" + std::to_string(data.last_price) + "|封单金额:" +
                              std::to_string(int(ask_amount / 10000))+ "万元|瞬时成交额: "+
                              std::to_string(int(data.inst_amt*0.0001))+"万",
                              data.timestamp);
+                return ask_amount;
             }
         }
         
         
-        return is_limit_up;
+        return 0;
     }
     std::string getGradientColor(float value) {
        // 归一化到[-1,1]范围（对应-10%到+10%）
@@ -2990,22 +3094,26 @@ private:
             return "\033[38;5;" + std::to_string(redyellow_id) + "m";
         }
     }
+    std::string f2s(float value){
+        std::string str = std::to_string(std::round((value*100))/100);
+        return str.substr(0, str.find(".") + 2 + 1);
+    }
     void logVolatility(const StockData& data, std::string& reason, 
                       double strength, const TimeWindowStats& stats, const std::string& change) {
         std::string display_name = stock_mapper_.getStockDisplayName(data.symbol);
          auto& log_msg = StringBuffer::getStream();
-        if(reason=="Top")
+        if(reason.substr(0,3)=="Top")
         {
-            reason= "\033[31m" + reason+"|" + display_name+ "\033[0m";
-        }else if (reason=="Low")
+            reason = "\033[31m" + reason+"\033[0m";
+        }else if (reason.substr(0,3)=="Low")
         {
-            reason= "\033[32m" + reason+"|" + display_name+ "\033[0m";
-        }else{
-            reason=reason +"|" + display_name ;
+            reason = "\033[32m" + reason+"\033[0m";
         }
         float price_change=(std::round((data.last_price - data.close) / data.close*10000) * 0.01);
+        // std::string price_change_str = std::to_string(price_change);
+        // std::string last_price = std::to_string(std::round((data.last_price*100))/100);
         std::string display;
-        display = "|涨幅:"+ std::to_string(price_change) + "%"
+        display = "|" + display_name+ "|价格:" + f2s(data.last_price) + "|涨幅:"+ f2s(price_change) + "%"
                 + "|瞬时:" + std::to_string(int(data.inst_amt*0.0001))+"万"
                 + "|1分速:" + change+"%";
         // price_change = price_change*0.09;
@@ -3015,7 +3123,8 @@ private:
 
         // std::ostringstream log_msg;
         log_msg << "异动|" << reason 
-                << "|价格:" << data.last_price << display
+                // << "|价格:" << data.last_price 
+                << display
                 // << "|涨幅:" << (std::round((data.last_price - data.close) / data.close*10000) * 0.01) << "%"
                 // << "|瞬时:" <<std::to_string(int(data.inst_amt*0.0001))+"万"
                 // << "|1分速:" << change<< "%"
@@ -3063,8 +3172,8 @@ private:
         long long time_5min_ago = current_time - config_.minute5_window_ms;
         
         // 查找时间窗口内的起始tick
-        const StockData* tick_1min_ago = findTickAtTime(history.ticks, time_1min_ago);
-        const StockData* tick_5min_ago = findTickAtTime(history.ticks, time_5min_ago);
+        const SimpleTickData* tick_1min_ago = findTickAtTime(history.ticks, time_1min_ago);
+        const SimpleTickData* tick_5min_ago = findTickAtTime(history.ticks, time_5min_ago);
         
         // 计算1分钟窗口统计数据
         if (tick_1min_ago) {
@@ -3097,10 +3206,10 @@ private:
         auto& history = stock_history_[data.symbol];
         
         // 更新上一个tick
-        history.last_tick = data;
+        history.last_tick = SimpleTickData::fromStockData(data);
         
         // 添加当前tick到历史队列
-        history.ticks.push_back(data);
+        history.ticks.push_back(history.last_tick);
         
         // 限制历史数据大小
         if (history.ticks.size() > config_.max_history_ticks) {
@@ -3111,7 +3220,7 @@ private:
         cleanupOldTicks(history.ticks, data.timestamp);
     }
     
-    const StockData* findTickAtTime(const std::deque<StockData>& ticks, long long target_time) {
+    const SimpleTickData* findTickAtTime(const std::deque<SimpleTickData>& ticks, long long target_time) {
         if (ticks.empty()) return nullptr;
         
         for (auto it = ticks.rbegin(); it != ticks.rend(); ++it) {
@@ -3123,7 +3232,7 @@ private:
         return &ticks.front();
     }
     
-    void cleanupOldTicks(std::deque<StockData>& ticks, long long current_time) {
+    void cleanupOldTicks(std::deque<SimpleTickData>& ticks, long long current_time) {
         long long cutoff_time = current_time - config_.minute5_window_ms - 60000;
         while (!ticks.empty() && ticks.front().timestamp < cutoff_time) {
             ticks.pop_front();
