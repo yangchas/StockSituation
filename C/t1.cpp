@@ -49,11 +49,11 @@ struct Config {
     int redis_db = 0;
    
     std::string volatile_pool_key = "stock:volatile_pool";
-    int volatile_expire = 300;
+    int volatile_expire = 300;//redis过期时间
     // 时间窗口配置
     int minute1_window_ms = 60000; // 1分钟窗口
     int minute5_window_ms = 300000; // 5分钟窗口
-    int max_history_ticks = 50; // 最大历史tick数量 (优化: 减小到50)
+    int max_history_ticks = 20*6; //6分钟 最大历史tick数量 (优化: 减小到60)
    
     double price_change_threshold = 0.02;
     double volume_ratio_threshold = 3.0;
@@ -70,11 +70,11 @@ struct Config {
     int max_retry_count = 3; // 最大重试次数
     int retry_delay_ms = 1000; // 重试延迟
     bool verbose = true;
-    int max_pending_messages = 50; // 最大待处理消息数
+    // int max_pending_messages = 50; // 最大待处理消息数
     // 串行处理相关配置
-    int processing_delay_ms = 100; // 每条消息处理后的延迟
+    int processing_delay_ms = 2; // 每条消息处理后的延迟
     bool enable_rate_limiting = true; // 启用速率限制
-    int report_time = 10; //报告输出间隔
+    int report_time = 10; //10s 报告输出间隔
    
     // 新增配置
     std::string log_file_path = "stock_analysis.log";
@@ -196,16 +196,16 @@ struct PendingMessage {
 // ==================== 竞价分析数据结构 ====================
 // 竞价指标数据结构 (优化: 精简)
 struct AuctionMetrics {
-    double price_change = 0.0;
-    double match_volume_ratio = 0.0;
-    double net_large_order_flow = 0.0;
-    double withdrawal_impact = 0.0;
-    double cumulative_net_flow = 0.0;
-    double cumulative_price_change = 0.0;
-    double bid_amount = 0.0;
-    double ask_amount = 0.0;
-    bool is_limit_up = false;
-    bool is_limit_down = false;
+    double price_change = 0.0;// 相对于前收盘价的涨跌幅
+    double match_volume_ratio = 0.0;// 匹配量相对于近期均值的比值
+    double net_large_order_flow = 0.0;// 大单净流入金额
+    double withdrawal_impact = 0.0;// 撤单影响
+    double cumulative_net_flow = 0.0;// 累计大单净流入
+    double cumulative_price_change = 0.0;// 累计涨跌幅
+    double bid_amount = 0.0; // 委买金额
+    double ask_amount = 0.0;// 委卖金额
+    bool is_limit_up = false;// 是否涨停
+    bool is_limit_down = false;// 是否跌停
 };
 
 // 股票竞价指标数据结构 (优化: history_size=10)
@@ -285,7 +285,7 @@ class IVolatilityDetector {
 public:
     virtual ~IVolatilityDetector() = default;
     virtual bool detectVolatility(const StockData& data, double change, double bid_amount) = 0; // 优化: 传入统一计算的指标
-    virtual void cleanupOldData() = 0;
+    // virtual void cleanVolOldData() = 0;
 };
 
 class IMessageProcessor {
@@ -477,7 +477,7 @@ public:
             default: level_str = "INFO";
         }
        
-        std::string log_timestamp = TimeUtils::formatTimestamp(timestamp).substr(5);
+        std::string log_timestamp = TimeUtils::formatTimestamp(timestamp).substr(11);//5
         std::string log_msg = log_timestamp + "[" + level_str + "]" + message;
        
         std::lock_guard<std::mutex> lock(log_mutex_);
@@ -711,26 +711,28 @@ public:
 class TickAnalysisEngine {
 private:
     struct StockTickState {
-        SimpleTickData prev_tick;
+        std::deque<SimpleTickData> history;
         double cumulative_large_net = 0.0;
-        bool has_previous = false;
+        // bool has_previous = false;
         long long last_update = 0;
     };
    
     std::unordered_map<std::string, StockTickState> stock_states_;
     std::mutex state_mutex_;
     double large_order_threshold_;
+    const Config& config_;
 public:
     TickAnalysisEngine(const Config& config, double threshold = 500000)
-        : large_order_threshold_(threshold) {}
+        : large_order_threshold_(threshold), config_(config)  {}
    
     void processTickData(StockData& current_tick, bool is_auction_period) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = stock_states_[current_tick.symbol];
        
-        if (state.has_previous) {
-            current_tick.inst_vol = current_tick.volume - state.prev_tick.volume;
-            current_tick.inst_amt = current_tick.amount - state.prev_tick.amount;
+        if (!state.history.empty()) {
+            const auto& prev_tick = state.history.back();
+            current_tick.inst_vol = current_tick.volume - prev_tick.volume;
+            current_tick.inst_amt = current_tick.amount - prev_tick.amount;
             // 大单计算分阶段
             if (is_auction_period) {
                 calculateAuctionLargeOrder(current_tick, state);
@@ -743,11 +745,18 @@ public:
             current_tick.large_net = 0;
         }
        
-        state.prev_tick = SimpleTickData::fromStockData(current_tick);
-        state.has_previous = true;
+        // state.prev_tick = SimpleTickData::fromStockData(current_tick);
+        // 添加当前 tick 到 history
+        state.history.push_back(SimpleTickData::fromStockData(current_tick));
+        // state.has_previous = true;
+        if (state.history.size() > config_.max_history_ticks) {
+            state.history.pop_front();  // 删除最旧的，保持 <= 40
+            state.history.shrink_to_fit(); 
+        }
         state.last_update = current_tick.timestamp;
     }
    
+    // 获取累计大单净额 后面需要接入API
     double getCumulativeLargeNet(const std::string& symbol) {
         std::lock_guard<std::mutex> lock(state_mutex_);
         auto it = stock_states_.find(symbol);
@@ -757,21 +766,42 @@ public:
         return 0.0;
     }
    
-    void cleanupOldData(long long current_time) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
-        long long cutoff_time = current_time - 1800000; // 30min
-        auto it = stock_states_.begin();
-        while (it != stock_states_.end()) {
-            if (it->second.last_update < cutoff_time) {
-                it = stock_states_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
+    // void cleanTickOldData() {
+    //     if (stock_states_.empty()) {
+    //         return;
+    //     }
+        
+    //     long long max_timestamp = 0;
+    //     long long min_timestamp = 0;
+    //     int count_stock=0;
+    //     for (const auto& pair : stock_states_) {
+    //         if (pair.second.last_update > max_timestamp) {
+    //             max_timestamp = pair.second.last_update;
+    //         }
+    //          if (pair.second.last_update < min_timestamp) {
+    //             min_timestamp = pair.second.last_update;
+    //         }
+    //     }
+        
+    //     long long cutoff_time = max_timestamp - 1* 60 * 1000;
+        
+    //     auto it = stock_states_.begin();
+    //     int count=0;
+    //     while (it != stock_states_.end()) {
+    //         count_stock+=1;
+    //         if (it->second.last_update < cutoff_time) {
+    //             count+=1;
+    //             it = stock_states_.erase(it);
+    //         } else {
+    //             ++it;
+    //         }
+    //     }
+    //     std::cout<<" cleanTickOldData 删除: "<<count<<" 最前:"<<min_timestamp<<" |最后"<<max_timestamp<<"||总共："<<count_stock<<std::endl;
+    // }
 private:
     void calculateAuctionLargeOrder(StockData& current_tick, StockTickState& state) {
-        double delta_bid = current_tick.bid_volumes[0] + current_tick.bid_volumes[1] - state.prev_tick.volume; // 简例，实际调整
+        const auto& prev_tick = state.history.back();
+        double delta_bid = current_tick.bid_volumes[0] + current_tick.bid_volumes[1] - prev_tick.volume; // 简例，实际调整
         double instant_amount = delta_bid * current_tick.last_price * 100;
         if (std::abs(instant_amount) > large_order_threshold_) {
             current_tick.large_net = (delta_bid > 0) ? instant_amount : -instant_amount;
@@ -782,9 +812,10 @@ private:
     }
    
     void calculateTradeLargeOrder(StockData& current_tick, StockTickState& state) {
+        const auto& prev_tick = state.history.back();
         double instant_amount = current_tick.inst_amt;
         if (std::abs(instant_amount) > large_order_threshold_) {
-            current_tick.large_net = (current_tick.last_price > state.prev_tick.last_price) ? instant_amount : -instant_amount;
+            current_tick.large_net = (current_tick.last_price > prev_tick.last_price) ? instant_amount : -instant_amount;
             state.cumulative_large_net += current_tick.large_net;
         } else {
             current_tick.large_net = 0;
@@ -823,7 +854,6 @@ public:
             if (!data_request.ParseFromArray(proto_data.data(), proto_data.size())) {
                 return false;
             }
-           
             std::vector<char> batch_bytes;
             {
                 std::vector<char> decompressed;
@@ -838,9 +868,7 @@ public:
             if (!data_batch.ParseFromArray(batch_bytes.data(), batch_bytes.size())) {
                 return false;
             }
-           
             bool result = convertDataBatchToStockData(data_batch, records);
-           
             return result;
            
         } catch (const std::exception& e) {
@@ -864,7 +892,7 @@ private:
        
         size_t proto_offset = 4 + header_len;
         proto_data.assign(body.begin() + proto_offset, body.end());
-       
+        // body.clear();
         return true;
     }
    
@@ -1005,7 +1033,7 @@ private:
         strm.opaque = Z_NULL;
         strm.avail_in = compressed.size();
         strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(compressed.data()));
-        
+
         int ret = inflateInit2(&strm, MAX_WBITS | 32);
         if (ret != Z_OK) {
             return false;
@@ -1034,7 +1062,7 @@ private:
             decompressed.insert(decompressed.end(), buffer.begin(), buffer.begin() + have);
             
         } while (ret != Z_STREAM_END);
-        
+        buffer.clear();
         return true;
     }
    
@@ -1213,7 +1241,7 @@ private:
         double cumulative_net_flow = 1000000;
         double cumulative_price_change = 0.05;
         double bid_amount_large = 5000000;
-        double accumulation_bid_increase = 1000000;
+        double accumulation_bid_increase = 5000000;
         double accumulation_price_increase = 0.01;
     };
    
@@ -1231,6 +1259,8 @@ private:
     const std::string TRIAL_END = "09:20:00";
     const std::string AUCTION_NEAR_END = "09:24:00";
     const std::string AUCTION_END = "09:25:00";
+    std::string last_summary_time_;
+    static int report_time;//报告输出次数
    
 public:
     AuctionAnalyzer(IExternalDataProvider* provider = new DefaultExternalProvider())
@@ -1278,10 +1308,10 @@ public:
         checkKeyTimepoints(data.timestamp);
     }
    
-    void cleanupOldData() {
+    void cleanAuctOldData() {
         std::lock_guard<std::mutex> lock(data_mutex_);
         long long current_time = TimeUtils::getCurrentTimestamp();
-        long long cutoff_time = current_time - 1800000; // 30min
+        long long cutoff_time = current_time - 30*60*1000; // 30min
         auto it = stock_auction_metrics_.begin();
         while (it != stock_auction_metrics_.end()) {
             if (it->second.last_analysis_time < cutoff_time) {
@@ -1297,7 +1327,9 @@ private:
         metrics.bid_amount_history.push_back(bid_amount);
         if (metrics.price_history.size() > StockAuctionMetrics::HISTORY_SIZE) {
             metrics.price_history.pop_front();
+            metrics.price_history.shrink_to_fit();
             metrics.bid_amount_history.pop_front();
+            metrics.price_history.shrink_to_fit();
         }
     }
    
@@ -1345,7 +1377,7 @@ private:
                 (data_points.back().bid_amount - data_points.front().bid_amount) >= thresholds_.accumulation_bid_increase &&
                 price_increase >= thresholds_.accumulation_price_increase) {
                 if (global_logger) {
-                    global_logger->warnWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|抢筹|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
+                    global_logger->infoWithTickTime("|抢筹|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
                 }
             }
         }
@@ -1370,7 +1402,7 @@ private:
                     metrics.auction_metrics.withdrawal_impact += withdrawal_value;
                     if (withdrawal_value > 500000) {
                         if (global_logger) {
-                            global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|撤单|" + stock_mapper_.getStockDisplayName(symbol) + " " + Logger::amountToWan(withdrawal_value) + "万", timestamp);
+                            global_logger->infoWithTickTime("|撤单|" + stock_mapper_.getStockDisplayName(symbol) + " " + Logger::amountToWan(withdrawal_value) + "万", timestamp);
                         }
                     }
                 }
@@ -1387,15 +1419,56 @@ private:
     }
    
     void analyzeAuctionVolatility(const std::string& symbol, StockAuctionMetrics& metrics, long long timestamp) {
-        double volatility_score = 0.0;
+        // 计算异动分数
+        double volatility_score = 0;
+        
+        // 累计涨跌幅异动
         if (std::abs(metrics.auction_metrics.cumulative_price_change) >= thresholds_.cumulative_price_change) {
             volatility_score += std::abs(metrics.auction_metrics.cumulative_price_change) * 300;
         }
-        // ... 其他计算 (参考原始)
+        
+        // 累计大单净流入异动
+        if (std::abs(metrics.auction_metrics.cumulative_net_flow) >= thresholds_.cumulative_net_flow) {
+            volatility_score += std::abs(metrics.auction_metrics.cumulative_net_flow) / 100000;
+        }
+        
+        // 价格异动
+        if (std::abs(metrics.auction_metrics.price_change) >= thresholds_.price_change) {
+            volatility_score += std::abs(metrics.auction_metrics.price_change) * 50;
+        }
+        
+        // 匹配量异动
+        if (metrics.auction_metrics.match_volume_ratio >= thresholds_.match_volume_ratio) {
+            volatility_score += metrics.auction_metrics.match_volume_ratio * 1;
+        }
+        
+        // 大单净流入异动
+        if (std::abs(metrics.auction_metrics.net_large_order_flow) >= thresholds_.net_large_order_flow) {
+            volatility_score += std::abs(metrics.auction_metrics.net_large_order_flow) / 100000;
+        }
+        
+        // 撤单影响
+        if (std::abs(metrics.auction_metrics.withdrawal_impact) >= thresholds_.net_large_order_flow) {
+            volatility_score += std::abs(metrics.auction_metrics.withdrawal_impact) / 100000;
+        }
+        
+        // 更新异动分数
+        metrics.volatility_score = volatility_score;
+        
+        // 确定异动级别
+        if (volatility_score >= 80) {
+            metrics.volatility_level = "high";
+        } else if (volatility_score >= 50) {
+            metrics.volatility_level = "medium";
+        } else if (volatility_score >= 30) {
+            metrics.volatility_level = "low";
+        } else {
+            metrics.volatility_level = "none";
+        }
         metrics.volatility_score = volatility_score;
         if (volatility_score > thresholds_.min_volatility_score) {
             if (global_logger) {
-                global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|异动|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
+                global_logger->infoWithTickTime("|异动|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
             }
         }
     }
@@ -1422,14 +1495,38 @@ private:
     }
    
     void checkKeyTimepoints(long long timestamp) {
-        std::string current_time = TimeUtils::formatTimestamp(timestamp).substr(11, 8);
+        std::string current_time = TimeUtils::formatTimestamp(timestamp).substr(11,8);
+        int cut=std::stoi(current_time.substr(3, 2)) * 60 + std::stoi(current_time.substr(6, 2));
+        
+        if (!last_summary_time_.empty() && 
+            std::abs(
+            (std::stoi(current_time.substr(3, 2)) * 60 + std::stoi(current_time.substr(6, 2))) -
+            (std::stoi(last_summary_time_.substr(3, 2)) * 60 + std::stoi(last_summary_time_.substr(6, 2))))< 10
+            ) {
+
+            return;
+        }
+
         if (current_time > "09:20:00" && current_time <= "09:20:09") {
+            report_time=report_time+1;
+            if(report_time<2000)  return;
+
             generateReport("9:20", timestamp); 
+            last_summary_time_ = current_time;
+            report_time=0;
         } else if (current_time >= "09:24:00" && current_time <= "09:24:09") {
+            report_time=report_time+1;
+            if(report_time<4000)  return;
             simulateOpen();
             generateReport("9:24", timestamp);
+            last_summary_time_ = current_time;
+            report_time=0;
         } else if (current_time >= "09:25:00" && current_time <= "09:25:09") {
+            report_time=report_time+1;
+            if(report_time<2000)  return;
             generateReport("9:25", timestamp);
+            last_summary_time_ = current_time;
+            report_time=0;
         }
     }
    
@@ -1475,7 +1572,7 @@ private:
         }
     }
 };
-
+int AuctionAnalyzer::report_time = 0;
 // ==================== 开盘异动检测器 ====================
 class VolatilityDetector : public IVolatilityDetector {
 private:
@@ -1484,9 +1581,12 @@ private:
     StockNameMapper& stock_mapper_;
     IExternalDataProvider* external_provider_;
     std::mutex data_mutex_;
+    std::unique_ptr<RedisClient> redis_; 
 public:
     VolatilityDetector(const Config& config, IExternalDataProvider* provider = new DefaultExternalProvider())
-        : config_(config), stock_mapper_(StockNameMapper::getInstance()), external_provider_(provider) {}
+        : config_(config), stock_mapper_(StockNameMapper::getInstance()), external_provider_(provider), 
+        redis_(std::make_unique<RedisClient>(config.redis_host, config.redis_port, config.redis_db)){
+        }
    
     ~VolatilityDetector() { delete external_provider_; }
    
@@ -1507,13 +1607,23 @@ public:
         
         // 其他异动
         if (data.inst_amt > 1000000 && stats.amount_5min > 10000000 && std::abs(stats.change_1min) > 0.01) {
+        //成交金额>100w 1分钟涨幅>1 5分钟涨幅>3 5分钟成交量>500w  量比>
+        // if (data.inst_amt>100*10000 && stats.amount_5min>1000*10000 && stats.change_1min>0.01)
+        // {
             is_volatile = true;
             reason = "Amount";
-            strength = std::abs(stats.change_1min * 100);
+            strength = int(std::abs(stats.change_1min * 100));
         }
-        
+        if (std::abs(change)>0.02 && stats.change_1min>0.01 &&std::abs(stats.change_5min)>0.03)
+        {
+            if (!is_volatile){//} || isSignificantChange(data.symbol, "price_change", price_change)) {
+                is_volatile = true;
+                reason = "Price";
+                strength = int((stats.change_5min+change)*50);
+            }
+        }
         if (is_volatile) {
-            logVolatility(data, reason, strength, stats, Logger::f2s(stats.change_1min * 100));
+            logVolatility(data, reason, strength, stats, Logger::f2s(change*100));
             storeToRedis(data, reason, strength, stats);
             // 板块聚合
             std::string sector = external_provider_->getSector(data.symbol);
@@ -1524,25 +1634,40 @@ public:
         return is_volatile;
     }
    
-    void cleanupOldData() override {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        long long current_time = TimeUtils::getCurrentTimestamp();
-        long long cutoff_time = current_time - 1800000; // 30min
-        auto it = stock_history_.begin();
-        while (it != stock_history_.end()) {
-            if (it->second.back().timestamp < cutoff_time) {
-                it = stock_history_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
+    // void cleanVolOldData() override {
+    //     std::lock_guard<std::mutex> lock(data_mutex_);
+    //     if (stock_history_.empty()) {
+    //         return;
+    //     }
+        
+    //     long long max_timestamp = 0;
+    //     for (const auto& pair : stock_history_) {
+    //         if (pair.second.back().timestamp > max_timestamp) {
+    //             max_timestamp = pair.second.back().timestamp;
+    //         }
+    //     }
+    //     long long cutoff_time = max_timestamp - 1 * 60 * 1000;
+    //     int count=0;
+    //     auto it = stock_history_.begin();
+    //     while (it != stock_history_.end()) {
+    //         if (it->second.back().timestamp < cutoff_time) {
+    //             count+=1;
+    //             it = stock_history_.erase(it);
+    //         } else {
+    //             ++it;
+    //         }
+    //     }
+    //      std::cout<<" cleanTickOldData "<<count<<std::endl;
+    // }
 private:
     void updateHistory(const StockData& data) {
         std::lock_guard<std::mutex> lock(data_mutex_);
         auto& history = stock_history_[data.symbol];
         history.push_back(SimpleTickData::fromStockData(data));
-        if (history.size() > config_.max_history_ticks) history.pop_front();
+        if (history.size() > config_.max_history_ticks) {
+            history.pop_front();
+            history.shrink_to_fit();
+        }
     }
    
     TimeWindowStats calculateTimeWindowStats(const StockData& data) {
@@ -1550,33 +1675,54 @@ private:
         std::lock_guard<std::mutex> lock(data_mutex_);
         auto it = stock_history_.find(data.symbol);
         if (it == stock_history_.end()) return stats;
-       
+    
         const auto& history = it->second;
         long long current_time = data.timestamp;
         long long time_1min_ago = current_time - config_.minute1_window_ms;
         long long time_5min_ago = current_time - config_.minute5_window_ms;
-       
-        auto find_tick = [&](long long target) -> const SimpleTickData* {
-            for (auto r_it = history.rbegin(); r_it != history.rend(); ++r_it) {
-                if (r_it->timestamp <= target) return &(*r_it);
+    
+        // 初始化
+        stats.large_net_1min = 0.0;
+        stats.large_net_5min = 0.0;
+        const SimpleTickData* tick_1min = nullptr;
+        const SimpleTickData* tick_5min = nullptr;
+        
+        // 单次遍历完成所有计算
+        for (auto r_it = history.rbegin(); r_it != history.rend(); ++r_it) {
+            const auto& tick = *r_it;
+            
+            // 如果在5分钟窗口内，累加大单净额到5分钟统计
+            if (tick.timestamp >= time_5min_ago) {
+                stats.large_net_5min += tick.large_net;
+                
+                // 如果在1分钟窗口内，累加大单净额到1分钟统计
+                if (tick.timestamp >= time_1min_ago) {
+                    stats.large_net_1min += tick.large_net;
+                }
+                
+                // 记录1分钟和5分钟边界点的tick
+                if (!tick_5min && tick.timestamp <= time_5min_ago) {
+                    tick_5min = &tick;
+                }
+                if (!tick_1min && tick.timestamp <= time_1min_ago) {
+                    tick_1min = &tick;
+                }
+            } else {
+                break; // 超过5分钟窗口，提前退出
             }
-            return nullptr;
-        };
-       
-        const SimpleTickData* tick_1min = find_tick(time_1min_ago);
+        }
+    
+        // 使用找到的边界点tick计算价格变化和成交额
         if (tick_1min) {
             stats.change_1min = (data.last_price - tick_1min->last_price) / tick_1min->last_price;
             stats.amount_1min = data.amount - tick_1min->amount;
-            stats.large_net_1min = data.large_net - tick_1min->large_net;
         }
-       
-        const SimpleTickData* tick_5min = find_tick(time_5min_ago);
+    
         if (tick_5min) {
             stats.change_5min = (data.last_price - tick_5min->last_price) / tick_5min->last_price;
             stats.amount_5min = data.amount - tick_5min->amount;
-            stats.large_net_5min = data.large_net - tick_5min->large_net;
         }
-       
+    
         return stats;
     }
     
@@ -1596,11 +1742,13 @@ private:
         return 0.0;
     }
     
-    void logVolatility(const StockData& data, std::string& reason, double strength, const TimeWindowStats& stats, const std::string& change_1min) {
+    void logVolatility(const StockData& data, std::string& reason, double strength, const TimeWindowStats& stats, const std::string& change) {
         std::ostringstream log_msg;
-        log_msg << "异动|" << reason << "|价格:" << Logger::f2s(data.last_price) << "|涨幅:" << Logger::f2s((data.last_price - data.close) / data.close * 100) << "%"
+        std::string display_name = stock_mapper_.getStockDisplayName(data.symbol);
+        log_msg << "异动|" << display_name <<"|"<<reason<< "|价格:" << Logger::f2s(data.last_price) 
+                << "|" << change << "%"
                 << "|瞬时:" << Logger::amountToWan(data.inst_amt) << "万"
-                << "|1分速:" << change_1min << "%"
+                << "|1分速:" << Logger::f2s(stats.change_1min*100) << "%"
                 << "|1分净额:" << Logger::amountToWan(stats.amount_1min) << "万"
                 << "|5分净额:" << Logger::amountToWan(stats.large_net_5min) << "万"
                 << "|5分金额:" << Logger::amountToWan(stats.amount_5min) << "万"
@@ -1630,6 +1778,9 @@ public:
         : tick_engine_(te), auction_analyzer_(aa), volatility_detector_(vd) {}
    
     void dispatch(StockData& data) {
+        //过滤
+        if (data.close <= 0 || (data.last_price > 700 && (data.symbol !="600519" || data.symbol != "688256"))) return;
+        if (data.ask_volumes[0] == 0 && data.bid_volumes[0] == 0) return;
         // 统一计算指标
         double change = (data.close > 0) ? std::round((data.last_price - data.close) / data.close * 10000) / 10000.0 : 0.0;
         double bid_amount = (data.bid_volumes[0] + data.bid_volumes[1]) * data.last_price * 100;
@@ -1664,20 +1815,41 @@ private:
     }
    
     bool declareQueue() {
-        amqp_queue_declare(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                          0, 1, 0, 0, amqp_empty_table);
-        amqp_rpc_reply_t reply = amqp_get_rpc_reply(conn_);
-        checkAmqpError(reply, "Declare queue");
-        return true;
+        try {
+            // 首先尝试被动声明，检查队列是否存在
+            amqp_queue_declare_ok_t* passive_declare = amqp_queue_declare(
+                conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                1, 0, 0, 0, amqp_empty_table
+            );
+            
+            amqp_rpc_reply_t passive_reply = amqp_get_rpc_reply(conn_);
+            if (passive_reply.reply_type == AMQP_RESPONSE_NORMAL) {
+                std::cout << "队列已存在，使用现有队列" << std::endl;
+            }
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "队列声明失败: " << e.what() << std::endl;
+            return false;
+        }
     }
    
     bool startConsumer() {
-        amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
-                          amqp_empty_bytes, 0, 0, 1, amqp_empty_table);
-        amqp_rpc_reply_t reply = amqp_get_rpc_reply(conn_);
-        checkAmqpError(reply, "Start consumer");
-        consumer_started_ = true;
-        return true;
+        try {
+            if (consumer_started_) {
+                    return true;
+            }
+            // 设置预取数量为1，一次只消费一条消息
+            amqp_basic_qos(conn_, 1, 0, 1, 0);
+            amqp_basic_consume(conn_, 1, amqp_cstring_bytes(config_.queue_name.c_str()),
+                            amqp_empty_bytes, 0, 0, 1, amqp_empty_table);
+            amqp_rpc_reply_t reply = amqp_get_rpc_reply(conn_);
+            checkAmqpError(reply, "Start consumer");
+            consumer_started_ = true;
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "启动消费者失败: " << e.what() << std::endl;
+            return false;
+        }
     }
    
 public:
@@ -1688,10 +1860,28 @@ public:
     }
    
     bool connect() override {
+        if (conn_) {
+            return true;
+        }
         conn_ = amqp_new_connection();
+        if (!conn_) {
+            std::cerr << "Failed to create RabbitMQ connection" << std::endl;
+            return false;
+        }
         amqp_socket_t* socket = amqp_tcp_socket_new(conn_);
+        if (!socket) {
+            std::cerr << "Failed to create RabbitMQ socket" << std::endl;
+            amqp_destroy_connection(conn_);
+            conn_ = nullptr;
+            return false;
+        }
         int status = amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port);
-        if (status != AMQP_STATUS_OK) return false;
+         if (status != AMQP_STATUS_OK) {
+            std::cerr << "Failed to open RabbitMQ socket: " << amqp_error_string2(status) << std::endl;
+            amqp_destroy_connection(conn_);
+            conn_ = nullptr;
+            return false;
+        }
         amqp_rpc_reply_t login_reply = amqp_login(conn_, config_.rabbitmq_vhost.c_str(),
                                                 0, 131072, 0, AMQP_SASL_METHOD_PLAIN,
                                                 config_.rabbitmq_user.c_str(), config_.rabbitmq_password.c_str());
@@ -1699,7 +1889,10 @@ public:
         amqp_channel_open(conn_, 1);
         amqp_rpc_reply_t channel_reply = amqp_get_rpc_reply(conn_);
         checkAmqpError(channel_reply, "Open channel");
-        declareQueue();
+        // 声明并检查队列
+        if (!declareQueue()) {
+            return false;
+        }
         startConsumer();
         return true;
     }
@@ -1712,17 +1905,33 @@ public:
         }
     }
    
-    bool consumeMessages(std::vector<PendingMessage>& messages, int count) override {
-        messages.clear();
+     bool consumeMessages(std::vector<PendingMessage>& messages, int count) override {
+        if (!conn_ && !connect()) {
+            std::cerr << "Failed to connect to RabbitMQ" << std::endl;
+            return false;
+        }
+        
+        // 单条消息消费，不需要向量操作
+        // messages.clear();
+        
         amqp_envelope_t envelope;
-        struct timeval timeout = {1, 0};
+        struct timeval timeout = {1, 0}; // 100ms timeout
         amqp_rpc_reply_t ret = amqp_consume_message(conn_, &envelope, &timeout, 0);
+        
         if (ret.reply_type == AMQP_RESPONSE_NORMAL) {
-            std::vector<char> body(envelope.message.body.bytes, (char*)envelope.message.body.bytes + envelope.message.body.len);
-            messages.emplace_back(std::move(body), envelope.delivery_tag);
+            // 直接构造，避免不必要的拷贝
+            messages.emplace_back(
+                std::vector<char>(
+                    static_cast<char*>(envelope.message.body.bytes),
+                    static_cast<char*>(envelope.message.body.bytes) + envelope.message.body.len
+                ),
+                envelope.delivery_tag
+            );
             amqp_destroy_envelope(&envelope);
+            amqp_maybe_release_buffers_on_channel(conn_, 1);
             return true;
         }
+        
         return false;
     }
    
@@ -1756,6 +1965,7 @@ private:
     std::unique_ptr<RedisClient> redis_;
     StockNameMapper& stock_mapper_;
    
+    // 服务器时间延迟统计
     std::atomic<long long> max_server_timestamp_{0};
     std::atomic<long long> total_delay_{0};
     std::atomic<int> delay_count_{0};
@@ -1801,13 +2011,23 @@ public:
        
         auto last_cleanup = std::chrono::steady_clock::now();
         auto last_report = std::chrono::steady_clock::now();
-       
+         // 预分配向量，减少重复分配
+        std::vector<PendingMessage> messages;
+        std::vector<StockData> all_records;
+        std::vector<PendingMessage> valid_messages;
+        
+        // 预留合理容量
+        messages.reserve(config_.messages_per_batch);
+        valid_messages.reserve(config_.messages_per_batch);
         while (running_) {
             if (config_.enable_rate_limiting) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing_delay_ms));
             }
-           
-            std::vector<PendingMessage> messages;
+            // 清空向量但保留容量
+            messages.clear();
+            all_records.clear();
+            valid_messages.clear();
+
             bool has_messages = consumer_->consumeMessages(messages, config_.messages_per_batch);
            
             if (!has_messages) {
@@ -1818,21 +2038,35 @@ public:
            
             empty_cycles = 0;
            
-            std::vector<StockData> all_records;
-            std::vector<PendingMessage> valid_messages;
-           
             for (auto& message : messages) {
                 std::vector<StockData> records;
                 if (message_processor_->processMessage(message.data, records)) {
-                    for (auto& record : records) {
+                    // 更精确的reserve
+                    size_t needed = all_records.size() + records.size();
+                    if (all_records.capacity() < needed) {
+                        all_records.reserve(needed);
+                    }
+                    if(records.size())
+                        // 取第一个更新服务器时间戳
+                        updateServerTimestamp(records[0].timestamp);
+                    for (StockData& record : records) {
                         phase_dispatcher_->dispatch(record);
                     }
-                    all_records.insert(all_records.end(), std::make_move_iterator(records.begin()), std::make_move_iterator(records.end()));
+                    // 使用移动语义
+                    all_records.insert(all_records.end(),
+                                    std::make_move_iterator(records.begin()),
+                                    std::make_move_iterator(records.end()));
                     valid_messages.push_back(std::move(message));
+                    records.clear();
                 } else {
+                    // 处理失败，拒绝消息并重新入队
                     failed_messages++;
                     consumer_->rejectMessage(message.delivery_tag, true);
+                    // 手动释放消息数据
+                    message.data.clear();
+                    message.data.shrink_to_fit();
                 }
+                
             }
            
             if (!all_records.empty()) {
@@ -1863,20 +2097,25 @@ public:
            
             auto now = std::chrono::steady_clock::now();
            
-            if (std::chrono::duration_cast<std::chrono::minutes>(now - last_cleanup).count() >= 5) {
-                cleanupOldData();
-                last_cleanup = now;
-            }
-           
+
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= config_.report_time) {
+                long long current_delay = getServerDelay();
                 logger_->warn("处理: " + std::to_string(total_messages) + " 条消息, " +
                              std::to_string(total_records) + " 条记录, " +
-                             std::to_string(failed_messages) + " 条失败");
+                             std::to_string(failed_messages) + " 条失败"+
+                             std::to_string(total_messages/config_.report_time) + " msg/s, " +
+                            //  "延迟: " + (int(current_delay*0.001)>60*60*12?"historical":std::to_string(int(current_delay*0.001))) + "s");
+                             "延迟: " + std::to_string(int(current_delay*0.001)) + "s");
                 last_report = now;
                 total_messages = 0;
                 total_records = 0;
                 failed_messages = 0;
+                // last_cleanup = now;
+                //重置延时器
+                resetDelayStats();
+                // exit(0);
             }
+           
         }
        
         logger_->info("Processor stopped");
@@ -1891,10 +2130,25 @@ public:
     }
    
 private:
-    void cleanupOldData() {
-        tick_engine_->cleanupOldData(TimeUtils::getCurrentTimestamp());
-        auction_analyzer_->cleanupOldData();
-        volatility_detector_->cleanupOldData();
+
+     void updateServerTimestamp(long long timestamp) {
+        long long current_max = max_server_timestamp_.load();
+        if (timestamp > current_max) {
+            max_server_timestamp_.store(timestamp);
+            long long current_time = TimeUtils::getCurrentTimestamp();
+            long long delay = current_time - timestamp;
+            total_delay_.fetch_add(delay);
+            delay_count_.fetch_add(1);
+        }
+    }
+    long long getServerDelay() const {
+        long long current_time = TimeUtils::getCurrentTimestamp();
+        long long max_server_time = max_server_timestamp_.load();
+        return (max_server_time > 0) ? current_time - max_server_time : 0;
+    }
+    void resetDelayStats() {
+        total_delay_.store(0);
+        delay_count_.store(0);
     }
 };
 
