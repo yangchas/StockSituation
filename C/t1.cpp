@@ -72,7 +72,7 @@ struct Config {
     bool verbose = true;
     // int max_pending_messages = 50; // 最大待处理消息数
     // 串行处理相关配置
-    int processing_delay_ms = 2; // 每条消息处理后的延迟
+    int processing_delay_ms = 100; // 每条消息处理后的延迟
     bool enable_rate_limiting = true; // 启用速率限制
     int report_time = 10; //10s 报告输出间隔
    
@@ -284,7 +284,7 @@ public:
 class IVolatilityDetector {
 public:
     virtual ~IVolatilityDetector() = default;
-    virtual bool detectVolatility(const StockData& data, double change, double bid_amount) = 0; // 优化: 传入统一计算的指标
+    virtual bool detectVolatility(const StockData& data, double change, double bid_amount,double ask_amount) = 0; // 优化: 传入统一计算的指标
     // virtual void cleanVolOldData() = 0;
 };
 
@@ -340,7 +340,7 @@ public:
         return oss.str();
     }
     static bool isAuctionTime(const std::string& time_str) {
-        return time_str >= "09:15:00" && time_str <= "09:25:00";
+        return time_str >= "09:15:00" && time_str <= "09:26:00";
     }
    
     static bool isTrialPeriod(const std::string& time_str) {
@@ -820,6 +820,9 @@ private:
         } else {
             current_tick.large_net = 0;
         }
+//         |德明利(001309)|Top|封单:3516|价格:247.14|10%|瞬时:13624万|1分速:0%|1分净额:15300万|5分净额:-15574万|5分金额:16306万|强度:10
+// 13:09:24[WARN]异动|德明利(001309)|Top|封单:711|价格:247.14|10%|瞬时:2791万|1分速:0%|1分净额:18060万|5分净额:-18366万|5分金额:19093万|强度:10
+
     }
 };
 
@@ -1278,7 +1281,7 @@ public:
         return time_str >= "09:15:00" && time_str < "09:20:00";
     }
    
-    void processTickData(const StockData& data, double change, double bid_amount) {
+    void processTickData(const StockData& data, double change, double bid_amount,double ask_amount) {
         std::lock_guard<std::mutex> lock(data_mutex_);
         const std::string& symbol = data.symbol;
        
@@ -1288,7 +1291,7 @@ public:
         updateHistoryData(metrics, data.last_price, bid_amount);
        
         // 更新指标 (复用change)
-        updateAuctionMetrics(metrics, data, change, bid_amount);
+        updateAuctionMetrics(metrics, data, change, bid_amount,ask_amount);
        
         std::string current_time = TimeUtils::formatTimestamp(data.timestamp).substr(11, 8);
         if (current_time >= "09:20:00") {
@@ -1297,7 +1300,7 @@ public:
        
         analyzeOrderFlow(symbol, data, metrics, data.timestamp, change, bid_amount);
        
-        if (data.timestamp - metrics.last_analysis_time > 1000) {
+        if (data.timestamp - metrics.last_analysis_time > 3000) {
             analyzeAuctionVolatility(symbol, metrics, data.timestamp);
             metrics.last_analysis_time = data.timestamp;
         }
@@ -1333,10 +1336,10 @@ private:
         }
     }
    
-    void updateAuctionMetrics(StockAuctionMetrics& metrics, const StockData& data, double change, double bid_amount) {
+    void updateAuctionMetrics(StockAuctionMetrics& metrics, const StockData& data, double change, double bid_amount,double ask_amount) {
         metrics.auction_metrics.price_change = change;
         metrics.auction_metrics.bid_amount = bid_amount;
-        metrics.auction_metrics.ask_amount = (data.ask_volumes[0] + data.ask_volumes[1]) * data.last_price * 100;
+        metrics.auction_metrics.ask_amount =ask_amount;
         double limit_up_price = std::round(data.close * 1.1 * 100) / 100.0;
         double limit_down_price = std::round(data.close * 0.9 * 100) / 100.0;
         std::string symbol_prefix = data.symbol.substr(0, 2);
@@ -1429,7 +1432,7 @@ private:
         
         // 累计大单净流入异动
         if (std::abs(metrics.auction_metrics.cumulative_net_flow) >= thresholds_.cumulative_net_flow) {
-            volatility_score += std::abs(metrics.auction_metrics.cumulative_net_flow) / 100000;
+            volatility_score += std::abs(metrics.auction_metrics.cumulative_net_flow) / 1000000;
         }
         
         // 价格异动
@@ -1444,33 +1447,33 @@ private:
         
         // 大单净流入异动
         if (std::abs(metrics.auction_metrics.net_large_order_flow) >= thresholds_.net_large_order_flow) {
-            volatility_score += std::abs(metrics.auction_metrics.net_large_order_flow) / 100000;
+            volatility_score += std::abs(metrics.auction_metrics.net_large_order_flow) / 1000000;
         }
         
         // 撤单影响
         if (std::abs(metrics.auction_metrics.withdrawal_impact) >= thresholds_.net_large_order_flow) {
-            volatility_score += std::abs(metrics.auction_metrics.withdrawal_impact) / 100000;
+            volatility_score += std::abs(metrics.auction_metrics.withdrawal_impact) / 1000000;
         }
         
         // 更新异动分数
         metrics.volatility_score = volatility_score;
         
         // 确定异动级别
-        if (volatility_score >= 80) {
+        if (volatility_score >= 5000) {
             metrics.volatility_level = "high";
-        } else if (volatility_score >= 50) {
+        } else if (volatility_score >= 3000) {
             metrics.volatility_level = "medium";
-        } else if (volatility_score >= 30) {
+        } else if (volatility_score >= 1000) {
             metrics.volatility_level = "low";
         } else {
             metrics.volatility_level = "none";
         }
         metrics.volatility_score = volatility_score;
-        if (volatility_score > thresholds_.min_volatility_score) {
-            if (global_logger) {
-                global_logger->infoWithTickTime("|异动|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
-            }
-        }
+        // if (volatility_score > thresholds_.min_volatility_score) {
+        //     if (global_logger) {
+        //         global_logger->infoWithTickTime("|异动|" + stock_mapper_.getStockDisplayName(symbol), timestamp);
+        //     }
+        // }
     }
    
     void updateMarketReport(const std::string& symbol, const StockAuctionMetrics& metrics) {
@@ -1590,7 +1593,7 @@ public:
    
     ~VolatilityDetector() { delete external_provider_; }
    
-    bool detectVolatility(const StockData& data, double change, double bid_amount) override {
+    bool detectVolatility(const StockData& data, double change, double bid_amount,double ask_amount) override {
         updateHistory(data);
         TimeWindowStats stats = calculateTimeWindowStats(data);
         bool is_volatile = false;
@@ -1598,7 +1601,7 @@ public:
         double strength = 0.0;
         
         // 涨跌停
-        double limit = checkLimit(data, bid_amount);
+        double limit = checkLimit(data, bid_amount,ask_amount);
         if (limit > 0 && data.inst_amt > 3000000) {
             is_volatile = true;
             reason = (change > 0) ? "Top|封单:" + Logger::amountToWan(limit) : "Low|封单:" + Logger::amountToWan(limit);
@@ -1606,7 +1609,7 @@ public:
         }
         
         // 其他异动
-        if (data.inst_amt > 1000000 && stats.amount_5min > 10000000 && std::abs(stats.change_1min) > 0.01) {
+        if (data.inst_amt > 2000000 && stats.amount_5min > 10000000 && std::abs(stats.change_1min) > 0.02) {
         //成交金额>100w 1分钟涨幅>1 5分钟涨幅>3 5分钟成交量>500w  量比>
         // if (data.inst_amt>100*10000 && stats.amount_5min>1000*10000 && stats.change_1min>0.01)
         // {
@@ -1624,7 +1627,7 @@ public:
         }
         if (is_volatile) {
             logVolatility(data, reason, strength, stats, Logger::f2s(change*100));
-            storeToRedis(data, reason, strength, stats);
+            storeToRedis(data, reason, strength, stats, Logger::f2s(change*100));
             // 板块聚合
             std::string sector = external_provider_->getSector(data.symbol);
             if (!sector.empty()) {
@@ -1726,7 +1729,7 @@ private:
         return stats;
     }
     
-    double checkLimit(const StockData& data, double bid_amount) {
+    double checkLimit(const StockData& data, double bid_amount,double ask_amount) {
         double limit_up_price = std::round(data.close * 1.1 * 100) / 100.0;
         double limit_down_price = std::round(data.close * 0.9 * 100) / 100.0;
         std::string symbol_prefix = data.symbol.substr(0, 2);
@@ -1734,10 +1737,10 @@ private:
             limit_up_price = std::round(data.close * 1.2 * 100) / 100.0;
             limit_down_price = std::round(data.close * 0.8 * 100) / 100.0;
         }
-        if (std::abs(data.last_price - limit_up_price) < 0.01) {
+        if (std::abs(data.last_price - limit_up_price) < 0.01 &&ask_amount<1) {
             return bid_amount;
-        } else if (std::abs(data.last_price - limit_down_price) < 0.01) {
-            return -bid_amount; // 简例
+        } else if (std::abs(data.last_price - limit_down_price) < 0.01 &&bid_amount<0) {
+            return ask_amount; // 简例
         }
         return 0.0;
     }
@@ -1757,10 +1760,10 @@ private:
         global_logger->warnWithTickTime(log_msg.str(), data.timestamp);
     }
     
-    void storeToRedis(const StockData& data, const std::string& reason, double strength, const TimeWindowStats& stats) {
+    void storeToRedis(const StockData& data, const std::string& reason, double strength, const TimeWindowStats& stats, const std::string& change) {
         std::ostringstream json;
-        json << "{\"symbol\":\"" << data.symbol << "\",\"timestamp\":" << data.timestamp << ",\"price\":" << Logger::f2s(data.last_price) << ","
-             << "\"reason\":\"" << reason << "\",\"strength\":" << strength << ","
+        json << "{\"symbol\":\"" << data.symbol << "\",\"timestamp\":" << data.timestamp << ",\"name\":\"" <<  stock_mapper_.getStockDisplayName(data.symbol) << "\",\"price\":" << Logger::f2s(data.last_price) << ","
+             << "\"reason\":\"" << reason << "\",\"strength\":" << strength << ",\"change\":\"" << change<< "\",\"amount\":\"" << data.inst_amt<< "\","
              << "\"large_net_5min\":" << Logger::f2s(stats.large_net_5min) << ",\"change_5min\":" << Logger::f2s(stats.change_5min) << ",\"amount_5min\":" << Logger::f2s(stats.amount_5min) << "}";
         redis_->zadd(config_.volatile_pool_key, data.timestamp, json.str());
         redis_->expire(config_.volatile_pool_key, config_.volatile_expire);
@@ -1792,9 +1795,9 @@ public:
         tick_engine_->processTickData(data, is_auction);
         
         if (is_auction) {
-            auction_analyzer_->processTickData(data, change, bid_amount);
+            auction_analyzer_->processTickData(data, change, bid_amount, ask_amount);
         } else if (TimeUtils::isTradeTime(time_str)) {
-            volatility_detector_->detectVolatility(data, change, bid_amount);
+            volatility_detector_->detectVolatility(data, change, bid_amount, ask_amount);
         }
     }
 };
