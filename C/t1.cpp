@@ -62,6 +62,9 @@ struct Config {
     double price_change_threshold = 0.02;
     double volume_ratio_threshold = 3.0;
     double min_amount_threshold = 1000000;
+    
+    // 异动提醒阈值配置
+    int volatility_threshold_ms = 10000; // 10秒内不重复提醒
    
     std::string tdengine_host = "chaos";
     int tdengine_port = 6030;
@@ -593,7 +596,7 @@ public:
         };
         return HttpRequest::get("https://apphwhq.longhuvip.com/w1/api/index.php", params);
     }
-
+    // 获取历史DDE
     // 获取其他指标的方法可以在这里添加
     // std::string getOtherIndicator(const std::string& stock_id) { ... }
 };
@@ -804,7 +807,7 @@ public:
         : large_order_threshold_(threshold), config_(config)  {}
    
     void processTickData(StockData& current_tick, bool is_auction_period) {
-        std::lock_guard<std::mutex> lock(state_mutex_);
+        // std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = stock_states_[current_tick.symbol];
        
         if (!state.history.empty()) {
@@ -1370,8 +1373,8 @@ public:
         return time_str >= "09:15:00" && time_str < "09:20:00";
     }
     
-    void processTickData(const StockData& data, double change, double bid_amount, double ask_amount) {
-        std::lock_guard<std::mutex> lock(data_mutex_);
+    void processAuctionData(const StockData& data, double change, double bid_amount, double ask_amount) {
+        // std::lock_guard<std::mutex> lock(data_mutex_);
         const std::string& symbol = data.symbol;
         
         StockAuctionMetrics& metrics = stock_auction_metrics_[symbol];
@@ -1650,7 +1653,7 @@ private:
                 global_logger->warnWithTickTime(stock_mapper_.getStockDisplayName(data.symbol) 
                      + " 已涨停，涨停价: " + Logger::f2s(limit_up_price) 
                      + "，委买金额: " + Logger::amountToWan(bid_amount) + "万元"
-                     + "，已成交:" + Logger::amountToWan(metrics.auction_volume) + "万元",
+                     + "，已匹配:" + Logger::amountToWan(metrics.auction_volume) + "万元",
                      data.timestamp);
             }
         }
@@ -1736,7 +1739,7 @@ private:
                          + stock_mapper_.getStockDisplayName(symbol) + " 出现抢筹模式: "
                          + "委买增加 " + Logger::amountToWan(bid_amounts.back() - bid_amounts.front()) + "万, "
                          + "价格上涨 " + Logger::f2s(price_increase * 100) + "%"
-                         + "，已成交:" + Logger::amountToWan(metrics.auction_volume) + "万元",
+                         + "，已匹配:" + Logger::amountToWan(bid_amount) + "万元",
                          timestamp);
                 }
             }
@@ -2158,6 +2161,8 @@ private:
     IExternalDataProvider* external_provider_;
     std::mutex data_mutex_;
     std::unique_ptr<RedisClient> redis_; 
+        // 存储股票最后异动时间的内存变量
+    std::unordered_map<std::string, long long> last_volatility_time_;
 public:
     VolatilityDetector(const Config& config, IExternalDataProvider* provider = new DefaultExternalProvider())
         : config_(config), stock_mapper_(StockNameMapper::getInstance()), external_provider_(provider), 
@@ -2166,6 +2171,19 @@ public:
    
     ~VolatilityDetector() { delete external_provider_; }
    
+    bool checkLastVolatilityTime(const std::string& symbol, long long current_time, int threshold_ms = 10000) {
+        // 检查股票最近指定时间内是否已经提醒过
+        auto it = last_volatility_time_.find(symbol);
+        
+        // 如果没有记录或已经超过阈值时间，则允许提醒
+        if (it == last_volatility_time_.end() || (current_time - it->second) > static_cast<long long>(threshold_ms)) {
+            // 更新最后提醒时间
+            last_volatility_time_[symbol] = current_time;
+            return true;
+        }
+        return false;
+    }
+    
     bool detectVolatility(const StockData& data, double change, double bid_amount,double ask_amount) override {
         updateHistory(data);
         TimeWindowStats stats = calculateTimeWindowStats(data);
@@ -2199,42 +2217,25 @@ public:
             }
         }
         if (is_volatile) {
-            logVolatility(data, reason, strength, stats, Logger::f2s(change*100));
-            storeToRedis(data, reason, strength, stats, Logger::f2s(change*100));
-            // 板块聚合
-            std::string sector = external_provider_->getSector(data.symbol);
-            if (!sector.empty()) {
-                // 聚合逻辑
+            // 检查是否在指定时间内已经提醒过该股票的异动
+            if (checkLastVolatilityTime(data.symbol, data.timestamp, config_.volatility_threshold_ms)) {
+                // 30秒内未提醒过，进行记录和存储
+                logVolatility(data, reason, strength, stats, Logger::f2s(change*100));
+                storeToRedis(data, reason, strength, stats, Logger::f2s(change*100));
+                // 板块聚合
+                std::string sector = external_provider_->getSector(data.symbol);
+                if (!sector.empty()) {
+                    // 聚合逻辑
+                }
             }
+            //  else {
+            //     // 30秒内已提醒过，跳过重复提醒
+            //     global_logger->info("跳过" + data.symbol + "的重复异动提醒，30秒内已提醒过");
+            // }
         }
         return is_volatile;
     }
-   
-    // void cleanVolOldData() override {
-    //     std::lock_guard<std::mutex> lock(data_mutex_);
-    //     if (stock_history_.empty()) {
-    //         return;
-    //     }
-        
-    //     long long max_timestamp = 0;
-    //     for (const auto& pair : stock_history_) {
-    //         if (pair.second.back().timestamp > max_timestamp) {
-    //             max_timestamp = pair.second.back().timestamp;
-    //         }
-    //     }
-    //     long long cutoff_time = max_timestamp - 1 * 60 * 1000;
-    //     int count=0;
-    //     auto it = stock_history_.begin();
-    //     while (it != stock_history_.end()) {
-    //         if (it->second.back().timestamp < cutoff_time) {
-    //             count+=1;
-    //             it = stock_history_.erase(it);
-    //         } else {
-    //             ++it;
-    //         }
-    //     }
-    //      std::cout<<" cleanTickOldData "<<count<<std::endl;
-    // }
+
 private:
     void updateHistory(const StockData& data) {
         // std::lock_guard<std::mutex> lock(data_mutex_);
@@ -2376,7 +2377,7 @@ public:
         tick_engine_->processTickData(data, is_auction);
         
         if (is_auction) {
-            auction_analyzer_->processTickData(data, change, bid_amount, ask_amount);
+            auction_analyzer_->processAuctionData(data, change, bid_amount, ask_amount);
         } else if (TimeUtils::isTradeTime(time_str)) {
             volatility_detector_->detectVolatility(data, change, bid_amount, ask_amount);
         }
