@@ -809,16 +809,17 @@ public:
     void processTickData(StockData& current_tick, bool is_auction_period) {
         // std::lock_guard<std::mutex> lock(state_mutex_);
         auto& state = stock_states_[current_tick.symbol];
-       
+        
         if (!state.history.empty()) {
             const auto& prev_tick = state.history.back();
             current_tick.inst_vol = current_tick.volume - prev_tick.volume;
             current_tick.inst_amt = current_tick.amount - prev_tick.amount;
-            // 大单计算分阶段
-            if (is_auction_period) {
-                calculateAuctionLargeOrder(current_tick, state);
-            } else {
+            // 竞价阶段不进行大单计算，完全由AuctionAnalyzer处理
+            if (!is_auction_period) {
                 calculateTradeLargeOrder(current_tick, state);
+            } else {
+                // 竞价阶段设为0，避免重复计算
+                current_tick.large_net = 0;
             }
         } else {
             current_tick.inst_vol = 0;
@@ -1759,11 +1760,11 @@ private:
         
         bool is_trial_period = isTrialPeriod(timestamp);
         
-        if (is_trial_period) {
-            analyzeWithdrawals(symbol, curr_data, prev_data, metrics, timestamp);
-        } else {
+        // if (is_trial_period) {
+        //     analyzeWithdrawals(symbol, curr_data, prev_data, metrics, timestamp);
+        // } else {
             analyzeLargeOrders(symbol, curr_data, prev_data, metrics, timestamp);
-        }
+        // }
         
         // 更新前一个tick数据
         prev_data = SimpleTickData::fromStockData(curr_data);
@@ -1784,8 +1785,7 @@ private:
                     // 只记录高级别撤单
                     if (withdrawal_value > 500000) {
                         if (global_logger) {
-                            global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_.getStockDisplayName(symbol) 
+                            global_logger->infoWithTickTime(stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + Logger::f2s(metrics.auction_metrics.price_change * 100) + "% "
                                      + "卖单撤单: " + Logger::f2s(std::abs(delta_av1)) + "股, "
                                      + "价格: " + Logger::f2s(curr_data.ask_prices[0]) + ", "
@@ -1808,8 +1808,7 @@ private:
                     // 只记录高级别撤单
                     if (withdrawal_value > 500000) {
                         if (global_logger) {
-                            global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_.getStockDisplayName(symbol) 
+                            global_logger->infoWithTickTime(stock_mapper_.getStockDisplayName(symbol) 
                                      + " 涨幅：" + Logger::f2s(metrics.auction_metrics.price_change * 100) + "% "
                                      + "买单撤单: " + Logger::f2s(std::abs(delta_bv1)) + "股, "
                                      + "价格: " + Logger::f2s(curr_data.bid_prices[0]) + ", "
@@ -1824,61 +1823,131 @@ private:
     void analyzeLargeOrders(const std::string& symbol, const StockData& curr_data,
                           const SimpleTickData& prev_data, StockAuctionMetrics& metrics,
                           long long timestamp) {
-        // 计算匹配量变化
-        double delta_av1 = curr_data.ask_volumes[0] - (prev_data.volume / curr_data.ask_prices[0] / 100);
-        double delta_bv1 = curr_data.bid_volumes[0] - (prev_data.volume / curr_data.bid_prices[0] / 100);
+        // 判断是否为竞价阶段的试盘期（20分前）
+        bool is_trial_period = isTrialPeriod(timestamp);
         
-        // 检查卖单大单：匹配量增加且价格下降
-        if (delta_av1 > 0) {
-            double threshold = getLargeOrderThreshold(curr_data.ask_prices[0]);
-            if (delta_av1 >= threshold) {
-                // 判断价格变化
-                double price_change = curr_data.ask_prices[0] - prev_data.last_price;
-                if (price_change < 0) {  // 价格下降，卖单大单
-                    double order_value = delta_av1 * curr_data.ask_prices[0] * 100;
-                    metrics.auction_metrics.net_large_order_flow -= order_value;
-                    metrics.auction_metrics.cumulative_net_flow -= order_value;
-                    
-                    // 只记录高级别大单
-                    if (order_value > 5000000) {
-                        if (global_logger) {
-                            global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|大单|"
-                                     + stock_mapper_.getStockDisplayName(symbol) 
-                                     + " 涨幅：" + Logger::f2s(metrics.auction_metrics.price_change * 100) + "% "
-                                     + "卖单大单: " + Logger::f2s(delta_av1) + "股, "
-                                     + "价格: " + Logger::f2s(curr_data.ask_prices[0]) + ", "
-                                     + "金额: " + Logger::amountToWan(order_value) + "万元", timestamp);
-                        }
-                    }
-                }
+        // 检查是否为涨停或跌停状态
+        double price_change_rate = metrics.auction_metrics.price_change;
+        bool is_limit_up = price_change_rate >= 0.1 && fabs(price_change_rate - 0.1) < 0.0001;
+        bool is_limit_down = price_change_rate <= -0.1 && fabs(price_change_rate + 0.1) < 0.0001;
+        metrics.auction_metrics.is_limit_up = is_limit_up;
+        metrics.auction_metrics.is_limit_down = is_limit_down;
+        
+        // 计算当前总挂单量
+        double current_total_bid = curr_data.bid_volumes[0] + curr_data.bid_volumes[1];
+        double current_total_ask = curr_data.ask_volumes[0] + curr_data.ask_volumes[1];
+        
+        // 计算匹配量
+        double match_volume = std::min(curr_data.bid_volumes[0], curr_data.ask_volumes[0]);
+        
+        // 计算未匹配量
+        double unmatched_bid = current_total_bid - match_volume;
+        double unmatched_ask = current_total_ask - match_volume;
+        
+        // 计算价格变化
+        double price_change = curr_data.bid_prices[0] - prev_data.last_price;
+        
+        // 大单阈值
+        double threshold = getLargeOrderThreshold(curr_data.bid_prices[0]);
+        
+        // 处理涨停特殊情况
+        if (is_limit_up) {
+            // 涨停时，买单增加或卖单减少都视为买盘强势
+            if (unmatched_bid > threshold) {
+                double order_value = unmatched_bid * curr_data.bid_prices[0] * 100;
+                metrics.auction_metrics.net_large_order_flow = order_value;
+                metrics.auction_metrics.cumulative_net_flow += order_value;
             }
+            return;
         }
         
-        // 检查买单大单：匹配量增加且价格上升或不变
-        if (delta_bv1 > 0) {
-            double threshold = getLargeOrderThreshold(curr_data.bid_prices[0]);
-            if (delta_bv1 >= threshold) {
-                // 判断价格变化
-                double price_change = curr_data.ask_prices[0] - prev_data.last_price;
-                if (price_change >= 0) {  // 价格上升或不变，买单大单
-                    double order_value = delta_bv1 * curr_data.bid_prices[0] * 100;
-                    metrics.auction_metrics.net_large_order_flow += order_value;
+        // 处理跌停特殊情况
+        if (is_limit_down) {
+            // 跌停时，卖单增加或买单减少都视为卖盘强势
+            if (unmatched_ask > threshold) {
+                double order_value = unmatched_ask * curr_data.bid_prices[0] * 100;
+                metrics.auction_metrics.net_large_order_flow = -order_value;
+                metrics.auction_metrics.cumulative_net_flow -= order_value;
+            }
+            return;
+        }
+        
+        // 试盘期（20分前）分析逻辑
+        if (is_trial_period) {
+            // 20分前可以撤单，需要考虑撤单影响
+            if (price_change > 0) {
+                // 价格上涨：买单增加或卖单撤单
+                if (unmatched_bid > threshold || curr_data.ask_volumes[0] < (prev_data.volume / prev_data.last_price / 100) * 0.8) {
+                    // 买单增加或卖单大幅减少，视为买单大单
+                    double buy_force = unmatched_bid;
+                    if (buy_force > threshold) {
+                        double order_value = buy_force * curr_data.bid_prices[0] * 100;
+                        metrics.auction_metrics.net_large_order_flow = order_value;
+                        metrics.auction_metrics.cumulative_net_flow += order_value;
+                    }
+                }
+            } else if (price_change < 0) {
+                // 价格下跌：卖单增加或买单撤单
+                if (unmatched_ask > threshold || curr_data.bid_volumes[0] < (prev_data.volume / prev_data.last_price / 100) * 0.8) {
+                    // 卖单增加或买单大幅减少，视为卖单大单
+                    double sell_force = unmatched_ask;
+                    if (sell_force > threshold) {
+                        double order_value = sell_force * curr_data.bid_prices[0] * 100;
+                        metrics.auction_metrics.net_large_order_flow = -order_value;
+                        metrics.auction_metrics.cumulative_net_flow -= order_value;
+                    }
+                }
+            } else {
+                // 价格不变，但也可能有大单
+                if (unmatched_bid > threshold && unmatched_bid > unmatched_ask * 1.5) {
+                    // 买单远大于卖单，视为买单大单
+                    double order_value = unmatched_bid * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = order_value;
                     metrics.auction_metrics.cumulative_net_flow += order_value;
-                    
-                    // 只记录高级别大单
-                    if (order_value > 5000000) {
-                        if (global_logger) {
-                            global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                     + stock_mapper_.getStockDisplayName(symbol) 
-                                     + " 涨幅：" + Logger::f2s(metrics.auction_metrics.price_change * 100) + "% "
-                                     + "买单大单: " + Logger::f2s(delta_bv1) + "股, "
-                                     + "价格: " + Logger::f2s(curr_data.bid_prices[0]) + ", "
-                                     + "金额: " + Logger::amountToWan(order_value) + "万元", timestamp);
-                        }
-                    }
+                } else if (unmatched_ask > threshold && unmatched_ask > unmatched_bid * 1.5) {
+                    // 卖单远大于买单，视为卖单大单
+                    double order_value = unmatched_ask * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = -order_value;
+                    metrics.auction_metrics.cumulative_net_flow -= order_value;
+                }
+            }
+        } else {
+            // 20分后分析逻辑（不能撤单）
+            if (price_change > 0) {
+                // 价格上涨：买单增加力度大于卖单
+                if (unmatched_bid > threshold && unmatched_bid > unmatched_ask * 1.5) {
+                    // 买单远大于卖单，视为买单大单
+                    double order_value = unmatched_bid * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = order_value;
+                    metrics.auction_metrics.cumulative_net_flow += order_value;
+                }
+            } else if (price_change < 0) {
+                // 价格下跌：卖单增加力度大于买单
+                if (unmatched_ask > threshold && unmatched_ask > unmatched_bid * 1.5) {
+                    // 卖单远大于买单，视为卖单大单
+                    double order_value = unmatched_ask * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = -order_value;
+                    metrics.auction_metrics.cumulative_net_flow -= order_value;
+                }
+            } else {
+                // 价格不变，但也可能有大单
+                if (unmatched_bid > threshold && unmatched_bid > unmatched_ask * 1.5) {
+                    // 买单远大于卖单，视为买单大单
+                    double order_value = unmatched_bid * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = order_value;
+                    metrics.auction_metrics.cumulative_net_flow += order_value;
+                } else if (unmatched_ask > threshold && unmatched_ask > unmatched_bid * 1.5) {
+                    // 卖单远大于买单，视为卖单大单
+                    double order_value = unmatched_ask * curr_data.bid_prices[0] * 100;
+                    metrics.auction_metrics.net_large_order_flow = -order_value;
+                    metrics.auction_metrics.cumulative_net_flow -= order_value;
                 }
             }
         }
+        
+        // 更新委买委卖金额
+        metrics.auction_metrics.bid_amount = current_total_bid * curr_data.bid_prices[0] * 100;
+        metrics.auction_metrics.ask_amount = current_total_ask * curr_data.ask_prices[0] * 100;
     }
     
     double getLargeOrderThreshold(double price) {
@@ -1965,8 +2034,7 @@ private:
                     std::abs(auction_metrics.cumulative_net_flow) > 2000000 || 
                     std::abs(auction_metrics.cumulative_price_change) > 0.08) {
                     if (global_logger) {
-                        global_logger->infoWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                                 + "异动" + metrics.volatility_level + ": " 
+                        global_logger->infoWithTickTime("异动" + metrics.volatility_level + ": " 
                                  + stock_mapper_.getStockDisplayName(symbol) 
                                  + " - " + reason + "  涨幅：" 
                                  + Logger::f2s(metrics.auction_metrics.price_change * 100) + "%", timestamp);
