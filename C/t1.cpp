@@ -1357,6 +1357,11 @@ private:
     const std::string AUCTION_END = "09:25:00";
     std::string last_summary_time_;
     static int report_time;
+
+    std::atomic<int> active_threads_{0};
+    std::mutex metrics_mutex_; // 专门用于保护stock_auction_metrics_
+    const int MAX_CONCURRENT_THREADS = 50; // 控制并发数，避免被服务器封禁
+
     
 public:
     AuctionAnalyzer(IExternalDataProvider* provider = new DefaultExternalProvider())
@@ -1389,13 +1394,16 @@ public:
         
         // 更新竞价指标
         updateAuctionMetrics(metrics, data, change, bid_amount, ask_amount);
-        
+        std::string current_time = TimeUtils::formatTimestamp(data.timestamp);
         // 计算匹配量
         // double auction_volume = std::min(av1, bv1) * data.last_price * 0.01;
         double auction_volume = std::min(bid_amount, ask_amount);
         metrics.auction_volume = auction_volume;
+        if(current_time >= "09:25:00" && av1 != bv1){
+            metrics.auction_volume = data.volume * data.last_price * 100;
+        }
         // std::cout<<data.symbol<<"| 匹配量："<<metrics.auction_volume<<"万 "<<av1<<" "<<bv1<<" "<<data.last_price<<std::endl;
-        std::string current_time = TimeUtils::formatTimestamp(data.timestamp);
+        
         
         if (current_time >= "09:20:00") {
             analyzeAccumulationPattern(symbol, data.timestamp, data.last_price, bid_amount, data.close);
@@ -1428,57 +1436,101 @@ public:
             }
         }
     }
-    // 获取开盘数据 - 通过外部接口补充真实数据并重新计算排名
-    void getKaipan(){
-        // std::lock_guard<std::mutex> lock(data_mutex_);
+
+    // 获取开盘数据 - 多线程版本
+    void getKaipan() {
+        if (stock_auction_metrics_.empty()) {
+            return;
+        }
+        auto start_time = std::chrono::steady_clock::now();
         
-        // 创建指标获取器
-        IndicatorProvider indicator_provider;
-        // 这里需要设置实际的device_id, token, user_id
-        // indicator_provider.setConfig("your_device_id", "your_token", "your_user_id");
-        
-        // 逐个获取活跃股票的DDE数据
-        int updated_count = 0;
-        for (const auto& pair : stock_auction_metrics_) {
-            const std::string& symbol = pair.first;
-            
-            // 单个获取DDE数据
-            std::string dde_data = indicator_provider.getStockDDE(symbol);
-            // std::cout<<"获取大单 "<<symbol<<" "<<dde_data<<std::endl;
-            if (!dde_data.empty()) {
-                // 使用真实DDE数据更新竞价指标
-                updateMetricsWithRealData(symbol, dde_data);
-                updated_count++;
-                
-                // 添加适当延迟，避免请求过于频繁
-                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        // 创建股票代码列表的副本，避免长时间持有锁
+        std::vector<std::string> symbols;
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            symbols.reserve(stock_auction_metrics_.size());
+            for (const auto& pair : stock_auction_metrics_) {
+                if(pair.second.auction_volume > 500 * 10000)
+                    symbols.push_back(pair.first);
             }
         }
-        
-        if (global_logger) {
-            global_logger->info("成功更新 " + std::to_string(updated_count) + " 只股票的DDE数据");
+
+        int total_symbols = symbols.size();
+        int batch_size = std::min(MAX_CONCURRENT_THREADS, total_symbols);
+        std::vector<std::thread> threads;
+        std::atomic<int> processed_count{0};
+        std::atomic<int> success_count{0};
+
+        // 分批处理
+        for (int i = 0; i < batch_size; i++) {
+            threads.emplace_back([&, i]() {
+                this->processSymbolsBatch(symbols, i, batch_size, processed_count, success_count);
+            });
         }
-        
-        // // 生成基于真实数据的开盘分析报告
-        // generateRealDataOpeningReport();
+
+        // 等待所有线程完成
+        for (auto& thread : threads) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+        if (global_logger) {
+            global_logger->info("多线程更新完成: " + std::to_string(success_count) + 
+                               "/" + std::to_string(total_symbols) + " 只股票, 耗时: " + 
+                               std::to_string(duration.count() / 1000.0) + "秒");
+        }
     }
-    
-    // 使用真实DDE数据更新单个股票的竞价指标
-    void updateMetricsWithRealData(const std::string& symbol, const std::string& dde_data) {
-        auto it = stock_auction_metrics_.find(symbol);
-        if (it != stock_auction_metrics_.end()) {
-            // 解析DDE数据
-            double real_large_net = parseDDEData(dde_data);
+
+    // 处理符号批次
+    void processSymbolsBatch(const std::vector<std::string>& symbols, int thread_id, 
+                           int batch_size, std::atomic<int>& processed_count,
+                           std::atomic<int>& success_count) {
+        IndicatorProvider indicator_provider;
+        
+        for (size_t i = thread_id; i < symbols.size(); i += batch_size) {
+            const std::string& symbol = symbols[i];
             
-            // 使用真实DDE数据更新竞价指标
-            if (real_large_net != 0) {
+            try {
+                std::string dde_data = indicator_provider.getStockDDE(symbol);
+                if (!dde_data.empty()) {
+                    updateMetricsWithRealData(symbol, dde_data);
+                    success_count++;
+                }
+            } catch (const std::exception& e) {
+                if (global_logger) {
+                    global_logger->error("获取股票 " + symbol + " DDE数据失败: " + e.what());
+                }
+            }
+            
+            processed_count++;
+            
+            // 每处理10个股票输出一次进度
+            if (processed_count % 10 == 0) {
+                if (global_logger) {
+                    global_logger->info("DDE数据获取进度: " + std::to_string(processed_count) + 
+                                       "/" + std::to_string(symbols.size()));
+                }
+            }
+            
+            // 轻微延迟，避免对服务器造成过大压力
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    // 更新指标时需要加锁
+    void updateMetricsWithRealData(const std::string& symbol, const std::string& dde_data) {
+        double real_large_net = parseDDEData(dde_data);
+        
+        if (real_large_net != 0) {
+            std::lock_guard<std::mutex> lock(metrics_mutex_);
+            auto it = stock_auction_metrics_.find(symbol);
+            if (it != stock_auction_metrics_.end()) {
                 it->second.auction_metrics.net_large_order_flow = real_large_net;
                 it->second.auction_metrics.cumulative_net_flow = real_large_net;
-                
-                if (global_logger) {
-                    global_logger->info("更新股票 " + stock_mapper_.getStockDisplayName(symbol) + 
-                                       " 的DDE数据: 大单净额 " + Logger::amountToWan(real_large_net) + "万元");
-                }
             }
         }
     }
@@ -1508,7 +1560,7 @@ public:
         }
     }
     
-    // 增强的竞价报告生成（包含真实DDE数据）
+    // 增强的竞价报告生成
     void generateEnhancedAuctionReport(const std::string& time_str, long long timestamp) {
         // std::lock_guard<std::mutex> lock(data_mutex_);
         
@@ -1527,18 +1579,65 @@ public:
         // 涨跌幅分布
         report << "高开>3%: " << summary.high_open_count << " 只, "
                << "低开<-3%: " << summary.low_open_count << " 只, "
-               << "平开: " << (summary.total_stocks - summary.high_open_count - summary.low_open_count) << " 只\n";
+               << "平开: " << (summary.total_stocks - summary.high_open_count - summary.low_open_count) << " 只, "
+               <<"涨停数量: " << summary.limit_up_stocks.size() << " 只, "
+               <<"跌停数量: " << summary.limit_down_stocks.size() << " 只\n";
+               
+        // 计算统计总和
+        double total_auction_volume = 0.0; // 全部股票的成交金额之和
+        double total_net_large_order_flow = 0.0; // 全部股票的大单净额之和
+        double total_limit_up_bid_amount = 0.0; // 涨停股票的封单金额之和
+        
+        // 遍历所有股票计算总和
+        for (const auto& pair : stock_auction_metrics_) {
+            const auto& metrics = pair.second;
+            total_auction_volume += metrics.auction_volume;
+            total_net_large_order_flow += metrics.auction_metrics.net_large_order_flow;
+            
+            // 检查是否是涨停股票并累加封单金额
+            if (std::find(summary.limit_up_stocks.begin(), summary.limit_up_stocks.end(), pair.first) != summary.limit_up_stocks.end()) {
+                total_limit_up_bid_amount += metrics.auction_metrics.bid_amount;
+            }
+        }
+        
+        // 输出统计总和
+        report << "统计总和 - 成交金额: " << Logger::amountToWan(total_auction_volume*0.0001) << "亿, "
+               << "大单净额: " << Logger::amountToWan(total_net_large_order_flow*0.0001) << "亿, "
+               << "涨停封单: " << Logger::amountToWan(total_limit_up_bid_amount*0.0001) << "亿\n";
         
         // 涨停股票统计
         report << "涨停数量: " << summary.limit_up_stocks.size() << "\n";
         if (!summary.limit_up_stocks.empty()) {
-            report << "涨停股票详情:\n";
+            report << "涨停股票详情(按买一封单金额排序):\n";
+            
+            // 创建临时容器存储涨停股票及其买一封单金额
+            std::vector<std::pair<std::string, double>> limit_up_stocks_with_bid;
             for (const auto& symbol : summary.limit_up_stocks) {
+                auto it = stock_auction_metrics_.find(symbol);
+                if (it != stock_auction_metrics_.end()) {
+                    double bid_amount = it->second.auction_metrics.bid_amount;
+                    limit_up_stocks_with_bid.emplace_back(symbol, bid_amount);
+                }
+            }
+            
+            // 按买一封单金额降序排序
+            std::sort(limit_up_stocks_with_bid.begin(), limit_up_stocks_with_bid.end(),
+                     [this](const auto& a, const auto& b) {
+                         auto it_a = stock_auction_metrics_.find(a.first);
+                         auto it_b = stock_auction_metrics_.find(b.first);
+                         if (it_a != stock_auction_metrics_.end() && it_b != stock_auction_metrics_.end()) {
+                             return it_a->second.auction_metrics.bid_amount > it_b->second.auction_metrics.bid_amount;
+                         }
+                         return false;
+                     });
+            
+            // 输出排序后的涨停股票
+            for (const auto& pair : limit_up_stocks_with_bid) {
+                const auto& symbol = pair.first;
                 auto it = stock_auction_metrics_.find(symbol);
                 if (it != stock_auction_metrics_.end()) {
                     const auto& metrics = it->second;
                     double bid_amount = metrics.auction_metrics.bid_amount;
-                    // double match_amount = metrics.auction_volume * 0.01; // 估算成交金额
                     report << "  " << stock_mapper_.getStockDisplayName(symbol) 
                            << " 涨幅:" << Logger::f2s(metrics.auction_metrics.price_change * 100) << "%"
                            << " 封单:" << Logger::amountToWan(bid_amount) << "万"
@@ -1551,13 +1650,36 @@ public:
         // 跌停股票统计
         report << "跌停数量: " << summary.limit_down_stocks.size() << "\n";
         if (!summary.limit_down_stocks.empty()) {
-            report << "跌停股票详情:\n";
+            report << "跌停股票详情(按卖一封单金额排序):\n";
+            
+            // 创建临时容器存储跌停股票及其卖一封单金额
+            std::vector<std::pair<std::string, double>> limit_down_stocks_with_ask;
             for (const auto& symbol : summary.limit_down_stocks) {
+                auto it = stock_auction_metrics_.find(symbol);
+                if (it != stock_auction_metrics_.end()) {
+                    double ask_amount = it->second.auction_metrics.ask_amount;
+                    limit_down_stocks_with_ask.emplace_back(symbol, ask_amount);
+                }
+            }
+            
+            // 按卖一封单金额降序排序
+            std::sort(limit_down_stocks_with_ask.begin(), limit_down_stocks_with_ask.end(),
+                     [this](const auto& a, const auto& b) {
+                         auto it_a = stock_auction_metrics_.find(a.first);
+                         auto it_b = stock_auction_metrics_.find(b.first);
+                         if (it_a != stock_auction_metrics_.end() && it_b != stock_auction_metrics_.end()) {
+                             return it_a->second.auction_metrics.ask_amount > it_b->second.auction_metrics.ask_amount;
+                         }
+                         return false;
+                     });
+            
+            // 输出排序后的跌停股票
+            for (const auto& pair : limit_down_stocks_with_ask) {
+                const auto& symbol = pair.first;
                 auto it = stock_auction_metrics_.find(symbol);
                 if (it != stock_auction_metrics_.end()) {
                     const auto& metrics = it->second;
                     double ask_amount = metrics.auction_metrics.ask_amount;
-                    // double match_amount = metrics.auction_volume * 100; // 估算成交金额
                     report << "  " << stock_mapper_.getStockDisplayName(symbol) 
                            << " 跌幅:" << Logger::f2s(metrics.auction_metrics.price_change * 100) << "%"
                            << " 封单:" << Logger::amountToWan(ask_amount) << "万"
@@ -1594,19 +1716,49 @@ public:
             if (it != stock_auction_metrics_.end()) {
                 const auto& metrics = it->second;
                 report << "  " << stock_mapper_.getStockDisplayName(item.first) 
-                       << " 大单净额:" << Logger::amountToWan(item.second) << "万元"
-                       << " 涨幅:" << Logger::f2s(metrics.auction_metrics.price_change * 100) << "%"
-                       << " 竞价强度:" << Logger::f2s(metrics.volatility_score) << "\n";
+                    << " 涨幅:" << Logger::f2s(metrics.auction_metrics.price_change * 100) << "%"
+                    << " 大单净额:" << Logger::amountToWan(item.second) << "万元"
+                    <<" 成交："<< Logger::amountToWan(metrics.auction_volume) << "万"   
+                    << " 竞价强度:" << Logger::f2s(metrics.volatility_score) << "\n";
             }
         }
         
         // 成交额排名
-        report << "成交额排名(前20):\n";
+        report << "成交额排名(前20，按成交额降序):\n";
+        
+        // 创建临时容器存储股票及其成交额
+        std::vector<std::pair<std::string, double>> volume_ranking;
+        for (const auto& pair : stock_auction_metrics_) {
+            const auto& symbol = pair.first;
+            const auto& metrics = pair.second;
+            volume_ranking.emplace_back(symbol, metrics.auction_volume);
+        }
+        
+        // 按成交额降序排序
+        std::sort(volume_ranking.begin(), volume_ranking.end(),
+                 [this](const auto& a, const auto& b) {
+                     auto it_a = stock_auction_metrics_.find(a.first);
+                     auto it_b = stock_auction_metrics_.find(b.first);
+                     if (it_a != stock_auction_metrics_.end() && it_b != stock_auction_metrics_.end()) {
+                         return it_a->second.auction_volume > it_b->second.auction_volume;
+                     }
+                     return false;
+                 });
+        
+        // 输出前20名
         count = 0;
-        for (const auto& item : summary.amount_ranking) {
+        for (const auto& pair : volume_ranking) {
             if (count++ >= 20) break;
-            report << "  " << stock_mapper_.getStockDisplayName(item.first) 
-                   << " " << Logger::amountToWan(item.second) << "万元\n";
+            const auto& symbol = pair.first;
+            auto it = stock_auction_metrics_.find(symbol);
+            if (it != stock_auction_metrics_.end()) {
+                const auto& metrics = it->second;
+                report << "  " << stock_mapper_.getStockDisplayName(symbol) 
+                    << " 涨幅:" << Logger::f2s(metrics.auction_metrics.price_change * 100) << "%"
+                    << " 大单净额:" << Logger::amountToWan(metrics.auction_metrics.net_large_order_flow) << "万元"
+                    <<" 成交："<< Logger::amountToWan(metrics.auction_volume) << "万"   
+                    << " 竞价强度:" << Logger::f2s(metrics.volatility_score) << "\n";
+            }
         }
         
         // 输出到日志
@@ -1615,6 +1767,24 @@ public:
         }
     }
 private:
+    // 统一的涨跌停检查方法
+    bool checkLimitUp(const StockData& data) {
+        double limit_up_price = std::round(data.close * 1.1 * 100) / 100.0;
+        std::string symbol_prefix = data.symbol.substr(0, 2);
+        if (symbol_prefix == "30" || symbol_prefix == "68") {
+            limit_up_price = std::round(data.close * 1.2 * 100) / 100.0;
+        }
+        return std::abs(data.last_price - limit_up_price) < 0.01;
+    }
+    
+    bool checkLimitDown(const StockData& data) {
+        double limit_down_price = std::round(data.close * 0.9 * 100) / 100.0;
+        std::string symbol_prefix = data.symbol.substr(0, 2);
+        if (symbol_prefix == "30" || symbol_prefix == "68") {
+            limit_down_price = std::round(data.close * 0.8 * 100) / 100.0;
+        }
+        return std::abs(data.last_price - limit_down_price) < 0.01;
+    }
     void updateHistoryData(StockAuctionMetrics& metrics, double price, double av1, double bv1, double bid_amount) {
         metrics.price_history.push_back(price);
         metrics.bid_amount_history.push_back(bid_amount);
@@ -1633,18 +1803,20 @@ private:
         auction_metrics.bid_amount = bid_amount;
         auction_metrics.ask_amount = ask_amount;
         
-        // 计算涨停跌停价格
-        double limit_up_price = std::round(data.close * 1.1 * 100) / 100.0;
-        double limit_down_price = std::round(data.close * 0.9 * 100) / 100.0;
-        std::string symbol_prefix = data.symbol.substr(0, 2);
-        if (symbol_prefix == "30" || symbol_prefix == "68") {
-            limit_up_price = std::round(data.close * 1.2 * 100) / 100.0;
-            limit_down_price = std::round(data.close * 0.8 * 100) / 100.0;
-        }
+        // // 计算涨停跌停价格
+        // double limit_up_price = std::round(data.close * 1.1 * 100) / 100.0;
+        // double limit_down_price = std::round(data.close * 0.9 * 100) / 100.0;
+        // std::string symbol_prefix = data.symbol.substr(0, 2);
+        // if (symbol_prefix == "30" || symbol_prefix == "68") {
+        //     limit_up_price = std::round(data.close * 1.2 * 100) / 100.0;
+        //     limit_down_price = std::round(data.close * 0.8 * 100) / 100.0;
+        // }
         
-        auction_metrics.is_limit_up = std::abs(data.last_price - limit_up_price) < 0.01;
-        auction_metrics.is_limit_down = std::abs(data.last_price - limit_down_price) < 0.01;
-        
+        // auction_metrics.is_limit_up = std::abs(data.last_price - limit_up_price) < 0.01;
+        // auction_metrics.is_limit_down = std::abs(data.last_price - limit_down_price) < 0.01;
+         // 统一计算涨跌停状态
+        auction_metrics.is_limit_up = checkLimitUp(data);
+        auction_metrics.is_limit_down = checkLimitDown(data);
         // 涨停股票记录
         if (auction_metrics.is_limit_up && 
             std::find(limit_up_stocks_.begin(), limit_up_stocks_.end(), data.symbol) == limit_up_stocks_.end() &&
@@ -1652,7 +1824,7 @@ private:
             limit_up_stocks_.push_back(data.symbol);
             if (global_logger) {
                 global_logger->warnWithTickTime(stock_mapper_.getStockDisplayName(data.symbol) 
-                     + " 已涨停，涨停价: " + Logger::f2s(limit_up_price) 
+                     + " 已涨停，涨停价: " + Logger::f2s(data.last_price) 
                      + "，委买金额: " + Logger::amountToWan(bid_amount) + "万元"
                      + "，已匹配:" + Logger::amountToWan(metrics.auction_volume) + "万元",
                      data.timestamp);
@@ -1666,7 +1838,7 @@ private:
             limit_down_stocks_.push_back(data.symbol);
             if (global_logger) {
                 global_logger->warnWithTickTime(stock_mapper_.getStockDisplayName(data.symbol) 
-                     + " 已跌停，跌停价: " + Logger::f2s(limit_down_price) 
+                     + " 已跌停，跌停价: " + Logger::f2s(data.last_price) 
                      + "，委卖金额: " + Logger::amountToWan(ask_amount) + "万元"
                      + "，已成交:" + Logger::amountToWan(metrics.auction_volume) + "万元",
                      data.timestamp);
@@ -1736,8 +1908,7 @@ private:
                 
                 accumulation_stocks_.push_back(symbol);
                 if (global_logger) {
-                    global_logger->warnWithTickTime(TimeUtils::formatTimestamp(timestamp) + "|"
-                         + stock_mapper_.getStockDisplayName(symbol) + " 出现抢筹模式: "
+                    global_logger->warnWithTickTime(stock_mapper_.getStockDisplayName(symbol) + " 出现抢筹模式: "
                          + "委买增加 " + Logger::amountToWan(bid_amounts.back() - bid_amounts.front()) + "万, "
                          + "价格上涨 " + Logger::f2s(price_increase * 100) + "%"
                          + "，已匹配:" + Logger::amountToWan(bid_amount) + "万元",
@@ -2446,7 +2617,7 @@ public:
         
         if (is_auction) {
             auction_analyzer_->processAuctionData(data, change, bid_amount, ask_amount);
-        } else if (TimeUtils::isTradeTime(time_str)) {
+        } else{
             volatility_detector_->detectVolatility(data, change, bid_amount, ask_amount);
         }
     }
@@ -2789,6 +2960,7 @@ public:
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= config_.report_time) {
                 long long current_delay = getServerDelay();
+                // auction_analyzer_->getKaipan();
                 logger_->warn("处理: " + std::to_string(total_messages) + " 条消息, " +
                              std::to_string(total_records) + " 条记录, " +
                              std::to_string(failed_messages) + " 条失败"+
