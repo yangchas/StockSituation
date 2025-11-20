@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>股票异动监控系统 - 短线精灵</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: system-ui, sans-serif; 
+            background: #1a1a1a; 
+            color: #fff;
+            padding: 10px;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 10px;
+            height: 100vh;
+        }
+        .sidebar {
+            background: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .main-content {
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 10px;
+        }
+        .control-panel {
+            background: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .data-panel {
+            background: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            overflow-y: auto;
+        }
+        .volatile-item {
+            background: #3d3d3d;
+            margin: 8px 0;
+            padding: 12px;
+            border-radius: 6px;
+            border-left: 4px solid #007acc;
+        }
+        .volatile-item.high { border-left-color: #ff4444; }
+        .volatile-item.medium { border-left-color: #ffaa00; }
+        .volatile-item.low { border-left-color: #00ff88; }
+        .volatile-header {
+            display: flex;
+            justify-content: between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .stock-symbol {
+            font-size: 18px;
+            font-weight: bold;
+            color: #fff;
+        }
+        .volatile-type {
+            background: #007acc;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+        .volatile-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            font-size: 14px;
+        }
+        .volatile-strength {
+            text-align: right;
+            font-weight: bold;
+        }
+        .positive { color: #00ff88; }
+        .negative { color: #ff4444; }
+        .filter-section {
+            background: #3d3d3d;
+            padding: 12px;
+            border-radius: 6px;
+        }
+        .filter-group {
+            margin: 10px 0;
+        }
+        .filter-group label {
+            display: block;
+            margin: 5px 0;
+            cursor: pointer;
+        }
+        .stats-section {
+            background: #3d3d3d;
+            padding: 12px;
+            border-radius: 6px;
+        }
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        input, button, select {
+            padding: 8px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+        }
+        input { background: #3d3d3d; color: white; }
+        button { 
+            background: #007acc; 
+            color: white; 
+            cursor: pointer; 
+            padding: 8px 12px;
+        }
+        button:hover { background: #005a9e; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        .connection-status {
+            padding: 8px 12px;
+            border-radius: 4px;
+            background: #444;
+        }
+        .connected { background: #2d5a2d; }
+        .disconnected { background: #5a2d2d; }
+        .timestamp {
+            color: #888;
+            font-size: 12px;
+        }
+        .action-text {
+            font-weight: bold;
+            margin: 4px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 侧边栏 -->
+        <div class="sidebar">
+            <!-- 筛选面板 -->
+            <div class="filter-section">
+                <h3>异动类型筛选</h3>
+                
+                <div class="filter-group">
+                    <h4>异动级别</h4>
+                    <label><input type="checkbox" name="level" value="high" checked> 强烈异动</label>
+                    <label><input type="checkbox" name="level" value="medium" checked> 中度异动</label>
+                    <label><input type="checkbox" name="level" value="low" checked> 轻微异动</label>
+                </div>
+                
+                <div class="filter-group">
+                    <h4>异动类型</h4>
+                    <label><input type="checkbox" name="type" value="封单异动" checked> 封单异动</label>
+                    <label><input type="checkbox" name="type" value="成交额异动" checked> 成交额异动</label>
+                    <label><input type="checkbox" name="type" value="其他" checked> 其他异动</label>
+                </div>
+                
+                <div class="filter-group">
+                    <h4>强度筛选</h4>
+                    <label>最小强度: <input type="number" id="minStrength" value="0" min="0" max="10"></label>
+                </div>
+                
+                <button onclick="applyFilters()">应用筛选</button>
+                <button onclick="resetFilters()" class="secondary">重置筛选</button>
+            </div>
+            
+            <!-- 统计面板 -->
+            <div class="stats-section">
+                <h3>统计信息</h3>
+                <div class="stat-item">
+                    <span>总异动数:</span>
+                    <span id="totalCount">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>强烈异动:</span>
+                    <span id="highCount">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>中度异动:</span>
+                    <span id="mediumCount">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>轻微异动:</span>
+                    <span id="lowCount">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>封单异动:</span>
+                    <span id="breakthroughCount">0</span>
+                </div>
+                <div class="stat-item">
+                    <span>成交额异动:</span>
+                    <span id="largeOrderCount">0</span>
+                </div>
+            </div>
+            
+            <!-- 控制按钮 -->
+            <div>
+                <button onclick="clearAllData()" class="secondary">清空所有数据</button>
+                <button onclick="exportData()">导出数据</button>
+            </div>
+        </div>
+        
+        <!-- 主内容区 -->
+        <div class="main-content">
+            <!-- 控制面板 -->
+            <div class="control-panel">
+                <button onclick="toggleAutoScroll()" id="autoScrollBtn">🔒 暂停自动滚动</button>
+                <button onclick="clearDisplay()" class="secondary">清空显示</button>
+                <div class="connection-status" id="connectionStatus">❌ 断开连接</div>
+                <div id="lastUpdate"></div>
+            </div>
+            
+            <!-- 数据展示区 -->
+            <div class="data-panel" id="volatileData">
+                <!-- 异动数据将在这里显示 -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class VolatileMonitor {
+            constructor() {
+                this.ws = null;
+                this.allVolatiles = []; // 存储所有异动数据
+                this.filteredVolatiles = []; // 存储筛选后的数据
+                this.filters = {
+                    levels: ['high', 'medium', 'low'],
+                    types: ['封单异动', '成交额异动', '其他'],
+                    minStrength: 0
+                };
+                this.stats = {
+                    total: 0,
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    breakthrough: 0,
+                    largeOrder: 0
+                };
+                this.autoScroll = true;
+                this.reconnectDelay = 1000;
+                this.init();
+            }
+            
+            init() {
+                this.loadFromStorage();
+                this.applyFilters();
+                this.updateStats();
+                this.renderVolatiles();
+                this.connect();
+            }
+            
+            connect() {
+                try {
+                    this.ws = new WebSocket('ws://115.190.156.240:8080/');
+                    
+                    this.ws.onopen = () => {
+                        document.getElementById('connectionStatus').textContent = '✅ 已连接';
+                        document.getElementById('connectionStatus').className = 'connection-status connected';
+                        this.reconnectDelay = 1000;
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        this.handleMessage(data);
+                    };
+                    
+                    this.ws.onclose = () => {
+                        document.getElementById('connectionStatus').textContent = '❌ 断开连接';
+                        document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                        setTimeout(() => this.connect(), this.reconnectDelay);
+                        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket错误:', error);
+                    };
+                    
+                } catch (error) {
+                    console.error('连接失败:', error);
+                }
+            }
+            
+            handleMessage(data) {
+                switch(data.type) {
+                    case 'volatile_alert':
+                        this.addVolatile(data);
+                        break;
+                    case 'system':
+                        this.showSystemMessage(data);
+                        break;
+                }
+            }
+            
+            addVolatile(volatileData) {
+                // 添加到所有数据
+                this.allVolatiles.unshift(volatileData);
+                
+                // 更新统计
+                this.updateStats();
+                
+                // 应用筛选
+                this.applyFilters();
+                
+                // 保存到本地存储
+                this.saveToStorage();
+                
+                // 更新显示
+                this.renderVolatiles();
+                
+                // 更新最后更新时间
+                this.updateLastUpdateTime();
+            }
+            
+            updateStats() {
+                // 重置统计
+                this.stats = {
+                    total: this.allVolatiles.length,
+                    high: 0,
+                    medium: 0,
+                    low: 0,
+                    breakthrough: 0,
+                    largeOrder: 0
+                };
+                
+                // 计算统计
+                this.allVolatiles.forEach(volatile => {
+                    switch(volatile.alert_level) {
+                        case 'high': this.stats.high++; break;
+                        case 'medium': this.stats.medium++; break;
+                        case 'low': this.stats.low++; break;
+                    }
+                    
+                    if (volatile.action_text === '封单异动') {
+                        this.stats.breakthrough++;
+                    } else if (volatile.action_text === '成交额异动') {
+                        this.stats.largeOrder++;
+                    }
+                });
+                
+                // 更新UI
+                this.updateStatsDisplay();
+            }
+            
+            updateStatsDisplay() {
+                document.getElementById('totalCount').textContent = this.stats.total;
+                document.getElementById('highCount').textContent = this.stats.high;
+                document.getElementById('mediumCount').textContent = this.stats.medium;
+                document.getElementById('lowCount').textContent = this.stats.low;
+                document.getElementById('breakthroughCount').textContent = this.stats.breakthrough;
+                document.getElementById('largeOrderCount').textContent = this.stats.largeOrder;
+            }
+            
+            applyFilters() {
+                this.filteredVolatiles = this.allVolatiles.filter(volatile => {
+                    // 检查级别筛选
+                    if (!this.filters.levels.includes(volatile.alert_level)) {
+                        return false;
+                    }
+                    
+                    // 检查类型筛选
+                    if (!this.filters.types.includes(volatile.action_text)) {
+                        return false;
+                    }
+                    
+                    // 检查强度筛选
+                    if (volatile.strength < this.filters.minStrength) {
+                        return false;
+                    }
+                    
+                    return true;
+                });
+                
+                this.renderVolatiles();
+            }
+            
+            renderVolatiles() {
+                const container = document.getElementById('volatileData');
+                container.innerHTML = '';
+                
+                this.filteredVolatiles.forEach(volatile => {
+                    const item = document.createElement('div');
+                    item.className = `volatile-item ${volatile.alert_level}`;
+                    
+                    const changeClass = volatile.change_5min >= 0 ? 'positive' : 'negative';
+                    const changeSign = volatile.change_5min >= 0 ? '+' : '';
+                    
+                    item.innerHTML = `
+                        <div class="volatile-header">
+                            <div class="stock-symbol">${volatile.symbol}</div>
+                            <div class="volatile-type">${volatile.level_text}</div>
+                        </div>
+                        <div class="action-text">${volatile.action_text}</div>
+                        <div class="volatile-info">
+                            <div>价格: <span class="${changeClass}">${volatile.price}</span></div>
+                            <div>5分钟涨跌: <span class="${changeClass}">${changeSign}${volatile.change_5min}%</span></div>
+                            <div>强度: ${volatile.strength}/10</div>
+                            <div>时间: ${volatile.display_time}</div>
+                        </div>
+                        <div class="timestamp">原因: ${volatile.reason}</div>
+                    `;
+                    
+                    container.appendChild(item);
+                });
+                
+                // 自动滚动到底部
+                if (this.autoScroll && container.children.length > 0) {
+                    container.scrollTop = 0;
+                }
+            }
+            
+            updateLastUpdateTime() {
+                const now = new Date();
+                document.getElementById('lastUpdate').textContent = 
+                    `最后更新: ${now.toLocaleTimeString()}`;
+            }
+            
+            showSystemMessage(data) {
+                console.log('系统消息:', data.message);
+                // 可以在这里显示系统通知
+            }
+            
+            // 本地存储相关方法
+            saveToStorage() {
+                try {
+                    // 只保存最近500条数据，避免存储过大
+                    const dataToSave = this.allVolatiles.slice(0, 500);
+                    localStorage.setItem('volatileData', JSON.stringify(dataToSave));
+                    localStorage.setItem('volatileFilters', JSON.stringify(this.filters));
+                    localStorage.setItem('volatileStats', JSON.stringify(this.stats));
+                } catch (e) {
+                    console.error('保存到本地存储失败:', e);
+                }
+            }
+            
+            loadFromStorage() {
+                try {
+                    // 加载数据
+                    const savedData = localStorage.getItem('volatileData');
+                    if (savedData) {
+                        this.allVolatiles = JSON.parse(savedData);
+                    }
+                    
+                    // 加载筛选条件
+                    const savedFilters = localStorage.getItem('volatileFilters');
+                    if (savedFilters) {
+                        this.filters = JSON.parse(savedFilters);
+                        this.applyUIFilters();
+                    }
+                    
+                    // 加载统计
+                    const savedStats = localStorage.getItem('volatileStats');
+                    if (savedStats) {
+                        this.stats = JSON.parse(savedStats);
+                    }
+                } catch (e) {
+                    console.error('从本地存储加载失败:', e);
+                }
+            }
+            
+            applyUIFilters() {
+                // 更新UI筛选控件
+                const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+                levelCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.levels.includes(checkbox.value);
+                });
+                
+                const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+                typeCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.types.includes(checkbox.value);
+                });
+                
+                document.getElementById('minStrength').value = this.filters.minStrength;
+            }
+            
+            clearAllData() {
+                if (confirm('确定要清空所有数据吗？此操作不可撤销。')) {
+                    this.allVolatiles = [];
+                    this.filteredVolatiles = [];
+                    this.stats = {
+                        total: 0,
+                        high: 0,
+                        medium: 0,
+                        low: 0,
+                        breakthrough: 0,
+                        largeOrder: 0
+                    };
+                    this.updateStatsDisplay();
+                    this.renderVolatiles();
+                    this.saveToStorage();
+                }
+            }
+            
+            exportData() {
+                const dataStr = JSON.stringify(this.allVolatiles, null, 2);
+                const dataBlob = new Blob([dataStr], {type: 'application/json'});
+                const url = URL.createObjectURL(dataBlob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `volatile_data_${new Date().toISOString().split('T')[0]}.json`;
+                link.click();
+                URL.revokeObjectURL(url);
+            }
+            
+            toggleAutoScroll() {
+                this.autoScroll = !this.autoScroll;
+                const btn = document.getElementById('autoScrollBtn');
+                btn.textContent = this.autoScroll ? '🔒 暂停自动滚动' : '🔓 开启自动滚动';
+            }
+        }
+        
+        // 全局函数
+        const monitor = new VolatileMonitor();
+        
+        function applyFilters() {
+            // 获取级别筛选
+            const levelCheckboxes = document.querySelectorAll('input[name="level"]:checked');
+            monitor.filters.levels = Array.from(levelCheckboxes).map(cb => cb.value);
+            
+            // 获取类型筛选
+            const typeCheckboxes = document.querySelectorAll('input[name="type"]:checked');
+            monitor.filters.types = Array.from(typeCheckboxes).map(cb => cb.value);
+            
+            // 获取强度筛选
+            monitor.filters.minStrength = parseInt(document.getElementById('minStrength').value) || 0;
+            
+            // 应用筛选
+            monitor.applyFilters();
+            
+            // 保存筛选条件
+            monitor.saveToStorage();
+        }
+        
+        function resetFilters() {
+            // 重置级别筛选
+            const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+            levelCheckboxes.forEach(cb => cb.checked = true);
+            
+            // 重置类型筛选
+            const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+            typeCheckboxes.forEach(cb => cb.checked = true);
+            
+            // 重置强度筛选
+            document.getElementById('minStrength').value = 0;
+            
+            // 应用重置后的筛选
+            applyFilters();
+        }
+        
+        function clearDisplay() {
+            if (confirm('确定要清空显示吗？数据不会被删除，只是暂时隐藏。')) {
+                document.getElementById('volatileData').innerHTML = '';
+            }
+        }
+        
+        function clearAllData() {
+            monitor.clearAllData();
+        }
+        
+        function exportData() {
+            monitor.exportData();
+        }
+        
+        function toggleAutoScroll() {
+            monitor.toggleAutoScroll();
+        }
+        
+        // 页面加载完成后初始化
+        window.addEventListener('load', () => {
+            monitor.updateLastUpdateTime();
+        });
+    </script>
+</body>
+</html>

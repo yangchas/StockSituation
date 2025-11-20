@@ -1,0 +1,1348 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>股票异动监控 - 短线精灵</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: "Microsoft YaHei", sans-serif; 
+            background: #0a0a0a; 
+            color: #e0e0e0;
+           
+        }
+        
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+        
+        .main-content {
+            flex: 1;
+            background: #1a1a1a;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .volatile-sidebar {
+            width: 400px;
+            background: #151515;
+            border-left: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .sidebar-header {
+            background: #d4af37;
+            color: #000;
+            padding: 1px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 18px;
+        }
+        
+        .connection-status {
+            background: #222;
+            /* padding: 10px; */
+            text-align: center;
+            border-bottom: 1px solid #333;
+        }
+        
+        .status-connected { color: #6235c3; }
+        .status-disconnected { color: #4b1a1a; }
+        
+        .filter-panel {
+            background: #222;
+            padding: 4px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .filter-group {
+            margin-bottom: 10px;
+        }
+        
+        .filter-title {
+            font-size: 14px;
+            margin-bottom: 2px;
+            color: #d4af37;
+        }
+        
+        .filter-options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .filter-option {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        .filter-option input {
+            margin: 0;
+        }
+        
+        .strength-filter {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .strength-slider {
+            flex: 1;
+        }
+        
+        .strength-value {
+            min-width: 30px;
+            text-align: center;
+        }
+        
+        .control-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        
+        .control-btn {
+            flex: 1;
+            padding: 6px;
+            background: #333;
+            border: none;
+            color: #e0e0e0;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .control-btn:hover {
+            background: #444;
+        }
+        
+        .control-btn.active {
+            background: #d4af37;
+            color: #000;
+        }
+        
+        .debug-info {
+            background: #333;
+            padding: 4px;
+            font-size: 12px;
+            border-bottom: 1px solid #444;
+            max-height: 100px;
+            overflow-y: auto;
+        }
+        
+        .alert-stats {
+            background: #222;
+            padding: 4px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .stat-item {
+            text-align: center;
+            padding: 1px;
+            background: #2a2a2a;
+            border-radius: 5px;
+        }
+        
+        .stat-value {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 1px;
+        }
+        
+        .stat-label {
+            font-size: 12px;
+            color: #888;
+        }
+        
+        .high-count { color: #ff4444; }
+        .medium-count { color: #ffaa00; }
+        .low-count { color: #00aa00; }
+        .total-count { color: #ffffff; }
+        
+        .alerts-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .alert-item {
+            background: #1e1e1e;
+            padding: 12px;
+            border-radius: 6px;
+            border-left: 4px solid #444;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            transform-origin: top;
+            max-height: 200px;
+        }
+        
+        .alert-item.animate-in {
+            animation: slideDown 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+        }
+        
+        .alert-item.animate-out {
+            animation: slideUp 0.3s ease forwards;
+        }
+        
+        .alert-item:hover {
+            background: #252525;
+        }
+        
+        .alert-item.high { border-left-color: #ff4444; background: #2a1a1a; }
+        .alert-item.medium { border-left-color: #ffaa00; background: #2a2a1a; }
+        .alert-item.low { border-left-color: #00aa00; background: #1a2a1a; }
+        
+        .alert-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .stock-symbol {
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+        }
+        
+        .alert-level {
+            font-size: 12px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: #444;
+        }
+        
+        .alert-level.high { background: #ff4444; color: white; }
+        .alert-level.medium { background: #ffaa00; color: black; }
+        .alert-level.low { background: #00aa00; color: white; }
+        
+        .alert-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            font-size: 13px;
+        }
+        
+        .alert-reason {
+            font-size: 14px;
+            font-weight: bold;
+            margin: 5px 0;
+            color: #d4af37;
+        }
+        
+        .price-info {
+            color: #fff;
+            font-weight: bold;
+        }
+        
+        .change-positive { color: #ff4444; }
+        .change-negative { color: #00aa00; }
+        
+        .alert-time {
+            text-align: right;
+            font-size: 11px;
+            color: #888;
+            margin-top: 5px;
+        }
+        
+        .alert-details {
+            font-size: 11px;
+            color: #aaa;
+            margin-top: 8px;
+        }
+        
+        .detail-item {
+            margin: 2px 0;
+        }
+        
+        @keyframes slideDown {
+            0% {
+                transform: translateY(-100%);
+                opacity: 0;
+                max-height: 0;
+                margin-bottom: 0;
+            }
+            70% {
+                transform: translateY(5%);
+                opacity: 0.8;
+            }
+            100% {
+                transform: translateY(0);
+                opacity: 1;
+                max-height: 200px;
+                margin-bottom: 0;
+            }
+        }
+        
+        @keyframes slideUp {
+            0% {
+                transform: translateY(0);
+                opacity: 1;
+                max-height: 200px;
+            }
+            100% {
+                transform: translateY(-100%);
+                opacity: 0;
+                max-height: 0;
+                margin-bottom: 0;
+                padding-top: 0;
+                padding-bottom: 0;
+            }
+        }
+        
+        @keyframes pushDown {
+            0% {
+                transform: translateY(0);
+            }
+            100% {
+                transform: translateY(calc(100% + 8px));
+            }
+        }
+        
+        .no-alerts {
+            text-align: center;
+            color: #666;
+            padding: 40px 20px;
+            font-size: 14px;
+        }
+        
+        /* 为容器添加过渡效果，让下面的条目平滑下移 */
+        .alerts-container.smooth-transition .alert-item:not(.animate-in):not(.animate-out) {
+            transition: transform 0.3s ease;
+        }
+        /* 替换原有的 alert-item 相关样式 */
+.alert-item {
+    background: #1e1e1e;
+    padding: 10px 12px;
+    border-radius: 6px;
+    border-left: 4px solid #444;
+    margin: 6px 0;
+    font-size: 13px;
+    line-height: 1.3;
+    transform-origin: top;
+    max-height: 200px;
+    
+}
+
+.alert-item.low { border-left-color: #00aa00; background: #1a2a1a; }
+.alert-item.medium { border-left-color: #ffaa00; background: #2a2a1a; }
+.alert-item.high { border-left-color: #ff4444; background: #2a1a1a; }
+
+.alert-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 8px;
+}
+
+.stock-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.stock-symbol {
+    font-size: 16px;
+    font-weight: bold;
+    color: #fff;
+}
+
+.alert-reason {
+    font-size: 13px;
+    font-weight: bold;
+    color: #d4af37;
+    background: rgba(212, 175, 55, 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.alert-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 2px;
+}
+
+.alert-level {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: #444;
+    color: white;
+}
+
+.alert-level.high { background: #ff4444; }
+.alert-level.medium { background: #ffaa00; color: black; }
+.alert-level.low { background: #00aa00; }
+
+.alert-time {
+    font-size: 11px;
+    color: #888;
+}
+
+.alert-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.price-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.price-label {
+    font-size: 11px;
+    color: #aaa;
+}
+
+.price-value {
+    font-size: 18px;
+    font-weight: bold;
+    color: #fff;
+}
+
+.change-5min {
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.change-positive { color: #ff4444; }
+.change-negative { color: #00aa00; }
+
+.data-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.data-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+}
+
+.data-label {
+    color: #aaa;
+}
+
+.data-value {
+    color: #fff;
+    font-weight: bold;
+}
+
+/* 保持原有的动画效果不变 */
+.alert-item.animate-in {
+    animation: slideDown 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94) forwards;
+}
+
+@keyframes slideDown {
+    0% {
+        transform: translateY(-100%);
+        opacity: 0;
+        max-height: 0;
+        margin-bottom: 0;
+    }
+    70% {
+        transform: translateY(5%);
+        opacity: 0.8;
+    }
+    100% {
+        transform: translateY(0);
+        opacity: 1;
+        max-height: 200px;
+        margin-bottom: 0;
+    }
+}
+
+/* 其他动画保持不变 */
+@keyframes slideUp {
+    0% {
+        transform: translateY(0);
+        opacity: 1;
+        max-height: 200px;
+    }
+    100% {
+        transform: translateY(-100%);
+        opacity: 0;
+        max-height: 0;
+        margin-bottom: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+}
+
+.alerts-container.smooth-transition .alert-item:not(.animate-in):not(.animate-out) {
+    transition: transform 0.3s ease;
+}
+
+/* 设置对话框样式 */
+.settings-dialog {
+    display: none;
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #2a2a2a;
+    padding: 20px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    z-index: 1000;
+    min-width: 300px;
+}
+
+.settings-dialog h3 {
+    margin-bottom: 15px;
+    color: #d4af37;
+}
+
+.settings-dialog label {
+    display: block;
+    margin-bottom: 5px;
+    color: #e0e0e0;
+}
+
+.settings-dialog input {
+    width: 100%;
+    padding: 5px;
+    background: #333;
+    border: 1px solid #555;
+    color: #e0e0e0;
+    border-radius: 4px;
+    margin-bottom: 15px;
+}
+
+.settings-buttons {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+}
+
+.settings-btn {
+    padding: 8px 15px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.settings-btn.cancel {
+    background: #555;
+    color: #e0e0e0;
+}
+
+.settings-btn.apply {
+    background: #d4af37;
+    color: #000;
+}
+
+.dialog-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.5);
+    z-index: 999;
+}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="main-content">
+            <h1>股票行情监控系统</h1>
+            <div id="mainStockData">
+                <p>主要行情数据展示区域...</p>
+            </div>
+        </div>
+        
+        <div class="volatile-sidebar">
+            <div class="sidebar-header">
+                🚀 短线精灵 - 实时异动监控 <span id="connectionStatus" class="status-disconnected">❌ 断开连接</span>
+            </div>
+            
+            <!-- <div class="connection-status">
+                连接状态: <span id="connectionStatus" class="status-disconnected">❌ 断开连接</span>
+            </div> -->
+            
+            <!-- 筛选面板 -->
+            <div class="filter-panel">
+                <div class="filter-group">
+                    <!-- <div class="filter-title">异动级别</div> -->
+                    <div class="filter-options">
+                        <label class="filter-option">
+                            <input type="checkbox" name="level" value="high" checked> 强烈异动
+                        </label>
+                        <label class="filter-option">
+                            <input type="checkbox" name="level" value="medium" checked> 中度异动
+                        </label>
+                        <label class="filter-option">
+                            <input type="checkbox" name="level" value="low" checked> 轻微异动
+                        </label>
+                    </div>
+                </div>
+                
+                <div class="filter-group">
+                    <!-- <div class="filter-title">异动类型</div> -->
+                    <div class="filter-options">
+                        <label class="filter-option">
+                            <input type="checkbox" name="type" value="封单异动" checked> 封单异动
+                        </label>
+                        <label class="filter-option">
+                            <input type="checkbox" name="type" value="成交额异动" checked> 成交额异动
+                        </label>
+                        <label class="filter-option">
+                            <input type="checkbox" name="type" value="其他" checked> 其他异动
+                        </label>
+                    </div>
+                </div>
+                
+                <div class="filter-group">
+                    <!-- <div class="filter-title">强度筛选</div> -->
+                    <div class="strength-filter">
+                        <span>最小强度:</span>
+                        <input type="range" id="strengthSlider" min="0" max="10" value="0" class="strength-slider">
+                        <span id="strengthValue" class="strength-value">0</span>
+                    </div>
+                </div>
+                
+                <div class="control-buttons">
+                    <button class="control-btn" onclick="applyFilters()">应用筛选</button>
+                    <button class="control-btn" onclick="resetFilters()">重置筛选</button>
+                    <button class="control-btn" id="autoScrollBtn" onclick="toggleAutoScroll()">🔒 暂停滚动</button>
+                    <button class="control-btn" onclick="clearAllData()">清空数据</button>
+                    <button class="control-btn" onclick="toggleDataPersistence()" id="persistenceBtn">💾 持久化:开</button>
+                    <!-- 新增设置按钮 -->
+                    <button class="control-btn" onclick="showSettings()">⚙️ 设置</button>
+                </div>
+            </div>
+            
+            <div class="debug-info" id="debugInfo">
+                <!-- 调试信息将显示在这里 -->
+            </div>
+            
+            <div class="alert-stats">
+                <div class="stat-item">
+                    <div class="stat-value high-count" id="highCount">0</div>
+                    <div class="stat-label">强烈异动</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value medium-count" id="mediumCount">0</div>
+                    <div class="stat-label">中度异动</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value low-count" id="lowCount">0</div>
+                    <div class="stat-label">轻微异动</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value total-count" id="totalCount">0</div>
+                    <div class="stat-label">总计</div>
+                </div>
+            </div>
+            
+            <div class="alerts-container" id="alertsContainer">
+                <div class="no-alerts">等待连接...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 设置对话框 -->
+    <div id="settingsDialog" class="settings-dialog">
+        <h3>显示设置</h3>
+        
+        <div>
+            <label for="storageLimit">存储最大数量:</label>
+            <input type="number" id="storageLimit" min="50" max="1000" value="200">
+        </div>
+        
+        <div>
+            <label for="displayLimit">显示最大数量:</label>
+            <input type="number" id="displayLimit" min="20" max="500" value="100">
+        </div>
+        
+        <div class="settings-buttons">
+            <button class="settings-btn cancel" onclick="hideSettings()">取消</button>
+            <button class="settings-btn apply" onclick="applySettings()">应用</button>
+        </div>
+    </div>
+
+    <!-- 对话框遮罩 -->
+    <div id="dialogOverlay" class="dialog-overlay"></div>
+
+    <script>
+        class ShortTermSpirit {
+            constructor() {
+                this.ws = null;
+                this.allAlerts = []; // 存储所有警报（受maxStorageAlerts限制）
+                this.filteredAlerts = []; // 存储筛选后的警报（受maxDisplayAlerts限制）
+                this.alertCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                this.cumulativeCounts = { high: 0, medium: 0, low: 0, total: 0 }; // 新增：累计统计
+                this.maxStorageAlerts = 200; // 存储的最大警报数量
+                this.maxDisplayAlerts = 100; // 显示的最大警报数量
+                this.reconnectDelay = 1000;
+                this.messageCount = 0;
+                this.autoScroll = true;
+                this.dataPersistence = true;
+                this.sessionId = this.generateSessionId();
+                this.lastProcessedTimestamps = new Set();
+                this.isFiltering = false;
+                this.pendingAlerts = [];
+                
+                // 筛选条件
+                this.filters = {
+                    levels: ['high', 'medium', 'low'],
+                    types: ['封单异动', '成交额异动', '其他'],
+                    minStrength: 0
+                };
+                
+                // UI状态
+                this.uiState = {
+                    autoScroll: true,
+                    dataPersistence: true,
+                    filters: this.filters
+                };
+                
+                this.init();
+            }
+            
+            init() {
+                this.loadFromStorage();
+                this.applyUIFilters();
+                this.updateStatsDisplay();
+                // this.renderAlerts();
+                 // 修复：确保数据正确渲染
+                if (this.allAlerts.length > 0) {
+                    this.applyFilters(); // 如果有历史数据，立即应用筛选
+                } else {
+                    this.renderAlerts(); // 如果没有数据，显示等待消息
+                }
+                this.connect();
+            }
+            
+            connect() {
+                try {
+                    this.addDebugInfo('尝试连接 WebSocket...');
+                    this.ws = new WebSocket('ws://115.190.156.240:8080/ws');
+                    
+                    this.ws.onopen = () => {
+                        console.log('✅ WebSocket连接成功');
+                        this.addDebugInfo('✅ WebSocket连接成功');
+                        this.updateConnectionStatus(true);
+                        this.reconnectDelay = 1000;
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        this.messageCount++;
+                        console.log(`📨 收到消息 #${this.messageCount}:`, event.data);
+                        
+                        try {
+                            const data = JSON.parse(event.data);
+                            
+                            if (data.type === 'volatile_alert') {
+                                // 如果正在筛选，将警报放入待处理队列
+                                if (this.isFiltering) {
+                                    this.pendingAlerts.push(data);
+                                } else {
+                                    this.handleAlert(data);
+                                }
+                            } else if (data.type === 'system') {
+                                this.addDebugInfo(`系统消息: ${data.message}`);
+                            }
+                        } catch (e) {
+                            console.error('消息解析错误:', e);
+                        }
+                    };
+                    
+                    this.ws.onclose = (event) => {
+                        console.log('❌ WebSocket连接关闭:', event.code, event.reason);
+                        this.addDebugInfo(`❌ 连接关闭: ${event.code} - ${event.reason}`);
+                        this.updateConnectionStatus(false);
+                        setTimeout(() => this.connect(), this.reconnectDelay);
+                        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket错误:', error);
+                        this.addDebugInfo('❌ WebSocket连接错误');
+                    };
+                    
+                } catch (error) {
+                    console.error('连接失败:', error);
+                    this.addDebugInfo(`❌ 连接失败: ${error.message}`);
+                    setTimeout(() => this.connect(), this.reconnectDelay);
+                }
+            }
+            
+            handleAlert(alertData) {
+                // 检查是否已处理过此警报（基于时间戳）
+                const alertKey = `${alertData.symbol}_${alertData.timestamp}`;
+                if (this.lastProcessedTimestamps.has(alertKey)) {
+                    return;
+                }
+                
+                // 添加到已处理集合
+                this.lastProcessedTimestamps.add(alertKey);
+                
+                // 添加到所有警报（存储限制）
+                this.allAlerts.unshift(alertData);
+                
+                // 限制存储数据量（避免内存泄漏）
+                if (this.allAlerts.length > this.maxStorageAlerts) {
+                    const removedAlert = this.allAlerts.pop();
+                    const removedKey = `${removedAlert.symbol}_${removedAlert.timestamp}`;
+                    this.lastProcessedTimestamps.delete(removedKey);
+                }
+                
+                // 更新统计（包括累计统计）
+                this.updateStats(alertData);
+                
+                // 应用筛选
+                this.applyFilters();
+                
+                // 保存到本地存储（如果启用持久化）
+                if (this.dataPersistence) {
+                    this.saveToStorage();
+                }
+            }
+            
+            updateStats(alertData) {
+                // 重置当前统计（基于存储的数据）
+                this.alertCounts = { high: 0, medium: 0, low: 0, total: this.allAlerts.length };
+                
+                // 计算当前存储数据的各级别数量
+                this.allAlerts.forEach(alert => {
+                    this.alertCounts[alert.alert_level]++;
+                });
+                
+                // 更新累计统计（不受存储限制）
+                this.cumulativeCounts.total++;
+                if (alertData && alertData.alert_level) {
+                    this.cumulativeCounts[alertData.alert_level]++;
+                }
+                
+                this.updateStatsDisplay();
+            }
+            
+            updateStatsDisplay() {
+                // 显示累计统计，不受存储限制
+                document.getElementById('highCount').textContent = this.cumulativeCounts.high;
+                document.getElementById('mediumCount').textContent = this.cumulativeCounts.medium;
+                document.getElementById('lowCount').textContent = this.cumulativeCounts.low;
+                document.getElementById('totalCount').textContent = this.cumulativeCounts.total;
+            }
+            
+            applyFilters() {
+                // 先筛选所有存储的数据
+                let filtered = this.allAlerts.filter(alert => {
+                    // 检查级别筛选
+                    if (!this.filters.levels.includes(alert.alert_level)) {
+                        return false;
+                    }
+                    
+                    // 检查类型筛选
+                    if (!this.filters.types.includes(alert.action_text)) {
+                        return false;
+                    }
+                    
+                    // 检查强度筛选
+                    if (alert.strength < this.filters.minStrength) {
+                        return false;
+                    }
+                    
+                    return true;
+                });
+                
+                // 限制显示数量（提高性能）
+                this.filteredAlerts = filtered.slice(0, this.maxDisplayAlerts);
+                
+                this.renderAlerts();
+            }
+            
+            renderAlerts() {
+                const container = document.getElementById('alertsContainer');
+                
+                if (this.filteredAlerts.length === 0) {
+                    container.innerHTML = '<div class="no-alerts">暂无符合条件的异动数据</div>';
+                    return;
+                }
+                
+                // 清除等待消息
+                if (container.innerHTML.includes('等待连接') || container.innerHTML.includes('等待异动数据')) {
+                    container.innerHTML = '';
+                }
+                
+                // 添加平滑过渡类
+                container.classList.add('smooth-transition');
+                
+                // 清空容器
+                container.innerHTML = '';
+                
+                // 添加所有警报项
+                this.filteredAlerts.forEach((alert, index) => {
+                    const alertElement = this.createAlertElement(alert);
+                    
+                    // 如果是第一个元素（最新），添加入场动画
+                    if (index === 0) {
+                        setTimeout(() => {
+                            alertElement.classList.add('animate-in');
+                        }, 10);
+                    }
+                    
+                    container.appendChild(alertElement);
+                });
+                
+                // 移除平滑过渡类（只在渲染完成后）
+                setTimeout(() => {
+                    container.classList.remove('smooth-transition');
+                }, 300);
+                
+                // 自动滚动到底部
+                if (this.autoScroll) {
+                    container.scrollTop = 0;
+                }
+            }
+            
+            createAlertElement(alert) {
+                const alertElement = document.createElement('div');
+                alertElement.className = `alert-item ${alert.alert_level}`;
+                
+                const changeClass = alert.change_5min >= 0 ? 'change-positive' : 'change-negative';
+                const changeSign = alert.change_5min >= 0 ? '+' : '';
+                
+                // 格式化大数字为万/亿单位
+                const formatLargeNumber = (num) => {
+                    // 检查是否为有效数字
+                    if (num === undefined || num === null) {
+                        return '0';
+                    }
+                    
+                    // 转换为数字
+                    const numberValue = Number(num);
+                    if (isNaN(numberValue)) {
+                        return '0';
+                    }
+                    const absNum = Math.abs(num);
+                    if (absNum >= 100000000) {
+                        return (num / 100000000).toFixed(1) + '亿';
+                    } else if (absNum >= 10000) {
+                        return (num / 10000).toFixed(0) + '万';
+                    }
+                    return num.toString();
+                };
+                
+                alertElement.innerHTML = `
+                    <div class="alert-header">
+                        <div class="stock-info">
+                            <span class="stock-symbol">${alert.name}</span>
+                            <span class="alert-reason">${alert.action_text}</span>
+                        </div>
+                        <div class="alert-meta">
+                            <span class="alert-level ${alert.alert_level}">${alert.level_text}</span>
+                            <span class="alert-time">${alert.display_time}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="alert-content">
+                        <div class="price-section">
+                            <span class="price-label">现价</span>
+                            <span class="price-value">${alert.price}</span>
+                            <span class="change-5min ${changeClass}">${alert.change}% ${changeSign}${alert.change_5min}%</span>
+                        </div>
+                        
+                        <div class="data-grid">
+                            <div class="data-item">
+                                <span class="data-label">瞬时成交额</span>
+                                <span class="data-value">${formatLargeNumber(alert.amount)}</span>
+                            </div>
+                            <div class="data-item">
+                                <span class="data-label">5分大单</span>
+                                <span class="data-value">${formatLargeNumber(alert.large_net_5min)}</span>
+                            </div>
+                            <div class="data-item">
+                                <span class="data-label">5分成交额</span>
+                                <span class="data-value">${formatLargeNumber(alert.amount_5min)}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                return alertElement;
+            }
+            
+            updateConnectionStatus(connected) {
+                const statusElement = document.getElementById('connectionStatus');
+                if (connected) {
+                    statusElement.textContent = '✅ 已连接';
+                    statusElement.className = 'status-connected';
+                } else {
+                    statusElement.textContent = '❌ 断开连接';
+                    statusElement.className = 'status-disconnected';
+                }
+            }
+            
+            addDebugInfo(message) {
+                const debugElement = document.getElementById('debugInfo');
+                const time = new Date().toLocaleTimeString();
+                const infoItem = document.createElement('div');
+                infoItem.textContent = `[${time}] ${message}`;
+                debugElement.appendChild(infoItem);
+                
+                // 限制调试信息数量
+                if (debugElement.children.length > 10) {
+                    debugElement.removeChild(debugElement.firstChild);
+                }
+                
+                // 自动滚动到底部
+                debugElement.scrollTop = debugElement.scrollHeight;
+            }
+            
+            // 生成会话ID
+            generateSessionId() {
+                return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            }
+            
+            // 本地存储方法
+            saveToStorage() {
+                try {
+                    // 保存所有数据
+                    localStorage.setItem('shortTermAlerts', JSON.stringify(this.allAlerts));
+                    localStorage.setItem('shortTermFilters', JSON.stringify(this.filters));
+                    localStorage.setItem('shortTermStats', JSON.stringify(this.alertCounts));
+                    localStorage.setItem('shortTermCumulativeStats', JSON.stringify(this.cumulativeCounts));
+                    localStorage.setItem('shortTermPersistence', JSON.stringify(this.dataPersistence));
+                    localStorage.setItem('shortTermUIState', JSON.stringify(this.uiState));
+                    localStorage.setItem('shortTermSession', this.sessionId);
+                    // 保存限制设置
+                    localStorage.setItem('shortTermLimits', JSON.stringify({
+                        storage: this.maxStorageAlerts,
+                        display: this.maxDisplayAlerts
+                    }));
+                } catch (e) {
+                    console.error('保存到本地存储失败:', e);
+                }
+            }
+            
+            loadFromStorage() {
+                try {
+                    // 加载UI状态和筛选条件
+                    const savedUIState = localStorage.getItem('shortTermUIState');
+                    if (savedUIState) {
+                        this.uiState = JSON.parse(savedUIState);
+                        this.autoScroll = this.uiState.autoScroll;
+                        this.dataPersistence = this.uiState.dataPersistence;
+                        
+                        if (this.uiState.filters) {
+                            this.filters = this.uiState.filters;
+                        }
+                        
+                        this.updateUIButtons();
+                    }
+                    
+                    // 加载限制设置
+                    const savedLimits = localStorage.getItem('shortTermLimits');
+                    if (savedLimits) {
+                        const limits = JSON.parse(savedLimits);
+                        this.maxStorageAlerts = limits.storage || 200;
+                        this.maxDisplayAlerts = limits.display || 100;
+                    }
+                    
+                    // 检查是否是同一会话
+                    const lastSession = localStorage.getItem('shortTermSession');
+                    
+                    // 如果禁用持久化或者是新会话，不清除数据
+                    if (!this.dataPersistence || !lastSession) {
+                        console.log('跳过加载历史数据: 持久化关闭或新会话');
+                        return;
+                    }
+                    
+                    // 加载警报数据
+                    const savedAlerts = localStorage.getItem('shortTermAlerts');
+                    if (savedAlerts) {
+                        this.allAlerts = JSON.parse(savedAlerts);
+                        console.log(`从存储加载了 ${this.allAlerts.length} 条警报`);
+                        
+                        // 重建已处理时间戳集合
+                        this.lastProcessedTimestamps.clear();
+                        this.allAlerts.forEach(alert => {
+                            const alertKey = `${alert.symbol}_${alert.timestamp}`;
+                            this.lastProcessedTimestamps.add(alertKey);
+                        });
+                        
+                        // 修复：加载数据后立即更新统计
+                        this.updateStats(); // 不传入alertData，只基于现有数据更新
+                    }
+                    
+                    // 加载当前统计信息
+                    const savedStats = localStorage.getItem('shortTermStats');
+                    if (savedStats) {
+                        this.alertCounts = JSON.parse(savedStats);
+                    }
+                    
+                    // 加载累计统计信息
+                    const savedCumulativeStats = localStorage.getItem('shortTermCumulativeStats');
+                    if (savedCumulativeStats) {
+                        this.cumulativeCounts = JSON.parse(savedCumulativeStats);
+                    } else {
+                        // 如果没有累计统计，从当前统计初始化（兼容旧版本）
+                        this.cumulativeCounts = { ...this.alertCounts };
+                    }
+                } catch (e) {
+                    console.error('从本地存储加载失败:', e);
+                }
+            }
+            
+            applyUIFilters() {
+                // 更新级别筛选
+                const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+                levelCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.levels.includes(checkbox.value);
+                });
+                
+                // 更新类型筛选
+                const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+                typeCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.types.includes(checkbox.value);
+                });
+                
+                // 更新强度筛选
+                document.getElementById('strengthSlider').value = this.filters.minStrength;
+                document.getElementById('strengthValue').textContent = this.filters.minStrength;
+            }
+            
+            updateUIButtons() {
+                // 更新自动滚动按钮
+                const autoScrollBtn = document.getElementById('autoScrollBtn');
+                autoScrollBtn.textContent = this.autoScroll ? '🔒 暂停滚动' : '🔓 开启滚动';
+                
+                // 更新持久化按钮
+                const persistenceBtn = document.getElementById('persistenceBtn');
+                persistenceBtn.textContent = this.dataPersistence ? '💾 持久化:开' : '💾 持久化:关';
+            }
+            
+            clearAllData() {
+                if (confirm('确定要清空所有股票异动数据吗？此操作将重置累计统计，不可撤销。')) {
+                    // 清空所有数据
+                    this.allAlerts = [];
+                    this.filteredAlerts = [];
+                    this.lastProcessedTimestamps.clear();
+                    
+                    // 重置所有统计（包括累计统计）
+                    this.alertCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                    this.cumulativeCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                    
+                    this.updateStatsDisplay();
+                    this.renderAlerts();
+                    
+                    if (this.dataPersistence) {
+                        this.saveToStorage();
+                    }
+                }
+            }
+            
+            toggleAutoScroll() {
+                this.autoScroll = !this.autoScroll;
+                this.uiState.autoScroll = this.autoScroll;
+                this.updateUIButtons();
+                this.saveToStorage();
+            }
+            
+            toggleDataPersistence() {
+                this.dataPersistence = !this.dataPersistence;
+                this.uiState.dataPersistence = this.dataPersistence;
+                this.updateUIButtons();
+                
+                if (this.dataPersistence) {
+                    // 开启持久化时保存当前数据
+                    this.saveToStorage();
+                } else {
+                    // 关闭持久化时清除存储的数据
+                    localStorage.removeItem('shortTermAlerts');
+                    localStorage.removeItem('shortTermStats');
+                    localStorage.removeItem('shortTermCumulativeStats');
+                }
+                
+                this.saveToStorage(); // 保存持久化设置
+            }
+            
+            // 处理筛选期间的待处理警报
+            processPendingAlerts() {
+                if (this.pendingAlerts.length > 0) {
+                    this.addDebugInfo(`处理 ${this.pendingAlerts.length} 条待处理警报`);
+                    
+                    // 处理所有待处理警报
+                    this.pendingAlerts.forEach(alert => {
+                        this.handleAlert(alert);
+                    });
+                    
+                    // 清空待处理队列
+                    this.pendingAlerts = [];
+                }
+            }
+            
+            // 保存筛选条件到UI状态
+            saveFiltersToUIState() {
+                this.uiState.filters = {
+                    levels: [...this.filters.levels],
+                    types: [...this.filters.types],
+                    minStrength: this.filters.minStrength
+                };
+            }
+            
+            // 新增：设置存储限制的方法
+            setStorageLimit(limit) {
+                this.maxStorageAlerts = limit;
+                // 如果当前存储的数据超过新限制，需要截断
+                if (this.allAlerts.length > this.maxStorageAlerts) {
+                    const removeCount = this.allAlerts.length - this.maxStorageAlerts;
+                    const removedAlerts = this.allAlerts.splice(-removeCount);
+                    
+                    // 从已处理集合中移除
+                    removedAlerts.forEach(alert => {
+                        const alertKey = `${alert.symbol}_${alert.timestamp}`;
+                        this.lastProcessedTimestamps.delete(alertKey);
+                    });
+                    
+                    this.applyFilters();
+                    if (this.dataPersistence) {
+                        this.saveToStorage();
+                    }
+                }
+            }
+            
+            // 新增：设置显示限制的方法
+            setDisplayLimit(limit) {
+                this.maxDisplayAlerts = limit;
+                this.applyFilters(); // 重新应用筛选以更新显示
+            }
+        }
+        
+        // 全局函数
+        const spirit = new ShortTermSpirit();
+        
+        function applyFilters() {
+            // 标记开始筛选
+            spirit.isFiltering = true;
+            
+            // 获取级别筛选
+            const levelCheckboxes = document.querySelectorAll('input[name="level"]:checked');
+            spirit.filters.levels = Array.from(levelCheckboxes).map(cb => cb.value);
+            
+            // 获取类型筛选
+            const typeCheckboxes = document.querySelectorAll('input[name="type"]:checked');
+            spirit.filters.types = Array.from(typeCheckboxes).map(cb => cb.value);
+            
+            // 获取强度筛选
+            spirit.filters.minStrength = parseInt(document.getElementById('strengthSlider').value);
+            
+            // 保存筛选条件到UI状态
+            spirit.saveFiltersToUIState();
+            
+            // 应用筛选
+            spirit.applyFilters();
+            
+            // 标记筛选结束
+            spirit.isFiltering = false;
+            
+            // 处理筛选期间积累的警报
+            spirit.processPendingAlerts();
+            
+            // 保存筛选条件
+            spirit.saveToStorage();
+        }
+        
+        function resetFilters() {
+            // 重置级别筛选
+            const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+            levelCheckboxes.forEach(cb => cb.checked = true);
+            
+            // 重置类型筛选
+            const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+            typeCheckboxes.forEach(cb => cb.checked = true);
+            
+            // 重置强度筛选
+            document.getElementById('strengthSlider').value = 0;
+            document.getElementById('strengthValue').textContent = '0';
+            
+            // 应用重置后的筛选
+            applyFilters();
+        }
+        
+        function clearAllData() {
+            spirit.clearAllData();
+        }
+        
+        function toggleAutoScroll() {
+            spirit.toggleAutoScroll();
+        }
+        
+        function toggleDataPersistence() {
+            spirit.toggleDataPersistence();
+        }
+        
+        // 设置相关函数
+        function showSettings() {
+            document.getElementById('settingsDialog').style.display = 'block';
+            document.getElementById('dialogOverlay').style.display = 'block';
+            
+            // 设置当前值
+            document.getElementById('storageLimit').value = spirit.maxStorageAlerts;
+            document.getElementById('displayLimit').value = spirit.maxDisplayAlerts;
+        }
+        
+        function hideSettings() {
+            document.getElementById('settingsDialog').style.display = 'none';
+            document.getElementById('dialogOverlay').style.display = 'none';
+        }
+        
+        function applySettings() {
+            const storageLimit = parseInt(document.getElementById('storageLimit').value);
+            const displayLimit = parseInt(document.getElementById('displayLimit').value);
+            
+            if (storageLimit >= 50 && displayLimit >= 20 && displayLimit <= storageLimit) {
+                spirit.setStorageLimit(storageLimit);
+                spirit.setDisplayLimit(displayLimit);
+                hideSettings();
+                spirit.addDebugInfo(`设置已更新: 存储${storageLimit}条, 显示${displayLimit}条`);
+                // 保存限制设置
+                spirit.saveToStorage();
+            } else {
+                alert('请输入有效的数值：存储≥50，显示≥20，且显示数量≤存储数量');
+            }
+        }
+        
+        // 初始化强度滑块
+        document.addEventListener('DOMContentLoaded', function() {
+            const strengthSlider = document.getElementById('strengthSlider');
+            const strengthValue = document.getElementById('strengthValue');
+            
+            strengthSlider.addEventListener('input', function() {
+                strengthValue.textContent = this.value;
+            });
+            
+            // 添加重新连接功能
+            const statusElement = document.getElementById('connectionStatus');
+            statusElement.style.cursor = 'pointer';
+            statusElement.title = '点击重新连接';
+            statusElement.addEventListener('click', function() {
+                spirit.connect();
+            });
+            
+            // 点击遮罩关闭对话框
+            document.getElementById('dialogOverlay').addEventListener('click', hideSettings);
+        });
+    </script>
+</body>
+</html>
