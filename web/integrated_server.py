@@ -7,22 +7,23 @@ import os
 from typing import Dict, Set, List
 import logging
 from aiohttp import web
-from plate_updater import OptimizedPlateUpdater, PlateDataSimulator
+
+# 修改导入路径
+from plate_updater import RedisPlateUpdater, PlateDataSimulator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class IntegratedWebService:
     def __init__(self):
-        # 初始化板块更新器
-        self.plate_updater = OptimizedPlateUpdater(
+        # 修改：使用RedisPlateUpdater替代原来的OptimizedPlateUpdater
+        self.plate_updater = RedisPlateUpdater(
             'data/板块.csv', 
-            'data/个股板块.csv', 
-            'data/概念.csv'
+            'data/个股板块.csv'
         )
         
-        # 初始化数据模拟器
-        self.data_simulator = PlateDataSimulator(self.plate_updater, update_interval=2)
+        # 修改：使用新的PlateDataSimulator
+        self.data_simulator = PlateDataSimulator(self.plate_updater, update_interval=10)
         
         # WebSocket连接管理
         self.plate_connections: Set = set()
@@ -46,7 +47,7 @@ class IntegratedWebService:
         while True:
             try:
                 if self.plate_connections:
-                    # 获取最新数据
+                    # 获取最新数据 - 现在从Redis获取
                     all_metrics = self.plate_updater.get_all_plate_metrics()
                     main_metrics = self.plate_updater.get_main_plates_metrics()
                     
@@ -68,7 +69,7 @@ class IntegratedWebService:
                     if self.update_count % 30 == 0:  # 每30次更新记录一次
                         logger.info(f"📤 广播板块更新 #{self.update_count}, 客户端: {len(self.plate_connections)}")
                 
-                await asyncio.sleep(1)  # 1秒广播一次
+                await asyncio.sleep(self.data_simulator.update_interval)  # 1秒广播一次
                 
             except Exception as e:
                 logger.error(f"❌ 广播板块更新失败: {e}")
@@ -90,7 +91,7 @@ class IntegratedWebService:
             connections.remove(ws)
     
     async def handle_plate_websocket(self, request):
-        """处理板块数据WebSocket连接 - 修复aiohttp版本"""
+        """处理板块数据WebSocket连接"""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         
@@ -98,7 +99,7 @@ class IntegratedWebService:
         logger.info(f"🔗 板块客户端连接, 总数: {len(self.plate_connections)}")
         
         try:
-            # 发送初始数据
+            # 发送初始数据 - 现在从Redis获取
             hierarchy, main_plates = self.plate_updater.get_plate_hierarchy()
             all_metrics = self.plate_updater.get_all_plate_metrics()
             main_metrics = self.plate_updater.get_main_plates_metrics()
@@ -200,7 +201,7 @@ class IntegratedWebService:
         elif msg_type == 'get_plate_detail':
             plate_id = data.get('plate_id')
             metrics = self.plate_updater.get_plate_metrics(plate_id)
-            
+            print("get_plate_detail 获取板块指标",plate_id,metrics)
             response = {
                 'type': 'plate_detail',
                 'data': metrics,
@@ -237,7 +238,6 @@ async def handle_bankuai(request):
         </html>
         """
         return web.Response(text=html, content_type='text/html')
-
 
 async def handle_plate_websocket(request):
     """板块WebSocket"""
@@ -277,6 +277,24 @@ async def health_check(request):
         'plate_count': len(service.plate_updater.plates)
     })
 
+# Redis状态检查
+async def redis_status(request):
+    """Redis状态检查"""
+    try:
+        from redis_storage import RedisStorageManager
+        storage = RedisStorageManager()
+        memory_info = storage.get_memory_info()
+        
+        return web.json_response({
+            'status': 'healthy',
+            'redis_memory': memory_info
+        })
+    except Exception as e:
+        return web.json_response({
+            'status': 'error',
+            'error': str(e)
+        }, status=500)
+
 async def main():
     global service
     service = IntegratedWebService()
@@ -293,6 +311,7 @@ async def main():
     app.router.add_get('/ws/plate', handle_plate_websocket)
     app.router.add_get('/api/plate', plate_api)
     app.router.add_get('/health', health_check)
+    app.router.add_get('/redis-status', redis_status)  # 新增Redis状态检查
     
     # 启动服务器
     runner = web.AppRunner(app)
@@ -305,6 +324,7 @@ async def main():
     logger.info("🔌 ws://localhost:8080/ws/plate - 板块WebSocket")
     logger.info("📊 http://localhost:8080/api/plate - 板块API")
     logger.info("❤️ http://localhost:8080/health - 健康检查")
+    logger.info("💾 http://localhost:8080/redis-status - Redis状态")
     
     # 永久运行
     await asyncio.Future()
