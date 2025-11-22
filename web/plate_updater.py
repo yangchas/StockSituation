@@ -23,6 +23,8 @@ class OptimizedPlateUpdater:
         self.load_data()
         self.build_optimized_structures()
         self.initialize_metrics()
+        # 初始化模拟个股数据
+        self.initialize_mock_stocks()
     
     def load_data(self):
         """加载所有数据"""
@@ -41,7 +43,7 @@ class OptimizedPlateUpdater:
                 plate_name = row['name']
                 market_cap = float(row['流通值']) if row['流通值'] else 0.0
                 
-                # 解析inner字段 - 修复这里！
+                # 解析inner字段
                 inner_data = []
                 inner_str = row.get('inner', '').strip()
                 if inner_str and inner_str != '[]':
@@ -141,6 +143,32 @@ class OptimizedPlateUpdater:
         
         logger.info(f"📐 指标初始化完成: {n_plates}个板块")
     
+    def initialize_mock_stocks(self):
+        """初始化模拟个股数据"""
+        self.mock_stocks_data = {}
+        
+        # 为每个板块生成模拟个股数据
+        for plate_id in self.plate_ids:
+            stock_count = self.plate_stock_count[self.plate_to_idx[plate_id]]
+            if stock_count > 0:
+                stocks = []
+                for i in range(min(stock_count, 10)):  # 每个板块最多10只个股
+                    stock_code = f"{plate_id}{i+1:03d}"
+                    stock_name = f"{self.plates[plate_id]['name']}个股{i+1}"
+                    
+                    stocks.append({
+                        'code': stock_code,
+                        'name': stock_name,
+                        'change_pct': round(random.uniform(-0.05, 0.05), 4),
+                        'price': round(random.uniform(5, 100), 2),
+                        'volume': random.randint(1000000, 100000000),
+                        'market_cap': random.randint(100000000, 10000000000)
+                    })
+                
+                self.mock_stocks_data[plate_id] = stocks
+        
+        logger.info(f"📈 初始化模拟个股数据: {len(self.mock_stocks_data)}个板块")
+    
     def update_stocks(self, stock_updates):
         """
         高效批量更新股票数据
@@ -199,7 +227,7 @@ class OptimizedPlateUpdater:
             return None
             
         plate_info = self.plates[plate_id]
-        change_pct = self.section_sum_change[idx] / count
+        change_pct = self.section_sum_change[idx] / count if count > 0 else 0
         
         return {
             'id': plate_id,
@@ -246,7 +274,24 @@ class OptimizedPlateUpdater:
             if metrics:
                 sub_metrics.append(metrics)
         
+        # 如果没有找到子板块，返回所有类型为sub的板块
+        if not sub_metrics:
+            logger.warning(f"未找到 {main_plate_name} 的子板块，返回所有子板块")
+            for plate_id, plate_info in self.plates.items():
+                if not plate_info.get('inner'):  # 没有inner字段的认为是子板块
+                    metrics = self.get_plate_metrics(plate_id)
+                    if metrics:
+                        sub_metrics.append(metrics)
+        
         return sub_metrics
+    
+    def get_plate_stocks(self, plate_id):
+        """获取板块个股数据"""
+        if plate_id in self.mock_stocks_data:
+            return self.mock_stocks_data[plate_id]
+        
+        # 如果没有模拟数据，返回空数组
+        return []
     
     def get_plate_hierarchy(self):
         """获取板块层级关系"""

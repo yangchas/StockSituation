@@ -82,19 +82,19 @@ class IntegratedWebService:
         disconnected = []
         for ws in connections:
             try:
-                if hasattr(ws, 'send_str'):  # aiohttp WebSocket
-                    await ws.send_str(json.dumps(message, ensure_ascii=False))
-                else:  # websockets库
-                    await ws.send(json.dumps(message, ensure_ascii=False))
+                await ws.send_str(json.dumps(message, ensure_ascii=False))
             except:
                 disconnected.append(ws)
         
         for ws in disconnected:
             connections.remove(ws)
     
-    async def handle_plate_websocket(self, websocket):
-        """处理板块数据WebSocket连接"""
-        self.plate_connections.add(websocket)
+    async def handle_plate_websocket(self, request):
+        """处理板块数据WebSocket连接 - 修复aiohttp版本"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        self.plate_connections.add(ws)
         logger.info(f"🔗 板块客户端连接, 总数: {len(self.plate_connections)}")
         
         try:
@@ -114,28 +114,31 @@ class IntegratedWebService:
                 'timestamp': int(time.time() * 1000)
             }
             
-            if hasattr(websocket, 'send_str'):
-                await websocket.send_str(json.dumps(init_data, ensure_ascii=False))
-            else:
-                await websocket.send(json.dumps(init_data, ensure_ascii=False))
+            await ws.send_str(json.dumps(init_data, ensure_ascii=False))
             
             # 处理客户端消息
-            async for message in websocket:
+            async for msg in ws:
                 try:
-                    data = json.loads(message)
-                    await self.handle_plate_message(data, websocket)
+                    if msg.type == web.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        await self.handle_plate_message(data, ws)
+                    elif msg.type == web.WSMsgType.ERROR:
+                        logger.error(f"WebSocket错误: {ws.exception()}")
                 except json.JSONDecodeError as e:
                     logger.error(f"❌ 解析消息失败: {e}")
                     
         except Exception as e:
             logger.error(f"❌ 板块WebSocket错误: {e}")
         finally:
-            self.plate_connections.remove(websocket)
+            self.plate_connections.remove(ws)
             logger.info(f"🔌 板块客户端断开, 总数: {len(self.plate_connections)}")
+        
+        return ws
     
     async def handle_plate_message(self, data: Dict, websocket):
         """处理板块相关消息"""
         msg_type = data.get('type')
+        logger.info(f"📨 收到消息类型: {msg_type}")
         
         if msg_type == 'get_sorted_plates':
             sort_by = data.get('sort_by', 'change_pct')
@@ -168,12 +171,29 @@ class IntegratedWebService:
             
         elif msg_type == 'get_sub_plates':
             main_plate_name = data.get('main_plate')
+            logger.info(f"🔍 获取子板块: {main_plate_name}")
+            
             sub_plates = self.plate_updater.get_sub_plates_metrics(main_plate_name)
+            logger.info(f"📋 找到子板块: {len(sub_plates)}个")
             
             response = {
                 'type': 'sub_plates',
                 'main_plate': main_plate_name,
                 'data': sub_plates,
+                'timestamp': int(time.time() * 1000)
+            }
+        
+        elif msg_type == 'get_plate_stocks':
+            plate_id = data.get('plate_id')
+            logger.info(f"📊 获取板块个股: {plate_id}")
+            
+            stocks = self.plate_updater.get_plate_stocks(plate_id)
+            logger.info(f"📈 找到个股: {len(stocks)}只")
+            
+            response = {
+                'type': 'plate_stocks',
+                'plate_id': plate_id,
+                'data': stocks,
                 'timestamp': int(time.time() * 1000)
             }
         
@@ -194,10 +214,7 @@ class IntegratedWebService:
             }
         
         # 发送响应
-        if hasattr(websocket, 'send_str'):
-            await websocket.send_str(json.dumps(response, ensure_ascii=False))
-        else:
-            await websocket.send(json.dumps(response, ensure_ascii=False))
+        await websocket.send_str(json.dumps(response, ensure_ascii=False))
 
 # HTTP路由处理
 async def handle_bankuai(request):
@@ -223,10 +240,7 @@ async def handle_bankuai(request):
 
 async def handle_plate_websocket(request):
     """板块WebSocket"""
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    await service.handle_plate_websocket(ws)
-    return ws
+    return await service.handle_plate_websocket(request)
 
 async def plate_api(request):
     """板块数据API"""
