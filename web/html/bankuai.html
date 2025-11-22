@@ -636,60 +636,6 @@
     </div>
 
     <script>
-        // 模拟WebSocket数据 - 确保包含所有子板块
-        const mockWebSocketData = {
-            "type": "plate_update", 
-            "data": {
-                "all_plates": [
-                    {"id": "801159", "name": "机器人概念", "change_pct": 0.00015469945355190822, "total_volume": 453779794.0, "total_large_net": 839113.0, "stock_count": 1830, "rise_count": 15470, "fall_count": 15595, "market_cap": 10352625190976.0, "type": "main"},
-                    {"id": "801313", "name": "金融概念", "change_pct": 0.0018269315673289154, "total_volume": 232755098.0, "total_large_net": -536843.0, "stock_count": 453, "rise_count": 7686, "fall_count": 7682, "market_cap": 10245811325824.0, "type": "main"},
-                    {"id": "801120", "name": "电力", "change_pct": 0.0003833333333333334, "total_volume": 127915470.0, "total_large_net": 225453.0, "stock_count": 516, "rise_count": 4425, "fall_count": 4331, "market_cap": 5661125262080.0, "type": "main"},
-                    {"id": "801572", "name": "中报增长", "change_pct": 0.0014224999999999856, "total_volume": 44078781.0, "total_large_net": 496292.0, "stock_count": 80, "rise_count": 1371, "fall_count": 1347, "market_cap": 2269760734848.0, "type": "sub"},
-                    {"id": "801584", "name": "数字经济", "change_pct": 0.0006115207373271911, "total_volume": 559777269.0, "total_large_net": 883823.0, "stock_count": 2170, "rise_count": 18484, "fall_count": 18337, "market_cap": 14917585842176.0, "type": "main"},
-                    {"id": "801045", "name": "医药", "change_pct": 0.0004687975646879731, "total_volume": 323348774.0, "total_large_net": -734867.0, "stock_count": 657, "rise_count": 11096, "fall_count": 11209, "market_cap": 6964113516244.0, "type": "main"},
-                    {"id": "801346", "name": "智能电网", "change_pct": 0.0007261194029850778, "total_volume": 213402745.0, "total_large_net": 592624.0, "stock_count": 804, "rise_count": 6854, "fall_count": 6791, "market_cap": 5928070620800.0, "type": "main"},
-                    {"id": "801660", "name": "通信", "change_pct": 0.0009364389233954452, "total_volume": 243270676.0, "total_large_net": 1635761.0, "stock_count": 966, "rise_count": 8142, "fall_count": 8253, "market_cap": 7245423560512.0, "type": "main"},
-                    {"id": "801314", "name": "ST板块", "change_pct": 0.0026034682080924845, "total_volume": 87717373.0, "total_large_net": -89115.0, "stock_count": 173, "rise_count": 2929, "fall_count": 2947, "market_cap": 600343090523.0, "type": "sub"},
-                    {"id": "801676", "name": "地产链", "change_pct": 2.758620689655242e-05, "total_volume": 189307627.0, "total_large_net": 540360.0, "stock_count": 377, "rise_count": 6426, "fall_count": 6373, "market_cap": 2739515265502.0, "type": "main"},
-                    {"id": "801577", "name": "高送转", "change_pct": 0.00123456789, "total_volume": 123456789.0, "total_large_net": 123456.0, "stock_count": 50, "rise_count": 35, "fall_count": 15, "market_cap": 987654321.0, "type": "sub"},
-                    {"id": "801578", "name": "次新股", "change_pct": -0.00098765432, "total_volume": 98765432.0, "total_large_net": -654321.0, "stock_count": 120, "rise_count": 45, "fall_count": 75, "market_cap": 1234567890.0, "type": "sub"}
-                ],
-                "main_plates": [
-                    {"id": "801159", "name": "机器人概念", "change_pct": 0.00015469945355190822, "total_volume": 453779794.0, "total_large_net": 839113.0, "stock_count": 1830, "rise_count": 15470, "fall_count": 15595, "market_cap": 10352625190976.0, "type": "main"},
-                    {"id": "801313", "name": "金融概念", "change_pct": 0.0018269315673289154, "total_volume": 232755098.0, "total_large_net": -536843.0, "stock_count": 453, "rise_count": 7686, "fall_count": 7682, "market_cap": 10245811325824.0, "type": "main"},
-                    {"id": "801120", "name": "电力", "change_pct": 0.0003833333333333334, "total_volume": 127915470.0, "total_large_net": 225453.0, "stock_count": 516, "rise_count": 4425, "fall_count": 4331, "market_cap": 5661125262080.0, "type": "main"},
-                    {"id": "801584", "name": "数字经济", "change_pct": 0.0006115207373271911, "total_volume": 559777269.0, "total_large_net": 883823.0, "stock_count": 2170, "rise_count": 18484, "fall_count": 18337, "market_cap": 14917585842176.0, "type": "main"},
-                    {"id": "801045", "name": "医药", "change_pct": 0.0004687975646879731, "total_volume": 323348774.0, "total_large_net": -734867.0, "stock_count": 657, "rise_count": 11096, "fall_count": 11209, "market_cap": 6964113516244.0, "type": "main"}
-                ]
-            }, 
-            "timestamp": 1763663418539, 
-            "update_count": 66
-        };
-
-        // 模拟个股数据
-        const mockStocksData = {
-            "801159": [ // 机器人概念个股
-                {code: "300024", name: "机器人", change_pct: 0.0234, price: 12.45, volume: 123456789, market_cap: 15678000000},
-                {code: "002230", name: "科大讯飞", change_pct: 0.0156, price: 45.67, volume: 98765432, market_cap: 102340000000},
-                {code: "300124", name: "汇川技术", change_pct: -0.0089, price: 67.89, volume: 45678901, market_cap: 89345000000},
-                {code: "002415", name: "海康威视", change_pct: 0.0345, price: 34.56, volume: 234567890, market_cap: 324560000000}
-            ],
-            "801313": [ // 金融概念个股
-                {code: "601318", name: "中国平安", change_pct: 0.0123, price: 48.90, volume: 345678901, market_cap: 893450000000},
-                {code: "601328", name: "交通银行", change_pct: -0.0056, price: 5.67, volume: 123456789, market_cap: 42156000000},
-                {code: "601988", name: "中国银行", change_pct: 0.0034, price: 3.45, volume: 234567890, market_cap: 123450000000}
-            ],
-            "801572": [ // 中报增长个股
-                {code: "002415", name: "海康威视", change_pct: 0.0345, price: 34.56, volume: 234567890, market_cap: 324560000000},
-                {code: "000858", name: "五粮液", change_pct: 0.0289, price: 156.78, volume: 45678901, market_cap: 607890000000},
-                {code: "600519", name: "贵州茅台", change_pct: 0.0156, price: 1678.90, volume: 12345678, market_cap: 2100000000000}
-            ],
-            "801314": [ // ST板块个股
-                {code: "600666", name: "ST瑞德", change_pct: -0.0234, price: 2.45, volume: 1234567, market_cap: 123450000},
-                {code: "600817", name: "ST宏盛", change_pct: 0.0456, price: 5.67, volume: 2345678, market_cap: 234560000}
-            ]
-        };
-
         class PlateMonitor {
             constructor() {
                 this.ws = null;
@@ -733,60 +679,100 @@
                 this.connect();
                 this.setupEventListeners();
                 this.setupScrollLoading();
-                this.startMockDataUpdates();
             }
             
             connect() {
                 try {
-                    setTimeout(() => {
+                    // 连接真实的WebSocket服务
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const host = window.location.host;
+                    const wsUrl = `ws://115.190.156.240:8080/ws/plate`;
+                    
+                    this.ws = new WebSocket(wsUrl);
+                    
+                    this.ws.onopen = () => {
                         console.log('✅ 板块WebSocket连接成功');
                         this.updateConnectionStatus(true);
                         this.showMessage('连接成功，正在加载数据...');
-                        this.handlePlateUpdate(mockWebSocketData);
-                    }, 1000);
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            this.handleWebSocketMessage(data);
+                        } catch (error) {
+                            console.error('解析WebSocket消息失败:', error, event.data);
+                        }
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket连接错误:', error);
+                        this.updateConnectionStatus(false);
+                        this.showMessage('连接错误，正在尝试重连...');
+                    };
+                    
+                    this.ws.onclose = () => {
+                        console.log('WebSocket连接关闭');
+                        this.updateConnectionStatus(false);
+                        // 5秒后尝试重连
+                        setTimeout(() => this.connect(), 5000);
+                    };
                     
                 } catch (error) {
                     console.error('连接失败:', error);
-                    setTimeout(() => this.connect(), 3000);
+                    setTimeout(() => this.connect(), 5000);
                 }
             }
             
-            startMockDataUpdates() {
-                this.dataUpdateInterval = setInterval(() => {
-                    if (this.autoUpdate) {
-                        this.generateMockUpdate();
-                    }
-                }, 3000);
+            handleWebSocketMessage(data) {
+                console.log('📡 收到WebSocket消息:', data.type);
+                
+                if (data.type === 'plate_init') {
+                    this.handlePlateInit(data);
+                } else if (data.type === 'plate_update') {
+                    this.handlePlateUpdate(data);
+                } else if (data.type === 'sub_plates') {
+                    this.handleSubPlates(data);
+                } else if (data.type === 'error') {
+                    console.error('服务器返回错误:', data.message);
+                    this.showMessage(`服务器错误: ${data.message}`);
+                }
             }
             
-            generateMockUpdate() {
-                const updatedData = JSON.parse(JSON.stringify(mockWebSocketData));
+            handlePlateInit(data) {
+                console.log('📊 处理初始化数据');
                 
-                updatedData.data.all_plates.forEach(plate => {
-                    const change = (Math.random() - 0.5) * 0.01;
-                    plate.change_pct += change;
-                    plate.total_volume += (Math.random() - 0.5) * 10000000;
-                    plate.total_large_net += (Math.random() - 0.5) * 100000;
-                    plate.rise_count += Math.floor((Math.random() - 0.5) * 10);
-                    plate.fall_count += Math.floor((Math.random() - 0.5) * 10);
+                if (data.data) {
+                    // 处理所有板块数据
+                    if (data.data.all_plates) {
+                        this.allPlates = data.data.all_plates;
+                        console.log(`📈 加载所有板块: ${this.allPlates.length}个`);
+                    }
                     
-                    plate.total_volume = Math.max(plate.total_volume, 0);
-                    plate.rise_count = Math.max(plate.rise_count, 0);
-                    plate.fall_count = Math.max(plate.fall_count, 0);
-                });
-                
-                updatedData.timestamp = Date.now();
-                updatedData.update_count = this.updateCount + 1;
-                
-                this.handlePlateUpdate(updatedData);
+                    // 处理主流板块数据
+                    if (data.data.main_plates) {
+                        this.mainPlates = data.data.main_plates;
+                        console.log(`🏆 加载主流板块: ${this.mainPlates.length}个`);
+                    }
+                    
+                    // 处理主流板块指标
+                    if (data.data.main_plates_metrics) {
+                        this.mainPlates = data.data.main_plates_metrics;
+                    }
+                    
+                    this.updateCurrentPlates();
+                    this.renderPlatesTable();
+                    this.updateStats();
+                    
+                    this.showMessage('数据加载完成');
+                }
             }
             
             handlePlateUpdate(data) {
-                console.log('📡 收到实时板块更新', data.timestamp);
+                console.log('🔄 处理实时更新数据');
                 
                 if (data.data) {
                     this.updateCount++;
-                    // 移除对不存在的updateCount元素的更新
                     
                     if (data.data.all_plates) {
                         this.updatePlateData(this.allPlates, data.data.all_plates, '全部板块');
@@ -804,11 +790,19 @@
                         this.updateCurrentPlates();
                         this.updatePlatesDisplay();
                         
-                        // 修复：保持当前查看状态，不重置
+                        // 保持当前查看状态
                         if (this.viewState.currentMainPlate || this.viewState.currentSubPlate) {
                             this.restoreViewState();
                         }
                     }
+                }
+            }
+
+            handleSubPlates(data) {
+                console.log('📋 处理子板块数据:', data);
+                if (this.selectedPlate && data.data) {
+                    const mainStocks = this.currentStocks; // 保持当前个股数据
+                    this.renderDetailView(this.selectedPlate, data.data, mainStocks);
                 }
             }
 
@@ -957,6 +951,11 @@
                 const container = document.getElementById('platesContainer');
                 this.plateElements.clear();
                 
+                if (this.displayedPlates.length === 0) {
+                    container.innerHTML = '<div class="loading">正在加载板块数据...</div>';
+                    return;
+                }
+                
                 let html = `
                     <div class="plates-flex-container">
                         <div class="plate-header">
@@ -1019,6 +1018,7 @@
                     this.currentSort.direction = direction;
                 }
                 
+                // 本地排序，不发送请求到服务器
                 this.updateCurrentPlates();
                 this.applySortOrder();
                 this.updateSortInfo();
@@ -1105,16 +1105,20 @@
                 
                 document.getElementById('detailTitle').textContent = `📈 ${plateName} - 子板块`;
                 
-                // 获取子板块 - 修复：确保获取所有子板块
-                const subPlates = this.allPlates.filter(p => p.type === 'sub');
-                // 获取主板块的个股
-                const mainStocks = mockStocksData[this.selectedPlate.id] || [];
+                // 发送请求获取子板块数据
+                this.sendMessage({
+                    type: 'get_sub_plates',
+                    main_plate: plateName
+                });
                 
-                this.renderDetailView(this.selectedPlate, subPlates, mainStocks);
+                // 临时显示加载状态
+                document.getElementById('plateDetails').innerHTML = '<div class="loading">正在加载子板块数据...</div>';
             }
             
             loadStocks(plateId) {
-                this.currentStocks = mockStocksData[plateId] || [];
+                // 这里可以扩展为从服务器获取个股数据
+                // 暂时使用空数据
+                this.currentStocks = [];
                 this.renderStocks();
             }
             
@@ -1173,7 +1177,7 @@
                 html += `</div></div>`;
                 
                 // 添加主板块个股
-                if (mainStocks.length > 0) {
+                if (mainStocks && mainStocks.length > 0) {
                     html += this.renderStocksSection(mainPlate.name, mainStocks, false);
                 }
                 
@@ -1224,15 +1228,9 @@
                 if (!this.selectedPlate) return;
                 
                 // 重新获取子板块数据
-                const subPlates = this.allPlates.filter(p => p.type === 'sub');
-                const sortedSubPlates = this.sortSubPlatesArray(subPlates);
-                
-                // 更新DOM顺序
-                sortedSubPlates.forEach((plate, index) => {
-                    const element = this.subPlateElements.get(plate.id);
-                    if (element) {
-                        element.style.order = index;
-                    }
+                this.sendMessage({
+                    type: 'get_sub_plates',
+                    main_plate: this.selectedPlate.name
                 });
             }
 
@@ -1288,6 +1286,24 @@
             renderStocks() {
                 const container = document.getElementById('plateDetails');
                 const stocks = this.currentStocks;
+                
+                if (stocks.length === 0) {
+                    let html = `
+                        <div class="breadcrumb">
+                            <span class="breadcrumb-item" onclick="plateMonitor.backToMain()">全部板块</span>
+                            <span class="breadcrumb-separator">></span>
+                            <span class="breadcrumb-item" onclick="plateMonitor.backToSubPlates()">${this.selectedPlate.name}</span>
+                            <span class="breadcrumb-separator">></span>
+                            <span class="breadcrumb-item">${this.selectedSubPlate.name}</span>
+                        </div>
+                        <div style="margin-bottom: 15px; color: #d4af37; font-weight: 600;">
+                            ${this.selectedSubPlate.name} 成分股
+                        </div>
+                        <div class="no-data">暂无个股数据</div>
+                    `;
+                    container.innerHTML = html;
+                    return;
+                }
                 
                 let html = `
                     <div class="breadcrumb">
@@ -1455,7 +1471,11 @@
             }
             
             refreshData() {
-                this.sortPlates(this.currentSort.field, this.currentSort.direction);
+                // 重新连接WebSocket获取最新数据
+                if (this.ws) {
+                    this.ws.close();
+                }
+                this.connect();
                 this.showMessage('正在刷新数据...');
             }
             
