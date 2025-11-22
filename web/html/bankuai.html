@@ -661,6 +661,9 @@
                 this.subPlateElements = new Map();
                 this.subPlateSort = { field: 'change_pct', direction: 'desc' };
                 
+                // 新增：子板块数据缓存
+                this.subPlatesCache = new Map(); // 缓存每个主板块的子板块数据
+                
                 this.stats = {
                     total: 0,
                     rise: 0,
@@ -686,7 +689,7 @@
                     // 连接真实的WebSocket服务
                     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                     const host = window.location.host;
-                    const wsUrl = `ws://115.190.156.240:8080/ws/plate`;
+                    const wsUrl = `${protocol}//${host}/ws/plate`;
                     
                     this.ws = new WebSocket(wsUrl);
                     
@@ -733,6 +736,8 @@
                     this.handlePlateUpdate(data);
                 } else if (data.type === 'sub_plates') {
                     this.handleSubPlates(data);
+                } else if (data.type === 'plate_stocks') {
+                    this.handlePlateStocks(data);
                 } else if (data.type === 'error') {
                     console.error('服务器返回错误:', data.message);
                     this.showMessage(`服务器错误: ${data.message}`);
@@ -800,10 +805,158 @@
 
             handleSubPlates(data) {
                 console.log('📋 处理子板块数据:', data);
-                if (this.selectedPlate && data.data) {
-                    const mainStocks = this.currentStocks; // 保持当前个股数据
-                    this.renderDetailView(this.selectedPlate, data.data, mainStocks);
+                if (data.main_plate && data.data) {
+                    // 缓存子板块数据
+                    this.subPlatesCache.set(data.main_plate, data.data);
+                    
+                    // 如果当前选中的主板块匹配，则更新显示
+                    if (this.selectedPlate && this.selectedPlate.name === data.main_plate) {
+                        this.renderSubPlates(data.data);
+                    }
                 }
+            }
+
+            handlePlateStocks(data) {
+                console.log('📊 处理个股数据:', data);
+                if (data.plate_id && data.data) {
+                    this.currentStocks = data.data;
+                    this.renderStocks();
+                }
+            }
+
+            // 新增：渲染子板块（不重新创建DOM）
+            renderSubPlates(subPlates) {
+                const container = document.getElementById('plateDetails');
+                if (!container) return;
+                
+                // 如果已经有子板块容器，只更新内容
+                let subPlatesContainer = container.querySelector('#subPlatesContainer');
+                
+                if (!subPlatesContainer) {
+                    // 创建子板块容器结构
+                    let html = `
+                        <div class="breadcrumb">
+                            <span class="breadcrumb-item" onclick="plateMonitor.backToMain()">全部板块</span>
+                            <span class="breadcrumb-separator">></span>
+                            <span class="breadcrumb-item">${this.selectedPlate.name}</span>
+                        </div>
+                        <div class="sub-plate-controls">
+                            <div style="color: #d4af37; font-weight: 600;">
+                                子板块 (${subPlates.length})
+                            </div>
+                            <div class="sub-sort-controls">
+                                <button class="control-btn small ${this.subPlateSort.field === 'change_pct' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('change_pct')">涨跌幅</button>
+                                <button class="control-btn small ${this.subPlateSort.field === 'total_volume' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('total_volume')">成交额</button>
+                            </div>
+                        </div>
+                        <div class="sub-plates-container">
+                            <div class="sub-plates-flex-container" id="subPlatesContainer">
+                    `;
+                    
+                    // 排序子板块
+                    const sortedSubPlates = this.sortSubPlatesArray(subPlates);
+                    
+                    sortedSubPlates.forEach((plate, index) => {
+                        const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
+                        const changeSign = plate.change_pct >= 0 ? '+' : '';
+                        const turnover = this.formatNumber(plate.total_volume);
+                        const mainNet = this.formatNumber(plate.total_large_net);
+                        
+                        html += `
+                            <div class="sub-plate-card" data-sub-plate-id="${plate.id}" 
+                                 onclick="plateMonitor.selectSubPlate(${JSON.stringify(plate).replace(/"/g, '&quot;')})" 
+                                 style="order: ${index}">
+                                <div class="sub-plate-name">${plate.name}</div>
+                                <div class="sub-plate-change ${changeClass}">
+                                    ${changeSign}${(plate.change_pct * 100).toFixed(2)}%
+                                </div>
+                                <div class="sub-plate-stats">
+                                    <div>成交额: ${turnover}</div>
+                                    <div>主力: ${mainNet}</div>
+                                    <div>成分股: ${plate.stock_count || 0}只</div>
+                                    <div>涨跌: <span class="change-positive">${plate.rise_count || 0}↑</span> / 
+                                    <span class="change-negative">${plate.fall_count || 0}↓</span></div>
+                                </div>
+                            </div>
+                        `;
+                    });
+                    
+                    html += `</div></div>`;
+                    container.innerHTML = html;
+                    
+                    // 保存子板块DOM引用
+                    this.cacheSubPlateElements();
+                } else {
+                    // 更新现有子板块内容
+                    const sortedSubPlates = this.sortSubPlatesArray(subPlates);
+                    
+                    sortedSubPlates.forEach((plate, index) => {
+                        let element = this.subPlateElements.get(plate.id);
+                        
+                        if (!element) {
+                            // 创建新的子板块卡片
+                            const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
+                            const changeSign = plate.change_pct >= 0 ? '+' : '';
+                            const turnover = this.formatNumber(plate.total_volume);
+                            const mainNet = this.formatNumber(plate.total_large_net);
+                            
+                            element = document.createElement('div');
+                            element.className = 'sub-plate-card';
+                            element.setAttribute('data-sub-plate-id', plate.id);
+                            element.style.order = index;
+                            element.onclick = () => this.selectSubPlate(plate);
+                            
+                            element.innerHTML = `
+                                <div class="sub-plate-name">${plate.name}</div>
+                                <div class="sub-plate-change ${changeClass}">
+                                    ${changeSign}${(plate.change_pct * 100).toFixed(2)}%
+                                </div>
+                                <div class="sub-plate-stats">
+                                    <div>成交额: ${turnover}</div>
+                                    <div>主力: ${mainNet}</div>
+                                    <div>成分股: ${plate.stock_count || 0}只</div>
+                                    <div>涨跌: <span class="change-positive">${plate.rise_count || 0}↑</span> / 
+                                    <span class="change-negative">${plate.fall_count || 0}↓</span></div>
+                                </div>
+                            `;
+                            
+                            subPlatesContainer.appendChild(element);
+                            this.subPlateElements.set(plate.id, element);
+                        } else {
+                            // 更新现有卡片内容
+                            const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
+                            const changeSign = plate.change_pct >= 0 ? '+' : '';
+                            const turnover = this.formatNumber(plate.total_volume);
+                            const mainNet = this.formatNumber(plate.total_large_net);
+                            
+                            element.innerHTML = `
+                                <div class="sub-plate-name">${plate.name}</div>
+                                <div class="sub-plate-change ${changeClass}">
+                                    ${changeSign}${(plate.change_pct * 100).toFixed(2)}%
+                                </div>
+                                <div class="sub-plate-stats">
+                                    <div>成交额: ${turnover}</div>
+                                    <div>主力: ${mainNet}</div>
+                                    <div>成分股: ${plate.stock_count || 0}只</div>
+                                    <div>涨跌: <span class="change-positive">${plate.rise_count || 0}↑</span> / 
+                                    <span class="change-negative">${plate.fall_count || 0}↓</span></div>
+                                </div>
+                            `;
+                            element.style.order = index;
+                        }
+                    });
+                    
+                    // 移除不存在的子板块
+                    const existingIds = new Set(subPlates.map(p => p.id));
+                    for (const [id, element] of this.subPlateElements.entries()) {
+                        if (!existingIds.has(id)) {
+                            element.remove();
+                            this.subPlateElements.delete(id);
+                        }
+                    }
+                }
+                
+                this.updateSelectedPlateInfo();
             }
 
             // 新增：恢复查看状态
@@ -1105,89 +1258,42 @@
                 
                 document.getElementById('detailTitle').textContent = `📈 ${plateName} - 子板块`;
                 
-                // 发送请求获取子板块数据
-                this.sendMessage({
-                    type: 'get_sub_plates',
-                    main_plate: plateName
-                });
-                
-                // 临时显示加载状态
-                document.getElementById('plateDetails').innerHTML = '<div class="loading">正在加载子板块数据...</div>';
+                // 检查缓存中是否有子板块数据
+                if (this.subPlatesCache.has(plateName)) {
+                    console.log('📋 使用缓存的子板块数据');
+                    this.renderSubPlates(this.subPlatesCache.get(plateName));
+                } else {
+                    // 发送请求获取子板块数据
+                    this.sendMessage({
+                        type: 'get_sub_plates',
+                        main_plate: plateName
+                    });
+                    
+                    // 临时显示加载状态
+                    document.getElementById('plateDetails').innerHTML = '<div class="loading">正在加载子板块数据...</div>';
+                }
             }
             
             loadStocks(plateId) {
-                // 这里可以扩展为从服务器获取个股数据
-                // 暂时使用空数据
-                this.currentStocks = [];
-                this.renderStocks();
-            }
-            
-            renderDetailView(mainPlate, subPlates, mainStocks) {
-                const container = document.getElementById('plateDetails');
-                
-                let html = `
-                    <div class="breadcrumb">
-                        <span class="breadcrumb-item" onclick="plateMonitor.backToMain()">全部板块</span>
-                        <span class="breadcrumb-separator">></span>
-                        <span class="breadcrumb-item">${mainPlate.name}</span>
-                    </div>
-                    <div class="sub-plate-controls">
-                        <div style="color: #d4af37; font-weight: 600;">
-                            子板块 (${subPlates.length})
-                        </div>
-                        <div class="sub-sort-controls">
-                            <button class="control-btn small ${this.subPlateSort.field === 'change_pct' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('change_pct')">涨跌幅</button>
-                            <button class="control-btn small ${this.subPlateSort.field === 'total_volume' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('total_volume')">成交额</button>
-                        </div>
-                    </div>
-                    <div class="sub-plates-container">
-                        <div class="sub-plates-flex-container" id="subPlatesContainer">
-                `;
-                
-                // 排序子板块
-                const sortedSubPlates = this.sortSubPlatesArray(subPlates);
-                
-                sortedSubPlates.forEach((plate, index) => {
-                    const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
-                    const changeSign = plate.change_pct >= 0 ? '+' : '';
-                    const turnover = this.formatNumber(plate.total_volume);
-                    const mainNet = this.formatNumber(plate.total_large_net);
-                    const isSelected = this.selectedSubPlate && this.selectedSubPlate.id === plate.id;
-                    const cardClass = isSelected ? 'sub-plate-card selected' : 'sub-plate-card';
-                    
-                    html += `
-                        <div class="${cardClass}" data-sub-plate-id="${plate.id}" 
-                             onclick="plateMonitor.selectSubPlate(${JSON.stringify(plate).replace(/"/g, '&quot;')})" 
-                             style="order: ${index}">
-                            <div class="sub-plate-name">${plate.name}</div>
-                            <div class="sub-plate-change ${changeClass}">
-                                ${changeSign}${(plate.change_pct * 100).toFixed(2)}%
-                            </div>
-                            <div class="sub-plate-stats">
-                                <div>成交额: ${turnover}</div>
-                                <div>主力: ${mainNet}</div>
-                                <div>成分股: ${plate.stock_count || 0}只</div>
-                                <div>涨跌: <span class="change-positive">${plate.rise_count || 0}↑</span> / 
-                                <span class="change-negative">${plate.fall_count || 0}↓</span></div>
-                            </div>
-                        </div>
-                    `;
+                // 发送请求获取个股数据
+                this.sendMessage({
+                    type: 'get_plate_stocks',
+                    plate_id: plateId
                 });
                 
-                html += `</div></div>`;
-                
-                // 添加主板块个股
-                if (mainStocks && mainStocks.length > 0) {
-                    html += this.renderStocksSection(mainPlate.name, mainStocks, false);
+                // 临时显示加载状态
+                const container = document.getElementById('plateDetails');
+                let stocksSection = container.querySelector('.stocks-section');
+                if (!stocksSection) {
+                    stocksSection = document.createElement('div');
+                    stocksSection.className = 'stocks-section';
+                    stocksSection.innerHTML = '<div class="loading">正在加载个股数据...</div>';
+                    container.appendChild(stocksSection);
+                } else {
+                    stocksSection.innerHTML = '<div class="loading">正在加载个股数据...</div>';
                 }
-                
-                container.innerHTML = html;
-                
-                // 保存子板块DOM引用
-                this.cacheSubPlateElements();
-                this.updateSelectedPlateInfo();
             }
-
+            
             // 新增：缓存子板块DOM元素
             cacheSubPlateElements() {
                 this.subPlateElements.clear();
@@ -1227,11 +1333,11 @@
             applySubPlateSort() {
                 if (!this.selectedPlate) return;
                 
-                // 重新获取子板块数据
-                this.sendMessage({
-                    type: 'get_sub_plates',
-                    main_plate: this.selectedPlate.name
-                });
+                // 从缓存获取子板块数据并重新排序
+                const cachedSubPlates = this.subPlatesCache.get(this.selectedPlate.name);
+                if (cachedSubPlates) {
+                    this.renderSubPlates(cachedSubPlates);
+                }
             }
 
             updateSubPlateSortButtons() {

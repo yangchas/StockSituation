@@ -238,6 +238,7 @@ async def handle_bankuai(request):
         """
         return web.Response(text=html, content_type='text/html')
 
+
 async def handle_plate_websocket(request):
     """板块WebSocket"""
     return await service.handle_plate_websocket(request)

@@ -34,6 +34,7 @@ class OptimizedPlateUpdater:
         self.plates = {}
         self.plate_hierarchy = {}  # 主流板块 -> 子板块映射
         self.main_plates = []      # 主流板块列表
+        self.plate_name_to_id = {}  # 板块名称到ID的映射
         
         plate_path = os.path.join(script_dir, self.plate_file)
         with open(plate_path, 'r', encoding='gbk') as f:
@@ -42,6 +43,9 @@ class OptimizedPlateUpdater:
                 plate_id = row['id']
                 plate_name = row['name']
                 market_cap = float(row['流通值']) if row['流通值'] else 0.0
+                
+                # 保存名称到ID的映射
+                self.plate_name_to_id[plate_name] = plate_id
                 
                 # 解析inner字段
                 inner_data = []
@@ -79,6 +83,7 @@ class OptimizedPlateUpdater:
         
         # 加载个股-板块关系
         self.stock_plate_relations = defaultdict(list)
+        self.plate_stock_relations = defaultdict(list)  # 新增：板块到个股的映射
         relation_path = os.path.join(script_dir, self.relation_file)
         with open(relation_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
@@ -87,6 +92,7 @@ class OptimizedPlateUpdater:
                 if len(row) >= 2:
                     plate_id, stock_id = row[0], row[1]
                     self.stock_plate_relations[stock_id].append(plate_id)
+                    self.plate_stock_relations[plate_id].append(stock_id)  # 新增：建立反向映射
         
         logger.info(f"📈 加载个股关系: {len(self.stock_plate_relations)}只股票")
         
@@ -152,8 +158,10 @@ class OptimizedPlateUpdater:
             stock_count = self.plate_stock_count[self.plate_to_idx[plate_id]]
             if stock_count > 0:
                 stocks = []
-                for i in range(min(stock_count, 10)):  # 每个板块最多10只个股
-                    stock_code = f"{plate_id}{i+1:03d}"
+                # 使用实际的股票ID
+                actual_stock_ids = self.plate_stock_relations.get(plate_id, [])
+                for i, stock_id in enumerate(actual_stock_ids[:10]):  # 每个板块最多10只个股
+                    stock_code = stock_id
                     stock_name = f"{self.plates[plate_id]['name']}个股{i+1}"
                     
                     stocks.append({
@@ -265,33 +273,67 @@ class OptimizedPlateUpdater:
         return main_metrics
     
     def get_sub_plates_metrics(self, main_plate_name):
-        """获取指定主流板块的子板块指标"""
-        sub_plates = self.plate_hierarchy.get(main_plate_name, [])
+        """获取指定主流板块的子板块指标 - 修复版本"""
+        logger.info(f"🔍 查找主板块 '{main_plate_name}' 的子板块")
+        
+        # 首先通过名称找到主板块ID
+        main_plate_id = self.plate_name_to_id.get(main_plate_name)
+        if not main_plate_id:
+            logger.warning(f"❌ 未找到主板块: {main_plate_name}")
+            return []
+        
+        # 获取主板块的子板块信息
+        main_plate_info = self.plates.get(main_plate_id)
+        if not main_plate_info:
+            logger.warning(f"❌ 未找到主板块信息: {main_plate_id}")
+            return []
+        
+        sub_plates_data = main_plate_info.get('inner', [])
         sub_metrics = []
         
-        for sub_plate in sub_plates:
-            metrics = self.get_plate_metrics(sub_plate['code'])
-            if metrics:
-                sub_metrics.append(metrics)
+        for sub_plate_data in sub_plates_data:
+            if isinstance(sub_plate_data, list) and len(sub_plate_data) >= 2:
+                sub_plate_id = sub_plate_data[0]
+                sub_plate_name = sub_plate_data[1]
+                
+                # 获取子板块的指标
+                metrics = self.get_plate_metrics(sub_plate_id)
+                if metrics:
+                    sub_metrics.append(metrics)
+                    logger.info(f"✅ 找到子板块: {sub_plate_name} ({sub_plate_id})")
+                else:
+                    logger.warning(f"❌ 子板块无指标数据: {sub_plate_name} ({sub_plate_id})")
         
-        # 如果没有找到子板块，返回所有类型为sub的板块
-        if not sub_metrics:
-            logger.warning(f"未找到 {main_plate_name} 的子板块，返回所有子板块")
-            for plate_id, plate_info in self.plates.items():
-                if not plate_info.get('inner'):  # 没有inner字段的认为是子板块
-                    metrics = self.get_plate_metrics(plate_id)
-                    if metrics:
-                        sub_metrics.append(metrics)
-        
+        logger.info(f"📋 主板块 '{main_plate_name}' 共有 {len(sub_metrics)} 个子板块")
         return sub_metrics
     
     def get_plate_stocks(self, plate_id):
-        """获取板块个股数据"""
-        if plate_id in self.mock_stocks_data:
-            return self.mock_stocks_data[plate_id]
+        """获取板块个股数据 - 修复版本"""
+        logger.info(f"📊 获取板块 {plate_id} 的个股数据")
         
-        # 如果没有模拟数据，返回空数组
-        return []
+        # 检查是否有模拟数据
+        if plate_id in self.mock_stocks_data:
+            stocks = self.mock_stocks_data[plate_id]
+            logger.info(f"✅ 返回模拟个股数据: {len(stocks)} 只股票")
+            return stocks
+        
+        # 如果没有模拟数据，尝试从实际关系生成
+        actual_stock_ids = self.plate_stock_relations.get(plate_id, [])
+        stocks = []
+        
+        for i, stock_id in enumerate(actual_stock_ids[:20]):  # 限制返回数量
+            stock_data = {
+                'code': stock_id,
+                'name': f"股票{stock_id}",
+                'change_pct': round(random.uniform(-0.05, 0.05), 4),
+                'price': round(random.uniform(5, 100), 2),
+                'volume': random.randint(1000000, 100000000),
+                'market_cap': random.randint(100000000, 10000000000)
+            }
+            stocks.append(stock_data)
+        
+        logger.info(f"✅ 生成个股数据: {len(stocks)} 只股票")
+        return stocks
     
     def get_plate_hierarchy(self):
         """获取板块层级关系"""
@@ -382,6 +424,20 @@ def test_plate_updater():
     
     # 初始化
     updater = OptimizedPlateUpdater('data/板块.csv', 'data/个股板块.csv', 'data/概念.csv')
+    
+    # 测试子板块查找
+    logger.info("🔍 测试子板块查找...")
+    sub_plates = updater.get_sub_plates_metrics('机器人概念')
+    logger.info(f"机器人概念子板块: {len(sub_plates)}个")
+    for sub in sub_plates[:3]:  # 显示前3个
+        logger.info(f"  - {sub['name']}: {sub['change_pct']:+.2%}")
+    
+    # 测试个股数据
+    logger.info("📊 测试个股数据...")
+    stocks = updater.get_plate_stocks('801159')
+    logger.info(f"机器人概念个股: {len(stocks)}只")
+    for stock in stocks[:3]:  # 显示前3个
+        logger.info(f"  - {stock['name']}({stock['code']}): {stock['change_pct']:+.2%}")
     
     # 生成测试数据
     test_updates = {}
