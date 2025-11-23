@@ -28,6 +28,7 @@ class IntegratedWebService:
         # WebSocket连接管理
         self.plate_connections: Set = set()
         self.volatile_connections: Set = set()
+        self.stock_connections: Dict[str, Set] = {}  # 新增：个股订阅连接 {plate_id: set(connections)}
         
         # 更新统计
         self.update_count = 0
@@ -39,6 +40,9 @@ class IntegratedWebService:
         
         # 启动板块数据广播
         asyncio.create_task(self.broadcast_plate_updates())
+        
+        # 新增：启动个股数据广播
+        asyncio.create_task(self.broadcast_stock_updates())
         
         logger.info("🚀 所有服务已启动")
     
@@ -73,6 +77,43 @@ class IntegratedWebService:
                 
             except Exception as e:
                 logger.error(f"❌ 广播板块更新失败: {e}")
+                await asyncio.sleep(5)
+    
+    async def broadcast_stock_updates(self):
+        """定期广播个股更新"""
+        while True:
+            try:
+                if self.stock_connections:
+                    current_time = int(time.time() * 1000)
+                    
+                    # 遍历所有被订阅的板块
+                    for plate_id, connections in list(self.stock_connections.items()):
+                        if not connections:
+                            continue
+                        
+                        # 获取该板块的最新个股数据
+                        stocks = self.plate_updater.get_plate_stocks(plate_id)
+                        
+                        # 构建更新消息
+                        update_msg = {
+                            'type': 'stock_update',
+                            'plate_id': plate_id,
+                            'data': stocks,
+                            'timestamp': current_time
+                        }
+                        
+                        # 广播给订阅该板块的所有客户端
+                        await self.broadcast_to_connections(update_msg, connections)
+                    
+                    # 每5秒记录一次日志
+                    if int(time.time()) % 5 == 0:
+                        active_subscriptions = sum(len(conns) for conns in self.stock_connections.values())
+                        logger.info(f"📤 广播个股更新, 活跃订阅: {active_subscriptions}个连接")
+                
+                await asyncio.sleep(3)  # 3秒更新一次
+                
+            except Exception as e:
+                logger.error(f"❌ 广播个股更新失败: {e}")
                 await asyncio.sleep(5)
     
     async def broadcast_to_connections(self, message: Dict, connections: Set):
@@ -131,7 +172,14 @@ class IntegratedWebService:
         except Exception as e:
             logger.error(f"❌ 板块WebSocket错误: {e}")
         finally:
+            # 连接关闭时清理所有订阅
             self.plate_connections.remove(ws)
+            for plate_id in list(self.stock_connections.keys()):
+                if ws in self.stock_connections[plate_id]:
+                    self.stock_connections[plate_id].remove(ws)
+                    if not self.stock_connections[plate_id]:
+                        del self.stock_connections[plate_id]
+            
             logger.info(f"🔌 板块客户端断开, 总数: {len(self.plate_connections)}")
         
         return ws
@@ -207,6 +255,41 @@ class IntegratedWebService:
                 'data': metrics,
                 'timestamp': int(time.time() * 1000)
             }
+        
+        # 新增：个股订阅消息处理
+        elif msg_type == 'subscribe_stocks':
+            plate_id = data.get('plate_id')
+            action = data.get('action', 'subscribe')  # subscribe 或 unsubscribe
+            
+            if action == 'subscribe':
+                # 订阅个股更新
+                if plate_id not in self.stock_connections:
+                    self.stock_connections[plate_id] = set()
+                self.stock_connections[plate_id].add(websocket)
+                logger.info(f"✅ 客户端订阅个股更新: {plate_id}, 当前订阅数: {len(self.stock_connections[plate_id])}")
+                
+                response = {
+                    'type': 'subscribe_result',
+                    'plate_id': plate_id,
+                    'action': 'subscribed',
+                    'message': f'已订阅 {plate_id} 的个股更新'
+                }
+            else:
+                # 取消订阅
+                if plate_id in self.stock_connections and websocket in self.stock_connections[plate_id]:
+                    self.stock_connections[plate_id].remove(websocket)
+                    logger.info(f"❌ 客户端取消订阅个股更新: {plate_id}, 剩余订阅数: {len(self.stock_connections[plate_id])}")
+                    
+                    # 如果该板块没有订阅者了，清理空集合
+                    if not self.stock_connections[plate_id]:
+                        del self.stock_connections[plate_id]
+                
+                response = {
+                    'type': 'subscribe_result',
+                    'plate_id': plate_id,
+                    'action': 'unsubscribed',
+                    'message': f'已取消订阅 {plate_id} 的个股更新'
+                }
         
         else:
             response = {
