@@ -210,8 +210,6 @@ class RedisStorageManager:
         
         # 获取指标数据
         metrics_data = self.redis.hgetall(metrics_key)
-        if(plate_id == "801128" or plate_id == "801709"):
-            print("国产软件：",plate_id,metrics_data)
         if not metrics_data:
             return None
         
@@ -278,7 +276,7 @@ class RedisStorageManager:
         """获取子板块列表及数据"""
         hierarchy_key = f"{self.PLATE_HIERARCHY_PREFIX}{main_plate_id}"
         sub_plate_ids = self.redis.lrange(hierarchy_key, 0, -1)
-        print("获取子板块列表及数据",main_plate_id,sub_plate_ids)
+        
         sub_plates = []
         for plate_id in sub_plate_ids:
             plate_data = self.get_plate_data(plate_id)
@@ -290,7 +288,6 @@ class RedisStorageManager:
     def get_main_plates(self) -> List[Dict]:
         """获取所有主板块数据"""
         main_plate_ids = self.redis.smembers(self.MAIN_PLATES_KEY)
-        print("获取所有主板块数据 ",main_plate_ids)
         
         main_plates = []
         for plate_id in main_plate_ids:
@@ -316,7 +313,6 @@ class RedisStorageManager:
         """获取所有板块指标（用于前端初始化）"""
         plates = []
         pattern = f"{self.PLATE_METRICS_PREFIX}*"
-        print("获取所有板块指标（用于前端初始化）",pattern)
         
         for metrics_key in self.redis.scan_iter(match=pattern):
             plate_id = metrics_key[len(self.PLATE_METRICS_PREFIX):]

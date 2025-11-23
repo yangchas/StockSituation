@@ -9,15 +9,15 @@ import logging
 from aiohttp import web
 
 # 修改导入路径
-from plate_updater import RedisPlateUpdater, PlateDataSimulator
+from plate_updater import LazyPlateUpdater, PlateDataSimulator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class IntegratedWebService:
     def __init__(self):
-        # 修改：使用RedisPlateUpdater替代原来的OptimizedPlateUpdater
-        self.plate_updater = RedisPlateUpdater(
+        # 修改：使用LazyPlateUpdater替代原来的PlateUpdater
+        self.plate_updater = LazyPlateUpdater(
             'data/板块.csv', 
             'data/个股板块.csv'
         )
@@ -201,7 +201,7 @@ class IntegratedWebService:
         elif msg_type == 'get_plate_detail':
             plate_id = data.get('plate_id')
             metrics = self.plate_updater.get_plate_metrics(plate_id)
-            print("get_plate_detail 获取板块指标",plate_id,metrics)
+            
             response = {
                 'type': 'plate_detail',
                 'data': metrics,
@@ -273,8 +273,8 @@ async def health_check(request):
         'status': 'healthy',
         'plate_connections': len(service.plate_connections),
         'update_count': service.update_count,
-        'stock_count': len(service.plate_updater.stock_plate_relations),
-        'plate_count': len(service.plate_updater.plates)
+        'stock_count': len(service.plate_updater.stock_to_plates),
+        'plate_count': len(service.plate_updater.all_plates)
     })
 
 # Redis状态检查
@@ -295,6 +295,31 @@ async def redis_status(request):
             'error': str(e)
         }, status=500)
 
+# 调试接口 - 个股数据状态
+async def debug_plate_stocks_api(request):
+    """调试板块个股API"""
+    try:
+        plate_id = request.query.get('plate_id', '')
+        
+        if not plate_id:
+            return web.json_response({'error': '请提供plate_id参数'}, status=400)
+        
+        # 调用调试方法
+        service.plate_updater.debug_plate_stocks(plate_id)
+        
+        # 获取实际的个股数据
+        stocks = service.plate_updater.get_plate_stocks(plate_id)
+        
+        return web.json_response({
+            'plate_id': plate_id,
+            'stock_count': len(stocks),
+            'stocks_sample': stocks[:5]  # 返回前5只作为样本
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 调试接口错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
 async def main():
     global service
     service = IntegratedWebService()
@@ -311,7 +336,8 @@ async def main():
     app.router.add_get('/ws/plate', handle_plate_websocket)
     app.router.add_get('/api/plate', plate_api)
     app.router.add_get('/health', health_check)
-    app.router.add_get('/redis-status', redis_status)  # 新增Redis状态检查
+    app.router.add_get('/redis-status', redis_status)
+    app.router.add_get('/debug/plate-stocks', debug_plate_stocks_api)  # 新增调试接口
     
     # 启动服务器
     runner = web.AppRunner(app)
@@ -325,6 +351,7 @@ async def main():
     logger.info("📊 http://localhost:8080/api/plate - 板块API")
     logger.info("❤️ http://localhost:8080/health - 健康检查")
     logger.info("💾 http://localhost:8080/redis-status - Redis状态")
+    logger.info("🐛 http://localhost:8080/debug/plate-stocks?plate_id=801159 - 个股调试")
     
     # 永久运行
     await asyncio.Future()
