@@ -23,7 +23,7 @@ class IntegratedWebService:
         )
         
         # 修改：使用新的PlateDataSimulator
-        self.data_simulator = PlateDataSimulator(self.plate_updater, update_interval=10)
+        # self.data_simulator = PlateDataSimulator(self.plate_updater, update_interval=10)
         
         # WebSocket连接管理
         self.plate_connections: Set = set()
@@ -36,8 +36,8 @@ class IntegratedWebService:
     async def start_services(self):
         """启动所有服务"""
         # 启动数据模拟
-        asyncio.create_task(self.data_simulator.start_simulation())
-        
+        # asyncio.create_task(self.data_simulator.start_simulation())
+        asyncio.create_task(self.refresh_plate_data_periodically())
         # 启动板块数据广播
         asyncio.create_task(self.broadcast_plate_updates())
         
@@ -45,6 +45,22 @@ class IntegratedWebService:
         asyncio.create_task(self.broadcast_stock_updates())
         
         logger.info("🚀 所有服务已启动")
+    async def refresh_plate_data_periodically(self):
+        """定期从Redis刷新板块数据（新增）"""
+        while True:
+            try:
+                # 从Redis刷新股票数据并计算板块指标
+                self.plate_updater.refresh_stock_data_from_redis()
+                
+                # 记录刷新状态
+                logger.info("🔄 板块数据已从Redis刷新")
+                
+                # 每10秒刷新一次
+                await asyncio.sleep(10)
+                
+            except Exception as e:
+                logger.error(f"❌ 刷新板块数据失败: {e}")
+                await asyncio.sleep(5)
     
     async def broadcast_plate_updates(self):
         """定期广播板块更新"""
@@ -73,7 +89,7 @@ class IntegratedWebService:
                     if self.update_count % 30 == 0:  # 每30次更新记录一次
                         logger.info(f"📤 广播板块更新 #{self.update_count}, 客户端: {len(self.plate_connections)}")
                 
-                await asyncio.sleep(self.data_simulator.update_interval)  # 1秒广播一次
+                await asyncio.sleep(3)  # 1秒广播一次
                 
             except Exception as e:
                 logger.error(f"❌ 广播板块更新失败: {e}")

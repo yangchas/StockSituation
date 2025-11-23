@@ -169,7 +169,87 @@ class LazyPlateUpdater:
                 if plate_id in self.main_plate_to_idx:
                     idx = self.main_plate_to_idx[plate_id]
                     self.main_plate_stock_count[idx] += 1
-    
+    def refresh_stock_data_from_redis(self):
+        """
+        从Redis刷新所有股票数据并更新板块指标 - 修复版本
+        """
+        refresh_start = time.time()
+        
+        # 重置板块指标
+        n_main_plates = len(self.main_plate_ids)
+        self.main_section_sum_change = np.zeros(n_main_plates, dtype=np.float32)
+        self.main_section_total_volume = np.zeros(n_main_plates, dtype=np.int32)
+        self.main_section_total_large_net = np.zeros(n_main_plates, dtype=np.int32)
+        self.main_section_rise_count = np.zeros(n_main_plates, dtype=np.int16)
+        self.main_section_fall_count = np.zeros(n_main_plates, dtype=np.int16)
+        
+        # 清空当前股票状态
+        self.stock_current_change = {}
+        self.stock_current_volume = {}
+        self.stock_current_large_net = {}
+        
+        processed_count = 0
+        valid_stock_count = 0
+        error_count = 0
+        
+        # 遍历所有已知的股票
+        for stock_id in self.stock_to_plates.keys():
+            try:
+                # 从Redis获取股票数据
+                stock_data = self.redis_storage.get_stock_data(stock_id)
+                
+                if not stock_data:
+                    continue
+                    
+                # 获取股票所属的所有板块
+                plate_list = self.stock_to_plates[stock_id]
+                
+                # 只更新主流板块
+                main_plate_indices = []
+                for plate_id in plate_list:
+                    if plate_id in self.main_plate_to_idx:
+                        main_plate_indices.append(self.main_plate_to_idx[plate_id])
+                
+                if not main_plate_indices:
+                    continue
+                    
+                main_plate_indices = np.array(main_plate_indices, dtype=np.int32)
+                
+                # 获取股票指标
+                change = stock_data.get('change_pct', 0.0)
+                volume = stock_data.get('volume', 0)
+                large_net = stock_data.get('large_net', 0)
+                
+                # 更新股票当前状态
+                self.stock_current_change[stock_id] = change
+                self.stock_current_volume[stock_id] = volume
+                self.stock_current_large_net[stock_id] = large_net
+                
+                # 更新板块指标
+                self.main_section_sum_change[main_plate_indices] += change
+                self.main_section_total_volume[main_plate_indices] += volume
+                self.main_section_total_large_net[main_plate_indices] += large_net
+                
+                # 更新涨跌计数
+                for idx in main_plate_indices:
+                    if change > 0:
+                        self.main_section_rise_count[idx] += 1
+                    elif change < 0:
+                        self.main_section_fall_count[idx] += 1
+                
+                processed_count += 1
+                if stock_data.get('price', 0) > 0:  # 有有效价格的股票
+                    valid_stock_count += 1
+                    
+            except Exception as e:
+                error_count += 1
+                logger.warning(f"⚠️ 处理股票数据失败 {stock_id}: {e}")
+        
+        # 更新主流板块数据到Redis
+        self._update_main_plates_to_redis()
+        
+        refresh_time = (time.time() - refresh_start) * 1000
+        logger.info(f"🔄 从Redis刷新 {processed_count}只股票数据, 其中{valid_stock_count}只有效, {error_count}只错误, 耗时: {refresh_time:.2f}ms")
     def update_stocks(self, stock_updates: Dict[str, Dict]):
         """
         更新股票数据 - 修复版本，确保股票数据更新到Redis
@@ -290,17 +370,38 @@ class LazyPlateUpdater:
         self.redis_storage.batch_update_plates(plate_metrics)
     
     def get_plate_metrics(self, plate_id: str) -> Dict:
-        """获取板块指标 - 懒加载版本"""
+        """获取板块指标 - 改进的懒加载版本"""
         # 首先尝试从Redis获取
         plate_data = self.redis_storage.get_plate_data(plate_id)
-        if plate_data:
+        
+        # 检查Redis中的数据是否有效
+        if plate_data and self._is_plate_data_valid(plate_data):
             return plate_data
         
-        # Redis中没有数据，实时计算
+        # Redis中没有有效数据，实时计算
         return self._calculate_plate_metrics_lazy(plate_id)
-    
+
+    def _is_plate_data_valid(self, plate_data: Dict) -> bool:
+        """检查板块数据是否有效"""
+        try:
+            timestamp = plate_data.get('timestamp', 0)
+            current_time = int(time.time())
+            
+            # 如果数据超过30秒，认为已过期
+            if current_time - timestamp > 30:
+                return False
+            
+            # 检查必要字段是否存在
+            required_fields = ['change_pct', 'total_volume', 'rise_count', 'fall_count']
+            for field in required_fields:
+                if field not in plate_data:
+                    return False
+            
+            return True
+        except Exception:
+            return False
     def _calculate_plate_metrics_lazy(self, plate_id: str) -> Dict:
-        """懒加载计算板块指标"""
+        """懒加载计算板块指标 - 改进版本"""
         plate_info = self.all_plates.get(plate_id)
         if not plate_info:
             return None
@@ -311,7 +412,7 @@ class LazyPlateUpdater:
         
         if stock_count == 0:
             # 没有股票，返回基础信息
-            return {
+            metrics = {
                 'id': plate_id,
                 'name': plate_info['name'],
                 'change_pct': 0.0,
@@ -324,55 +425,60 @@ class LazyPlateUpdater:
                 'market_cap': plate_info.get('market_cap', 0),
                 'timestamp': int(time.time())
             }
-        
-        # 实时计算板块指标
-        total_change = 0.0
-        total_volume = 0
-        total_large_net = 0
-        rise_count = 0
-        fall_count = 0
-        
-        for stock_id in stock_ids:
-            # 获取股票的当前状态
-            change = self.stock_current_change.get(stock_id, 0.0)
-            volume = self.stock_current_volume.get(stock_id, 0)
-            large_net = self.stock_current_large_net.get(stock_id, 0)
+        else:
+            # 实时计算板块指标
+            total_change = 0.0
+            total_volume = 0
+            total_large_net = 0
+            rise_count = 0
+            fall_count = 0
+            valid_stock_count = 0
             
-            total_change += change
-            total_volume += volume
-            total_large_net += large_net
+            for stock_id in stock_ids:
+                # 从Redis获取股票的当前状态（确保是最新数据）
+                stock_data = self.redis_storage.get_stock_data(stock_id)
+                if not stock_data:
+                    continue
+                    
+                change = stock_data.get('change_pct', 0.0)
+                volume = stock_data.get('volume', 0)
+                large_net = stock_data.get('large_net', 0)
+                
+                total_change += change
+                total_volume += volume
+                total_large_net += large_net
+                
+                if change > 0:
+                    rise_count += 1
+                elif change < 0:
+                    fall_count += 1
+                    
+                valid_stock_count += 1
             
-            if change > 0:
-                rise_count += 1
-            elif change < 0:
-                fall_count += 1
-        
-        # 计算平均涨跌幅
-        avg_change = total_change / stock_count if stock_count > 0 else 0.0
-        
-        metrics = {
-            'id': plate_id,
-            'name': plate_info['name'],
-            'change_pct': avg_change,
-            'total_volume': total_volume,
-            'total_large_net': total_large_net,
-            'rise_count': rise_count,
-            'fall_count': fall_count,
-            'stock_count': stock_count,
-            'type': plate_info['type'],
-            'market_cap': plate_info.get('market_cap', 0),
-            'timestamp': int(time.time())
-        }
+            # 计算平均涨跌幅（只使用有效股票）
+            if valid_stock_count > 0:
+                avg_change = total_change / valid_stock_count
+            else:
+                avg_change = 0.0
+            
+            metrics = {
+                'id': plate_id,
+                'name': plate_info['name'],
+                'change_pct': avg_change,
+                'total_volume': total_volume,
+                'total_large_net': total_large_net,
+                'rise_count': rise_count,
+                'fall_count': fall_count,
+                'stock_count': valid_stock_count,
+                'type': plate_info['type'],
+                'market_cap': plate_info.get('market_cap', 0),
+                'timestamp': int(time.time())
+            }
         
         # 缓存到Redis
         self.redis_storage.update_plate_metrics(plate_id, metrics)
-        self.redis_storage.update_plate_info(plate_id, {
-            "name": plate_info['name'],
-            "type": plate_info['type'],
-            "market_cap": plate_info.get('market_cap', 0)
-        })
         
-        logger.info(f"🔄 懒加载计算板块: {plate_info['name']} ({stock_count}只股票)")
+        logger.info(f"🔄 懒加载计算板块: {plate_info['name']} ({metrics['stock_count']}只有效股票)")
         return metrics
     
     def get_all_plate_metrics(self) -> List[Dict]:
@@ -427,7 +533,7 @@ class LazyPlateUpdater:
         return sub_metrics
     
     def get_plate_stocks(self, plate_id: str) -> List[Dict]:
-        """获取板块个股数据 - 修复版本，从个股板块.csv获取股票ID，从Redis获取详情"""
+        """获取板块个股数据 - 从Redis获取实际数据"""
         logger.info(f"📊 获取板块 {plate_id} 的个股数据")
         
         # 1. 从个股板块关系获取该板块的所有股票ID
@@ -442,40 +548,33 @@ class LazyPlateUpdater:
         found_count = 0
         not_found_count = 0
         
-        # 2. 从Redis获取每只股票的详情
-        for stock_id in stock_ids:#[:100]:  # 限制返回数量，避免性能问题
+        # 2. 从Redis获取每只股票的详情（C++端存储的实际数据）
+        for stock_id in stock_ids:  # 不再限制数量，获取所有股票
             stock_data = self.redis_storage.get_stock_data(stock_id)
             
             if stock_data:
                 # 确保数据结构符合前端要求
                 formatted_stock = {
-                    'code': stock_data.get('code', stock_id),
+                    'code': stock_id,  # 使用实际的股票ID
                     'name': stock_data.get('name', f"股票{stock_id}"),
                     'change_pct': stock_data.get('change_pct', 0.0),
                     'price': stock_data.get('price', 0.0),
                     'volume': stock_data.get('volume', 0),
-                    'market_cap': stock_data.get('market_cap', 0)
+                    'market_cap': stock_data.get('market_cap', 0),
+                    'large_net': stock_data.get('large_net', 0),
+                    'timestamp': stock_data.get('timestamp', 0)
                 }
                 stocks.append(formatted_stock)
                 found_count += 1
             else:
-                # Redis中没有找到，创建模拟数据
-                logger.warning(f"⚠️ Redis中未找到股票 {stock_id} 的数据，创建模拟数据")
-                simulated_stock = self._create_simulated_stock_data(stock_id, plate_id)
-                stocks.append(simulated_stock)
+                # Redis中没有找到该股票的数据
+                logger.debug(f"⚠️ Redis中未找到股票 {stock_id} 的数据")
                 not_found_count += 1
-                
-                # 将模拟数据保存到Redis，避免下次再找不到
-                self.redis_storage.update_stock_data(stock_id, {
-                    "price": simulated_stock['price'],
-                    "change_pct": simulated_stock['change_pct'],
-                    "volume": simulated_stock['volume'],
-                    "timestamp": int(time.time()),
-                    "name": simulated_stock['name'],
-                    "market_cap": simulated_stock['market_cap']
-                }, plates=[plate_id])
         
-        logger.info(f"✅ 获取个股数据完成: 找到 {found_count} 只, 模拟 {not_found_count} 只")
+        # 按涨跌幅排序
+        stocks.sort(key=lambda x: x.get('change_pct', 0), reverse=True)
+        
+        logger.info(f"✅ 获取个股数据完成: 找到 {found_count} 只, 未找到 {not_found_count} 只")
         return stocks
     
     def _create_simulated_stock_data(self, stock_id: str, plate_id: str) -> Dict:
@@ -537,7 +636,28 @@ class PlateDataSimulator:
         # 获取所有股票ID
         self.all_stock_ids = list(plate_updater.stock_to_plates.keys())
         logger.info(f"🎯 懒加载模拟器初始化: {len(self.all_stock_ids)}只股票")
-    
+
+    async def start_refreshing(self):
+        """开始定期从Redis刷新数据"""
+        self.running = True
+        tick = 0
+        
+        try:
+            while self.running:
+                tick += 1
+                
+                # 从Redis刷新所有股票数据
+                self.plate_updater.refresh_stock_data_from_redis()
+                
+                # 每10次刷新打印一次状态
+                if tick % 10 == 0:
+                    logger.info(f"🔄 第 {tick} 轮数据刷新完成")
+                    self.print_sample_metrics()
+                
+                await asyncio.sleep(self.refresh_interval)
+                
+        except Exception as e:
+            logger.error(f"❌ 数据刷新器错误: {e}")
     async def start_simulation(self):
         """开始模拟数据更新"""
         self.running = True

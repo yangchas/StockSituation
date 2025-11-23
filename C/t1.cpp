@@ -1316,6 +1316,36 @@ public:
         freeReplyObject(reply);
         return success;
     }
+     // 添加hset方法用于存储哈希表字段
+    bool hset(const std::string& key, const std::string& field, const std::string& value) {
+        if (!context_ && !connect()) return false;
+       
+        redisReply* reply = (redisReply*)redisCommand(context_,
+                                                    "HSET %s %s %s",
+                                                    key.c_str(), field.c_str(), value.c_str());
+        if (!reply) {
+            disconnect();
+            return false;
+        }
+       
+        bool success = (reply->type != REDIS_REPLY_ERROR);
+        freeReplyObject(reply);
+        return success;
+    }
+    
+    // 批量执行命令（可选，用于优化性能）
+    bool startPipeline() {
+        if (!context_ && !connect()) return false;
+        // Redis hiredis 库会自动处理pipeline
+        return true;
+    }
+    
+    // 执行pipeline中的所有命令
+    bool executePipeline() {
+        if (!context_) return false;
+        // 对于hiredis，不需要特殊处理，命令会立即发送
+        return true;
+    }
 };
 
 // ==================== 竞价分析器 ====================
@@ -1939,7 +1969,7 @@ private:
     
     void analyzeOrderFlow(const std::string& symbol, const StockData& curr_data, 
                          StockAuctionMetrics& metrics, long long timestamp, 
-                         double change, double bid_amount, double ·) {
+                         double change, double bid_amount, double ask_amount) {
         SimpleTickData& prev_data = metrics.prev_tick_data;
         
         // 如果是第一条数据，只存储不分析
@@ -2782,9 +2812,14 @@ private:
     TickAnalysisEngine* tick_engine_;
     AuctionAnalyzer* auction_analyzer_;
     IVolatilityDetector* volatility_detector_;
+    std::unique_ptr<RedisClient> redis_client_;
+    const Config& config_;
+    StockNameMapper& stock_mapper_;
 public:
-    PhaseDispatcher(TickAnalysisEngine* te, AuctionAnalyzer* aa, IVolatilityDetector* vd)
-        : tick_engine_(te), auction_analyzer_(aa), volatility_detector_(vd) {}
+    PhaseDispatcher(TickAnalysisEngine* te, AuctionAnalyzer* aa, IVolatilityDetector* vd, const Config& config)
+        : tick_engine_(te), auction_analyzer_(aa), volatility_detector_(vd), config_(config), stock_mapper_(StockNameMapper::getInstance()){
+            redis_client_ = std::make_unique<RedisClient>(config.redis_host, config.redis_port, config.redis_db);
+        }
    
     void dispatch(StockData& data) {
         //过滤
@@ -2799,12 +2834,51 @@ public:
         bool is_auction = TimeUtils::isAuctionTime(time_str);
         
         tick_engine_->processTickData(data, is_auction);
-        
+         // 存储股票数据到Redis（新增）
+        storeStockDataToRedis(data, change);
         if (is_auction) {
             auction_analyzer_->processAuctionData(data, change, bid_amount, ask_amount);
         } else{
             volatility_detector_->detectVolatility(data, change, bid_amount, ask_amount);
         }
+    }
+private:
+    void storeStockDataToRedis(const StockData& data, double change) {
+        if (!redis_client_->connect()) {
+            return;
+        }
+        
+        // 使用与Python脚本相同的键格式: stock:quote:{symbol}
+        std::string key = "stock:quote:" + data.symbol;
+        
+        // 存储到Redis哈希表中，与Python脚本格式匹配
+        redis_client_->hset(key, "price", std::to_string(data.last_price));
+        redis_client_->hset(key, "change_pct", std::to_string(change));
+        redis_client_->hset(key, "volume", std::to_string(static_cast<int>(data.volume)));
+        redis_client_->hset(key, "large_net", std::to_string(static_cast<int>(data.large_net)));
+        // 修复：将时间戳转换为整数（毫秒）
+        long long timestamp_ms = static_cast<long long>(data.timestamp);
+        redis_client_->hset(key, "timestamp", std::to_string(timestamp_ms));
+        redis_client_->hset(key, "name", stock_mapper_.getStockDisplayName(data.symbol));
+         long long market_cap = static_cast<long long>(calculateMarketCap(data));
+        redis_client_->hset(key, "market_cap", std::to_string(market_cap));
+        
+        // 设置过期时间，与Python脚本一致
+        redis_client_->expire(key, 300); // 5分钟过期
+        
+        // 可选：记录存储成功的日志
+        static int stored_count = 0;
+        stored_count++;
+        if (stored_count % 1000 == 0 && global_logger) {
+            global_logger->info("Stored " + std::to_string(stored_count) + " stock records to Redis");
+        }
+    }
+    
+    // 计算市值（模拟实现）
+    double calculateMarketCap(const StockData& data) {
+        // 这里使用一个简单的模拟计算，实际应该从其他数据源获取准确的流通市值
+        // 假设价格 * 1亿股作为模拟市值
+        return data.last_price * 100000000.0;
     }
 };
 
@@ -2993,7 +3067,7 @@ public:
         tick_engine_ = std::make_unique<TickAnalysisEngine>(config_);
         auction_analyzer_ = std::make_unique<AuctionAnalyzer>();
         volatility_detector_ = std::make_unique<VolatilityDetector>(config_);
-        phase_dispatcher_ = std::make_unique<PhaseDispatcher>(tick_engine_.get(), auction_analyzer_.get(), volatility_detector_.get());
+        phase_dispatcher_ = std::make_unique<PhaseDispatcher>(tick_engine_.get(), auction_analyzer_.get(), volatility_detector_.get(), config_);
         logger_ = std::make_unique<Logger>(config.log_file_path, config.log_level, config.enable_file_log);
         redis_ = std::make_unique<RedisClient>(config.redis_host, config.redis_port, config.redis_db);
         global_logger = logger_.get();
@@ -3067,7 +3141,6 @@ public:
                             // auction_analyzer_->getKaipan();
                             phase_dispatcher_->dispatch(record);
                         // }
-                        
                     }
                     // 使用移动语义
                     all_records.insert(all_records.end(),

@@ -98,18 +98,67 @@ class RedisStorageManager:
                 redis_client.sadd(plates_key, *plates)
             redis_client.expire(plates_key, self.BASE_INFO_TTL)
     
-    def batch_update_stocks(self, stock_updates: Dict[str, Dict]) -> None:
-        """批量更新个股数据"""
-        pipeline = self.start_pipeline()
-        
-        for stock_id, data in stock_updates.items():
-            plates = data.get("plates")
-            self.update_stock_data(stock_id, data, plates, pipeline)
-        
-        self.execute_pipeline(pipeline)
-        logger.info(f"✅ 批量更新 {len(stock_updates)} 只股票数据到Redis")
-    
-    def get_stock_data(self, stock_id: str) -> Optional[Dict]:
+    def batch_update_stocks(self, stock_updates: Dict[str, Dict]):
+        """批量更新股票数据到Redis - 同时支持C++和Python访问"""
+        try:
+            pipeline = self.redis.pipeline()
+            
+            for stock_id, data in stock_updates.items():
+                key = f"stock:quote:{stock_id}"
+                
+                # 存储到哈希表（供C++读取）
+                pipeline.hset(key, "price", str(data.get('price', 0.0)))
+                pipeline.hset(key, "change_pct", str(data.get('change_pct', 0.0)))
+                pipeline.hset(key, "volume", str(data.get('volume', 0)))
+                pipeline.hset(key, "large_net", str(data.get('large_net', 0)))
+                pipeline.hset(key, "timestamp", str(data.get('timestamp', int(time.time()))))
+                pipeline.hset(key, "name", data.get('name', f"股票{stock_id}"))
+                pipeline.hset(key, "market_cap", str(data.get('market_cap', 0)))
+                
+                # 设置过期时间
+                pipeline.expire(key, 300)  # 5分钟
+            
+            pipeline.execute()
+            logger.info(f"💾 批量更新 {len(stock_updates)} 只股票数据到Redis")
+            
+        except Exception as e:
+            logger.error(f"❌ 批量更新股票数据到Redis失败: {e}")
+    def get_stock_data(self, stock_id: str) -> Dict:
+        """从Redis获取股票数据 - 兼容C++和Python两种格式"""
+        try:
+            # 尝试从哈希表获取（C++格式）
+            key = f"stock:quote:{stock_id}"
+            stock_data = self.redis.hgetall(key)
+            
+            if stock_data:
+                # 转换数据类型
+                decoded_data = {}
+                for field, value in stock_data.items():
+                    field_str = field.decode('utf-8') if isinstance(field, bytes) else field
+                    value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                    
+                    # 根据字段名转换数据类型
+                    if field_str in ['price', 'change_pct']:
+                        decoded_data[field_str] = float(value_str) if value_str else 0.0
+                    elif field_str in ['volume', 'large_net', 'timestamp', 'market_cap']:
+                        decoded_data[field_str] = int(value_str) if value_str else 0
+                    else:
+                        decoded_data[field_str] = value_str
+                
+                # 确保包含所有必需字段
+                required_fields = ['price', 'change_pct', 'volume', 'large_net', 'timestamp', 'name']
+                for field in required_fields:
+                    if field not in decoded_data:
+                        decoded_data[field] = 0.0 if field in ['price', 'change_pct'] else 0
+                
+                return decoded_data
+            else:
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ 从Redis获取股票数据失败 {stock_id}: {e}")
+            return None
+    def get_stock_data1(self, stock_id: str) -> Optional[Dict]:
         """获取个股数据"""
         stock_key = f"{self.STOCK_PREFIX}{stock_id}"
         info_key = f"{self.STOCK_INFO_PREFIX}{stock_id}"
