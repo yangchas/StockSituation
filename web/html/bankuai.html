@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>实时板块监控系统</title>
     <style>
-        /* 所有样式保持不变 */
+        /* 重置样式 */
         * {
             margin: 0;
             padding: 0;
@@ -17,41 +17,52 @@
             background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 100%);
             color: #e0e0e0;
             line-height: 1.6;
-            padding: 20px;
+            padding: 10px;
             min-height: 100vh;
         }
         
         .container {
             max-width: 1400px;
             margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
         }
         
+        /* 紧凑的头部区域 */
         .header {
             background: rgba(26, 26, 46, 0.8);
-            padding: 25px;
-            border-radius: 15px;
-            margin-bottom: 25px;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
             border: 1px solid #333;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
             backdrop-filter: blur(10px);
+            flex-shrink: 0;
+        }
+        
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
         }
         
         .header h1 {
             display: flex;
             align-items: center;
-            gap: 15px;
-            font-size: 28px;
-            margin-bottom: 15px;
+            gap: 10px;
+            font-size: 20px;
             color: #fff;
         }
         
         .connection-status {
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            padding: 8px 18px;
-            border-radius: 20px;
-            font-size: 14px;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 12px;
             font-weight: 600;
             cursor: pointer;
             transition: all 0.3s;
@@ -60,108 +71,138 @@
         .status-connected {
             background: linear-gradient(135deg, #00c853, #64dd17);
             color: white;
-            box-shadow: 0 4px 15px rgba(0, 200, 83, 0.3);
+            box-shadow: 0 2px 8px rgba(0, 200, 83, 0.3);
         }
         
         .status-disconnected {
             background: linear-gradient(135deg, #ff1744, #f50057);
             color: white;
-            box-shadow: 0 4px 15px rgba(255, 23, 68, 0.3);
+            box-shadow: 0 2px 8px rgba(255, 23, 68, 0.3);
         }
         
         .real-time-badge {
             background: linear-gradient(135deg, #ffab00, #ff6d00);
             color: #000;
-            padding: 5px 12px;
-            border-radius: 15px;
-            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 10px;
             font-weight: bold;
             animation: pulse 2s infinite;
-            box-shadow: 0 4px 15px rgba(255, 171, 0, 0.3);
+            box-shadow: 0 2px 8px rgba(255, 171, 0, 0.3);
+        }
+        
+        .header-bottom {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         
         .control-panel {
             display: flex;
-            gap: 12px;
-            margin: 20px 0;
-            flex-wrap: wrap;
+            gap: 8px;
         }
         
         .control-btn {
-            padding: 10px 18px;
+            padding: 8px 14px;
             background: rgba(255, 255, 255, 0.1);
             border: 1px solid rgba(255, 255, 255, 0.2);
             color: #e0e0e0;
-            border-radius: 8px;
+            border-radius: 6px;
             cursor: pointer;
             transition: all 0.3s;
             font-weight: 500;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
+            font-size: 13px;
         }
         
         .control-btn:hover {
             background: rgba(255, 255, 255, 0.15);
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            transform: translateY(-1px);
+            box-shadow: 0 3px 10px rgba(0, 0, 0, 0.2);
         }
         
         .control-btn.active {
             background: linear-gradient(135deg, #d4af37, #f7ef8a);
             color: #000;
             border-color: #d4af37;
-            box-shadow: 0 5px 15px rgba(212, 175, 55, 0.3);
+            box-shadow: 0 3px 10px rgba(212, 175, 55, 0.3);
+        }
+        
+        .refresh-btn {
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .refresh-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 3px 10px rgba(212, 175, 55, 0.4);
         }
         
         .stats-bar {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-            gap: 15px;
-            margin: 20px 0;
-            padding: 15px;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 8px;
+            padding: 8px;
             background: rgba(255, 255, 255, 0.05);
-            border-radius: 12px;
+            border-radius: 8px;
             border: 1px solid rgba(255, 255, 255, 0.1);
+            width: 70%;
+            max-width: 600px;
         }
         
         .stat-item {
             text-align: center;
-            padding: 12px;
+            padding: 8px 4px;
             background: rgba(0, 0, 0, 0.3);
-            border-radius: 10px;
+            border-radius: 6px;
             transition: all 0.3s;
         }
         
         .stat-item:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
         }
         
         .stat-value {
-            font-size: 24px;
+            font-size: 16px;
             font-weight: bold;
-            margin-bottom: 5px;
+            margin-bottom: 3px;
         }
         
         .stat-label {
-            font-size: 14px;
+            font-size: 11px;
             color: #aaa;
         }
         
+        /* 主要内容区域 - 始终显示左右两栏 */
         .content {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 25px;
-            height: 70vh;
+            display: flex;
+            gap: 15px;
+            flex: 1;
+            min-height: 500px;
+            overflow: hidden;
         }
         
-        .section {
+        .left-panel, .right-panel {
+            flex: 1;
+            min-width: 300px;
             background: rgba(26, 26, 46, 0.8);
-            border-radius: 15px;
-            padding: 25px;
+            border-radius: 10px;
+            padding: 15px;
             border: 1px solid #333;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
             backdrop-filter: blur(10px);
             display: flex;
             flex-direction: column;
@@ -172,25 +213,26 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
-            padding-bottom: 15px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             flex-shrink: 0;
         }
         
         .section-header h2 {
-            font-size: 20px;
+            font-size: 16px;
             color: #fff;
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 8px;
         }
         
-        .plates-container {
+        /* 修复滚动容器样式 */
+        .plates-container, .stocks-container {
             flex: 1;
             overflow-y: auto;
             position: relative;
-            border-radius: 10px;
+            border-radius: 8px;
             background: rgba(0, 0, 0, 0.2);
         }
         
@@ -200,58 +242,75 @@
             min-height: 100%;
         }
         
-        .plate-header {
+        .plate-header, .stock-header {
             display: grid;
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 0.8fr;
-            gap: 10px;
-            padding: 15px 12px;
+            gap: 8px;
+            padding: 12px 10px;
             background: rgba(40, 40, 60, 0.8);
             border-bottom: 2px solid rgba(255, 255, 255, 0.1);
             position: sticky;
             top: 0;
             z-index: 10;
             font-weight: 600;
+            font-size: 13px;
         }
         
-        .plate-header-item {
+        .plate-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+        
+        .stock-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
+        }
+        
+        .plate-header-item, .stock-header-item {
             cursor: pointer;
             user-select: none;
             transition: all 0.3s;
-            padding: 5px;
+            padding: 4px;
             border-radius: 4px;
+            font-size: 12px;
         }
         
-        .plate-header-item:hover {
+        .plate-header-item:hover, .stock-header-item:hover {
             background: rgba(50, 50, 70, 0.9);
         }
         
-        .plate-header-item.sort-asc::after {
+        .plate-header-item.sort-asc::after, .stock-header-item.sort-asc::after {
             content: " ↑";
             color: #d4af37;
         }
         
-        .plate-header-item.sort-desc::after {
+        .plate-header-item.sort-desc::after, .stock-header-item.sort-desc::after {
             content: " ↓";
             color: #d4af37;
         }
         
-        .plate-row {
+        .plate-row, .stock-row {
             display: grid;
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 0.8fr;
-            gap: 10px;
-            padding: 14px 12px;
+            gap: 8px;
+            padding: 10px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             transition: all 0.3s;
             align-items: center;
+            font-size: 13px;
         }
         
-        .plate-row:hover {
+        .plate-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+        
+        .stock-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
+        }
+        
+        .plate-row:hover, .stock-row:hover {
             background: rgba(255, 255, 255, 0.05);
         }
         
         .plate-row.plate-selected {
             background: rgba(41, 98, 255, 0.2);
-            border-left: 4px solid #d4af37;
+            border-left: 3px solid #d4af37;
         }
         
         .change-positive {
@@ -275,21 +334,17 @@
             color: #f7ef8a;
         }
         
-        .value-updated {
-            animation: valueUpdate 1s ease;
+        .stock-name {
+            font-weight: 500;
+            color: #e0e0e0;
         }
         
-        @keyframes valueUpdate {
-            0% { background: rgba(76, 175, 80, 0.3); }
-            100% { background: transparent; }
+        .stock-code {
+            font-size: 11px;
+            color: #aaa;
         }
         
-        .sub-plates-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 5px;
-        }
-        
+        /* 子板块样式 */
         .sub-plates-tabs {
             display: flex;
             flex-wrap: wrap;
@@ -369,128 +424,6 @@
             color: #000;
         }
         
-        .stocks-section {
-            margin-top: 20px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-            padding-top: 20px;
-        }
-        
-        .stocks-header {
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
-            gap: 10px;
-            padding: 12px;
-            background: rgba(40, 40, 60, 0.6);
-            border-radius: 8px;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }
-        
-        .stock-header-item {
-            cursor: pointer;
-            user-select: none;
-            transition: all 0.3s;
-            padding: 5px;
-            border-radius: 4px;
-        }
-        
-        .stock-header-item:hover {
-            background: rgba(50, 50, 70, 0.9);
-        }
-        
-        .stock-header-item.sort-asc::after {
-            content: " ↑";
-            color: #d4af37;
-        }
-        
-        .stock-header-item.sort-desc::after {
-            content: " ↓";
-            color: #d4af37;
-        }
-        
-        .stock-row {
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
-            gap: 10px;
-            padding: 10px 12px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            transition: all 0.3s;
-            align-items: center;
-        }
-        
-        .stock-row:hover {
-            background: rgba(255, 255, 255, 0.05);
-        }
-        
-        .stock-name {
-            font-weight: 500;
-            color: #e0e0e0;
-        }
-        
-        .stock-code {
-            font-size: 12px;
-            color: #aaa;
-        }
-        
-        .loading {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-            font-size: 16px;
-        }
-        
-        .no-data {
-            text-align: center;
-            padding: 40px;
-            color: #666;
-            font-size: 16px;
-        }
-        
-        .refresh-btn {
-            background: linear-gradient(135deg, #d4af37, #f7ef8a);
-            color: #000;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-        
-        .refresh-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(212, 175, 55, 0.4);
-        }
-        
-        .loading-more {
-            text-align: center;
-            padding: 15px;
-            color: #666;
-            font-size: 14px;
-        }
-        
-        .update-indicator {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            background: linear-gradient(135deg, #d4af37, #f7ef8a);
-            color: #000;
-            padding: 10px 20px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: 600;
-            z-index: 1000;
-            animation: slideIn 0.5s ease;
-            box-shadow: 0 5px 20px rgba(212, 175, 55, 0.4);
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
         .breadcrumb {
             display: flex;
             align-items: center;
@@ -514,6 +447,54 @@
             color: #666;
         }
         
+        .value-updated {
+            animation: valueUpdate 1s ease;
+        }
+        
+        @keyframes valueUpdate {
+            0% { background: rgba(76, 175, 80, 0.3); }
+            100% { background: transparent; }
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 30px;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .no-data {
+            text-align: center;
+            padding: 30px;
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .loading-more {
+            text-align: center;
+            padding: 12px;
+            color: #666;
+            font-size: 12px;
+        }
+        
+        .update-indicator {
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
+            padding: 8px 15px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: 600;
+            z-index: 1000;
+            animation: slideIn 0.5s ease;
+            box-shadow: 0 3px 15px rgba(212, 175, 55, 0.4);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
         @keyframes pulse {
             0% { opacity: 1; }
             50% { opacity: 0.7; }
@@ -526,148 +507,205 @@
         }
         
         ::-webkit-scrollbar {
-            width: 8px;
+            width: 6px;
         }
         
         ::-webkit-scrollbar-track {
             background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
+            border-radius: 8px;
         }
         
         ::-webkit-scrollbar-thumb {
             background: rgba(212, 175, 55, 0.5);
-            border-radius: 10px;
+            border-radius: 8px;
         }
         
         ::-webkit-scrollbar-thumb:hover {
             background: rgba(212, 175, 55, 0.7);
         }
         
-        @media (max-width: 1200px) {
-            .content {
-                grid-template-columns: 1fr;
-                height: auto;
+        /* 响应式设计 - 手机端保持左右两栏布局 */
+        @media (max-width: 768px) {
+            body {
+                padding: 5px;
             }
             
-            .section {
-                min-height: 500px;
+            .container {
+                height: 100vh;
             }
-        }
-        
-        @media (max-width: 768px) {
-            .control-panel {
-                justify-content: center;
+            
+            .header {
+                padding: 10px;
+                margin-bottom: 10px;
+            }
+            
+            .header-top {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+                margin-bottom: 8px;
+            }
+            
+            .header h1 {
+                font-size: 18px;
+            }
+            
+            .header-bottom {
+                flex-direction: column;
+                gap: 8px;
             }
             
             .stats-bar {
-                grid-template-columns: repeat(2, 1fr);
+                width: 100%;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 5px;
             }
             
-            .sub-plates-grid {
-                grid-template-columns: 1fr;
+            .stat-item {
+                padding: 6px 3px;
             }
             
-            .plate-header,
-            .plate-row {
+            .stat-value {
+                font-size: 14px;
+            }
+            
+            .stat-label {
+                font-size: 10px;
+            }
+            
+            .content {
+                flex-direction: row;
+                gap: 10px;
+                overflow-x: auto;
+            }
+            
+            .left-panel, .right-panel {
+                min-width: 280px;
+                padding: 10px;
+            }
+            
+            .section-header h2 {
+                font-size: 14px;
+            }
+            
+            .plate-header, .stock-header {
                 grid-template-columns: 1.5fr 1fr 1fr 1fr;
-                gap: 8px;
+                gap: 6px;
+                padding: 10px 8px;
+                font-size: 12px;
             }
             
             .plate-header-item:nth-child(5),
             .plate-row > div:nth-child(5),
             .plate-header-item:nth-child(6),
-            .plate-row > div:nth-child(6) {
-                display: none;
-            }
-            
-            .stocks-header,
-            .stock-row {
-                grid-template-columns: 1.5fr 1fr 1fr 1fr;
-                gap: 8px;
-            }
-            
+            .plate-row > div:nth-child(6),
             .stock-header-item:nth-child(2),
             .stock-row > div:nth-child(2),
             .stock-header-item:nth-child(6),
             .stock-row > div:nth-child(6) {
                 display: none;
             }
+            
+            .plate-row, .stock-row {
+                grid-template-columns: 1.5fr 1fr 1fr 1fr;
+                gap: 6px;
+                padding: 8px;
+                font-size: 12px;
+            }
+            
+            .control-btn, .refresh-btn {
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+            
+            .sub-plates-tabs {
+                flex-direction: column;
+                gap: 6px;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .left-panel, .right-panel {
+                min-width: 260px;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
+        <!-- 紧凑的头部区域 -->
         <div class="header">
-            <h1>
-                📊 板块实时监控系统 
-                <span id="connectionStatus" class="connection-status status-disconnected">
-                    <span class="status-icon">❌</span> 断开连接
-                </span>
-                <span id="realTimeBadge" class="real-time-badge" style="display: none;">实时更新中</span>
-            </h1>
+            <div class="header-top">
+                <h1>
+                    📊 板块实时监控系统 
+                    <span id="connectionStatus" class="connection-status status-disconnected">
+                        <span class="status-icon">❌</span> 断开连接
+                    </span>
+                    <span id="realTimeBadge" class="real-time-badge" style="display: none;">实时更新中</span>
+                </h1>
+                <div class="control-panel">
+                    <button class="control-btn" onclick="plateMonitor.togglePlateType()" id="plateTypeBtn">
+                        <span>🏆</span> 主流板块
+                    </button>
+                    <button class="control-btn active" onclick="plateMonitor.toggleAutoUpdate()" id="autoUpdateBtn">
+                        <span>🔄</span> 自动更新:开
+                    </button>
+                </div>
+            </div>
             
-            <div class="control-panel">
-                <button class="control-btn" onclick="plateMonitor.togglePlateType()" id="plateTypeBtn">
-                    <span>🏆</span> 主流板块
-                </button>
-                <button class="control-btn active" onclick="plateMonitor.toggleAutoUpdate()" id="autoUpdateBtn">
-                    <span>🔄</span> 自动更新:开
-                </button>
+            <div class="header-bottom">
+                <div class="stats-bar">
+                    <div class="stat-item">
+                        <div class="stat-value" id="totalPlates">0</div>
+                        <div class="stat-label">总板块数</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value change-positive" id="risePlates">0</div>
+                        <div class="stat-label">上涨板块</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value change-negative" id="fallPlates">0</div>
+                        <div class="stat-label">下跌板块</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="marketRiseRate">--%</div>
+                        <div class="stat-label">市场上涨率</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="totalVolume">--</div>
+                        <div class="stat-label">总成交额</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="updateTime">--:--:--</div>
+                        <div class="stat-label">最后更新</div>
+                    </div>
+                </div>
                 <button class="refresh-btn" onclick="plateMonitor.refreshData()">
                     <span>🔄</span> 刷新数据
                 </button>
             </div>
-            
-            <div class="stats-bar">
-                <div class="stat-item">
-                    <div class="stat-value" id="totalPlates">0</div>
-                    <div class="stat-label">总板块数</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value change-positive" id="risePlates">0</div>
-                    <div class="stat-label">上涨板块</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value change-negative" id="fallPlates">0</div>
-                    <div class="stat-label">下跌板块</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="marketRiseRate">--%</div>
-                    <div class="stat-label">市场上涨率</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="totalVolume">--</div>
-                    <div class="stat-label">总成交额</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="updateTime">--:--:--</div>
-                    <div class="stat-label">最后更新</div>
-                </div>
-            </div>
         </div>
         
+        <!-- 主要内容区域 - 始终显示左右两栏 -->
         <div class="content">
-            <div class="section">
+            <!-- 左侧板块列表 -->
+            <div class="left-panel">
                 <div class="section-header">
                     <h2 id="leftTitle">🏆 板块排行</h2>
-                    <div style="display: flex; align-items: center; gap: 15px;">
-                        <span id="sortInfo" style="font-size: 14px; color: #aaa;">按涨跌幅排序</span>
-                        <button class="refresh-btn" onclick="plateMonitor.refreshData()">
-                            <span>🔄</span> 刷新数据
-                        </button>
-                    </div>
+                    <span id="sortInfo" style="font-size: 12px; color: #aaa;">按涨跌幅排序</span>
                 </div>
                 <div class="plates-container" id="platesContainer">
                     <div class="loading">正在连接服务器，加载板块数据...</div>
                 </div>
             </div>
             
-            <div class="section">
+            <!-- 右侧个股列表 -->
+            <div class="right-panel">
                 <div class="section-header">
-                    <h2 id="detailTitle">📈 板块详情</h2>
-                    <span id="selectedPlateInfo" style="font-size: 14px; color: #aaa;">请选择板块查看详情</span>
+                    <h2 id="rightTitle">📈 板块详情</h2>
+                    <span id="selectedPlateInfo" style="font-size: 12px; color: #aaa;">请选择板块查看详情</span>
                 </div>
-                <div class="sub-plates-container" id="plateDetails">
+                <div class="stocks-container" id="stocksContainer">
                     <div class="no-data">请从左侧板块列表中选择一个板块查看其详细信息</div>
                 </div>
             </div>
@@ -686,6 +724,7 @@
                 this.currentPlateType = 'main';
                 this.selectedPlate = null;
                 this.selectedSubPlate = null;
+                this.allStocks = [];
                 this.currentStocks = [];
                 this.autoUpdate = true;
                 this.displayCount = 30;
@@ -708,9 +747,6 @@
                 // 个股排序字段
                 this.stockSort = { field: 'change_pct', direction: 'desc' };
                 
-                // 新增：个股订阅状态
-                this.currentSubscribedPlate = null;  // 当前订阅的板块ID
-                
                 this.stats = {
                     total: 0,
                     rise: 0,
@@ -731,6 +767,9 @@
                 this.connect();
                 this.setupEventListeners();
                 this.setupScrollLoading();
+                
+                // 初始状态下尝试加载所有股票
+                this.requestAllStocks();
             }
             
             connect() {
@@ -749,6 +788,12 @@
                     
                     this.ws.onmessage = (event) => {
                         try {
+                            // 先检查数据是否为空
+                            if (!event.data || event.data.trim() === '') {
+                                console.warn('收到空数据，跳过解析');
+                                return;
+                            }
+                            
                             const data = JSON.parse(event.data);
                             this.handleWebSocketMessage(data);
                         } catch (error) {
@@ -777,292 +822,87 @@
             handleWebSocketMessage(data) {
                 console.log('📡 收到WebSocket消息:', data.type, data);
                 
+                // 检查数据是否有效
+                if (!data || typeof data !== 'object') {
+                    console.warn('收到无效数据格式，跳过处理');
+                    return;
+                }
+                
                 if (data.type === 'plate_init') {
                     this.handlePlateInit(data);
                 } else if (data.type === 'plate_update') {
                     this.handlePlateUpdate(data);
+                } else if (data.type === 'all_stocks') {
+                    this.handleAllStocks(data);
                 } else if (data.type === 'sub_plates') {
                     this.handleSubPlates(data);
                 } else if (data.type === 'plate_stocks') {
                     this.handlePlateStocks(data);
                 } else if (data.type === 'stock_update') {
-                    this.handleStockUpdate(data);  // 新增：处理个股更新
-                } else if (data.type === 'subscribe_result') {
-                    this.handleSubscribeResult(data);  // 新增：处理订阅结果
+                    this.handleStockUpdate(data);
                 } else if (data.type === 'error') {
                     console.error('服务器返回错误:', data.message);
                     this.showMessage(`服务器错误: ${data.message}`);
                 }
             }
             
-            // 新增：处理个股更新 - 保持原有DOM结构，只更新内容
-            // 修改：优化个股更新处理
-            handleStockUpdate(data) {
-                console.log('🔄 处理个股实时更新:', data.plate_id, data.data.length);
-                
-                // 检查是否是当前选中的板块
-                const isCurrentPlate = this.selectedPlate && this.selectedPlate.id === data.plate_id;
-                const isCurrentSubPlate = this.selectedSubPlate && this.selectedSubPlate.id === data.plate_id;
-                
-                if (!isCurrentPlate && !isCurrentSubPlate) {
-                    return; // 不是当前显示的板块，不处理
-                }
-                
-                // 更新股票数据缓存
-                this.stocksCache.set(data.plate_id, data.data);
-                
-                // 如果是当前选中的板块，更新显示
-                if (isCurrentPlate && !this.selectedSubPlate) {
-                    // 显示主板块的所有股票
-                    this.smoothUpdateStocksDisplay(data.data, `${this.selectedPlate.name} 全部个股`);
-                    this.updateSelectedPlateInfo();
-                } else if (isCurrentSubPlate) {
-                    // 显示子板块的股票
-                    this.smoothUpdateStocksDisplay(data.data, `${this.selectedSubPlate.name} 成分股`);
-                    this.updateSelectedPlateInfo();
-                }
-                
-                // 更新子板块选项卡计数
-                if (isCurrentPlate) {
-                    this.updateAllStocksTabCount(data.data.length);
-                }
-                
-                // 显示更新指示器
-                this.showStockUpdateIndicator();
+            // 新增：请求所有股票
+            requestAllStocks() {
+                this.sendMessage({
+                    type: 'get_all_stocks'
+                });
             }
             
-            // 新增：比较股票数据变化，只返回变化的字段
-            getStockChanges(oldStock, newStock) {
-                const changes = {};
-                const fields = ['change_pct', 'price', 'volume', 'market_cap'];
-                
-                fields.forEach(field => {
-                    const oldVal = oldStock[field] || 0;
-                    const newVal = newStock[field] || 0;
-                    
-                    // 对于浮点数，使用较小的阈值比较
-                    if (field === 'change_pct' || field === 'price') {
-                        if (Math.abs(oldVal - newVal) > 0.0001) {
-                            changes[field] = newVal;
-                        }
-                    } else {
-                        // 对于整数，直接比较
-                        if (oldVal !== newVal) {
-                            changes[field] = newVal;
-                        }
-                    }
-                });
-                
-                return changes;
-            }
-
-            // 新增：创建股票数据映射，便于快速查找
-            createStockMap(stocks) {
-                const map = new Map();
-                stocks.forEach(stock => {
-                    map.set(stock.code, stock);
-                });
-                return map;
-            }
-            // 修改：平滑更新股票显示，保持DOM结构
-            // 修改：优化平滑更新股票显示，只更新变化的值
-            smoothUpdateStocksDisplay(newStocks, title) {
-                const container = document.getElementById('plateDetails');
-                let stocksSection = container.querySelector('.stocks-section');
-                
-                if (!stocksSection) {
-                    // 如果没有股票部分，创建新的
-                    this.updateStocksDisplay(newStocks, title);
+            // 新增：处理所有股票数据
+            handleAllStocks(data) {
+                // 检查数据是否为空
+                if (!data || !data.data || !Array.isArray(data.data)) {
+                    console.warn('所有股票数据为空或格式错误');
+                    this.allStocks = [];
                     return;
                 }
                 
-                // 应用排序到新数据
-                const sortedNewStocks = [...newStocks];
-                this.applyStockSortToArray(sortedNewStocks);
+                console.log('📊 处理所有股票数据:', data.data.length);
+                this.allStocks = data.data;
                 
-                // 创建新旧数据的映射
-                const oldStockMap = this.createStockMap(this.currentStocks);
-                const newStockMap = this.createStockMap(sortedNewStocks);
-                
-                // 更新标题
-                const titleElement = stocksSection.querySelector('div:first-child');
-                if (titleElement) {
-                    titleElement.innerHTML = `${title} (${newStocks.length})`;
+                // 如果没有选中任何板块，显示所有股票
+                if (!this.selectedPlate) {
+                    this.currentStocks = this.allStocks;
+                    this.renderStocksTable();
+                    this.updateSelectedPlateInfo();
                 }
-                
-                // 获取股票行容器和现有行
-                let stocksContainer = stocksSection.querySelector('.stocks-container');
-                if (!stocksContainer) {
-                    stocksContainer = document.createElement('div');
-                    stocksContainer.className = 'stocks-container';
-                    const header = stocksSection.querySelector('.stocks-header');
-                    if (header && header.nextSibling) {
-                        stocksSection.insertBefore(stocksContainer, header.nextSibling);
-                    } else {
-                        stocksSection.appendChild(stocksContainer);
-                    }
-                }
-                
-                const existingRows = stocksContainer.querySelectorAll('.stock-row');
-                const existingRowMap = new Map();
-                
-                // 创建现有行的映射
-                existingRows.forEach(row => {
-                    const code = row.querySelector('.stock-code').textContent;
-                    existingRowMap.set(code, row);
-                });
-                
-                // 清空容器，准备重新添加（保持排序后的顺序）
-                stocksContainer.innerHTML = '';
-                
-                // 按照排序后的顺序添加或更新行
-                sortedNewStocks.forEach((newStock, index) => {
-                    const stockCode = newStock.code;
-                    let row = existingRowMap.get(stockCode);
-                    const oldStock = oldStockMap.get(stockCode);
-                    
-                    if (row && oldStock) {
-                        // 行已存在，检查并更新变化的值
-                        const changes = this.getStockChanges(oldStock, newStock);
-                        this.updateStockRow(row, changes);
-                        
-                        // 添加行到正确位置
-                        stocksContainer.appendChild(row);
-                    } else {
-                        // 新股票或行不存在，创建新行
-                        row = document.createElement('div');
-                        row.className = 'stock-row';
-                        row.innerHTML = this.renderStockRowHTML(newStock);
-                        stocksContainer.appendChild(row);
-                    }
-                });
-                
-                // 更新当前股票数据
-                this.currentStocks = sortedNewStocks;
-                
-                // 更新缓存
-                const plateId = this.selectedSubPlate ? this.selectedSubPlate.id : this.selectedPlate.id;
-                if (plateId) {
-                    this.stocksCache.set(plateId, sortedNewStocks);
-                }
-            }
-            // 新增：应用排序到数组（不修改原数组）
-            applyStockSortToArray(stocks) {
-                if (stocks.length === 0) return stocks;
-                
-                stocks.sort((a, b) => {
-                    let aVal = a[this.stockSort.field] || 0;
-                    let bVal = b[this.stockSort.field] || 0;
-                    
-                    // 特殊处理：股票名称按字母排序
-                    if (this.stockSort.field === 'name') {
-                        aVal = a.name || '';
-                        bVal = b.name || '';
-                        return this.stockSort.direction === 'desc' ? 
-                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
-                    }
-                    
-                    // 特殊处理：股票代码按字母排序
-                    if (this.stockSort.field === 'code') {
-                        aVal = a.code || '';
-                        bVal = b.code || '';
-                        return this.stockSort.direction === 'desc' ? 
-                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
-                    }
-                    
-                    // 数值排序
-                    if (this.stockSort.direction === 'desc') {
-                        return bVal - aVal;
-                    } else {
-                        return aVal - aVal;
-                    }
-                });
-                
-                return stocks;
-            }
-            // 新增：更新单行股票数据，只更新变化的字段
-            updateStockRow(row, changes) {
-                const cells = row.querySelectorAll('div');
-                if (cells.length < 6) return;
-                
-                // 更新涨跌幅
-                if (changes.change_pct !== undefined) {
-                    const changeCell = cells[2];
-                    const changeClass = changes.change_pct >= 0 ? 'change-positive' : 'change-negative';
-                    const changeSign = changes.change_pct >= 0 ? '+' : '';
-                    
-                    changeCell.textContent = `${changeSign}${(changes.change_pct * 100).toFixed(2)}%`;
-                    changeCell.className = changeClass;
-                    changeCell.classList.add('value-updated');
-                    setTimeout(() => changeCell.classList.remove('value-updated'), 1000);
-                }
-                
-                // 更新价格
-                if (changes.price !== undefined) {
-                    const priceCell = cells[3];
-                    priceCell.textContent = changes.price.toFixed(2);
-                    priceCell.classList.add('value-updated');
-                    setTimeout(() => priceCell.classList.remove('value-updated'), 1000);
-                }
-                
-                // 更新成交额
-                if (changes.volume !== undefined) {
-                    const volumeCell = cells[4];
-                    volumeCell.textContent = this.formatNumber(changes.volume);
-                    volumeCell.classList.add('value-updated');
-                    setTimeout(() => volumeCell.classList.remove('value-updated'), 1000);
-                }
-                
-                // 更新市值
-                if (changes.market_cap !== undefined) {
-                    const marketCapCell = cells[5];
-                    marketCapCell.textContent = this.formatNumber(changes.market_cap);
-                    marketCapCell.classList.add('value-updated');
-                    setTimeout(() => marketCapCell.classList.remove('value-updated'), 1000);
-                }
-            }
-
-            // 新增：处理订阅结果
-            handleSubscribeResult(data) {
-                console.log(`✅ ${data.action}: ${data.message}`);
-                
-                if (data.action === 'subscribed') {
-                    this.showMessage(`✅ 已开启 ${data.plate_id} 个股实时更新`);
-                } else {
-                    this.showMessage(`❌ 已关闭 ${data.plate_id} 个股实时更新`);
-                }
-            }
-            
-            // 新增：显示个股更新指示器
-            showStockUpdateIndicator() {
-                const indicator = document.createElement('div');
-                indicator.className = 'update-indicator';
-                indicator.innerHTML = '<span>📈</span> 个股数据更新 ' + new Date().toLocaleTimeString();
-                indicator.style.background = 'linear-gradient(135deg, #4caf50, #8bc34a)';
-                document.body.appendChild(indicator);
-                
-                setTimeout(() => {
-                    if (indicator.parentNode) {
-                        indicator.parentNode.removeChild(indicator);
-                    }
-                }, 2000);
             }
             
             handlePlateInit(data) {
                 console.log('📊 处理初始化数据');
                 
+                // 检查数据是否为空
+                if (!data || !data.data) {
+                    console.warn('初始化数据为空');
+                    this.allPlates = [];
+                    this.mainPlates = [];
+                    this.updateCurrentPlates();
+                    this.renderPlatesTable();
+                    this.updateStats();
+                    return;
+                }
+                
                 if (data.data) {
-                    if (data.data.all_plates) {
+                    if (data.data.all_plates && Array.isArray(data.data.all_plates)) {
                         this.allPlates = data.data.all_plates;
                         console.log(`📈 加载所有板块: ${this.allPlates.length}个`);
+                    } else {
+                        this.allPlates = [];
                     }
                     
-                    if (data.data.main_plates) {
+                    if (data.data.main_plates && Array.isArray(data.data.main_plates)) {
                         this.mainPlates = data.data.main_plates;
                         console.log(`🏆 加载主流板块: ${this.mainPlates.length}个`);
+                    } else {
+                        this.mainPlates = [];
                     }
                     
-                    if (data.data.main_plates_metrics) {
+                    if (data.data.main_plates_metrics && Array.isArray(data.data.main_plates_metrics)) {
                         this.mainPlates = data.data.main_plates_metrics;
                     }
                     
@@ -1077,14 +917,20 @@
             handlePlateUpdate(data) {
                 console.log('🔄 处理实时更新数据');
                 
+                // 检查数据是否为空
+                if (!data || !data.data) {
+                    console.warn('实时更新数据为空');
+                    return;
+                }
+                
                 if (data.data) {
                     this.updateCount++;
                     
-                    if (data.data.all_plates) {
+                    if (data.data.all_plates && Array.isArray(data.data.all_plates)) {
                         this.updatePlateData(this.allPlates, data.data.all_plates, '全部板块');
                     }
                     
-                    if (data.data.main_plates) {
+                    if (data.data.main_plates && Array.isArray(data.data.main_plates)) {
                         this.updatePlateData(this.mainPlates, data.data.main_plates, '主流板块');
                     }
                     
@@ -1092,7 +938,7 @@
                     this.updateStats();
                     
                     if (this.autoUpdate) {
-                        this.showRealTimeUpdate();
+                        // this.showRealTimeUpdate();
                         this.updateCurrentPlates();
                         this.updatePlatesDisplay();
                     }
@@ -1112,7 +958,6 @@
                 }
             }
 
-            // 修改：优化个股数据处理
             handlePlateStocks(data) {
                 console.log('📊 处理个股数据:', data);
                 if (data.plate_id && data.data) {
@@ -1133,7 +978,7 @@
                         
                         // 如果没有选中子板块，更新显示全部个股
                         if (!this.selectedSubPlate) {
-                            this.smoothUpdateStocksDisplay(data.data, `${this.selectedPlate.name} 全部个股`);
+                            this.updateStocksDisplay(data.data, `${this.selectedPlate.name} 全部个股`);
                             this.updateSelectedPlateInfo();
                         }
                     }
@@ -1141,15 +986,34 @@
                     // 检查是否是当前选中的子板块
                     if (this.selectedSubPlate && this.selectedSubPlate.id === data.plate_id) {
                         console.log(`✅ 更新选中的子板块股票: ${this.selectedSubPlate.name}`);
-                        this.smoothUpdateStocksDisplay(data.data, `${this.selectedSubPlate.name} 成分股`);
+                        this.updateStocksDisplay(data.data, `${this.selectedSubPlate.name} 成分股`);
                         this.updateSelectedPlateInfo();
                     }
                 }
             }
 
+            handleStockUpdate(data) {
+                console.log('🔄 处理个股实时更新:', data.plate_id, data.data ? data.data.length : 0);
+                
+                // 检查数据是否为空
+                if (!data || !data.plate_id || !data.data || !Array.isArray(data.data)) {
+                    console.warn('个股实时更新数据为空或格式错误');
+                    return;
+                }
+                
+                // 如果是当前选中的板块或所有股票，更新显示
+                if ((this.selectedPlate && this.selectedPlate.id === data.plate_id) || 
+                    (!this.selectedPlate && data.plate_id === 'all')) {
+                    this.currentStocks = data.data;
+                    this.updateStocksDisplay();
+                    this.updateSelectedPlateInfo();
+                    this.showStockUpdateIndicator();
+                }
+            }
+
             // 渲染子板块和股票（使用选项卡样式）
             renderSubPlatesAndStocks(subPlates) {
-                const container = document.getElementById('plateDetails');
+                const container = document.getElementById('stocksContainer');
                 if (!container) return;
                 
                 // 获取主板块的所有股票
@@ -1223,15 +1087,6 @@
 
             // 显示所有股票（取消子板块筛选）
             showAllStocks() {
-                // 如果之前订阅的是子板块，切换回主板块订阅
-                if (this.selectedPlate && this.currentSubscribedPlate !== this.selectedPlate.id) {
-                    console.log(`🔄 切换回主板块订阅: ${this.currentSubscribedPlate} -> ${this.selectedPlate.id}`);
-                    if (this.currentSubscribedPlate) {
-                        this.unsubscribeStocks(this.currentSubscribedPlate);
-                    }
-                    this.subscribeStocks(this.selectedPlate.id);
-                }
-                
                 this.selectedSubPlate = null;
                 
                 // 更新选项卡选中状态
@@ -1242,11 +1097,6 @@
                 
                 // 显示所有股票
                 const mainPlateStocks = this.stocksCache.get(this.selectedPlate.id) || [];
-                // 如果缓存为空但当前有股票数据，使用当前数据
-                if (mainPlateStocks.length === 0 && this.currentStocks.length > 0) {
-                    mainPlateStocks = this.currentStocks;
-                    this.stocksCache.set(this.selectedPlate.id, this.currentStocks);
-                }
                 this.updateStocksDisplay(mainPlateStocks, `${this.selectedPlate.name} 全部个股`);
                 
                 // 更新当前股票数据
@@ -1261,15 +1111,6 @@
             // 根据子板块筛选股票
             filterStocksBySubPlate(subPlate) {
                 console.log(`🔍 筛选子板块: ${subPlate.name}, ID: ${subPlate.id}`);
-                
-                // 取消之前的主板块订阅，订阅子板块
-                if (this.currentSubscribedPlate !== subPlate.id) {
-                    console.log(`🔄 切换订阅: ${this.currentSubscribedPlate} -> ${subPlate.id}`);
-                    if (this.currentSubscribedPlate) {
-                        this.unsubscribeStocks(this.currentSubscribedPlate);
-                    }
-                    this.subscribeStocks(subPlate.id);
-                }
                 
                 // 更新选项卡选中状态
                 document.querySelectorAll('.sub-plate-tab.selected').forEach(tab => {
@@ -1337,184 +1178,6 @@
                 });
             }
 
-            // 修改：优化股票排序，避免闪烁
-            sortStocks(field, direction = 'desc') {
-                if (this.stockSort.field === field) {
-                    this.stockSort.direction = this.stockSort.direction === 'desc' ? 'asc' : 'desc';
-                } else {
-                    this.stockSort.field = field;
-                    this.stockSort.direction = direction;
-                }
-                
-                if (this.currentStocks.length > 0) {
-                    // 应用排序到当前数据
-                    const sortedStocks = [...this.currentStocks];
-                    this.applyStockSortToArray(sortedStocks);
-                    
-                    // 更新显示，保持DOM重用
-                    const title = this.getCurrentStockTitle();
-                    this.smoothUpdateStocksDisplay(sortedStocks, title);
-                    this.updateStockHeaderSortClasses();
-                }
-            }
-            
-            // 新增：应用个股排序
-            applyStockSort() {
-                if (this.currentStocks.length === 0) return;
-                
-                this.currentStocks.sort((a, b) => {
-                    let aVal = a[this.stockSort.field] || 0;
-                    let bVal = b[this.stockSort.field] || 0;
-                    
-                    // 特殊处理：股票名称按字母排序
-                    if (this.stockSort.field === 'name') {
-                        aVal = a.name || '';
-                        bVal = b.name || '';
-                        return this.stockSort.direction === 'desc' ? 
-                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
-                    }
-                    
-                    // 特殊处理：股票代码按字母排序
-                    if (this.stockSort.field === 'code') {
-                        aVal = a.code || '';
-                        bVal = b.code || '';
-                        return this.stockSort.direction === 'desc' ? 
-                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
-                    }
-                    
-                    // 数值排序
-                    if (this.stockSort.direction === 'desc') {
-                        return bVal - aVal;
-                    } else {
-                        return aVal - aVal;
-                    }
-                });
-            }
-            
-            // 新增：获取当前股票列表标题
-            getCurrentStockTitle() {
-                if (this.selectedSubPlate) {
-                    return `${this.selectedSubPlate.name} 成分股`;
-                } else if (this.selectedPlate) {
-                    return `${this.selectedPlate.name} 全部个股`;
-                }
-                return '个股列表';
-            }
-            
-            // 新增：更新股票表头排序样式
-            updateStockHeaderSortClasses() {
-                const headerItems = document.querySelectorAll('.stock-header-item');
-                headerItems.forEach(item => {
-                    item.classList.remove('sort-asc', 'sort-desc');
-                });
-                
-                const currentHeader = document.querySelector(`.stock-header-item[onclick*="${this.stockSort.field}"]`);
-                if (currentHeader) {
-                    currentHeader.classList.add(this.stockSort.direction === 'desc' ? 'sort-desc' : 'sort-asc');
-                }
-            }
-
-            // 修改：优化初始股票显示
-            updateStocksDisplay(stocks, title) {
-                const container = document.getElementById('plateDetails');
-                let stocksSection = container.querySelector('.stocks-section');
-                
-                if (!stocksSection) {
-                    stocksSection = document.createElement('div');
-                    stocksSection.className = 'stocks-section';
-                    container.appendChild(stocksSection);
-                }
-                
-                // 应用排序
-                const sortedStocks = [...stocks];
-                this.applyStockSortToArray(sortedStocks);
-                
-                // 更新当前股票数据
-                this.currentStocks = sortedStocks;
-                
-                // 如果是主板块的全部个股，确保更新缓存和选项卡计数
-                if (title.includes('全部个股') && this.selectedPlate && !this.selectedSubPlate) {
-                    this.stocksCache.set(this.selectedPlate.id, sortedStocks);
-                    this.updateAllStocksTabCount(sortedStocks.length);
-                }
-                
-                if (sortedStocks.length === 0) {
-                    stocksSection.innerHTML = `
-                        <div style="margin-bottom: 15px; color: #d4af37; font-weight: 600;">
-                            ${title} (0)
-                        </div>
-                        <div class="loading">正在加载个股数据...</div>
-                    `;
-                } else {
-                    // 使用新的渲染方法
-                    this.renderStocksSectionSmooth(stocksSection, title, sortedStocks);
-                }
-            }
-
-            // 新增：平滑渲染股票部分
-            renderStocksSectionSmooth(container, title, stocks) {
-                // 清除现有内容但保留容器
-                container.innerHTML = '';
-                
-                const titleElement = document.createElement('div');
-                titleElement.style.marginBottom = '15px';
-                titleElement.style.color = '#d4af37';
-                titleElement.style.fontWeight = '600';
-                titleElement.innerHTML = `${title} (${stocks.length})`;
-                container.appendChild(titleElement);
-                
-                // 创建表头
-                const header = document.createElement('div');
-                header.className = 'stocks-header';
-                header.innerHTML = this.renderStockHeaderHTML();
-                container.appendChild(header);
-                
-                // 创建股票容器
-                const stocksContainer = document.createElement('div');
-                stocksContainer.className = 'stocks-container';
-                container.appendChild(stocksContainer);
-                
-                // 添加股票行
-                stocks.forEach(stock => {
-                    const row = document.createElement('div');
-                    row.className = 'stock-row';
-                    row.innerHTML = this.renderStockRowHTML(stock);
-                    stocksContainer.appendChild(row);
-                });
-            }
-
-            // 新增：渲染股票表头HTML
-            renderStockHeaderHTML() {
-                const getSortClass = (field) => {
-                    if (this.stockSort.field === field) {
-                        return this.stockSort.direction === 'desc' ? 'sort-desc' : 'sort-asc';
-                    }
-                    return '';
-                };
-                
-                return `
-                    <div class="stock-header-item ${getSortClass('name')}" onclick="plateMonitor.sortStocks('name')">股票名称</div>
-                    <div class="stock-header-item ${getSortClass('code')}" onclick="plateMonitor.sortStocks('code')">代码</div>
-                    <div class="stock-header-item ${getSortClass('change_pct')}" onclick="plateMonitor.sortStocks('change_pct')">涨跌幅</div>
-                    <div class="stock-header-item ${getSortClass('price')}" onclick="plateMonitor.sortStocks('price')">最新价</div>
-                    <div class="stock-header-item ${getSortClass('volume')}" onclick="plateMonitor.sortStocks('volume')">成交额</div>
-                    <div class="stock-header-item ${getSortClass('market_cap')}" onclick="plateMonitor.sortStocks('market_cap')">市值</div>
-                `;
-            }
-            // 新增：渲染单行股票HTML
-            renderStockRowHTML(stock) {
-                const changeClass = stock.change_pct >= 0 ? 'change-positive' : 'change-negative';
-                const changeSign = stock.change_pct >= 0 ? '+' : '';
-                
-                return `
-                    <div class="stock-name">${stock.name}</div>
-                    <div class="stock-code">${stock.code}</div>
-                    <div class="${changeClass}">${changeSign}${(stock.change_pct * 100).toFixed(2)}%</div>
-                    <div>${stock.price ? stock.price.toFixed(2) : '--'}</div>
-                    <div>${this.formatNumber(stock.volume)}</div>
-                    <div>${this.formatNumber(stock.market_cap)}</div>
-                `;
-            }
             // 更新全部个股选项卡数量
             updateAllStocksTabCount(count) {
                 const allStocksTab = document.querySelector('.sub-plate-tab.all-stocks-tab');
@@ -1548,7 +1211,7 @@
                     <div style="margin-bottom: 15px; color: #d4af37; font-weight: 600;">
                         ${title} (${stocks.length})
                     </div>
-                    <div class="stocks-header">
+                    <div class="stock-header">
                         <div class="stock-header-item ${getSortClass('name')}" onclick="plateMonitor.sortStocks('name')">股票名称</div>
                         <div class="stock-header-item ${getSortClass('code')}" onclick="plateMonitor.sortStocks('code')">代码</div>
                         <div class="stock-header-item ${getSortClass('change_pct')}" onclick="plateMonitor.sortStocks('change_pct')">涨跌幅</div>
@@ -1556,7 +1219,7 @@
                         <div class="stock-header-item ${getSortClass('volume')}" onclick="plateMonitor.sortStocks('volume')">成交额</div>
                         <div class="stock-header-item ${getSortClass('market_cap')}" onclick="plateMonitor.sortStocks('market_cap')">市值</div>
                     </div>
-                    <div class="stocks-container">
+                    <div class="stocks-container-inner">
                 `;
                 
                 stocks.forEach(stock => {
@@ -1579,8 +1242,13 @@
                 return html;
             }
             
-            // 修复板块排序问题
             updatePlateData(existingPlates, newPlates, plateType) {
+                // 检查新数据是否为空
+                if (!newPlates || !Array.isArray(newPlates) || newPlates.length === 0) {
+                    console.warn(`${plateType}更新数据为空`);
+                    return;
+                }
+                
                 const plateMap = new Map();
                 
                 existingPlates.forEach(plate => {
@@ -1765,13 +1433,83 @@
                 this.updateHeaderSortClasses();
             }
             
-            // 修复：板块排序方法
+            updateStocksDisplay(stocks, title) {
+                const container = document.getElementById('stocksContainer');
+                let stocksSection = container.querySelector('.stocks-section');
+                
+                if (!stocksSection) {
+                    stocksSection = document.createElement('div');
+                    stocksSection.className = 'stocks-section';
+                    container.appendChild(stocksSection);
+                }
+                
+                // 应用排序
+                const sortedStocks = [...stocks];
+                this.applyStockSortToArray(sortedStocks);
+                
+                // 更新当前股票数据
+                this.currentStocks = sortedStocks;
+                
+                // 如果是主板块的全部个股，确保更新缓存和选项卡计数
+                if (title.includes('全部个股') && this.selectedPlate && !this.selectedSubPlate) {
+                    this.stocksCache.set(this.selectedPlate.id, sortedStocks);
+                    this.updateAllStocksTabCount(sortedStocks.length);
+                }
+                
+                if (sortedStocks.length === 0) {
+                    stocksSection.innerHTML = `
+                        <div style="margin-bottom: 15px; color: #d4af37; font-weight: 600;">
+                            ${title} (0)
+                        </div>
+                        <div class="loading">正在加载个股数据...</div>
+                    `;
+                } else {
+                    stocksSection.innerHTML = this.renderStocksHTML(title, sortedStocks);
+                }
+                
+                this.updateStockHeaderSortClasses();
+            }
+            
+            // 新增：应用排序到数组（不修改原数组）
+            applyStockSortToArray(stocks) {
+                if (stocks.length === 0) return stocks;
+                
+                const sortedStocks = [...stocks];
+                sortedStocks.sort((a, b) => {
+                    let aVal = a[this.stockSort.field] || 0;
+                    let bVal = b[this.stockSort.field] || 0;
+                    
+                    // 特殊处理：股票名称按字母排序
+                    if (this.stockSort.field === 'name') {
+                        aVal = a.name || '';
+                        bVal = b.name || '';
+                        return this.stockSort.direction === 'desc' ? 
+                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+                    }
+                    
+                    // 特殊处理：股票代码按字母排序
+                    if (this.stockSort.field === 'code') {
+                        aVal = a.code || '';
+                        bVal = b.code || '';
+                        return this.stockSort.direction === 'desc' ? 
+                            bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+                    }
+                    
+                    // 数值排序
+                    if (this.stockSort.direction === 'desc') {
+                        return bVal - aVal;
+                    } else {
+                        return aVal - bVal;
+                    }
+                });
+                
+                return sortedStocks;
+            }
+            
             sortPlates(field, direction = null) {
                 if (this.currentSort.field === field) {
-                    // 如果点击同一列，切换排序方向
                     this.currentSort.direction = this.currentSort.direction === 'desc' ? 'asc' : 'desc';
                 } else {
-                    // 如果点击不同列，设置新的排序字段，默认降序
                     this.currentSort.field = field;
                     this.currentSort.direction = direction || 'desc';
                 }
@@ -1783,103 +1521,23 @@
                 this.updateSortInfo();
             }
             
-            updateHeaderSortClasses() {
-                const headerItems = document.querySelectorAll('.plate-header-item');
-                headerItems.forEach(item => {
-                    item.classList.remove('sort-asc', 'sort-desc');
-                });
-                
-                const currentHeader = document.querySelector(`.plate-header-item[onclick*="${this.currentSort.field}"]`);
-                if (currentHeader) {
-                    currentHeader.classList.add(this.currentSort.direction === 'desc' ? 'sort-desc' : 'sort-asc');
-                }
-            }
-            
-            togglePlateType() {
-                this.currentPlateType = this.currentPlateType === 'main' ? 'all' : 'main';
-                this.updateCurrentPlates();
-                this.renderPlatesTable();
-                this.updatePlateTypeButton();
-            }
-            
-            toggleAutoUpdate() {
-                this.autoUpdate = !this.autoUpdate;
-                const btn = document.getElementById('autoUpdateBtn');
-                if (this.autoUpdate) {
-                    btn.textContent = '自动更新:开';
-                    btn.classList.add('active');
-                    this.showMessage('✅ 已开启自动更新');
+            sortStocks(field, direction = null) {
+                if (this.stockSort.field === field) {
+                    this.stockSort.direction = this.stockSort.direction === 'desc' ? 'asc' : 'desc';
                 } else {
-                    btn.textContent = '自动更新:关';
-                    btn.classList.remove('active');
-                    this.showMessage('❌ 已关闭自动更新');
+                    this.stockSort.field = field;
+                    this.stockSort.direction = direction || 'desc';
+                }
+                
+                console.log(`🔄 股票排序: ${field}, 方向: ${this.stockSort.direction}`);
+                
+                if (this.currentStocks.length > 0) {
+                    const title = this.getCurrentStockTitle();
+                    const sortedStocks = this.applyStockSortToArray(this.currentStocks);
+                    this.updateStocksDisplay(sortedStocks, title);
                 }
             }
             
-            selectPlate(plate) {
-                console.log(`🔍 选择板块: ${plate.name}, ID: ${plate.id}`);
-                
-                // 取消之前的个股订阅
-                if (this.currentSubscribedPlate) {
-                    console.log(`❌ 取消之前订阅: ${this.currentSubscribedPlate}`);
-                    this.unsubscribeStocks(this.currentSubscribedPlate);
-                }
-                
-                document.querySelectorAll('.plate-selected').forEach(el => {
-                    el.classList.remove('plate-selected');
-                });
-                
-                const element = document.querySelector(`[data-plate-id="${plate.id}"]`);
-                if (element) {
-                    element.classList.add('plate-selected');
-                }
-                
-                this.selectedPlate = plate;
-                this.selectedSubPlate = null;
-                this.currentStocks = [];
-                
-                this.viewState.currentMainPlate = plate;
-                this.viewState.currentSubPlate = null;
-                this.viewState.showStocks = false;
-                
-                // 订阅该板块的个股更新
-                console.log(`✅ 订阅个股更新: ${plate.id}`);
-                this.subscribeStocks(plate.id);
-                
-                this.loadSubPlates(plate.name);
-                this.requestMainPlateStocks(plate.id);
-            }
-            
-            loadSubPlates(plateName) {
-                this.selectedPlate = this.allPlates.find(p => p.name === plateName) || this.mainPlates.find(p => p.name === plateName);
-                if (!this.selectedPlate) return;
-                
-                document.getElementById('detailTitle').textContent = `📈 ${plateName}`;
-                
-                if (this.subPlatesCache.has(plateName)) {
-                    console.log('📋 使用缓存的子板块数据');
-                    if (this.stocksCache.has(this.selectedPlate.id)) {
-                        this.renderSubPlatesAndStocks(this.subPlatesCache.get(plateName));
-                    }
-                } else {
-                    this.sendMessage({
-                        type: 'get_sub_plates',
-                        main_plate: plateName
-                    });
-                    
-                    document.getElementById('plateDetails').innerHTML = '<div class="loading">正在加载子板块数据...</div>';
-                }
-            }
-            
-            cacheSubPlateElements() {
-                this.subPlateElements.clear();
-                const elements = document.querySelectorAll('[data-sub-plate-id]');
-                elements.forEach(element => {
-                    const plateId = element.getAttribute('data-sub-plate-id');
-                    this.subPlateElements.set(plateId, element);
-                });
-            }
-
             sortSubPlates(field) {
                 if (this.subPlateSort.field === field) {
                     this.subPlateSort.direction = this.subPlateSort.direction === 'desc' ? 'asc' : 'desc';
@@ -1926,40 +1584,111 @@
                 }
             }
             
-            backToMain() {
-                // 取消当前订阅
-                if (this.currentSubscribedPlate) {
-                    this.unsubscribeStocks(this.currentSubscribedPlate);
+            // 新增：获取当前股票列表标题
+            getCurrentStockTitle() {
+                if (this.selectedSubPlate) {
+                    return `${this.selectedSubPlate.name} 成分股`;
+                } else if (this.selectedPlate) {
+                    return `${this.selectedPlate.name} 全部个股`;
+                }
+                return '个股列表';
+            }
+            
+            // 新增：更新股票表头排序样式
+            updateStockHeaderSortClasses() {
+                const headerItems = document.querySelectorAll('.stock-header-item');
+                headerItems.forEach(item => {
+                    item.classList.remove('sort-asc', 'sort-desc');
+                });
+                
+                const currentHeader = document.querySelector(`.stock-header-item[onclick*="${this.stockSort.field}"]`);
+                if (currentHeader) {
+                    currentHeader.classList.add(this.stockSort.direction === 'desc' ? 'sort-desc' : 'sort-asc');
+                }
+            }
+            
+            togglePlateType() {
+                this.currentPlateType = this.currentPlateType === 'main' ? 'all' : 'main';
+                this.updateCurrentPlates();
+                this.renderPlatesTable();
+                this.updatePlateTypeButton();
+            }
+            
+            toggleAutoUpdate() {
+                this.autoUpdate = !this.autoUpdate;
+                const btn = document.getElementById('autoUpdateBtn');
+                if (this.autoUpdate) {
+                    btn.textContent = '自动更新:开';
+                    btn.classList.add('active');
+                    this.showMessage('✅ 已开启自动更新');
+                } else {
+                    btn.textContent = '自动更新:关';
+                    btn.classList.remove('active');
+                    this.showMessage('❌ 已关闭自动更新');
+                }
+            }
+            
+            selectPlate(plate) {
+                console.log(`🔍 选择板块: ${plate.name}, ID: ${plate.id}`);
+                
+                document.querySelectorAll('.plate-selected').forEach(el => {
+                    el.classList.remove('plate-selected');
+                });
+                
+                const element = document.querySelector(`[data-plate-id="${plate.id}"]`);
+                if (element) {
+                    element.classList.add('plate-selected');
                 }
                 
+                this.selectedPlate = plate;
+                this.selectedSubPlate = null;
+                this.currentStocks = [];
+                
+                this.viewState.currentMainPlate = plate;
+                this.viewState.currentSubPlate = null;
+                this.viewState.showStocks = false;
+                
+                this.loadSubPlates(plate.name);
+                this.requestMainPlateStocks(plate.id);
+            }
+            
+            loadSubPlates(plateName) {
+                this.selectedPlate = this.allPlates.find(p => p.name === plateName) || this.mainPlates.find(p => p.name === plateName);
+                if (!this.selectedPlate) return;
+                
+                document.getElementById('rightTitle').textContent = `📈 ${plateName}`;
+                
+                if (this.subPlatesCache.has(plateName)) {
+                    console.log('📋 使用缓存的子板块数据');
+                    if (this.stocksCache.has(this.selectedPlate.id)) {
+                        this.renderSubPlatesAndStocks(this.subPlatesCache.get(plateName));
+                    }
+                } else {
+                    this.sendMessage({
+                        type: 'get_sub_plates',
+                        main_plate: plateName
+                    });
+                    
+                    document.getElementById('stocksContainer').innerHTML = '<div class="loading">正在加载子板块数据...</div>';
+                }
+            }
+            
+            cacheSubPlateElements() {
+                this.subPlateElements.clear();
+                const elements = document.querySelectorAll('[data-sub-plate-id]');
+                elements.forEach(element => {
+                    const plateId = element.getAttribute('data-sub-plate-id');
+                    this.subPlateElements.set(plateId, element);
+                });
+            }
+            
+            backToMain() {
                 this.viewState.currentMainPlate = null;
                 this.viewState.currentSubPlate = null;
                 this.viewState.showStocks = false;
-                document.getElementById('plateDetails').innerHTML = '<div class="no-data">请从左侧板块列表中选择一个板块查看其详细信息</div>';
-                document.getElementById('detailTitle').textContent = '📈 板块详情';
+                document.getElementById('stocksContainer').innerHTML = '<div class="no-data">请从左侧板块列表中选择一个板块查看其详细信息</div>';
+                document.getElementById('rightTitle').textContent = '📈 板块详情';
                 document.getElementById('selectedPlateInfo').textContent = '请选择板块查看详情';
-            }
-            
-            // 新增：订阅个股更新
-            subscribeStocks(plateId) {
-                console.log(`📤 发送订阅请求: ${plateId}`);
-                this.currentSubscribedPlate = plateId;
-                this.sendMessage({
-                    type: 'subscribe_stocks',
-                    plate_id: plateId,
-                    action: 'subscribe'
-                });
-            }
-
-            // 新增：取消订阅个股更新
-            unsubscribeStocks(plateId) {
-                console.log(`📤 发送取消订阅请求: ${plateId}`);
-                this.sendMessage({
-                    type: 'subscribe_stocks',
-                    plate_id: plateId,
-                    action: 'unsubscribe'
-                });
-                this.currentSubscribedPlate = null;
             }
             
             showRealTimeUpdate() {
@@ -1977,11 +1706,44 @@
                 }, 2000);
             }
             
+            showStockUpdateIndicator() {
+                const indicator = document.createElement('div');
+                indicator.className = 'update-indicator';
+                indicator.innerHTML = '<span>📈</span> 个股数据更新 ' + new Date().toLocaleTimeString();
+                indicator.style.background = 'linear-gradient(135deg, #4caf50, #8bc34a)';
+                document.body.appendChild(indicator);
+                
+                setTimeout(() => {
+                    if (indicator.parentNode) {
+                        indicator.parentNode.removeChild(indicator);
+                    }
+                }, 2000);
+            }
+            
             getSortClass(field) {
                 if (this.currentSort.field === field) {
                     return this.currentSort.direction === 'desc' ? 'sort-desc' : 'sort-asc';
                 }
                 return '';
+            }
+            
+            getStockSortClass(field) {
+                if (this.stockSort.field === field) {
+                    return this.stockSort.direction === 'desc' ? 'sort-desc' : 'sort-asc';
+                }
+                return '';
+            }
+            
+            updateHeaderSortClasses() {
+                const headerItems = document.querySelectorAll('.plate-header-item');
+                headerItems.forEach(item => {
+                    item.classList.remove('sort-asc', 'sort-desc');
+                });
+                
+                const currentHeader = document.querySelector(`.plate-header-item[onclick*="${this.currentSort.field}"]`);
+                if (currentHeader) {
+                    currentHeader.classList.add(this.currentSort.direction === 'desc' ? 'sort-desc' : 'sort-asc');
+                }
             }
             
             updateStats() {
@@ -2122,6 +1884,21 @@
         
         document.addEventListener('DOMContentLoaded', function() {
             plateMonitor.init();
+            
+            // 添加一个按钮来显示所有股票
+            const header = document.querySelector('.header-bottom');
+            const allStocksBtn = document.createElement('button');
+            allStocksBtn.className = 'control-btn';
+            allStocksBtn.innerHTML = '<span>📈</span> 全部个股';
+            allStocksBtn.onclick = () => {
+                plateMonitor.selectedPlate = null;
+                plateMonitor.selectedSubPlate = null;
+                plateMonitor.currentStocks = plateMonitor.allStocks;
+                plateMonitor.updateStocksDisplay(plateMonitor.allStocks, '全部个股');
+                plateMonitor.updateSelectedPlateInfo();
+                document.getElementById('rightTitle').textContent = '📈 全部个股';
+            };
+            header.insertBefore(allStocksBtn, header.querySelector('.refresh-btn'));
         });
     </script>
 </body>
