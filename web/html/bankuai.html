@@ -980,36 +980,37 @@
                 this.updateScheduled = false;
             }
             
-            // 修复1: 增量更新，只更新变化的字段
+            // 修复后的增量更新方法
             incrementalUpdateStocks(newStocks) {
                 if (!this.virtualScroll.container) return;
                 
-                const oldStockMap = new Map(this.currentStocks.map(stock => [stock.code, stock]));
-                const newStockMap = new Map(newStocks.map(stock => [stock.code, stock]));
+                // 使用Map确保股票代码唯一性
+                const stockMap = new Map();
                 
-                // 更新当前数据
-                this.currentStocks = newStocks;
-                this.virtualScroll.totalStocks = newStocks.length;
+                // 先添加新数据
+                newStocks.forEach(stock => {
+                    stockMap.set(stock.code, stock);
+                });
                 
-                // 只更新可见区域的股票
-                const start = Math.max(0, this.virtualScroll.visibleStart - this.virtualScroll.buffer);
-                const end = Math.min(newStocks.length, this.virtualScroll.visibleEnd + this.virtualScroll.buffer);
-                
-                for (let i = start; i < end; i++) {
-                    const stock = newStocks[i];
-                    const oldStock = oldStockMap.get(stock.code);
-                    
-                    if (!oldStock) continue;
-                    
-                    // 检查哪些字段发生了变化
-                    const changes = this.getStockChanges(oldStock, stock);
-                    if (Object.keys(changes).length > 0) {
-                        this.updateStockRow(stock.code, changes);
+                // 再添加当前数据中不在新数据中的股票
+                this.currentStocks.forEach(stock => {
+                    if (!stockMap.has(stock.code)) {
+                        stockMap.set(stock.code, stock);
                     }
-                }
+                });
+                
+                // 转换为数组并保持排序
+                const mergedStocks = Array.from(stockMap.values());
+                const sortedStocks = this.applyStockSortToArray(mergedStocks);
+                
+                this.currentStocks = sortedStocks;
+                this.virtualScroll.totalStocks = sortedStocks.length;
                 
                 // 更新标题中的股票数量
-                this.updateStockCountDisplay(newStocks.length);
+                this.updateStockCountDisplay(sortedStocks.length);
+                
+                // 重新渲染虚拟滚动
+                this.renderVisibleStocks(sortedStocks);
             }
             
             // 修复1: 更新单个股票行
@@ -1126,8 +1127,12 @@
                 });
             }
             
-            renderVisibleStocks(stocks) {
+            // 修复后的虚拟滚动渲染方法
+            renderVisibleStocks(stocks = null) {
                 if (!this.virtualScroll.content) return;
+                
+                // 如果没有传入stocks参数，使用当前数据
+                const displayStocks = stocks || this.currentStocks;
                 
                 const container = this.virtualScroll.container.querySelector('.virtual-scroll-container');
                 const scrollTop = container ? container.scrollTop : 0;
@@ -1139,19 +1144,65 @@
                 
                 // 扩展缓冲区
                 const start = Math.max(0, this.virtualScroll.visibleStart - this.virtualScroll.buffer);
-                const end = Math.min(stocks.length, this.virtualScroll.visibleEnd + this.virtualScroll.buffer);
+                const end = Math.min(displayStocks.length, this.virtualScroll.visibleEnd + this.virtualScroll.buffer);
                 
-                // 清空现有内容
-                this.virtualScroll.content.innerHTML = '';
+                // 使用Set检查重复，确保不重复渲染
+                const renderedCodes = new Set();
+                const fragment = document.createDocumentFragment();
                 
                 // 渲染可见股票
                 for (let i = start; i < end; i++) {
-                    const stock = stocks[i];
+                    const stock = displayStocks[i];
+                    
+                    // 检查是否已经渲染过这个股票代码
+                    if (renderedCodes.has(stock.code)) {
+                        console.log(`发现重复股票: ${stock.code} - ${stock.name}`);
+                        continue;
+                    }
+                    
+                    renderedCodes.add(stock.code);
                     const row = this.createVirtualStockRow(stock, i);
-                    this.virtualScroll.content.appendChild(row);
+                    fragment.appendChild(row);
                 }
+                
+                // 一次性更新DOM
+                this.virtualScroll.content.innerHTML = '';
+                this.virtualScroll.content.appendChild(fragment);
+                
+                // 渲染完成后清理重复元素
+                setTimeout(() => {
+                    const removedCount = this.cleanupDuplicateStockRows();
+                    if (removedCount > 0) {
+                        console.log(`清理了 ${removedCount} 个重复的股票行`);
+                    }
+                }, 0);
             }
-            
+            // 新增方法：清理重复的DOM元素
+            cleanupDuplicateStockRows() {
+                if (!this.virtualScroll.content) return 0;
+                
+                const rows = this.virtualScroll.content.querySelectorAll('.stock-row');
+                const seenCodes = new Set();
+                const duplicates = [];
+                
+                // 找出重复的股票行
+                rows.forEach(row => {
+                    const code = row.id.replace('stock-', '');
+                    if (seenCodes.has(code)) {
+                        duplicates.push(row);
+                    } else {
+                        seenCodes.add(code);
+                    }
+                });
+                
+                // 移除重复的行
+                duplicates.forEach(row => {
+                    console.warn(`移除重复DOM元素: ${row.id}`);
+                    row.remove();
+                });
+                
+                return duplicates.length;
+            }
             createVirtualStockRow(stock, index) {
                 const row = document.createElement('div');
                 row.className = 'stock-row';
@@ -1369,24 +1420,42 @@
                     }
                 }
             }
-
+            // 新增方法：移除重复股票
+            removeDuplicateStocks(stocks) {
+                const stockMap = new Map();
+                const uniqueStocks = [];
+                
+                stocks.forEach(stock => {
+                    if (!stockMap.has(stock.code)) {
+                        stockMap.set(stock.code, true);
+                        uniqueStocks.push(stock);
+                    } else {
+                        console.warn(`移除重复股票: ${stock.code} - ${stock.name}`);
+                    }
+                });
+                
+                return uniqueStocks;
+            }
+            // 修复handlePlateStocks方法
             handlePlateStocks(data) {
                 if (data.plate_id && data.data) {
                     this.pendingRequests.delete(`stocks_${data.plate_id}`);
                     
-                    this.stocksCache.set(data.plate_id, data.data);
+                    // 缓存前去重
+                    const uniqueStocks = this.removeDuplicateStocks(data.data);
+                    this.stocksCache.set(data.plate_id, uniqueStocks);
                     
                     if (this.selectedPlate && this.selectedPlate.id === data.plate_id) {
-                        this.updateAllStocksTabCount(data.data.length);
+                        this.updateAllStocksTabCount(uniqueStocks.length);
                         
                         if (!this.selectedSubPlate) {
-                            this.renderStocksWithVirtualScroll(data.data, `${this.selectedPlate.name} 全部个股`);
+                            this.renderStocksWithVirtualScroll(uniqueStocks, `${this.selectedPlate.name} 全部个股`);
                             this.updateSelectedPlateInfo();
                         }
                     }
                     
                     if (this.selectedSubPlate && this.selectedSubPlate.id === data.plate_id) {
-                        this.renderStocksWithVirtualScroll(data.data, `${this.selectedSubPlate.name} 成分股`);
+                        this.renderStocksWithVirtualScroll(uniqueStocks, `${this.selectedSubPlate.name} 成分股`);
                         this.updateSelectedPlateInfo();
                     }
                 }
