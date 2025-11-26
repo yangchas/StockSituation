@@ -2854,8 +2854,8 @@ private:
         // 存储到Redis哈希表中，与Python脚本格式匹配
         redis_client_->hset(key, "price", std::to_string(data.last_price));
         redis_client_->hset(key, "change_pct", std::to_string(change));
-        redis_client_->hset(key, "volume", std::to_string(static_cast<int>(data.volume)));
-        redis_client_->hset(key, "large_net", std::to_string(static_cast<int>(data.large_net)));
+        redis_client_->hset(key, "volume", Logger::amountToWan(data.amount));
+        redis_client_->hset(key, "large_net", Logger::amountToWan(data.large_net));
         // 修复：将时间戳转换为整数（毫秒）
         long long timestamp_ms = static_cast<long long>(data.timestamp);
         redis_client_->hset(key, "timestamp", std::to_string(timestamp_ms));
@@ -2864,7 +2864,7 @@ private:
         redis_client_->hset(key, "market_cap", std::to_string(market_cap));
         
         // 设置过期时间，与Python脚本一致
-        redis_client_->expire(key, 300); // 5分钟过期
+        redis_client_->expire(key, 60*60*2); // 5分钟过期
         
         // 可选：记录存储成功的日志
         static int stored_count = 0;
