@@ -1,18 +1,339 @@
 #!/usr/bin/env python3
 import asyncio
+from tracemalloc import start
 import websockets
 import json
+import pandas as pd
 import time
 import os
 from typing import Dict, Set, List
 import logging
+import tablib
 from aiohttp import web
-
+from datetime import datetime, timedelta
+import baostock as bs
 # 修改导入路径
 from plate_updater import LazyPlateUpdater, PlateDataSimulator
-
+from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+class StockKLineService:
+    def __init__(self):
+        # 使用现有的RedisStorageManager
+        self.redis_storage = RedisStorageManager()
+        
+        # 初始化baostock
+        try:
+            lg = bs.login()
+            if lg.error_code == '0':
+                logger.info("✅ Baostock登录成功")
+            else:
+                logger.error(f"❌ Baostock登录失败: {lg.error_msg}")
+        except Exception as e:
+            logger.error(f"❌ Baostock初始化失败: {e}")
+    
+    def get_cache_key(self, code: str, frequency: str, start_date: str, end_date: str) -> str:
+        """生成缓存键"""
+        key_str = f"kline_{code}_{frequency}_{start_date}_{end_date}"
+        return key_str.encode()
+    
+    def fetch_kline_data(self, code: str, frequency: str = "d", 
+                        start_date: str = None, end_date: str = None) -> List[Dict]:
+        """获取K线数据"""
+        
+        # 设置默认日期范围
+        if not end_date:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if not start_date:
+            if frequency == "5":
+                start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            elif frequency == "60":
+                start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+            elif frequency == "d":
+                start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+            elif frequency == "w":
+                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+        
+        cache_key = self.get_cache_key(code, frequency, start_date, end_date)
+        
+        # 检查缓存 - 使用现有的RedisStorageManager
+        try:
+            cached_data = self.redis_storage.get_data(cache_key)
+            if cached_data:
+                logger.info(f"📦 从缓存加载K线数据: {code}_{frequency}")
+                return json.loads(cached_data)
+        except Exception as e:
+            logger.error(f"❌ 缓存读取失败: {e}")
+        
+        # 从baostock获取数据
+        try:
+            # 构建查询字段
+            fields = "date,open,high,low,close,volume,amount"
+            print(type(start_date),start_date,type(end_date),end_date)
+            # 查询数据
+            if code[:2] in ["00","30"]:
+                code = f"sz.{code}"
+            else:
+                code = f"sh.{code}"
+            rs = bs.query_history_k_data_plus(
+                code, fields, 
+                start_date=start_date, 
+                end_date=end_date,
+                frequency=frequency, 
+                adjustflag="3"  # 复权类型: 1-后复权, 2-前复权, 3-不复权
+            )
+            
+            if rs.error_code != '0':
+                logger.error(f"❌ 查询K线数据失败: {rs.error_msg}")
+                return []
+            
+            # 处理数据
+            data_list = []
+            while (rs.error_code == '0') & rs.next():
+                row_data = rs.get_row_data()
+                data_list.append({
+                    'time': row_data[0],
+                    # 'code': row_data[1],
+                    'open': float(row_data[1]) if row_data[1] else 0,
+                    'high': float(row_data[2]) if row_data[2] else 0,
+                    'low': float(row_data[3]) if row_data[3] else 0,
+                    'close': float(row_data[4]) if row_data[4] else 0,
+                    'volume': int(float(row_data[5])) if row_data[5] else 0,
+                    'amount': float(row_data[6]) if row_data[6] else 0,
+                    # 'turnover': float(row_data[8]) if row_data[8] else 0,
+                    # 'pct_chg': float(row_data[9]) if row_data[9] else 0
+                })
+            
+            # 缓存数据（5分钟缓存）- 使用现有的RedisStorageManager
+            try:
+                cache_time = 300  # 5分钟
+                self.redis_storage.store_data(cache_key, json.dumps(data_list), expire_seconds=cache_time)
+                logger.info(f"💾 缓存K线数据: {code}_{frequency}, 数据点: {len(data_list)}")
+            except Exception as e:
+                logger.error(f"❌ 缓存写入失败: {e}")
+            
+            return data_list
+            
+        except Exception as e:
+            logger.error(f"❌ 获取K线数据异常: {e}")
+            return []
+    
+    def calculate_technical_indicators(self, kline_data: List[Dict]) -> Dict:
+        """计算技术指标"""
+        if not kline_data:
+            return {}
+        
+        # 这里可以添加BOLL、MACD、KDJ等指标计算
+        # 由于计算复杂，这里先返回空指标，后续可以扩展
+        if not kline_data or len(kline_data) < 20:
+            return {
+                'boll': [],
+                'macd': [],
+                'kdj': []
+            }
+        try:
+            
+            # 将数据转换为tablib Dataset
+            data = tablib.Dataset()
+            data.headers = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount']
+
+            for item in kline_data:
+                data.append([
+                    item['time'],
+                    item['open'],
+                    item['high'],
+                    item['low'],
+                    item['close'],
+                    item['volume'],
+                    item['amount']
+                ])
+
+            # 转换为pandas DataFrame进行指标计算
+            df = pd.DataFrame(data.dict)
+
+            # 确保数据类型正确
+            df['open'] = pd.to_numeric(df['open'])
+            df['high'] = pd.to_numeric(df['high'])
+            df['low'] = pd.to_numeric(df['low'])
+            df['close'] = pd.to_numeric(df['close'])
+            df['volume'] = pd.to_numeric(df['volume'])
+
+            # 按时间排序
+            df = df.sort_values('date').reset_index(drop=True)
+
+            indicators = {
+                'boll': self._calculate_bollinger_bands(df),
+                'macd': self._calculate_macd(df),
+                'kdj': self._calculate_kdj(df),
+                'ma': self._calculate_moving_averages(df),
+                'rsi': self._calculate_rsi(df)
+            }
+
+            return indicators
+
+        except Exception as e:
+            logger.error(f"❌ 计算技术指标失败: {e}")
+            return {
+                'boll': [],
+                'macd': [],
+                'kdj': [],
+                'ma': [],
+                'rsi': []
+            }
+
+    def _calculate_moving_averages(self, df: pd.DataFrame) -> List[Dict]:
+        """计算移动平均线"""
+        try:
+            closes = df['close']
+
+            # 计算不同周期的移动平均线
+            ma5 = closes.rolling(window=5).mean()
+            ma10 = closes.rolling(window=10).mean()
+            ma20 = closes.rolling(window=20).mean()
+            ma30 = closes.rolling(window=30).mean()
+
+            ma_data = []
+            for i in range(len(df)):
+                ma_data.append({
+                    'time': df.iloc[i]['date'],
+                    'ma5': float(ma5.iloc[i]) if not pd.isna(ma5.iloc[i]) else None,
+                    'ma10': float(ma10.iloc[i]) if not pd.isna(ma10.iloc[i]) else None,
+                    'ma20': float(ma20.iloc[i]) if not pd.isna(ma20.iloc[i]) else None,
+                    'ma30': float(ma30.iloc[i]) if not pd.isna(ma30.iloc[i]) else None
+                })
+
+            return ma_data
+        except Exception as e:
+            logger.error(f"❌ 计算移动平均线失败: {e}")
+            return []
+
+    def _calculate_bollinger_bands(self, df: pd.DataFrame, period: int = 20, std_dev: int = 2) -> List[Dict]:
+        """计算布林带指标"""
+        try:
+            closes = df['close']
+
+            # 计算中轨（20日移动平均线）
+            middle_band = closes.rolling(window=period).mean()
+
+            # 计算标准差
+            rolling_std = closes.rolling(window=period).std()
+
+            # 计算上轨和下轨
+            upper_band = middle_band + (rolling_std * std_dev)
+            lower_band = middle_band - (rolling_std * std_dev)
+
+            boll_data = []
+            for i in range(len(df)):
+                boll_data.append({
+                    'time': df.iloc[i]['date'],
+                    'upper': float(upper_band.iloc[i]) if not pd.isna(upper_band.iloc[i]) else None,
+                    'middle': float(middle_band.iloc[i]) if not pd.isna(middle_band.iloc[i]) else None,
+                    'lower': float(lower_band.iloc[i]) if not pd.isna(lower_band.iloc[i]) else None
+                })
+
+            return boll_data
+        except Exception as e:
+            logger.error(f"❌ 计算布林带失败: {e}")
+            return []
+
+    def _calculate_macd(self, df: pd.DataFrame, fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> List[Dict]:
+        """计算MACD指标"""
+        try:
+            closes = df['close']
+
+            # 计算EMA
+            ema_fast = closes.ewm(span=fast_period, adjust=False).mean()
+            ema_slow = closes.ewm(span=slow_period, adjust=False).mean()
+
+            # 计算DIF（差离值）
+            dif = ema_fast - ema_slow
+
+            # 计算DEA（信号线）
+            dea = dif.ewm(span=signal_period, adjust=False).mean()
+
+            # 计算MACD柱状图
+            macd_hist = (dif - dea) * 2
+
+            macd_data = []
+            for i in range(len(df)):
+                macd_data.append({
+                    'time': df.iloc[i]['date'],
+                    'dif': float(dif.iloc[i]) if not pd.isna(dif.iloc[i]) else None,
+                    'dea': float(dea.iloc[i]) if not pd.isna(dea.iloc[i]) else None,
+                    'macd': float(macd_hist.iloc[i]) if not pd.isna(macd_hist.iloc[i]) else None
+                })
+
+            return macd_data
+        except Exception as e:
+            logger.error(f"❌ 计算MACD失败: {e}")
+            return []
+
+    def _calculate_kdj(self, df: pd.DataFrame, period: int = 9) -> List[Dict]:
+        """计算KDJ指标"""
+        try:
+            high = df['high']
+            low = df['low']
+            close = df['close']
+
+            # 计算最近9日的最高价和最低价
+            lowest_low = low.rolling(window=period).min()
+            highest_high = high.rolling(window=period).max()
+
+            # 计算RSV（未成熟随机值）
+            rsv = ((close - lowest_low) / (highest_high - lowest_low)) * 100
+
+            # 计算K值（RSV的3日指数移动平均）
+            k = rsv.ewm(com=2).mean()
+
+            # 计算D值（K值的3日指数移动平均）
+            d = k.ewm(com=2).mean()
+
+            # 计算J值（3*K-2*D）
+            j = 3 * k - 2 * d
+
+            kdj_data = []
+            for i in range(len(df)):
+                kdj_data.append({
+                    'time': df.iloc[i]['date'],
+                    'k': float(k.iloc[i]) if not pd.isna(k.iloc[i]) else None,
+                    'd': float(d.iloc[i]) if not pd.isna(d.iloc[i]) else None,
+                    'j': float(j.iloc[i]) if not pd.isna(j.iloc[i]) else None
+                })
+
+            return kdj_data
+        except Exception as e:
+            logger.error(f"❌ 计算KDJ失败: {e}")
+            return []
+
+    def _calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> List[Dict]:
+        """计算RSI指标"""
+        try:
+            closes = df['close']
+
+            # 计算价格变动
+            delta = closes.diff()
+
+            # 分离上涨和下跌
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+            # 计算RS
+            rs = gain / loss
+
+            # 计算RSI
+            rsi = 100 - (100 / (1 + rs))
+
+            rsi_data = []
+            for i in range(len(df)):
+                rsi_data.append({
+                    'time': df.iloc[i]['date'],
+                    'rsi': float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else None
+                })
+
+            return rsi_data
+        except Exception as e:
+            logger.error(f"❌ 计算RSI失败: {e}")
+            return []
 
 class IntegratedWebService:
     def __init__(self):
@@ -29,7 +350,8 @@ class IntegratedWebService:
         self.plate_connections: Set = set()
         self.volatile_connections: Set = set()
         self.stock_connections: Dict[str, Set] = {}  # 新增：个股订阅连接 {plate_id: set(connections)}
-        
+        # 新增：K线服务
+        self.kline_service = StockKLineService()
         # 更新统计
         self.update_count = 0
     
@@ -315,6 +637,47 @@ class IntegratedWebService:
         
         # 发送响应
         await websocket.send_str(json.dumps(response, ensure_ascii=False))
+    async def handle_stock_kline_api(self, request):
+        """处理个股K线数据API请求"""
+        try:
+            # 获取查询参数
+            code = request.query.get('code', '')
+            frequency = request.query.get('frequency', 'd')  # d, 5, 60, w
+            start_date = request.query.get('start_date', '')
+            end_date = request.query.get('end_date', '')
+            
+            if not code:
+                return web.json_response({'error': '股票代码不能为空'}, status=400)
+            
+            # 验证频率参数
+            valid_frequencies = ['5', '60', 'd', 'w']
+            if frequency not in valid_frequencies:
+                return web.json_response({'error': f'频率参数必须是: {valid_frequencies}'}, status=400)
+            
+            logger.info(f"📈 请求K线数据: {code}, 频率: {frequency}")
+            
+            # 获取K线数据
+            kline_data = await asyncio.get_event_loop().run_in_executor(
+                None, self.kline_service.fetch_kline_data, code, frequency, start_date, end_date
+            )
+            
+            # 计算技术指标
+            indicators = self.kline_service.calculate_technical_indicators(kline_data)
+            
+            response_data = {
+                'code': code,
+                'frequency': frequency,
+                'data': kline_data,
+                'indicators': indicators,
+                'count': len(kline_data),
+                'timestamp': int(time.time() * 1000)
+            }
+            
+            return web.json_response(response_data)
+            
+        except Exception as e:
+            logger.error(f"❌ K线API错误: {e}")
+            return web.json_response({'error': str(e)}, status=500)
 
 # HTTP路由处理
 async def handle_bankuai(request):
@@ -418,6 +781,10 @@ async def debug_plate_stocks_api(request):
     except Exception as e:
         logger.error(f"❌ 调试接口错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
+# 新增：个股K线API路由
+async def stock_kline_api(request):
+    """个股K线数据API"""
+    return await service.handle_stock_kline_api(request)
 
 async def main():
     global service
@@ -434,6 +801,7 @@ async def main():
     app.router.add_get('/bankuai', handle_bankuai)
     app.router.add_get('/ws/plate', handle_plate_websocket)
     app.router.add_get('/api/plate', plate_api)
+    app.router.add_get('/api/stock/kline', stock_kline_api)  # 新增K线API
     app.router.add_get('/health', health_check)
     app.router.add_get('/redis-status', redis_status)
     app.router.add_get('/debug/plate-stocks', debug_plate_stocks_api)  # 新增调试接口
