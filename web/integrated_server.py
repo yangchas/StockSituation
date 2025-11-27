@@ -12,16 +12,201 @@ import tablib
 from aiohttp import web
 from datetime import datetime, timedelta
 import baostock as bs
+import taos
 # 修改导入路径
 from plate_updater import LazyPlateUpdater, PlateDataSimulator
 from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+class TDengineService:
+    """TDengine数据库服务"""
+    
+    def __init__(self, host: str = 'localhost', port: int = 6030, 
+                 user: str = 'root', password: str = 'taosdata', database: str = 'market_data1'):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.conn = None
+        self._connect()
+    
+    def _connect(self):
+        """连接TDengine数据库"""
+        try:
+            self.conn = taos.connect(host=self.host, port=self.port, 
+                                   user=self.user, password=self.password, 
+                                   database=self.database)
+            logger.info("✅ TDengine连接成功")
+        except Exception as e:
+            logger.error(f"❌ TDengine连接失败: {e}")
+            self.conn = None
+    
+    def execute_query(self, sql: str):
+        """执行SQL查询"""
+        if not self.conn:
+            self._connect()
+            if not self.conn:
+                return None
+        
+        try:
+            result = self.conn.query(sql)
+            return result
+        except Exception as e:
+            logger.error(f"❌ TDengine查询失败: {e}, SQL: {sql}")
+            # 尝试重新连接
+            try:
+                self._connect()
+                if self.conn:
+                    result = self.conn.query(sql)
+                    return result
+            except:
+                pass
+            return None
+    
+    def get_minute_kline(self, symbol: str, start_time: str = None, end_time: str = None, 
+                        days: int = 1) -> List[Dict]:
+        """
+        从TDengine获取分钟K线数据
+        
+        Args:
+            symbol: 股票代码 (如 '000001')
+            start_time: 开始时间 'YYYY-MM-DD HH:MM:SS'
+            end_time: 结束时间 'YYYY-MM-DD HH:MM:SS'
+            days: 获取最近几天的数据
+            
+        Returns:
+            List[Dict]: 分钟K线数据
+        """
+        try:
+            # 设置默认时间范围
+            if not end_time:
+                end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if not start_time:
+                start_time = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 构建SQL查询 - 按1分钟聚合tick数据
+            sql = f"""
+            SELECT 
+                _wstart as time,
+                FIRST(lp) as open,
+                MAX(lp) as high,
+                MIN(lp) as low,
+                LAST(lp) as close,
+                last(a)-first(a) as amount,
+                last(v)-first(v) as volum
+            FROM stock_data 
+            WHERE symbol = '{symbol}' 
+                AND ts >= '{start_time}' 
+                AND ts <= '{end_time}'
+            INTERVAL(1m)
+            ORDER BY time
+            """
+            
+            logger.info(f"📊 查询TDengine分钟数据: {symbol}, SQL: {sql[:100]}...")
+            
+            result = self.execute_query(sql)
+            if not result:
+                return []
+            
+            # 处理查询结果
+            data = []
+            for row in result:
+                data.append({
+                    'time': row[0].strftime('%Y-%m-%d %H:%M:%S'),
+                    'open': float(row[1]),
+                    'high': float(row[2]),
+                    'low': float(row[3]),
+                    'close': float(row[4]),
+                    'volume': int(row[5]),
+                    'amount': float(row[6])
+                })
+            
+            logger.info(f"✅ 从TDengine获取分钟数据成功: {symbol}, 数据点: {len(data)}")
+            return data
+            
+        except Exception as e:
+            logger.error(f"❌ 获取TDengine分钟数据失败: {e}")
+            return []
+    
+    def get_tick_data(self, symbol: str, start_time: str = None, end_time: str = None, 
+                     limit: int = 1000) -> List[Dict]:
+        """
+        获取原始tick数据（用于调试）
+        
+        Args:
+            symbol: 股票代码
+            start_time: 开始时间
+            end_time: 结束时间
+            limit: 限制条数
+            
+        Returns:
+            List[Dict]: tick数据
+        """
+        try:
+            if not end_time:
+                end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if not start_time:
+                start_time = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            sql = f"""
+            SELECT 
+                ts, lp, o, h, l, lc, a, v, p,
+                ap1, ap2, ap3, ap4, ap5,
+                bp1, bp2, bp3, bp4, bp5,
+                av1, av2, av3, av4, av5,
+                bv1, bv2, bv3, bv4, bv5,
+                inst_vol, inst_amt, large_net
+            FROM stock_data 
+            WHERE symbol = '{symbol}' 
+                AND ts >= '{start_time}' 
+                AND ts <= '{end_time}'
+            ORDER BY ts
+            LIMIT {limit}
+            """
+            
+            result = self.execute_query(sql)
+            if not result:
+                return []
+            
+            data = []
+            for row in result:
+                data.append({
+                    'ts': row[0].strftime('%Y-%m-%d %H:%M:%S.%f'),
+                    'last_price': float(row[1]),
+                    'open': float(row[2]),
+                    'high': float(row[3]),
+                    'low': float(row[4]),
+                    'last_close': float(row[5]),
+                    'amount': float(row[6]),
+                    'volume': int(row[7]),
+                    'price': float(row[8]),
+                    'ask_prices': [float(row[9]), float(row[10]), float(row[11]), float(row[12]), float(row[13])],
+                    'bid_prices': [float(row[14]), float(row[15]), float(row[16]), float(row[17]), float(row[18])],
+                    'ask_volumes': [int(row[19]), int(row[20]), int(row[21]), int(row[22]), int(row[23])],
+                    'bid_volumes': [int(row[24]), int(row[25]), int(row[26]), int(row[27]), int(row[28])],
+                    'inst_vol': int(row[29]),
+                    'inst_amt': float(row[30]),
+                    'large_net': float(row[31])
+                })
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"❌ 获取TDengine tick数据失败: {e}")
+            return []
+    
+    def close(self):
+        """关闭连接"""
+        if self.conn:
+            self.conn.close()
+            logger.info("🔌 TDengine连接已关闭")
 class StockKLineService:
     def __init__(self):
         # 使用现有的RedisStorageManager
         self.redis_storage = RedisStorageManager()
-        
+        # 新增：TDengine服务
+        self.tdengine = TDengineService()
         # 初始化baostock
         try:
             lg = bs.login()
@@ -45,15 +230,17 @@ class StockKLineService:
         if not end_date:
             end_date = datetime.now().strftime('%Y-%m-%d')
         if not start_date:
-            if frequency == "5":
-                start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            if frequency == "1":
+                start_date = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+            elif frequency == "5":
+                start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
             elif frequency == "60":
-                start_date = (datetime.now() - timedelta(days=180)).strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             elif frequency == "d":
-                start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+                start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
             elif frequency == "w":
                 start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
-        
+            
         cache_key = self.get_cache_key(code, frequency, start_date, end_date)
         
         # 检查缓存 - 使用现有的RedisStorageManager
@@ -64,7 +251,73 @@ class StockKLineService:
                 return json.loads(cached_data)
         except Exception as e:
             logger.error(f"❌ 缓存读取失败: {e}")
+                # 根据频率选择数据源
+        if frequency in ["1","5"]:
+            # 分钟数据从TDengine获取
+            data_list = self._fetch_minute_from_tdengine(code, frequency, start_date, end_date)
+        else:
+            # 日线、周线从baostock获取
+            data_list = self._fetch_from_baostock(code, frequency, start_date, end_date)
         
+        # 缓存数据（5分钟缓存）
+        try:
+            cache_time = 300  # 5分钟
+            self.redis_storage.store_data(cache_key, data_list, expire_seconds=cache_time)
+            logger.info(f"💾 缓存K线数据: {code}_{frequency}, 数据点: {len(data_list)}")
+        except Exception as e:
+            logger.error(f"❌ 缓存写入失败: {e}")
+        
+        return data_list
+    
+    def _fetch_minute_from_tdengine(self, code: str, frequency: str, 
+                                  start_date: str, end_date: str) -> List[Dict]:
+        """从TDengine获取分钟数据"""
+        try:
+            # # 提取纯数字股票代码（去除市场前缀）
+            # pure_code = self._extract_pure_symbol(code)
+            # if not pure_code:
+            #     logger.error(f"❌ 无法解析股票代码: {code}")
+            #     return []
+            
+            # 转换为TDengine需要的时间格式
+            start_time = f"{start_date} 09:30:00"
+            end_time = f"{end_date} 15:00:00"
+            
+            # 获取分钟数据
+            minute_data = self.tdengine.get_minute_kline(code, start_time, end_time)
+            
+            # 转换数据格式，与baostock保持一致
+            converted_data = []
+            for item in minute_data:
+                converted_data.append({
+                    'time': item['time'],
+                    'code': code,
+                    'open': item['open'],
+                    'high': item['high'],
+                    'low': item['low'],
+                    'close': item['close'],
+                    'volume': item['volume'],
+                    'amount': item['amount'],
+                    'turnover': 0,  # TDengine没有这个字段
+                    'pct_chg': 0    # 需要计算
+                })
+            
+            # 计算涨跌幅
+            if len(converted_data) > 1:
+                for i in range(1, len(converted_data)):
+                    prev_close = converted_data[i-1]['close']
+                    current_close = converted_data[i]['close']
+                    if prev_close > 0:
+                        converted_data[i]['pct_chg'] = (current_close - prev_close) / prev_close
+            
+            logger.info(f"✅ 从TDengine获取{code}的{frequency}分钟数据成功: {len(converted_data)}条")
+            return converted_data
+            
+        except Exception as e:
+            logger.error(f"❌ 从TDengine获取分钟数据失败: {e}")
+            return []
+    def _fetch_from_baostock(self, code: str, frequency: str, 
+                           start_date: str, end_date: str) -> List[Dict]:
         # 从baostock获取数据
         try:
             # 构建查询字段
