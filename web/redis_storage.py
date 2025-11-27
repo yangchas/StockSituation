@@ -23,23 +23,177 @@ class RedisStorageManager:
         self.PLATE_INFO_PREFIX = "pi:"   # 板块基础信息
         self.PLATE_HIERARCHY_PREFIX = "ph:" # 板块层级
         self.MAIN_PLATES_KEY = "main_plates" # 主板块列表
+        self.CACHE_PREFIX = "cache:"  # 通用缓存数据
         
         # 数据过期时间（秒）
         self.STOCK_DATA_TTL = 300      # 5分钟
         self.PLATE_METRICS_TTL = 600   # 10分钟
         self.BASE_INFO_TTL = 86400 * 7 # 基础信息7天
+        self.CACHE_TTL = 300           # 通用缓存5分钟
     
-    def _compress_data(self, data: Dict) -> str:
+    def _compress_data(self, data: Any) -> str:
         """压缩数据"""
         if not self.compression:
             return json.dumps(data, ensure_ascii=False)
         return zlib.compress(json.dumps(data, ensure_ascii=False).encode()).hex()
     
-    def _decompress_data(self, compressed_data: str) -> Dict:
+    def _decompress_data(self, compressed_data: str) -> Any:
         """解压数据"""
         if not self.compression:
             return json.loads(compressed_data)
         return json.loads(zlib.decompress(bytes.fromhex(compressed_data)))
+    
+    # ==================== 新增通用缓存方法 ====================
+    
+    def store_data(self, key: str, data: Any, expire_seconds: int = None) -> bool:
+        """
+        存储通用数据到缓存
+        
+        Args:
+            key: 缓存键
+            data: 要存储的数据（可序列化的任何数据）
+            expire_seconds: 过期时间（秒），默认使用CACHE_TTL
+            
+        Returns:
+            bool: 是否存储成功
+        """
+        try:
+            if expire_seconds is None:
+                expire_seconds = self.CACHE_TTL
+                
+            cache_key = f"{self.CACHE_PREFIX}{key}"
+            compressed_data = self._compress_data(data)
+            
+            self.redis.setex(cache_key, expire_seconds, compressed_data)
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 存储缓存数据失败 key={key}: {e}")
+            return False
+    
+    def get_data(self, key: str) -> Any:
+        """
+        从缓存获取通用数据
+        
+        Args:
+            key: 缓存键
+            
+        Returns:
+            Any: 缓存的数据，如果不存在或出错返回None
+        """
+        try:
+            cache_key = f"{self.CACHE_PREFIX}{key}"
+            compressed_data = self.redis.get(cache_key)
+            
+            if compressed_data is None:
+                return None
+                
+            return self._decompress_data(compressed_data)
+            
+        except Exception as e:
+            logger.error(f"❌ 获取缓存数据失败 key={key}: {e}")
+            return None
+    
+    def delete_data(self, key: str) -> bool:
+        """
+        删除缓存数据
+        
+        Args:
+            key: 缓存键
+            
+        Returns:
+            bool: 是否删除成功
+        """
+        try:
+            cache_key = f"{self.CACHE_PREFIX}{key}"
+            return bool(self.redis.delete(cache_key))
+        except Exception as e:
+            logger.error(f"❌ 删除缓存数据失败 key={key}: {e}")
+            return False
+    
+    def exists_data(self, key: str) -> bool:
+        """
+        检查缓存数据是否存在
+        
+        Args:
+            key: 缓存键
+            
+        Returns:
+            bool: 是否存在
+        """
+        try:
+            cache_key = f"{self.CACHE_PREFIX}{key}"
+            return bool(self.redis.exists(cache_key))
+        except Exception as e:
+            logger.error(f"❌ 检查缓存数据失败 key={key}: {e}")
+            return False
+    
+    def get_cache_keys(self, pattern: str = "*") -> List[str]:
+        """
+        获取匹配模式的缓存键列表
+        
+        Args:
+            pattern: 匹配模式
+            
+        Returns:
+            List[str]: 缓存键列表
+        """
+        try:
+            full_pattern = f"{self.CACHE_PREFIX}{pattern}"
+            keys = list(self.redis.scan_iter(match=full_pattern))
+            # 移除前缀返回
+            return [key[len(self.CACHE_PREFIX):] for key in keys]
+        except Exception as e:
+            logger.error(f"❌ 获取缓存键列表失败 pattern={pattern}: {e}")
+            return []
+    
+    def clear_cache_pattern(self, pattern: str = "*") -> int:
+        """
+        清除匹配模式的缓存数据
+        
+        Args:
+            pattern: 匹配模式
+            
+        Returns:
+            int: 删除的键数量
+        """
+        try:
+            keys = self.get_cache_keys(pattern)
+            if not keys:
+                return 0
+                
+            # 为每个键添加前缀
+            full_keys = [f"{self.CACHE_PREFIX}{key}" for key in keys]
+            deleted_count = self.redis.delete(*full_keys)
+            logger.info(f"🧹 清除缓存数据: {len(keys)} 个键")
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"❌ 清除缓存数据失败 pattern={pattern}: {e}")
+            return 0
+    
+    def get_cache_info(self) -> Dict[str, Any]:
+        """
+        获取缓存统计信息
+        
+        Returns:
+            Dict[str, Any]: 缓存统计信息
+        """
+        try:
+            cache_keys = self.get_cache_keys()
+            memory_info = self.get_memory_info()
+            
+            return {
+                "total_cache_keys": len(cache_keys),
+                "cache_keys_sample": cache_keys[:10],  # 前10个作为样本
+                "memory_usage": memory_info,
+                "cache_prefix": self.CACHE_PREFIX
+            }
+        except Exception as e:
+            logger.error(f"❌ 获取缓存统计信息失败: {e}")
+            return {}
+    
+    # ==================== 个股数据操作 ====================
     
     def start_pipeline(self):
         """开始批量操作"""
@@ -48,8 +202,6 @@ class RedisStorageManager:
     def execute_pipeline(self, pipeline):
         """执行批量操作"""
         return pipeline.execute()
-    
-    # ==================== 个股数据操作 ====================
     
     def update_stock_data(self, stock_id: str, data: Dict, plates: List[str] = None, 
                          pipeline: Optional[Any] = None) -> None:
@@ -123,6 +275,7 @@ class RedisStorageManager:
             
         except Exception as e:
             logger.error(f"❌ 批量更新股票数据到Redis失败: {e}")
+    
     def get_stock_data(self, stock_id: str) -> Dict:
         """从Redis获取股票数据 - 兼容C++和Python两种格式"""
         try:
@@ -158,6 +311,7 @@ class RedisStorageManager:
         except Exception as e:
             logger.error(f"❌ 从Redis获取股票数据失败 {stock_id}: {e}")
             return None
+    
     def get_stock_data1(self, stock_id: str) -> Optional[Dict]:
         """获取个股数据"""
         stock_key = f"{self.STOCK_PREFIX}{stock_id}"
