@@ -6,68 +6,514 @@ import json
 import pandas as pd
 import time
 import os
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Optional
 import logging
 import tablib
 from aiohttp import web
 from datetime import datetime, timedelta
 import baostock as bs
-import taos
+# import taos  # 暂时注释以避免依赖问题
 # 修改导入路径
 from plate_updater import LazyPlateUpdater, PlateDataSimulator
 from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-class TDengineService:
-    """TDengine数据库服务"""
+import json
+import requests
+from datetime import datetime, timedelta
+import logging
+from typing import List, Set, Dict
+import holidays
+
+logger = logging.getLogger(__name__)
+class F10DataService:
+    """F10数据服务 - 按需加载和缓存"""
     
-    def __init__(self, host: str = 'localhost', port: int = 6030, 
-                 user: str = 'root', password: str = 'taosdata', database: str = 'market_data1'):
+    def __init__(self, csv_file_path: str = 'data/f10.csv'):
+        self.csv_file_path = csv_file_path
+        self.data_loaded = False
+        self.f10_data = None
+        self.index_by_code = {}  # 按股票代码索引
+        self.memory_cache = {}   # 内存缓存
+        self.redis_storage = RedisStorageManager()  # 复用Redis缓存
+        
+        # 预加载索引，但不加载全部数据
+        self._load_index()
+    
+    def _load_index(self):
+        """加载数据索引，不加载具体数据"""
+        # try:
+        if not os.path.exists(self.csv_file_path):
+            logger.error(f"❌ F10数据文件不存在: {self.csv_file_path}")
+            return
+        
+        # 只读取股票代码列来构建索引
+        # 将ANSI改为gbk，因为在Windows系统上ANSI通常指的是系统默认编码（在中国通常是gbk）
+        df_codes = pd.read_csv(self.csv_file_path, usecols=['股票代码'],encoding='gbk')
+        for idx, row in df_codes.iterrows():
+            code = self._normalize_stock_code(row['股票代码'])
+            self.index_by_code[code] = idx
+        
+        logger.info(f"✅ F10数据索引加载完成: {len(self.index_by_code)} 只股票")
+            
+        # except Exception as e:
+            # logger.error(f"❌ 加载F10数据索引失败: {e}")
+    
+    def _normalize_stock_code(self, code: str) -> str:
+        """标准化股票代码格式"""
+        if pd.isna(code):
+            return ""
+        
+        code_str = str(code).strip().upper()
+        
+        # 统一格式: 000001.SZ -> 000001
+        if '.' in code_str:
+            code_str = code_str.split('.')[0]
+        
+        return code_str
+    
+    def _load_full_data_if_needed(self):
+        """按需加载完整数据"""
+        if not self.data_loaded:
+            try:
+                # 使用与_load_index方法相同的编码格式gbk
+                self.f10_data = pd.read_csv(self.csv_file_path, encoding='gbk')
+                self.data_loaded = True
+                logger.info("✅ F10完整数据加载完成")
+            except Exception as e:
+                logger.error(f"❌ 加载F10完整数据失败: {e}")
+    
+    def get_stock_f10(self, stock_code: str) -> Optional[Dict]:
+        """获取单只股票的F10数据"""
+        print("获取单只股票的F10数据")
+        # try:
+        normalized_code = self._normalize_stock_code(stock_code)
+        
+        if not normalized_code:
+            return None
+        
+        # 检查内存缓存
+        cache_key = f"f10_{normalized_code}"
+        if cache_key in self.memory_cache:
+            logger.debug(f"📦 从内存缓存获取F10数据: {normalized_code}")
+            return self.memory_cache[cache_key]
+        
+        # 检查Redis缓存
+        cached_data = self.redis_storage.get_data(cache_key)
+        if cached_data:
+            logger.debug(f"📦 从Redis缓存获取F10数据: {normalized_code}")
+            self.memory_cache[cache_key] = cached_data  # 写入内存缓存
+            return cached_data
+        
+        # 从CSV文件加载
+        if normalized_code not in self.index_by_code:
+            logger.warning(f"⚠️ 未找到股票的F10数据: {stock_code} -> {normalized_code}")
+            return None
+        
+        # 按需加载完整数据
+        self._load_full_data_if_needed()
+        if self.f10_data is None:
+            return None
+        
+        row_index = self.index_by_code[normalized_code]
+        if row_index >= len(self.f10_data):
+            return None
+        
+        row_data = self.f10_data.iloc[row_index]
+        
+        # 转换为字典格式
+        f10_info = self._format_f10_data(row_data)
+        
+        # 更新缓存
+        self.memory_cache[cache_key] = f10_info
+        # Redis缓存1小时
+        self.redis_storage.store_data(cache_key, f10_info, expire_seconds=3600)
+        
+        logger.debug(f"✅ 从CSV文件加载F10数据: {normalized_code}")
+        return f10_info
+            
+        # except Exception as e:
+        #     logger.error(f"❌ 获取F10数据失败 {stock_code}: {e}")
+        #     return None
+    
+    def _format_f10_data(self, row_data) -> Dict:
+        """格式化F10数据"""
+        # 基础信息
+        basic_info = {
+            'stock_code': str(row_data.get('股票代码', '')),
+            'stock_name': str(row_data.get('股票简称', '')),
+            'industry': str(row_data.get('所属同花顺行业', '')),
+            'city': str(row_data.get('城市', '')),
+            'listing_date': str(row_data.get('新股上市日期', ''))
+        }
+        
+        # 财务指标
+        financial_info = {
+            'total_market_cap': self._safe_float(row_data.get('总市值')),
+            'circulating_market_cap': self._safe_float(row_data.get('a股市值(不含限售股)')),
+            'total_shares': self._safe_float(row_data.get('总股本')),
+            'circulating_shares': self._safe_float(row_data.get('流通a股')),
+            'revenue': self._safe_float(row_data.get('营业收入')),
+            'net_profit': self._safe_float(row_data.get('归属于母公司所有者的净利润')),
+            'roe': self._safe_float(row_data.get('净资产收益率roe(加权,公布值)')),
+            'pb': self._safe_float(row_data.get('市净率(pb)')),
+            'pe': self._safe_float(row_data.get('市盈率(pe)')),
+            'debt_ratio': self._safe_float(row_data.get('资产负债率')),
+            'gross_margin': self._safe_float(row_data.get('销售毛利率'))
+        }
+        
+        # 业务信息
+        business_info = {
+            'main_products': self._parse_main_products(row_data.get('主营产品名称')),
+            'product_categories': self._extract_product_categories(row_data.get('主营产品名称'))
+        }
+        
+        return {
+            'basic': basic_info,
+            'financial': financial_info,
+            'business': business_info,
+            'timestamp': pd.Timestamp.now().isoformat()
+        }
+    
+    def _safe_float(self, value):
+        """安全转换为float"""
+        if pd.isna(value) or value == '':
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+    
+    def _parse_main_products(self, products_str):
+        """解析主营产品"""
+        if pd.isna(products_str) or not products_str:
+            return []
+        
+        try:
+            # 按||分割产品
+            products = str(products_str).split('||')
+            return [p.strip() for p in products if p.strip()]
+        except:
+            return []
+    
+    def _extract_product_categories(self, products_str):
+        """提取产品分类"""
+        if pd.isna(products_str) or not products_str:
+            return []
+        
+        products = self._parse_main_products(products_str)
+        
+        # 简单的分类提取（可以根据需要扩展）
+        categories = set()
+        for product in products:
+            if '材料' in product:
+                categories.add('材料')
+            if '设备' in product or '机器' in product:
+                categories.add('设备')
+            if '服务' in product:
+                categories.add('服务')
+            if '技术' in product or '研发' in product:
+                categories.add('技术')
+            if '贸易' in product:
+                categories.add('贸易')
+            if '金融' in product:
+                categories.add('金融')
+        
+        return list(categories)
+    
+    def batch_get_f10(self, stock_codes: list) -> Dict[str, Dict]:
+        """批量获取F10数据"""
+        results = {}
+        
+        for code in stock_codes:
+            f10_data = self.get_stock_f10(code)
+            if f10_data:
+                results[code] = f10_data
+        
+        return results
+    
+    def search_stocks(self, keyword: str, limit: int = 50) -> list:
+        """根据关键词搜索股票"""
+        try:
+            self._load_full_data_if_needed()
+            if self.f10_data is None:
+                return []
+            
+            results = []
+            keyword_lower = keyword.lower()
+            
+            for idx, row in self.f10_data.iterrows():
+                # 搜索股票代码、名称、行业、主营产品
+                stock_code = str(row.get('股票代码', '')).lower()
+                stock_name = str(row.get('股票简称', '')).lower()
+                industry = str(row.get('所属同花顺行业', '')).lower()
+                products = str(row.get('主营产品名称', '')).lower()
+                
+                if (keyword_lower in stock_code or 
+                    keyword_lower in stock_name or 
+                    keyword_lower in industry or 
+                    keyword_lower in products):
+                    
+                    results.append({
+                        'code': row.get('股票代码', ''),
+                        'name': row.get('股票简称', ''),
+                        'industry': row.get('所属同花顺行业', ''),
+                        'match_field': self._get_match_field(keyword_lower, stock_code, stock_name, industry, products)
+                    })
+                
+                if len(results) >= limit:
+                    break
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ 搜索股票失败 {keyword}: {e}")
+            return []
+    
+    def _get_match_field(self, keyword, code, name, industry, products):
+        """获取匹配的字段"""
+        if keyword in code:
+            return 'code'
+        elif keyword in name:
+            return 'name'
+        elif keyword in industry:
+            return 'industry'
+        elif keyword in products:
+            return 'products'
+        return 'other'
+    
+    def clear_cache(self, stock_code: str = None):
+        """清理缓存"""
+        if stock_code:
+            normalized_code = self._normalize_stock_code(stock_code)
+            cache_key = f"f10_{normalized_code}"
+            self.memory_cache.pop(cache_key, None)
+            self.redis_storage.delete_data(cache_key)
+            logger.info(f"🧹 清理F10缓存: {normalized_code}")
+        else:
+            self.memory_cache.clear()
+            logger.info("🧹 清理所有F10内存缓存")
+    
+    def get_cache_stats(self) -> Dict:
+        """获取缓存统计"""
+        return {
+            'memory_cache_size': len(self.memory_cache),
+            'index_size': len(self.index_by_code),
+            'data_loaded': self.data_loaded,
+            'cached_stocks': list(self.memory_cache.keys())[:10]  # 前10个作为样本
+        }
+class TradingCalendarService:
+    """交易日历服务"""
+    
+    def __init__(self):
+        self.cache = {}
+        self.cn_holidays = holidays.CN()  # 中国公共假期
+        self._init_trading_calendar()
+    
+    def _init_trading_calendar(self):
+        """初始化交易日历"""
+        # 中国股市交易时间：周一至周五 9:30-11:30, 13:00-15:00
+        # 不交易的时间：周六、周日、法定节假日
+        self.trading_hours = {
+            'morning_start': '09:30:00',
+            'morning_end': '11:30:00',
+            'afternoon_start': '13:00:00',
+            'afternoon_end': '15:00:00'
+        }
+    
+    def is_trading_day(self, date_str: str) -> bool:
+        """判断是否为交易日"""
+        try:
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+            print(f"判断日期{date_str}是否为交易日")
+            # 检查是否是周末
+            if date_obj.weekday() >= 5:  # 5=周六, 6=周日
+                return False
+            
+            # 检查是否是法定节假日
+            if date_obj in self.cn_holidays:
+                return False
+            
+            # 这里可以添加更多的特殊日期判断
+            # 比如调休上班的周末等
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 判断交易日失败 {date_str}: {e}")
+            return False
+    
+    def get_previous_trading_day(self, date_str: str = None) -> str:
+        """获取前一个交易日"""
+        if not date_str:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+        
+        current_date = datetime.strptime(date_str, '%Y-%m-%d')
+        
+        # 向前查找，最多找30天
+        for i in range(1, 31):
+            prev_date = current_date - timedelta(days=i)
+            prev_date_str = prev_date.strftime('%Y-%m-%d')
+            
+            if self.is_trading_day(prev_date_str):
+                return prev_date_str
+        
+        # 如果没找到，返回30天前的日期
+        return (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
+    
+    def get_next_trading_day(self, date_str: str = None) -> str:
+        """获取下一个交易日"""
+        if not date_str:
+            date_str = datetime.now().strftime('%Y-%m-%d')
+        
+        current_date = datetime.strptime(date_str, '%Y-%m-%d')
+        
+        # 向后查找，最多找30天
+        for i in range(1, 31):
+            next_date = current_date + timedelta(days=i)
+            next_date_str = next_date.strftime('%Y-%m-%d')
+            
+            if self.is_trading_day(next_date_str):
+                return next_date_str
+        
+        # 如果没找到，返回30天后的日期
+        return (current_date + timedelta(days=30)).strftime('%Y-%m-%d')
+    
+    def get_recent_trading_days(self, days: int = 30) -> List[str]:
+        """获取最近N个交易日"""
+        end_date = datetime.now()
+        trading_days = []
+        
+        current_date = end_date
+        while len(trading_days) < days:
+            date_str = current_date.strftime('%Y-%m-%d')
+            if self.is_trading_day(date_str):
+                print("交易日：",date_str)
+                trading_days.append(date_str)
+            current_date -= timedelta(days=1)
+            
+            # 防止无限循环
+            if (end_date - current_date).days > 365:
+                break
+        
+        return sorted(trading_days)
+    
+    def is_trading_time(self, datetime_str: str = None) -> bool:
+        """判断当前是否在交易时间内"""
+        if not datetime_str:
+            datetime_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        try:
+            dt_obj = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S')
+            date_str = dt_obj.strftime('%Y-%m-%d')
+            time_str = dt_obj.strftime('%H:%M:%S')
+            
+            # 首先检查是否是交易日
+            if not self.is_trading_day(date_str):
+                return False
+            
+            # 检查是否在交易时间段内
+            morning_session = (time_str >= self.trading_hours['morning_start'] and 
+                             time_str <= self.trading_hours['morning_end'])
+            afternoon_session = (time_str >= self.trading_hours['afternoon_start'] and 
+                               time_str <= self.trading_hours['afternoon_end'])
+            
+            return morning_session or afternoon_session
+            
+        except Exception as e:
+            logger.error(f"❌ 判断交易时间失败 {datetime_str}: {e}")
+            return False
+    
+    def get_today_trading_status(self) -> Dict:
+        """获取今日交易状态"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        current_time = datetime.now().strftime('%H:%M:%S')
+        
+        is_trading_day = self.is_trading_day(today)
+        is_trading_time = self.is_trading_time()
+        
+        status = "非交易日"
+        if is_trading_day:
+            if is_trading_time:
+                status = "交易中"
+            else:
+                if current_time < self.trading_hours['morning_start']:
+                    status = "开盘前"
+                elif current_time > self.trading_hours['afternoon_end']:
+                    status = "已收盘"
+                else:
+                    status = "午间休市"
+        
+        return {
+            'date': today,
+            'is_trading_day': is_trading_day,
+            'is_trading_time': is_trading_time,
+            'status': status,
+            'trading_hours': self.trading_hours,
+            'current_time': current_time
+        }
+class TDengineService:
+    """TDengine数据库服务 - 基于官方示例的连接方式"""
+    
+    def __init__(self, host: str = '127.0.0.1', port: int = 6030, 
+                 user: str = 'root', password: str = 'taosdata', 
+                 database: str = 'market_data1', config: str = '/etc/taos', 
+                 timezone: str = 'Asia/Shanghai'):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.database = database
+        self.config = config
+        self.timezone = timezone
         self.conn = None
+        self.cursor = None
         self._connect()
     
     def _connect(self):
-        """连接TDengine数据库"""
+        """连接TDengine数据库 - 使用官方示例的连接方式"""
         try:
-            self.conn = taos.connect(host=self.host, port=self.port, 
-                                   user=self.user, password=self.password, 
-                                   database=self.database)
+            self.conn = taos.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+                config=self.config,
+                timezone=self.timezone
+            )
+            self.cursor = self.conn.cursor()
             logger.info("✅ TDengine连接成功")
         except Exception as e:
             logger.error(f"❌ TDengine连接失败: {e}")
             self.conn = None
+            self.cursor = None
     
     def execute_query(self, sql: str):
-        """执行SQL查询"""
+        """执行SQL查询 - 使用cursor方式"""
         if not self.conn:
             self._connect()
             if not self.conn:
                 return None
         
         try:
-            result = self.conn.query(sql)
-            return result
+            self.cursor.execute(sql)
+            return self.cursor
         except Exception as e:
             logger.error(f"❌ TDengine查询失败: {e}, SQL: {sql}")
             # 尝试重新连接
             try:
                 self._connect()
                 if self.conn:
-                    result = self.conn.query(sql)
-                    return result
-            except:
-                pass
+                    self.cursor.execute(sql)
+                    return self.cursor
+            except Exception as reconnect_error:
+                logger.error(f"❌ TDengine重连失败: {reconnect_error}")
             return None
     
     def get_minute_kline(self, symbol: str, start_time: str = None, end_time: str = None, 
                         days: int = 1) -> List[Dict]:
         """
-        从TDengine获取分钟K线数据
+        从TDengine获取分钟K线数据 - 正确处理累计值volume和amount
         
         Args:
             symbol: 股票代码 (如 '000001')
@@ -85,7 +531,7 @@ class TDengineService:
             if not start_time:
                 start_time = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
             
-            # 构建SQL查询 - 按1分钟聚合tick数据
+            # 构建SQL查询 - 按1分钟聚合tick数据，正确处理累计值
             sql = f"""
             SELECT 
                 _wstart as time,
@@ -93,8 +539,8 @@ class TDengineService:
                 MAX(lp) as high,
                 MIN(lp) as low,
                 LAST(lp) as close,
-                last(a)-first(a) as amount,
-                last(v)-first(v) as volum
+                LAST(v) - FIRST(v) as volume,  -- 处理累计值：用最后一个值减去第一个值
+                LAST(a) - FIRST(a) as amount   -- 处理累计值：用最后一个值减去第一个值
             FROM stock_data 
             WHERE symbol = '{symbol}' 
                 AND ts >= '{start_time}' 
@@ -103,23 +549,25 @@ class TDengineService:
             ORDER BY time
             """
             
-            logger.info(f"📊 查询TDengine分钟数据: {symbol}, SQL: {sql[:100]}...")
+            logger.info(f"📊 查询TDengine分钟数据: {symbol}")
             
-            result = self.execute_query(sql)
-            if not result:
+            cursor = self.execute_query(sql)
+            if not cursor:
                 return []
             
-            # 处理查询结果
+            # 处理查询结果 - 使用cursor.fetchall()方式，并确保浮点数保留两位小数
             data = []
-            for row in result:
+            rows = cursor.fetchall()
+            for row in rows:
+                # row是一个元组，按SELECT字段顺序
                 data.append({
                     'time': row[0].strftime('%Y-%m-%d %H:%M:%S'),
-                    'open': float(row[1]),
-                    'high': float(row[2]),
-                    'low': float(row[3]),
-                    'close': float(row[4]),
-                    'volume': int(row[5]),
-                    'amount': float(row[6])
+                    'open': round(float(row[1]) if row[1] is not None else 0, 2),
+                    'high': round(float(row[2]) if row[2] is not None else 0, 2),
+                    'low': round(float(row[3]) if row[3] is not None else 0, 2),
+                    'close': round(float(row[4]) if row[4] is not None else 0, 2),
+                    'volume': int(row[5]) if row[5] is not None else 0,
+                    'amount': float(row[6]) if row[6] is not None else 0
                 })
             
             logger.info(f"✅ 从TDengine获取分钟数据成功: {symbol}, 数据点: {len(data)}")
@@ -165,30 +613,26 @@ class TDengineService:
             LIMIT {limit}
             """
             
-            result = self.execute_query(sql)
-            if not result:
+            cursor = self.execute_query(sql)
+            if not cursor:
                 return []
             
+            # 获取字段信息
+            fields = [field[0] for field in cursor.description]
+            
             data = []
-            for row in result:
-                data.append({
-                    'ts': row[0].strftime('%Y-%m-%d %H:%M:%S.%f'),
-                    'last_price': float(row[1]),
-                    'open': float(row[2]),
-                    'high': float(row[3]),
-                    'low': float(row[4]),
-                    'last_close': float(row[5]),
-                    'amount': float(row[6]),
-                    'volume': int(row[7]),
-                    'price': float(row[8]),
-                    'ask_prices': [float(row[9]), float(row[10]), float(row[11]), float(row[12]), float(row[13])],
-                    'bid_prices': [float(row[14]), float(row[15]), float(row[16]), float(row[17]), float(row[18])],
-                    'ask_volumes': [int(row[19]), int(row[20]), int(row[21]), int(row[22]), int(row[23])],
-                    'bid_volumes': [int(row[24]), int(row[25]), int(row[26]), int(row[27]), int(row[28])],
-                    'inst_vol': int(row[29]),
-                    'inst_amt': float(row[30]),
-                    'large_net': float(row[31])
-                })
+            rows = cursor.fetchall()
+            for row in rows:
+                row_dict = {}
+                for i, field_name in enumerate(fields):
+                    value = row[i]
+                    if isinstance(value, datetime):
+                        row_dict[field_name] = value.strftime('%Y-%m-%d %H:%M:%S.%f')
+                    elif value is None:
+                        row_dict[field_name] = None
+                    else:
+                        row_dict[field_name] = value
+                data.append(row_dict)
             
             return data
             
@@ -207,6 +651,8 @@ class StockKLineService:
         self.redis_storage = RedisStorageManager()
         # 新增：TDengine服务
         self.tdengine = TDengineService()
+         # 新增：交易日历服务
+        self.trading_calendar = TradingCalendarService()
         # 初始化baostock
         try:
             lg = bs.login()
@@ -226,14 +672,24 @@ class StockKLineService:
                         start_date: str = None, end_date: str = None) -> List[Dict]:
         """获取K线数据"""
         
-        # 设置默认日期范围
+        # 智能设置日期范围，考虑交易日
         if not end_date:
-            end_date = datetime.now().strftime('%Y-%m-%d')
-        if not start_date:
-            if frequency == "1":
-                start_date = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
-            elif frequency == "5":
-                start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            # 如果是非交易日，使用最后一个交易日作为结束日期
+            today = datetime.now().strftime('%Y-%m-%d')
+            if not self.trading_calendar.is_trading_day(today):
+                end_date = self.trading_calendar.get_previous_trading_day(today)
+                logger.info(f"📅 今日({today})非交易日，使用最近交易日: {end_date}")
+            else:
+                end_date = today
+        if not start_date or start_date>end_date:
+            if frequency in ["1","5"]:
+                trading_days = self.trading_calendar.get_recent_trading_days(2)
+                if trading_days:
+                    start_date = trading_days[0]  # 最早的交易日
+                else:
+                    start_date = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
+            # elif frequency == "5":
+            #     start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
             elif frequency == "60":
                 start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
             elif frequency == "d":
@@ -278,11 +734,15 @@ class StockKLineService:
             # if not pure_code:
             #     logger.error(f"❌ 无法解析股票代码: {code}")
             #     return []
-            
+             # 检查结束日期是否是交易日，如果不是则调整
+            if not self.trading_calendar.is_trading_day(end_date):
+                adjusted_end_date = self.trading_calendar.get_previous_trading_day(end_date)
+                logger.info(f"📅 结束日期{end_date}非交易日，调整为: {adjusted_end_date}")
+                end_date = adjusted_end_date
             # 转换为TDengine需要的时间格式
             start_time = f"{start_date} 09:30:00"
             end_time = f"{end_date} 15:00:00"
-            
+            print(f"查询{code} {frequency} 分钟数据时间范围: {start_time} 至 {end_time}")
             # 获取分钟数据
             minute_data = self.tdengine.get_minute_kline(code, start_time, end_time)
             
@@ -308,7 +768,7 @@ class StockKLineService:
                     prev_close = converted_data[i-1]['close']
                     current_close = converted_data[i]['close']
                     if prev_close > 0:
-                        converted_data[i]['pct_chg'] = (current_close - prev_close) / prev_close
+                        converted_data[i]['pct_chg'] = round((current_close - prev_close) / prev_close, 4)
             
             logger.info(f"✅ 从TDengine获取{code}的{frequency}分钟数据成功: {len(converted_data)}条")
             return converted_data
@@ -338,6 +798,11 @@ class StockKLineService:
             
             if rs.error_code != '0':
                 logger.error(f"❌ 查询K线数据失败: {rs.error_msg}")
+                lg = bs.login()
+                if lg.error_code == '0':
+                    logger.info("✅ Baostock登录成功")
+                else:
+                    logger.error(f"❌ Baostock登录失败: {lg.error_msg}")
                 return []
             
             # 处理数据
@@ -605,6 +1070,8 @@ class IntegratedWebService:
         self.stock_connections: Dict[str, Set] = {}  # 新增：个股订阅连接 {plate_id: set(connections)}
         # 新增：K线服务
         self.kline_service = StockKLineService()
+        # 新增：F10数据服务
+        self.f10_service = F10DataService('data/f10.csv')
         # 更新统计
         self.update_count = 0
     
@@ -656,8 +1123,8 @@ class IntegratedWebService:
                         'update_count': self.update_count
                     }
                     
-                    # 广播给所有客户端
-                    await self.broadcast_to_connections(update_msg, self.plate_connections)
+                    # 广播给所有客户端 - 创建副本避免在迭代时修改集合
+                    await self.broadcast_to_connections(update_msg, set(self.plate_connections))
                     
                     self.update_count += 1
                     
@@ -693,8 +1160,8 @@ class IntegratedWebService:
                             'timestamp': current_time
                         }
                         
-                        # 广播给订阅该板块的所有客户端
-                        await self.broadcast_to_connections(update_msg, connections)
+                        # 广播给订阅该板块的所有客户端 - 创建副本避免在迭代时修改集合
+                        await self.broadcast_to_connections(update_msg, set(connections))
                     
                     # 每5秒记录一次日志
                     if int(time.time()) % 5 == 0:
@@ -903,7 +1370,7 @@ class IntegratedWebService:
                 return web.json_response({'error': '股票代码不能为空'}, status=400)
             
             # 验证频率参数
-            valid_frequencies = ['5', '60', 'd', 'w']
+            valid_frequencies = ['1','5', '60', 'd', 'w']
             if frequency not in valid_frequencies:
                 return web.json_response({'error': f'频率参数必须是: {valid_frequencies}'}, status=400)
             
@@ -980,6 +1447,69 @@ async def plate_api(request):
         
     except Exception as e:
         logger.error(f"❌ 板块API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+# 添加F10数据API路由
+async def f10_data_api(request):
+    """F10数据API"""
+    # try:
+    # service = request.app['service']
+    stock_code = request.query.get('code', '')
+    
+    if not stock_code:
+        return web.json_response({'error': '股票代码不能为空'}, status=400)
+    
+    f10_data = service.f10_service.get_stock_f10(stock_code)
+    
+    if not f10_data:
+        return web.json_response({
+            'error': f'未找到股票 {stock_code} 的F10数据',
+            'code': stock_code
+        }, status=404)
+    
+    return web.json_response({
+        'data': f10_data,
+        'code': stock_code,
+        'timestamp': int(time.time() * 1000)
+    })
+        
+    # except Exception as e:
+    #     logger.error(f"❌ F10数据API错误: {e}")
+    #     return web.json_response({'error': str(e)}, status=500)
+async def f10_search_api(request):
+    """F10搜索API"""
+    try:
+        service = request.app['service']
+        keyword = request.query.get('keyword', '')
+        limit = int(request.query.get('limit', 50))
+        
+        if not keyword:
+            return web.json_response({'error': '搜索关键词不能为空'}, status=400)
+        
+        results = service.f10_service.search_stocks(keyword, limit)
+        
+        return web.json_response({
+            'results': results,
+            'keyword': keyword,
+            'count': len(results),
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ F10搜索API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+async def f10_cache_stats_api(request):
+    """F10缓存统计API"""
+    try:
+        service = request.app['service']
+        stats = service.f10_service.get_cache_stats()
+        
+        return web.json_response({
+            'stats': stats,
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ F10缓存统计API错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
 
 async def health_check(request):
@@ -1058,7 +1588,9 @@ async def main():
     app.router.add_get('/health', health_check)
     app.router.add_get('/redis-status', redis_status)
     app.router.add_get('/debug/plate-stocks', debug_plate_stocks_api)  # 新增调试接口
-    
+    app.router.add_get('/api/f10/data', f10_data_api)
+    app.router.add_get('/api/f10/search', f10_search_api)
+    app.router.add_get('/api/f10/cache-stats', f10_cache_stats_api)
     # 启动服务器
     runner = web.AppRunner(app)
     await runner.setup()

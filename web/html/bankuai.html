@@ -5,10 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>实时板块监控系统 - 优化版</title>
     <style>
-            /* 个股详情面板 */
+        
+        /* 个股详情面板 */
         .indicator-tabs {
-            display: flex;
-            gap: 6px;
+            z-index: 999;
+            /* position: absolute; */
+            left: 50px;
+            display: none;
+            gap: 10px;
             margin-bottom: 8px;
             padding: 6px;
             background: rgba(40, 40, 60, 0.6);
@@ -109,12 +113,13 @@
         .stock-detail-content {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 0 20px;
         }
         
         /* 图表容器 */
         .chart-container {
             height: 400px; /* 增加图表高度 */
+            top:-20px;
             margin-bottom: 10px;
             background: transparent;
             border-radius: 8px;
@@ -123,6 +128,7 @@
         
         /* 图表选项卡优化 */
         .chart-tabs {
+            z-index: 99;
             display: flex;
             gap: 8px;
             margin-bottom: 8px;
@@ -159,7 +165,7 @@
         }
         /* F10信息 */
         .f10-section {
-            margin-top: 20px;
+            /* margin-top: 20px; */
         }
         
         .f10-section-title {
@@ -169,12 +175,7 @@
             padding-bottom: 8px;
             border-bottom: 1px solid #333;
         }
-        
-        .f10-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 12px;
-        }
+
         
         .f10-item {
             display: flex;
@@ -862,6 +863,237 @@
                 min-width: 260px;
             }
         }
+        /* F10数据样式 - 新布局 */
+        .f10-data {
+            padding: 0 16px;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        /* 上部分：两列布局 */
+        .f10-top-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            flex-shrink: 0;
+        }
+
+        .f10-column {
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 卡片样式 */
+        .f10-card {
+            background: #fff;
+            border: 1px solid #e1e4e8;
+            border-radius: 8px;
+            padding: 16px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            height: fit-content;
+        }
+
+        .f10-card-title {
+            /* margin: 0 0 12px 0; */
+            font-size: 14px;
+            font-weight: 600;
+            color: #24292e;
+            border-bottom: 1px solid #eaecef;
+            padding-bottom: 8px;
+        }
+
+        /* 信息列表样式 */
+        .f10-info-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .f10-info-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+        }
+
+        .f10-info-label {
+            font-size: 12px;
+            color: #586069;
+            font-weight: 500;
+            flex-shrink: 0;
+        }
+
+        .f10-info-value {
+            font-size: 12px;
+            color: #24292e;
+            font-weight: 400;
+            text-align: right;
+            flex: 1;
+            margin-left: 8px;
+        }
+
+        /* 下部分：产品信息 */
+        .f10-bottom-section {
+            flex: 1;
+            min-height: 0; /* 允许flex item收缩 */
+        }
+
+        .f10-product-section {
+            margin-bottom: 12px;
+        }
+
+        .f10-product-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .f10-section-label {
+            font-size: 12px;
+            color: #586069;
+            font-weight: 500;
+            margin-bottom: 6px;
+        }
+
+        /* 产品分类容器 */
+        .f10-categories-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: flex-start;
+        }
+
+        .f10-category-tag {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: 500;
+            line-height: 1.2;
+            white-space: nowrap;
+        }
+
+        /* 主营产品容器 */
+        .f10-products-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: flex-start;
+            max-height: 80px; /* 限制高度，避免占用太多空间 */
+            overflow-y: auto; /* 如果产品太多，允许滚动 */
+        }
+
+        .f10-product-tag {
+            background: #f6f8fa;
+            color: #24292e;
+            padding: 2px 6px;
+            border: 1px solid #e1e4e8;
+            border-radius: 6px;
+            font-size: 10px;
+            line-height: 1.2;
+            white-space: nowrap;
+            transition: all 0.2s ease;
+        }
+
+        .f10-product-tag:hover {
+            background: #e1e4e8;
+            transform: translateY(-1px);
+        }
+
+        /* 无数据提示 */
+        .f10-no-data {
+            font-size: 10px;
+            color: #959da5;
+            font-style: italic;
+        }
+
+        /* 滚动条样式 */
+        .f10-products-container::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .f10-products-container::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 2px;
+        }
+
+        .f10-products-container::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 2px;
+        }
+
+        .f10-products-container::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
+
+        /* 响应式设计 */
+        @media (max-width: 768px) {
+            .f10-top-section {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+            
+            .f10-data {
+                padding: 12px;
+                gap: 12px;
+            }
+            
+            .f10-card {
+                padding: 12px;
+            }
+        }
+
+        /* 加载和错误状态样式保持不变 */
+        .f10-loading, .f10-error {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: #666;
+            height: 100%;
+        }
+
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #007bff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 16px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .error-message {
+            margin-bottom: 16px;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .retry-btn {
+            padding: 8px 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .retry-btn:hover {
+            background: #0056b3;
+        }
     </style>
 </head>
 <body>
@@ -978,9 +1210,11 @@
     <div class="stock-detail-content">
         <div class="chart-tabs">
             <button class="chart-tab active" onclick="plateMonitor.switchChart('minute')">分时</button>
+             <button class="chart-tab" onclick="plateMonitor.switchChart('1min')">1分钟</button>
+              <button class="chart-tab" onclick="plateMonitor.switchChart('60min')">60分钟</button>
             <button class="chart-tab" onclick="plateMonitor.switchChart('daily')">日K</button>
             <button class="chart-tab" onclick="plateMonitor.switchChart('weekly')">周K</button>
-            <button class="chart-tab" onclick="plateMonitor.switchChart('monthly')">月K</button>
+            <!-- <button class="chart-tab" onclick="plateMonitor.switchChart('monthly')">月K</button> -->
         </div>
         
         <!-- 新增指标选择器 -->
@@ -1158,6 +1392,8 @@
                 this.domCache.detailOverlay = document.getElementById('detailOverlay');
                 this.domCache.chartContainer = document.getElementById('chartContainer');
                 this.domCache.f10InfoGrid = document.getElementById('f10InfoGrid');
+                 // 修复：初始化遮罩层点击事件
+                this.setupDetailOverlayClick();
                 this.connect();
                 this.setupEventListeners();
                 this.setupScrollLoading();
@@ -1275,7 +1511,15 @@
                 this.loadChartData('minute');
                 this.loadF10Data();
             }
-            
+            // 新增方法：设置遮罩层点击事件
+            setupDetailOverlayClick() {
+                this.domCache.detailOverlay.addEventListener('click', (e) => {
+                    // 修复：点击遮罩层（左侧非详情区域）关闭详情
+                    if (e.target === this.domCache.detailOverlay) {
+                        this.closeStockDetail();
+                    }
+                });
+            }
             // 关闭个股详情
             closeStockDetail() {
                 this.domCache.stockDetailPanel.classList.remove('open');
@@ -1297,6 +1541,15 @@
                 event.target.classList.add('active');
                 
                 this.currentChartType = chartType;
+                
+                // 隐藏或显示指标选项卡
+                const indicatorTabs = document.querySelector('.indicator-tabs');
+                if (indicatorTabs) {
+                    indicatorTabs.style.display = chartType === 'minute' ? 'none' : 'flex';
+                }
+                
+                // 确保在加载新数据前清空当前数据
+                this.chartData = null;
                 this.loadChartData(chartType);
             }
             
@@ -1337,16 +1590,19 @@
                         startDate.setDate(startDate.getDate() - 150);
                         break;
                     case 'w': // 周线 - 100周约2年
-                        startDate.setDate(startDate.getDate() - 700);
+                        startDate.setDate(startDate.getDate() - 350);
                         break;
                     case 'm': // 月线 - 100个月约8年
-                        startDate.setDate(startDate.getDate() - 3000);
+                        startDate.setDate(startDate.getDate() - 1500);
                         break;
                     case '5': // 5分钟 - 最近5个交易日
                         startDate.setDate(startDate.getDate() - 7);
                         break;
                     case '60': // 60分钟 - 最近20个交易日
                         startDate.setDate(startDate.getDate() - 30);
+                        break;
+                    case '1': // 1分钟 - 最近3个交易日
+                        startDate.setDate(startDate.getDate() - 1);
                         break;
                     default:
                         startDate.setDate(startDate.getDate() - 150);
@@ -1366,7 +1622,10 @@
             // 获取频率参数
             getFrequencyByChartType(chartType) {
                 const frequencyMap = {
-                    'minute': '5',
+                    '1min': '1',
+                    'minute': '1',
+                    '5min': '5',
+                    '60min': '60',
                     'daily': 'd',
                     'weekly': 'w',
                     'monthly': 'm'
@@ -1485,192 +1744,253 @@
                 });
             }
             
-            // 修改 createMinuteChartOption 方法中的配色
-            createMinuteChartOption(chartData) {
-                const klineData = chartData.data;
+            // // 修改 createMinuteChartOption 方法中的配色
+            // createMinuteChartOption(chartData) {
+            //     const klineData = chartData.data;
                 
-                const times = klineData.map(item => item.time);
-                const prices = klineData.map(item => item.close);
-                const volumes = klineData.map(item => item.volume);
+            //     const times = klineData.map(item => item.time);
+            //     const prices = klineData.map(item => item.close);
+            //     const volumes = klineData.map(item => item.volume);
+            //     const tradingStartIndex = this.findTradingStartIndex(times);
+            //     // 使用相同的色弱友好配色
+            //     const upColor = '#00a8ff';
+            //     const downColor = '#ff9f43';
                 
-                // 使用相同的色弱友好配色
-                const upColor = '#00a8ff';
-                const downColor = '#ff9f43';
-                
-                // 计算均价
-                const totalValue = prices.reduce((sum, price, index) => 
-                    sum + price * volumes[index], 0);
-                const totalVolume = volumes.reduce((sum, vol) => sum + vol, 0);
-                const avgPrice = totalValue / totalVolume;
+            //     // 计算均价
+            //     const totalValue = prices.reduce((sum, price, index) => 
+            //         sum + price * volumes[index], 0);
+            //     const totalVolume = volumes.reduce((sum, vol) => sum + vol, 0);
+            //     const avgPrice = totalValue / totalVolume;
 
-                return {
-                    backgroundColor: 'transparent',
-                    grid: [
-                        {
-                            left: '3%',
-                            right: '3%',
-                            top: '10%',
-                            height: '60%',
-                            backgroundColor: 'transparent'
-                        },
-                        {
-                            left: '3%',
-                            right: '3%',
-                            top: '75%',
-                            height: '15%',
-                            backgroundColor: 'transparent'
-                        }
-                    ],
-                    xAxis: [
-                        {
-                            type: 'category',
-                            data: times,
-                            boundaryGap: false,
-                            axisLine: { 
-                                onZero: false,
-                                lineStyle: {
-                                    color: '#666'
-                                }
-                            },
-                            axisLabel: {
-                                color: '#999',
-                                fontSize: 11
-                            },
-                            splitLine: { 
-                                show: true,
-                                lineStyle: {
-                                    color: 'rgba(255,255,255,0.1)',
-                                    type: 'dashed'
-                                }
-                            }
-                        },
-                        {
-                            type: 'category',
-                            gridIndex: 1,
-                            data: times,
-                            show: false // 隐藏成交量时间轴
-                        }
-                    ],
-                    yAxis: [
-                        {
-                            scale: true,
-                            axisLine: {
-                                lineStyle: {
-                                    color: '#666'
-                                }
-                            },
-                            axisLabel: {
-                                color: '#999',
-                                fontSize: 11
-                            },
-                            splitLine: { 
-                                show: true,
-                                lineStyle: {
-                                    color: 'rgba(255,255,255,0.1)',
-                                    type: 'dashed'
-                                }
-                            },
-                            splitArea: { show: false }
-                        },
-                        {
-                            scale: true,
-                            gridIndex: 1,
-                            splitNumber: 2,
-                            axisLabel: { 
-                                show: true,
-                                color: '#999',
-                                fontSize: 10
-                            },
-                            axisLine: { show: false },
-                            axisTick: { show: false },
-                            splitLine: { 
-                                show: true,
-                                lineStyle: {
-                                    color: 'rgba(255,255,255,0.05)'
-                                }
-                            }
-                        }
-                    ],
-                    dataZoom: [
-                        {
-                            type: 'inside',
-                            xAxisIndex: [0, 1],
-                            start: 80,
-                            end: 100
-                        },
-                        {
-                            show: true,
-                            xAxisIndex: [0, 1],
-                            type: 'slider',
-                            bottom: '2%',
-                            height: 20,
-                            start: 80,
-                            end: 100,
-                            borderColor: 'rgba(255,255,255,0.1)',
-                            backgroundColor: 'rgba(40,40,60,0.8)',
-                            textStyle: {
-                                color: '#999'
-                            },
-                            handleStyle: {
-                                color: 'rgba(212,175,55,0.8)',
-                                borderColor: '#d4af37'
-                            }
-                        }
-                    ],
-                    series: [
-                        {
-                            name: '分时',
-                            type: 'line',
-                            data: prices,
-                            smooth: true,
-                            lineStyle: {
-                                color: upColor,
-                                width: 1.5
-                            },
-                            areaStyle: {
-                                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                                    { offset: 0, color: 'rgba(0,168,255,0.3)' },
-                                    { offset: 1, color: 'rgba(0,168,255,0.05)' }
-                                ])
-                            },
-                            markLine: {
-                                silent: true,
-                                data: [
-                                    {
-                                        yAxis: avgPrice,
-                                        lineStyle: {
-                                            color: '#ff9f43',
-                                            type: 'dashed',
-                                            width: 1
-                                        },
-                                        label: {
-                                            formatter: '均价: ' + avgPrice.toFixed(2),
-                                            color: '#999',
-                                            fontSize: 10
-                                        }
-                                    }
-                                ]
-                            }
-                        },
-                        {
-                            name: '成交量',
-                            type: 'bar',
-                            xAxisIndex: 1,
-                            yAxisIndex: 1,
-                            data: volumes.map((volume, index) => ({
-                                value: volume,
-                                itemStyle: {
-                                    color: index > 0 ? 
-                                        (prices[index] >= prices[index - 1] ? upColor : downColor) 
-                                        : upColor
-                                }
-                            })),
-                            barWidth: '60%'
-                        }
-                    ]
-                };
+            //     return {
+            //         backgroundColor: 'transparent',
+            //         animation: false,
+            //         grid: [
+            //             {
+            //                 left: '3%',
+            //                 right: '3%',
+            //                 top: '10%',
+            //                 height: '60%',
+            //                 backgroundColor: 'rgba(0,0,0,0.1)',
+            //                 borderColor: 'rgba(255,255,255,0.05)',
+            //                 show: true
+            //             },
+            //             {
+            //                 left: '3%',
+            //                 right: '3%',
+            //                 top: '75%',
+            //                 height: '15%',
+            //                 backgroundColor: 'rgba(0,0,0,0.1)',
+            //                 borderColor: 'rgba(255,255,255,0.05)',
+            //                 show: true
+            //             }
+            //         ],
+            //         // 使用与K线相同的坐标轴样式
+            //         xAxis: [
+            //             {
+            //                 type: 'category',
+            //                 data: times,
+            //                 boundaryGap: false,
+            //                 axisLine: {
+            //                     onZero: false,
+            //                     lineStyle: {
+            //                         color: '#666',
+            //                         width: 1
+            //                     }
+            //                 },
+            //                 axisTick: {
+            //                     show: true,
+            //                     inside: true,
+            //                     length: 3,
+            //                     lineStyle: {
+            //                         color: '#666'
+            //                     }
+            //                 },
+            //                 axisLabel: {
+            //                     color: '#999',
+            //                     fontSize: 11,
+            //                     margin: 8
+            //                 },
+            //                 splitLine: {
+            //                     show: true,
+            //                     lineStyle: {
+            //                         color: 'rgba(255,255,255,0.05)',
+            //                         type: 'dashed'
+            //                     }
+            //                 },
+            //                 splitArea: {
+            //                     show: true,
+            //                     areaStyle: {
+            //                         color: ['rgba(255,255,255,0.02)', 'rgba(0,0,0,0.02)']
+            //                     }
+            //                 }
+            //             },
+            //             {
+            //                 type: 'category',
+            //                 gridIndex: 1,
+            //                 data: times,
+            //                 show: false // 隐藏成交量时间轴
+            //             }
+            //         ],
+            //         yAxis: [
+            //             {
+            //                 scale: true,
+            //                 axisLine: {
+            //                     lineStyle: {
+            //                         color: '#666'
+            //                     }
+            //                 },
+            //                 axisLabel: {
+            //                     color: '#999',
+            //                     fontSize: 11
+            //                 },
+            //                 splitLine: { 
+            //                     show: true,
+            //                     lineStyle: {
+            //                         color: 'rgba(255,255,255,0.1)',
+            //                         type: 'dashed'
+            //                     }
+            //                 },
+            //                 splitArea: { show: false }
+            //             },
+            //             {
+            //                 scale: true,
+            //                 gridIndex: 1,
+            //                 splitNumber: 2,
+            //                 axisLabel: { 
+            //                     show: true,
+            //                     color: '#999',
+            //                     fontSize: 10
+            //                 },
+            //                 axisLine: { show: false },
+            //                 axisTick: { show: false },
+            //                 splitLine: { 
+            //                     show: true,
+            //                     lineStyle: {
+            //                         color: 'rgba(255,255,255,0.05)'
+            //                     }
+            //                 }
+            //             }
+            //         ],
+            //         dataZoom: [
+            //             {
+            //                 type: 'inside',
+            //                 xAxisIndex: [0, 1],
+            //                 start: tradingStartIndex,
+            //                 end: 100
+            //             },
+            //             {
+            //                 show: true,
+            //                 xAxisIndex: [0, 1],
+            //                 type: 'slider',
+            //                 bottom: '2%',
+            //                 height: 20,
+            //                 start:  tradingStartIndex,
+            //                 end: 100,
+            //                 borderColor: 'rgba(255,255,255,0.1)',
+            //                 backgroundColor: 'rgba(40,40,60,0.8)',
+            //                 textStyle: {
+            //                     color: '#999'
+            //                 },
+            //                 handleStyle: {
+            //                     color: 'rgba(212,175,55,0.8)',
+            //                     borderColor: '#d4af37'
+            //                 }
+            //             }
+            //         ],
+            //         series: [
+            //             {
+            //                 name: '分时',
+            //                 type: 'line',
+            //                 data: prices,
+            //                 smooth: true,
+            //                 lineStyle: {
+            //                     color: upColor,
+            //                     width: 1.5
+            //                 },
+            //                 areaStyle: {
+            //                     color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+            //                         { offset: 0, color: 'rgba(0,168,255,0.3)' },
+            //                         { offset: 1, color: 'rgba(0,168,255,0.05)' }
+            //                     ])
+            //                 },
+            //                 markLine: {
+            //                     silent: true,
+            //                     data: [
+            //                         {
+            //                             yAxis: avgPrice,
+            //                             lineStyle: {
+            //                                 color: '#ff9f43',
+            //                                 type: 'dashed',
+            //                                 width: 1
+            //                             },
+            //                             label: {
+            //                                 formatter: '均价: ' + avgPrice.toFixed(2),
+            //                                 color: '#999',
+            //                                 fontSize: 10
+            //                             }
+            //                         }
+            //                     ]
+            //                 }
+            //             },
+            //             {
+            //                 name: '成交量',
+            //                 type: 'bar',
+            //                 xAxisIndex: 1,
+            //                 yAxisIndex: 1,
+            //                 data: volumes.map((volume, index) => ({
+            //                     value: volume,
+            //                     itemStyle: {
+            //                         color: index > 0 ? 
+            //                             (prices[index] >= prices[index - 1] ? upColor : downColor) 
+            //                             : upColor
+            //                     }
+            //                 })),
+            //                 barWidth: '60%'
+            //             }
+            //         ]
+            //     };
+            // }
+            // 辅助方法：找到当天交易开始的位置
+            findTradingStartIndex(times) {
+                // 假设时间格式为 "HH:MM" 或 "YYYY-MM-DD HH:MM"
+                if (!times || times.length === 0) {
+                    return { position: 0, index: -1 };
+                }
+                
+                // 去掉最后几分钟的数据，避免影响查找
+                // 假设每天最多240分钟交易数据，去掉最后5分钟
+                const trimmedTimes = times.slice(0, Math.max(0, times.length - 5));
+                
+                // 从后往前查找最近的15:00或14:59时间点
+                for (let i = trimmedTimes.length - 1; i >= 0; i--) {
+                    const timeStr = trimmedTimes[i].toString();
+                    if (timeStr.includes(' 15:00') || timeStr.includes(' 14:59')) {
+                        // 计算相对于原始times数组的位置
+                        const originalIndex = i;
+                        // 返回百分比位置和索引，稍微往前一点以包含更多上下文
+                        return {
+                            position: Math.max(0, (originalIndex / times.length) * 100 - 3),
+                            index: originalIndex
+                        };
+                    }
+                }
+                
+                // 如果没找到15:00/14:59，尝试查找14:55左右的数据作为结束点的参考
+                for (let i = trimmedTimes.length - 1; i >= Math.max(0, trimmedTimes.length - 10); i--) {
+                    const timeStr = trimmedTimes[i].toString();
+                    if (timeStr.includes(' 14:5')) {
+                        const originalIndex = i;
+                        return {
+                            position: Math.max(0, (originalIndex / times.length) * 100 - 2),
+                            index: originalIndex
+                        };
+                    }
+                }
+                
+                // 默认返回最后30%的数据位置（与原来逻辑不同，这里关注最近数据）
+                return { position: 0, index: -1 }; // 默认显示最后30%的数据
             }
-            
             // 创建K线图配置
              // 创建K线图配置
             // 修改 createKLineChartOption 方法中的配色和工具栏配置
@@ -2267,7 +2587,7 @@
                                         color: value >= 0 ? upColor : downColor
                                     }
                                 })),
-                                barWidth: '60%'
+    
                             }
                         );
                         break;
@@ -2346,14 +2666,123 @@
                 const times = klineData.map(item => item.time);
                 const prices = klineData.map(item => item.close);
                 const volumes = klineData.map(item => item.volume);
+                const amounts = klineData.map(item => item.amount);
+                const tradingInfo = this.findTradingStartIndex(times);
+                const tradingStartIndex = tradingInfo.position;
                 
-                // 计算均价
-                const totalValue = prices.reduce((sum, price, index) => 
-                    sum + price * volumes[index], 0);
-                const totalVolume = volumes.reduce((sum, vol) => sum + vol, 0);
-                const avgPrice = totalValue / totalVolume;
+                // 找到15:00/14:59对应的价格作为y轴中轴参考
+                let midPrice = null;
+                if (tradingInfo.index >= 0 && tradingInfo.index < prices.length) {
+                    midPrice = prices[tradingInfo.index];
+                }
+                
+                // 计算累计均价（分时均价线），按天分组计算，每天独立从0开始累积
+                const avgPrices = [];
+                let currentDate = null;
+                let dailyCumulativeValue = 0;
+                let dailyCumulativeVolume = 0;
+                
+                // 遍历所有数据点
+                for (let i = 0; i < prices.length; i++) {
+                    // 获取当前数据点的日期部分
+                    // 假设time格式为"HH:MM"或包含日期的格式
+                    const timeStr = times[i];
+                    let dateStr = 'current'; // 默认日期标识
+                    
+                    // 检查时间格式是否包含日期部分
+                    if (timeStr && timeStr.includes('-')) {
+                        // 如果时间格式为"YYYY-MM-DD HH:MM"，提取日期部分
+                        dateStr = timeStr.split(' ')[0];
+                    } else if (tradingStartIndex && i >= tradingStartIndex && i > 0) {
+                        // 对于没有日期信息的数据，通过tradingStartIndex来识别不同的交易日
+                        // 这里简化处理，实际可能需要更复杂的逻辑来判断是否跨天
+                        const prevIndex = i - 1;
+                        // 如果当前点与前一个点的时间差超过一定阈值（例如1小时），则认为是新的一天
+                        if (times[prevIndex]) {
+                            const [prevHour, prevMin] = times[prevIndex].split(':').map(Number);
+                            const [currHour, currMin] = timeStr.split(':').map(Number);
+                            const timeDiff = (currHour * 60 + currMin) - (prevHour * 60 + prevMin);
+                            
+                            // 如果时间差为负或超过60分钟（可能跨天），重新计算当天均价
+                            if (timeDiff < 0 || timeDiff > 60) {
+                                dateStr = 'new_day_' + i;
+                            }
+                        }
+                    }
+                    
+                    // 检查是否需要重置当天的累计值（日期变更）
+                    if (dateStr !== currentDate) {
+                        currentDate = dateStr;
+                        dailyCumulativeValue = 0;
+                        dailyCumulativeVolume = 0;
+                    }
+                    
+                    // 累积当前天的数据
+                    dailyCumulativeValue += prices[i] * volumes[i];
+                    dailyCumulativeVolume += volumes[i];
+                    
+                    // 计算当前点的当日累计均价
+                    const currentAvgPrice = dailyCumulativeVolume > 0 ? 
+                        dailyCumulativeValue / dailyCumulativeVolume : prices[i];
+                    
+                    avgPrices.push(currentAvgPrice);
+                }
+                
+                // 计算最新一天的总体均价（作为参考值）
+                const totalValue = dailyCumulativeValue;
+                const totalVolume = dailyCumulativeVolume;
+                const avgPrice = totalVolume > 0 ? totalValue / totalVolume : prices[prices.length - 1] || 0;
 
                 return {
+                    backgroundColor: 'transparent',
+                    tooltip: {
+                        trigger: 'axis',
+                        axisPointer: {
+                            type: 'cross',
+                            lineStyle: {
+                                color: 'rgba(255,255,255,0.2)',
+                                width: 1
+                            }
+                        },
+                        backgroundColor: 'rgba(26, 26, 46, 0.95)',
+                        borderColor: '#d4af37',
+                        textStyle: {
+                            color: '#fff'
+                        },
+                        formatter: function(params) {
+                            if (!params || params.length === 0) return '';
+                            
+                            const date = params[0].name;
+                            let result = `<div>${date}</div>`;
+                            
+                            // 确保总是获取成交量数据
+                            let volumeValue = null;
+                            
+                            params.forEach(param => {
+                                if (param.seriesName === '分时') {
+                                    const price = param.value;
+                                    const change = (price - prices[0]).toFixed(2);
+                                    const changePercent = ((price - prices[0]) / prices[0] * 100).toFixed(2);
+                                    result += `<div style="margin-top: 4px;">${param.marker} ${param.seriesName}: ${price.toFixed(2)} (${changePercent >= 0 ? '+' : ''}${changePercent}%)</div>`;
+                                } else if (param.seriesName === '成交量') {
+                                    // 处理成交量数据可能是对象的情况
+                                    const volume = typeof param.value === 'object' ? param.value.value : param.value;
+                                    volumeValue = volume;
+                                    result += `<div style="margin-top: 4px;">${param.marker} ${param.seriesName}: ${volume.toLocaleString()}</div>`;
+                                }
+                            });
+                            
+                            // 如果没有通过params获取到成交量数据，手动从volumes数组获取
+                            if (volumeValue === null && params[0] && typeof params[0].dataIndex === 'number') {
+                                const index = params[0].dataIndex;
+                                if (index >= 0 && index < amounts.length) {
+                                    result += `<div style="margin-top: 4px;">📊 成交量: ${parseInt(amounts[index]*0.0001).toLocaleString()}万</div>`;
+                                }
+                            }
+                            
+                            return result;
+                        }
+                    },
                     grid: [
                         {
                             left: '3%',
@@ -2372,9 +2801,25 @@
                         {
                             type: 'category',
                             data: times,
+                            scale: true,
                             boundaryGap: false,
-                            axisLine: { onZero: false },
-                            splitLine: { show: false },
+                            axisLine: { 
+                                onZero: false,
+                                lineStyle: {
+                                    color: '#666'
+                                }
+                            },
+                            axisLabel: {
+                                color: '#999',
+                                fontSize: 11
+                            },
+                            splitLine: { 
+                                show: true,
+                                lineStyle: {
+                                    color: 'rgba(255,255,255,0.1)',
+                                    type: 'dashed'
+                                }
+                            },
                             min: 'dataMin',
                             max: 'dataMax'
                         },
@@ -2382,44 +2827,148 @@
                             type: 'category',
                             gridIndex: 1,
                             data: times,
-                            boundaryGap: false,
-                            axisLine: { onZero: false },
-                            axisTick: { show: false },
-                            splitLine: { show: false },
-                            axisLabel: { show: false },
-                            min: 'dataMin',
-                            max: 'dataMax'
+                            show: false // 隐藏成交量时间轴
                         }
                     ],
                     yAxis: [
                         {
                             scale: true,
-                            splitArea: { show: true }
+                            // 如果找到了中轴价格，设置合适的min和max使该价格位于中轴
+                            min: function(value) {
+                                if (midPrice !== null && !isNaN(midPrice)) {
+                                    // 计算价格范围，确保中轴价格在中间位置
+                                    const range = value.max - value.min;
+                                    return midPrice - (range * 1.001).toFixed(2);
+                                }
+                                // 默认使用原始值
+                                return value.min;
+                            },
+                            max: function(value) {
+                                if (midPrice !== null && !isNaN(midPrice)) {
+                                    const range = value.max - value.min;
+                                    return midPrice + (range * 1.001).toFixed(2);
+                                }
+                                // 默认使用原始值
+                                return value.max;
+                            },
+                            axisLine: {
+                                lineStyle: {
+                                    color: '#666'
+                                }
+                            },
+                            axisLabel: {
+                                color: '#999',
+                                fontSize: 11
+                            },
+                            splitLine: { 
+                                show: true,
+                                lineStyle: {
+                                    color: 'rgba(255,255,255,0.1)',
+                                    type: 'dashed'
+                                }
+                            },
+                            splitArea: { 
+                                show: false // 关闭背景色块
+                            }
                         },
                         {
                             scale: true,
                             gridIndex: 1,
                             splitNumber: 2,
-                            axisLabel: { show: false },
+                            axisLabel: { 
+                                show: true,
+                                color: '#999',
+                                fontSize: 10
+                            },
                             axisLine: { show: false },
                             axisTick: { show: false },
-                            splitLine: { show: false }
+                            splitLine: { 
+                                show: true,
+                                lineStyle: {
+                                    color: 'rgba(255,255,255,0.05)'
+                                }
+                            }
                         }
                     ],
+                    // 添加数据区域缩放，便于查看细节
                     dataZoom: [
                         {
                             type: 'inside',
                             xAxisIndex: [0, 1],
-                            start: 80,
-                            end: 100
+                            start: tradingStartIndex, // 默认显示最后30%的数据（当天）
+                            end: 100,
+                            zoomOnMouseWheel: false,
+                            moveOnMouseMove: true,
+                            preventDefaultMouseMove: true
                         },
                         {
                             show: true,
                             xAxisIndex: [0, 1],
                             type: 'slider',
-                            top: '95%',
-                            start: 80,
-                            end: 100
+                            bottom: '2%',
+                            height: 20,
+                            start: tradingStartIndex,
+                            end: 100,
+                            // 关键配置：与K线图一致的样式
+                            handleStyle: {
+                                color: '#d4af37',
+                                borderColor: '#d4af37',
+                                borderWidth: 1,
+                                opacity: 1,
+                                shadowBlur: 0,
+                                shadowColor: 'transparent'
+                            },
+                            moveHandleStyle: {
+                                color: 'rgba(212, 175, 55, 0.3)',
+                                borderColor: '#d4af37',
+                                borderWidth: 1,
+                                opacity: 1,
+                                shadowBlur: 0,
+                                shadowColor: 'transparent'
+                            },
+                            dataBackground: {
+                                lineStyle: {
+                                    color: '#666',
+                                    width: 1,
+                                    opacity: 0.8
+                                },
+                                areaStyle: {
+                                    color: 'rgba(100, 100, 100, 0.3)'
+                                }
+                            },
+                            selectedDataBackground: {
+                                lineStyle: {
+                                    color: '#d4af37',
+                                    width: 1,
+                                    opacity: 0.8
+                                },
+                                areaStyle: {
+                                    color: 'rgba(212, 175, 55, 0.2)'
+                                }
+                            },
+                            borderColor: '#555',
+                            textStyle: {
+                                color: '#999',
+                                fontSize: 10
+                            },
+                            brushSelect: false,
+                            // 关键：禁用所有hover效果
+                            emphasis: {
+                                disabled: true, // 完全禁用emphasis状态
+                                handleStyle: {
+                                    color: '#d4af37',
+                                    borderColor: '#d4af37',
+                                    opacity: 1
+                                },
+                                moveHandleStyle: {
+                                    color: 'rgba(212, 175, 55, 0.3)',
+                                    opacity: 1
+                                }
+                            },
+                            // 禁用所有提示
+                            showDetail: false,
+                            // 禁用数据阴影
+                            showDataShadow: false
                         }
                     ],
                     series: [
@@ -2436,22 +2985,21 @@
                                     { offset: 0, color: 'rgba(212, 175, 55, 0.3)' },
                                     { offset: 1, color: 'rgba(212, 175, 55, 0.1)' }
                                 ])
-                            },
-                            markLine: {
-                                silent: true,
-                                data: [
-                                    {
-                                        yAxis: avgPrice,
-                                        lineStyle: {
-                                            color: '#999',
-                                            type: 'dashed'
-                                        },
-                                        label: {
-                                            formatter: '均价: ' + avgPrice.toFixed(2)
-                                        }
-                                    }
-                                ]
                             }
+                        },
+                        {
+                            name: '均价线',
+                            type: 'line',
+                            data: avgPrices,
+                            smooth: true,
+                            lineStyle: {
+                                color: '#00cc99',
+                                width: 1.5
+                            },
+                            // 不显示点
+                            // showSymbol: false,
+                            // 不显示区域填充
+                            // areaStyle: {}
                         },
                         {
                             name: '成交量',
@@ -2558,6 +3106,7 @@
             // ==================== 副图指标切换 ====================
 
             // 切换副图指标
+            // 修改 switchSubIndicator 方法
             switchSubIndicator(indicatorType) {
                 this.currentSubIndicator = indicatorType;
                 
@@ -2571,87 +3120,229 @@
                     activeTab.classList.add('active');
                 }
                 
-                // 重新渲染图表
-                if (this.chartData && this.currentChartType !== 'minute') {
-                    this.renderChart(this.chartData, this.currentChartType);
+                // 修复：确保有数据且不是分时图时重新渲染
+                if (this.currentChartType !== 'minute') {
+                    if (this.ensureChartData()) {
+                        this.renderChart(this.chartData, this.currentChartType);
+                    } else {
+                        console.warn('图表数据不可用，无法切换指标');
+                    }
                 }
             }
-
+            // 在 PlateMonitor 类中添加方法
+            ensureChartData() {
+                if (!this.chartData && this.selectedStock && this.currentChartType) {
+                    const cacheKey = `${this.selectedStock.code}_${this.currentChartType}`;
+                    if (this.stockDetailCache.has(cacheKey)) {
+                        this.chartData = this.stockDetailCache.get(cacheKey);
+                        return true;
+                    }
+                }
+                return !!this.chartData;
+            }
             // 加载F10数据
             async loadF10Data() {
                 if (!this.selectedStock) return;
                 
-                const cacheKey = `${this.selectedStock.code}_f10`;
+                try {
+                    // 显示加载状态
+                    this.showF10Loading();
+                    
+                    const response = await fetch(`/api/f10/data?code=${this.selectedStock.code}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    
+                    const result = await response.json();
+                    
+                    if (result.error) {
+                        throw new Error(result.error);
+                    }
+                    
+                    this.renderF10Data(result.data);
+                    
+                } catch (error) {
+                    console.error('加载F10数据失败:', error);
+                    this.showF10Error(error.message);
+                }
+            }
+
+            // 显示F10加载状态
+            showF10Loading() {
+                const f10Container = document.getElementById('f10InfoGrid');
+                if (f10Container) {
+                    f10Container.innerHTML = `
+                        <div class="f10-loading">
+                            <div class="loading-spinner"></div>
+                            <div>加载F10数据中...</div>
+                        </div>
+                    `;
+                } else {
+                    console.warn('F10容器元素未找到');
+                }
+            }
+
+            // 显示F10错误
+            showF10Error(message) {
+                const f10Container = document.getElementById('f10InfoGrid');
+                if (f10Container) {
+                    f10Container.innerHTML = `
+                        <div class="f10-error">
+                            <div class="error-icon">⚠️</div>
+                            <div class="error-message">${message}</div>
+                            <button onclick="plateMonitor.loadF10Data()" class="retry-btn">重试</button>
+                        </div>
+                    `;
+                } else {
+                    console.warn('F10容器元素未找到');
+                }
+            }
+
+            // 重试加载F10
+            retryLoadF10() {
+                this.loadF10Data();
+            }
+
+            // 渲染F10数据 - 新布局
+            renderF10Data(f10Data) {
+                const f10Container = document.getElementById('f10InfoGrid');
                 
-                // 检查缓存
-                if (this.stockDetailCache.has(cacheKey)) {
-                    this.renderF10Info(this.stockDetailCache.get(cacheKey));
+                if (!f10Container) {
+                    console.warn('F10容器元素未找到');
                     return;
                 }
                 
+                const html = `
+                    <div class="f10-data">
+                        <!-- 上部分：基本信息 + 财务指标 -->
+                        <div class="f10-top-section">
+                            <!-- 第二列：财务指标 -->
+                            <div class="f10-column">
+                                <div class="f10-card">
+                                    <h3 class="f10-card-title">财务指标</h3>
+                                    <div class="f10-info-list">
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">总市值:</span>
+                                            <span class="f10-info-value">${this.formatMarketCap(f10Data.financial.total_market_cap)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">流通市值:</span>
+                                            <span class="f10-info-value">${this.formatMarketCap(f10Data.financial.circulating_market_cap)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">净资产收益率:</span>
+                                            <span class="f10-info-value">${this.formatPercentage(f10Data.financial.roe)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">市净率(PB):</span>
+                                            <span class="f10-info-value">${this.formatNumber(f10Data.financial.pb, 2)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">市盈率(PE):</span>
+                                            <span class="f10-info-value">${this.formatNumber(f10Data.financial.pe, 2)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">资产负债率:</span>
+                                            <span class="f10-info-value">${this.formatPercentage(f10Data.financial.debt_ratio)}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">销售毛利率:</span>
+                                            <span class="f10-info-value">${this.formatPercentage(f10Data.financial.gross_margin)}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- 第一列：基本信息 -->
+                            <div class="f10-column">
+                                <div class="f10-card">
+                                    <h3 class="f10-card-title">基本信息</h3>
+                                    <div class="f10-info-list">
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">所属行业:</span>
+                                            <span class="f10-info-value">${f10Data.basic.industry || '--'}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">所在城市:</span>
+                                            <span class="f10-info-value">${f10Data.basic.city || '--'}</span>
+                                        </div>
+                                        <div class="f10-info-item">
+                                            <span class="f10-info-label">上市日期:</span>
+                                            <span class="f10-info-value">${this.formatListingDate(f10Data.basic.listing_date)}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- 下部分：产品信息 -->
+                        <div class="f10-bottom-section">
+                            <div class="f10-card">
+                                <h3 class="f10-card-title">产品信息</h3>
+                                
+                                <!-- 产品分类 -->
+                                <div class="f10-product-section">
+                                    <div class="f10-section-label">产品分类:</div>
+                                    <div class="f10-categories-container">
+                                        ${f10Data.business.product_categories && f10Data.business.product_categories.length > 0 
+                                            ? f10Data.business.product_categories.map(category => 
+                                                `<span class="f10-category-tag">${category}</span>`
+                                            ).join('')
+                                            : '<span class="f10-no-data">暂无分类信息</span>'
+                                        }
+                                    </div>
+                                </div>
+                                
+                                <!-- 主营产品 -->
+                                <div class="f10-product-section">
+                                    <div class="f10-section-label">主营产品:</div>
+                                    <div class="f10-products-container">
+                                        ${f10Data.business.main_products && f10Data.business.main_products.length > 0 
+                                            ? f10Data.business.main_products.map(product => 
+                                                `<span class="f10-product-tag">${product}</span>`
+                                            ).join('')
+                                            : '<span class="f10-no-data">暂无产品信息</span>'
+                                        }
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                f10Container.innerHTML = html;
+            }
+            // 格式化上市日期
+            formatListingDate(dateStr) {
+                if (!dateStr) return '--';
+                
                 try {
-                    // 模拟API请求
-                    const f10Data = await this.fetchF10Data(this.selectedStock.code);
-                    this.stockDetailCache.set(cacheKey, f10Data);
-                    this.renderF10Info(f10Data);
-                } catch (error) {
-                    console.error('加载F10数据失败:', error);
-                    this.domCache.f10InfoGrid.innerHTML = '<div>F10信息加载失败</div>';
+                    // 假设日期格式为 YYYYMMDD
+                    const year = dateStr.substring(0, 4);
+                    const month = dateStr.substring(4, 6);
+                    const day = dateStr.substring(6, 8);
+                    return `${year}-${month}-${day}`;
+                } catch {
+                    return dateStr;
                 }
             }
-            
-            // 模拟获取F10数据
-            async fetchF10Data(stockCode) {
-                // 模拟网络延迟
-                await new Promise(resolve => setTimeout(resolve, 300));
+
+            // 格式化市值
+            formatMarketCap(value) {
+                if (!value) return '--';
                 
-                // 生成模拟F10数据
-                return {
-                    pe: (Math.random() * 50 + 10).toFixed(2),
-                    pb: (Math.random() * 5 + 1).toFixed(2),
-                    totalShares: Math.floor(Math.random() * 10000000000),
-                    floatShares: Math.floor(Math.random() * 5000000000),
-                    totalMarketCap: Math.floor(Math.random() * 500000000000),
-                    floatMarketCap: Math.floor(Math.random() * 200000000000),
-                    revenue: Math.floor(Math.random() * 100000000000),
-                    netProfit: Math.floor(Math.random() * 10000000000),
-                    roe: (Math.random() * 20 + 5).toFixed(2),
-                    industry: ['科技', '金融', '消费', '医药', '能源'][Math.floor(Math.random() * 5)],
-                    area: ['北京', '上海', '深圳', '杭州', '广州'][Math.floor(Math.random() * 5)],
-                    listingDate: new Date(2010 + Math.floor(Math.random() * 13), Math.floor(Math.random() * 12), 1)
-                        .toISOString().split('T')[0]
-                };
+                if (value >= 1e8) {
+                    return (value / 1e8).toFixed(2) + '亿元';
+                } else if (value >= 1e4) {
+                    return (value / 1e4).toFixed(2) + '万元';
+                } else {
+                    return value.toFixed(2) + '元';
+                }
             }
-            
-            // 渲染F10信息
-            renderF10Info(f10Data) {
-                const grid = this.domCache.f10InfoGrid;
-                grid.innerHTML = '';
-                
-                const f10Items = [
-                    { label: '市盈率(PE)', value: f10Data.pe },
-                    { label: '市净率(PB)', value: f10Data.pb },
-                    { label: '总股本', value: this.formatNumber(f10Data.totalShares) + '股' },
-                    { label: '流通股本', value: this.formatNumber(f10Data.floatShares) + '股' },
-                    { label: '总市值', value: this.formatNumber(f10Data.totalMarketCap) },
-                    { label: '流通市值', value: this.formatNumber(f10Data.floatMarketCap) },
-                    { label: '营业收入', value: this.formatNumber(f10Data.revenue) },
-                    { label: '净利润', value: this.formatNumber(f10Data.netProfit) },
-                    { label: '净资产收益率', value: f10Data.roe + '%' },
-                    { label: '所属行业', value: f10Data.industry },
-                    { label: '地区', value: f10Data.area },
-                    { label: '上市日期', value: f10Data.listingDate }
-                ];
-                
-                f10Items.forEach(item => {
-                    const div = document.createElement('div');
-                    div.className = 'f10-item';
-                    div.innerHTML = `
-                        <span class="f10-label">${item.label}</span>
-                        <span class="f10-value">${item.value}</span>
-                    `;
-                    grid.appendChild(div);
-                });
+
+            // 格式化百分比
+            formatPercentage(value) {
+                if (!value) return '--';
+                return value.toFixed(2) + '%';
             }
             // 修复1: 增量更新个股数据，不重新创建DOM
             handleStockUpdate(data) {
@@ -3062,7 +3753,7 @@
                 };
                 
                 stocksSection.innerHTML = `
-                    <div style="margin-bottom: 15px; color: #d4af37; font-weight: 600;">
+                    <div style="color: #d4af37; font-weight: 600;">
                         ${title} (${stocks.length})
                     </div>
                     <div class="stocks-header">
@@ -3212,8 +3903,11 @@
                             子板块筛选
                         </div>
                         <div class="sub-sort-controls">
-                            <button class="control-btn small ${this.subPlateSort.field === 'change_pct' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('change_pct')">涨跌幅</button>
-                            <button class="control-btn small ${this.subPlateSort.field === 'total_volume' ? 'active' : ''}" onclick="plateMonitor.sortSubPlates('total_volume')">成交额</button>
+                            <!-- 修复：确保这两个按钮只对子板块排序 -->
+                            <button class="control-btn small ${this.subPlateSort.field === 'change_pct' ? 'active' : ''}" 
+                                    onclick="plateMonitor.sortSubPlatesByField('change_pct')">涨跌幅</button>
+                            <button class="control-btn small ${this.subPlateSort.field === 'total_volume' ? 'active' : ''}" 
+                                    onclick="plateMonitor.sortSubPlatesByField('total_volume')">成交额</button>
                         </div>
                     </div>
                     <div class="sub-plates-tabs" id="subPlatesTabs">
@@ -3648,7 +4342,8 @@
                 });
             }
 
-            sortSubPlates(field) {
+           // 新增方法：专门用于子板块排序，不影响个股列表
+            sortSubPlatesByField(field) {
                 if (this.subPlateSort.field === field) {
                     this.subPlateSort.direction = this.subPlateSort.direction === 'desc' ? 'asc' : 'desc';
                 } else {
@@ -3656,8 +4351,63 @@
                     this.subPlateSort.direction = 'desc';
                 }
                 
-                this.applySubPlateSort();
+                // 只重新渲染子板块标签，不重新加载个股数据
+                this.applySubPlateSortOnly();
                 this.updateSubPlateSortButtons();
+            }
+
+            // 新增方法：只对子板块进行排序，不重新加载个股
+            applySubPlateSortOnly() {
+                if (!this.selectedPlate) return;
+                
+                const cachedSubPlates = this.subPlatesCache.get(this.selectedPlate.name);
+                if (cachedSubPlates) {
+                    // 只重新渲染子板块标签部分，保持当前选择的个股不变
+                    this.renderSubPlatesTabsOnly(cachedSubPlates);
+                }
+            }
+
+            // 新增方法：只重新渲染子板块标签，不重新渲染个股列表
+            renderSubPlatesTabsOnly(subPlates) {
+                const tabsContainer = document.getElementById('subPlatesTabs');
+                if (!tabsContainer) return;
+                
+                const sortedSubPlates = this.sortSubPlatesArray(subPlates);
+                const mainPlateStocks = this.stocksCache.get(this.selectedPlate.id) || [];
+                
+                let htmlParts = [];
+                htmlParts.push(`
+                    <div class="sub-plate-tab all-stocks-tab ${!this.selectedSubPlate ? 'selected' : ''}" 
+                        onclick="plateMonitor.showAllStocks()">
+                        <span class="sub-plate-tab-name">全部个股</span>
+                        <span class="sub-plate-tab-change">${mainPlateStocks.length}只</span>
+                    </div>
+                `);
+                
+                sortedSubPlates.forEach((plate, index) => {
+                    const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
+                    const changeSign = plate.change_pct >= 0 ? '+' : '';
+                    const isSelected = this.selectedSubPlate && this.selectedSubPlate.id === plate.id;
+                    
+                    htmlParts.push(`
+                        <div class="sub-plate-tab ${isSelected ? 'selected' : ''}" 
+                            data-sub-plate-id="${plate.id}" 
+                            onclick="plateMonitor.filterStocksBySubPlate(${JSON.stringify(plate).replace(/"/g, '&quot;')})">
+                            <span class="sub-plate-tab-name">${plate.name}</span>
+                            <span class="sub-plate-tab-change ${changeClass}">
+                                ${changeSign}${(plate.change_pct * 100).toFixed(2)}%
+                            </span>
+                        </div>
+                    `);
+                });
+                
+                tabsContainer.innerHTML = htmlParts.join('');
+                this.cacheSubPlateElements();
+            }
+            
+            // 保持向后兼容的旧方法
+            sortSubPlates(field) {
+                this.sortSubPlatesByField(field);
             }
 
             sortSubPlatesArray(plates) {
@@ -3714,7 +4464,8 @@
                     this.currentSort.field = field;
                     this.currentSort.direction = direction || 'desc';
                 }
-                
+                // 修复：手动排序时强制重置checksum，确保重新排序
+                this.lastSortChecksum = '';
                 this.updateCurrentPlates();
                 this.renderPlatesTable();
                 this.updateSortInfo();
