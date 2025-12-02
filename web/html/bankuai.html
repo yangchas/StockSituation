@@ -440,7 +440,7 @@
             min-width: 300px;
             background: rgba(26, 26, 46, 0.8);
             border-radius: 10px;
-            padding: 15px;
+            padding: 2px 15px;
             border: 1px solid #333;
             box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
             backdrop-filter: blur(10px);
@@ -453,8 +453,8 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
+            margin-bottom: 6px;
+            padding-bottom: 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             flex-shrink: 0;
         }
@@ -484,7 +484,7 @@
         .plate-header, .stocks-header {
             display: grid;
             gap: 8px;
-            padding: 12px 10px;
+            padding: 2px 0px;
             background: rgba(40, 40, 60, 0.8);
             border-bottom: 2px solid rgba(255, 255, 255, 0.1);
             position: sticky;
@@ -506,7 +506,7 @@
             cursor: pointer;
             user-select: none;
             transition: all 0.3s;
-            padding: 4px;
+            padding: 0;
             border-radius: 4px;
             font-size: 12px;
         }
@@ -580,14 +580,14 @@
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
-            margin-bottom: 15px;
+            margin-bottom: 4px;
             padding: 10px;
             background: rgba(40, 40, 60, 0.6);
             border-radius: 8px;
         }
         
         .sub-plate-tab {
-            padding: 6px 12px;
+            padding: 1px 4px;
             background: rgba(255, 255, 255, 0.1);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 15px;
@@ -659,7 +659,7 @@
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-bottom: 15px;
+            margin-bottom: 0;
             font-size: 14px;
         }
         
@@ -774,8 +774,8 @@
             }
             
             .header {
-                padding: 10px;
-                margin-bottom: 10px;
+                padding: 2px 10px;
+                margin-bottom: 2px;
             }
             
             .header-top {
@@ -1093,6 +1093,59 @@
 
         .retry-btn:hover {
             background: #0056b3;
+        }
+        /* 高级指标样式 */
+        .advanced-value {
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .advanced-value.change-positive {
+            color: #ff5252;
+        }
+
+        .advanced-value.change-negative {
+            color: #4caf50;
+        }
+
+        /* 调整网格布局以适应新增列 */
+        .plate-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+
+        .stocks-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
+        }
+
+        .plate-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+
+        .stock-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
+        }
+
+        /* 响应式调整 */
+        @media (max-width: 768px) {
+            .plate-header, .stocks-header {
+                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            }
+            
+            .plate-row, .stock-row {
+                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            }
+            
+            /* 在移动端隐藏部分列 */
+            .plate-header-item:nth-child(6),
+            .plate-row > div:nth-child(6),
+            .plate-header-item:nth-child(7),
+            .plate-row > div:nth-child(7),
+            .stock-header-item:nth-child(6),
+            .stock-row > div:nth-child(6),
+            .stock-header-item:nth-child(7),
+            .stock-row > div:nth-child(7) {
+                display: none;
+            }
         }
     </style>
 </head>
@@ -1561,8 +1614,10 @@
                 
                 // 检查缓存
                 if (this.stockDetailCache.has(cacheKey)) {
-                    this.renderChart(this.stockDetailCache.get(cacheKey), chartType);
-                    return;
+                    if(this.stockDetailCache.get(cacheKey).count){
+                        this.renderChart(this.stockDetailCache.get(cacheKey), chartType);
+                        return;
+                    }
                 }
                 
                 // 显示加载状态
@@ -1977,16 +2032,16 @@
                 }
                 
                 // 如果没找到15:00/14:59，尝试查找14:55左右的数据作为结束点的参考
-                for (let i = trimmedTimes.length - 1; i >= Math.max(0, trimmedTimes.length - 10); i--) {
-                    const timeStr = trimmedTimes[i].toString();
-                    if (timeStr.includes(' 14:5')) {
-                        const originalIndex = i;
-                        return {
-                            position: Math.max(0, (originalIndex / times.length) * 100 - 2),
-                            index: originalIndex
-                        };
-                    }
-                }
+                // for (let i = trimmedTimes.length - 1; i >= Math.max(0, trimmedTimes.length - 10); i--) {
+                //     const timeStr = trimmedTimes[i].toString();
+                //     if (timeStr.includes(' 14:5')) {
+                //         const originalIndex = i;
+                //         return {
+                //             position: Math.max(0, (originalIndex / times.length) * 100 - 2),
+                //             index: originalIndex
+                //         };
+                //     }
+                // }
                 
                 // 默认返回最后30%的数据位置（与原来逻辑不同，这里关注最近数据）
                 return { position: 0, index: -1 }; // 默认显示最后30%的数据
@@ -3235,11 +3290,11 @@
                                         </div>
                                         <div class="f10-info-item">
                                             <span class="f10-info-label">市净率(PB):</span>
-                                            <span class="f10-info-value">${this.formatNumber(f10Data.financial.pb, 2)}</span>
+                                            <span class="f10-info-value">${f10Data.financial.pb.toFixed(2)}</span>
                                         </div>
                                         <div class="f10-info-item">
                                             <span class="f10-info-label">市盈率(PE):</span>
-                                            <span class="f10-info-value">${this.formatNumber(f10Data.financial.pe, 2)}</span>
+                                            <span class="f10-info-value">${f10Data.financial.pe.toFixed(2)}</span>
                                         </div>
                                         <div class="f10-info-item">
                                             <span class="f10-info-label">资产负债率:</span>
@@ -3605,24 +3660,46 @@
                 
                 return duplicates.length;
             }
+            // 修改 createVirtualStockRow 方法
             createVirtualStockRow(stock, index) {
                 const row = document.createElement('div');
                 row.className = 'stock-row';
                 row.id = `stock-${stock.code}`;
                 row.style.top = `${index * this.virtualScroll.rowHeight}px`;
                 row.style.height = `${this.virtualScroll.rowHeight}px`;
-                 // 添加点击事件
+                
+                // 添加点击事件
                 row.addEventListener('click', () => {
                     this.showStockDetail(stock);
                 });
+                
                 const changeClass = stock.change_pct >= 0 ? 'change-positive' : 'change-negative';
                 const changeSign = stock.change_pct >= 0 ? '+' : '';
+                
+                
+                // 1分钟涨速 - 确保字段名正确
+                const changeRate1min = stock.change_rate_1min || 0;
+                
+                // 2分钟成交额 - 确保字段名正确  
+                const amount2min = stock.amount_2min || 0;
+                
+                // 格式化高级指标显示
+                const changeRate1minDisplay = changeRate1min !== 0 ? 
+                    `${changeRate1min >= 0 ? '+' : ''}${changeRate1min.toFixed(2)}%` : '--';
+                
+                const amount2minDisplay = amount2min !== 0 ? 
+                    this.formatNumber(amount2min) : '--';
+                
+                // 设置高级指标样式
+                const changeRate1minClass = changeRate1min >= 0 ? 'change-positive' : 'change-negative';
                 
                 row.innerHTML = `
                     <div class="stock-name">${stock.name}</div>
                     <div class="stock-code">${stock.code}</div>
                     <div class="${changeClass}">${changeSign}${(stock.change_pct * 100).toFixed(2)}%</div>
                     <div>${stock.price ? stock.price.toFixed(2) : '--'}</div>
+                    <div class="${changeRate1minClass} advanced-value">${changeRate1minDisplay}</div>
+                    <div class="advanced-value">${amount2minDisplay}</div>
                     <div>${this.formatNumber(stock.volume)}</div>
                     <div>${this.formatNumber(stock.market_cap)}</div>
                 `;
@@ -3707,10 +3784,23 @@
                     let aVal = a[this.stockSort.field] || 0;
                     let bVal = b[this.stockSort.field] || 0;
                     
+                    // 处理特殊字段
+                    if (this.stockSort.field === 'advanced_1min') {
+                        aVal = a.change_rate_1min || 0;
+                        bVal = b.change_rate_1min || 0;
+                    } else if (this.stockSort.field === 'advanced_2min') {
+                        aVal = a.amount_2min || 0;
+                        bVal = b.amount_2min || 0;
+                    }
+                    
                     if (this.stockSort.field === 'name' || this.stockSort.field === 'code') {
                         return this.stockSort.direction === 'desc' ? 
                             bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
                     }
+                    
+                    // 数值字段比较
+                    aVal = parseFloat(aVal) || 0;
+                    bVal = parseFloat(bVal) || 0;
                     
                     if (this.stockSort.direction === 'desc') {
                         return bVal - aVal;
@@ -3761,6 +3851,8 @@
                         <div class="stock-header-item ${getSortClass('code')}" onclick="plateMonitor.sortStocks('code')">代码</div>
                         <div class="stock-header-item ${getSortClass('change_pct')}" onclick="plateMonitor.sortStocks('change_pct')">涨跌幅</div>
                         <div class="stock-header-item ${getSortClass('price')}" onclick="plateMonitor.sortStocks('price')">最新价</div>
+                        <div class="stock-header-item" onclick="plateMonitor.sortStocks('advanced_1min')">1分速</div>
+                        <div class="stock-header-item" onclick="plateMonitor.sortStocks('advanced_2min')">2分额</div>
                         <div class="stock-header-item ${getSortClass('volume')}" onclick="plateMonitor.sortStocks('volume')">成交额</div>
                         <div class="stock-header-item ${getSortClass('market_cap')}" onclick="plateMonitor.sortStocks('market_cap')">市值</div>
                     </div>
@@ -4119,22 +4211,31 @@
             sortCurrentPlates() {
                 if (!this.currentPlates.length) return;
                 
-                const checksum = this.currentPlates
-                    .map(p => p[this.currentSort.field] || 0)
-                    .join(',');
-                    
-                if (checksum === this.lastSortChecksum) return;
-                
                 this.currentPlates.sort((a, b) => {
-                    let aVal = a[this.currentSort.field] || 0;
-                    let bVal = b[this.currentSort.field] || 0;
+                    let aVal = 0;
+                    let bVal = 0;
                     
-                    if (this.currentSort.field === 'name') {
+                    // 处理特殊字段 - 修复部分
+                    if (this.currentSort.field === 'advanced_1min') {
+                        // 直接使用plate对象的属性，而不是advanced_indicators
+                        aVal = a.avg_change_rate_1min || a.change_rate_1min || 0;
+                        bVal = b.avg_change_rate_1min || b.change_rate_1min || 0;
+                    } else if (this.currentSort.field === 'advanced_2min') {
+                        aVal = a.total_amount_2min || a.amount_2min || 0;
+                        bVal = b.total_amount_2min || b.amount_2min || 0;
+                    } else if (this.currentSort.field === 'name') {
                         aVal = a.name || '';
                         bVal = b.name || '';
                         return this.currentSort.direction === 'desc' ? 
                             bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+                    } else {
+                        aVal = a[this.currentSort.field] || 0;
+                        bVal = b[this.currentSort.field] || 0;
                     }
+                    
+                    // 确保数值类型
+                    aVal = parseFloat(aVal) || 0;
+                    bVal = parseFloat(bVal) || 0;
                     
                     if (this.currentSort.direction === 'desc') {
                         return bVal - aVal;
@@ -4142,8 +4243,6 @@
                         return aVal - bVal;
                     }
                 });
-                
-                this.lastSortChecksum = checksum;
             }
             
             updateDisplayedPlates() {
@@ -4164,10 +4263,31 @@
                 });
             }
             
+            // 修改板块行渲染
             updatePlateElement(element, plate) {
                 let hasChanged = false;
                 const changeClass = plate.change_pct >= 0 ? 'change-positive' : 'change-negative';
                 const changeSign = plate.change_pct >= 0 ? '+' : '';
+                
+                // 获取板块高级指标
+                const advancedIndicators = plate || {};
+                
+                // 1分钟涨速
+                const changeRate1min = advancedIndicators.avg_change_rate_1min || 
+                                    advancedIndicators.change_rate_1min || 0;
+                
+                // 2分钟成交额
+                const amount2min = advancedIndicators.total_amount_2min || 
+                                advancedIndicators.amount_2min || 0;
+                
+                // 格式化显示
+                const changeRate1minDisplay = changeRate1min !== 0 ? 
+                    `${changeRate1min >= 0 ? '+' : ''}${changeRate1min.toFixed(2)}%` : '--';
+                
+                const amount2minDisplay = amount2min !== 0 ? 
+                    this.formatNumber(amount2min) : '--';
+                
+                const changeRate1minClass = changeRate1min >= 0 ? 'change-positive' : 'change-negative';
                 
                 const changeElement = element.querySelector('.change-value');
                 if (changeElement) {
@@ -4181,48 +4301,32 @@
                     }
                 }
                 
-                const volumeElement = element.querySelector('.volume-value');
-                if (volumeElement) {
-                    const newVolume = this.formatNumber(plate.total_volume);
-                    if (volumeElement.textContent !== newVolume) {
-                        volumeElement.textContent = newVolume;
-                        volumeElement.classList.add('value-updated');
-                        setTimeout(() => volumeElement.classList.remove('value-updated'), 1000);
+                // 更新高级指标显示
+                const changeRateElement = element.querySelector('.advanced-value.change-rate');
+                if (changeRateElement) {
+                    if (changeRateElement.textContent !== changeRate1minDisplay) {
+                        changeRateElement.textContent = changeRate1minDisplay;
+                        changeRateElement.className = `advanced-value change-rate ${changeRate1minClass}`;
+                        changeRateElement.classList.add('value-updated');
+                        setTimeout(() => changeRateElement.classList.remove('value-updated'), 1000);
                         hasChanged = true;
                     }
                 }
                 
-                const netElement = element.querySelector('.net-value');
-                if (netElement) {
-                    const newNet = this.formatNumber(plate.total_large_net);
-                    if (netElement.textContent !== newNet) {
-                        netElement.textContent = newNet;
-                        netElement.className = `net-value ${plate.total_large_net >= 0 ? 'change-positive' : 'change-negative'}`;
-                        netElement.classList.add('value-updated');
-                        setTimeout(() => netElement.classList.remove('value-updated'), 1000);
+                const amountElement = element.querySelector('.advanced-value.amount');
+                if (amountElement) {
+                    if (amountElement.textContent !== amount2minDisplay) {
+                        amountElement.textContent = amount2minDisplay;
+                        amountElement.classList.add('value-updated');
+                        setTimeout(() => amountElement.classList.remove('value-updated'), 1000);
                         hasChanged = true;
                     }
                 }
                 
-                const riseFallElement = element.querySelector('.rise-fall-value');
-                if (riseFallElement) {
-                    const newRiseFall = `<span class="change-positive">${plate.rise_count || 0}↑</span> / <span class="change-negative">${plate.fall_count || 0}↓</span>`;
-                    if (riseFallElement.innerHTML !== newRiseFall) {
-                        riseFallElement.innerHTML = newRiseFall;
-                        hasChanged = true;
-                    }
-                }
-                
-                const stockElement = element.querySelector('.stock-value');
-                if (stockElement) {
-                    const newStockCount = plate.stock_count || 0;
-                    if (stockElement.textContent !== newStockCount.toString()) {
-                        stockElement.textContent = newStockCount;
-                        hasChanged = true;
-                    }
-                }
+                return hasChanged;
             }
             
+            // 在 renderPlatesTable 方法中修改表头
             renderPlatesTable() {
                 const container = this.domCache.platesContainer;
                 this.plateElements.clear();
@@ -4241,6 +4345,8 @@
                             <div class="plate-header-item ${this.getSortClass('total_volume')}" onclick="plateMonitor.sortPlates('total_volume')">成交额</div>
                             <div class="plate-header-item ${this.getSortClass('total_large_net')}" onclick="plateMonitor.sortPlates('total_large_net')">主力净额</div>
                             <div class="plate-header-item ${this.getSortClass('rise_count')}" onclick="plateMonitor.sortPlates('rise_count')">涨/跌</div>
+                            <div class="plate-header-item " onclick="plateMonitor.sortPlates('advanced_1min')">1分速</div>
+                            <div class="plate-header-item " onclick="plateMonitor.sortPlates('advanced_2min')">2分额</div>
                             <div class="plate-header-item ${this.getSortClass('stock_count')}" onclick="plateMonitor.sortPlates('stock_count')">成分股</div>
                         </div>
                 `);
@@ -4252,6 +4358,19 @@
                     const mainNet = this.formatNumber(plate.total_large_net);
                     const isSelected = this.selectedPlate && this.selectedPlate.id === plate.id;
                     const rowClass = isSelected ? 'plate-row plate-selected' : 'plate-row';
+                    
+                    // 获取高级指标数据
+                    const advancedIndicators = plate || {};
+                    const changeRate1min = advancedIndicators.change_rate_1min || 0;
+                    const amount2min = advancedIndicators.total_amount_2min || 0;
+                    
+                    // 格式化高级指标显示
+                    const changeRate1minDisplay = changeRate1min !== 0 ? 
+                        `${changeRate1min >= 0 ? '+' : ''}${changeRate1min.toFixed(2)}%` : '--';
+                    const amount2minDisplay = amount2min !== 0 ? 
+                        this.formatNumber(amount2min) : '--';
+                    
+                    const changeRate1minClass = changeRate1min >= 0 ? 'change-positive' : 'change-negative';
                     
                     htmlParts.push(`
                         <div class="${rowClass}" data-plate-id="${plate.id}" onclick="plateMonitor.selectPlate(${JSON.stringify(plate).replace(/"/g, '&quot;')})">
@@ -4271,6 +4390,10 @@
                                     <span class="change-negative">${plate.fall_count || 0}↓</span>
                                 </span>
                             </div>
+                            <div>
+                                <span class="advanced-value change-rate ${changeRate1minClass}">${changeRate1minDisplay}</span>
+                            </div>
+                            <div><span class="advanced-value amount">${amount2minDisplay}</span></div>
                             <div><span class="stock-value">${plate.stock_count || 0}</span></div>
                         </div>
                     `);
@@ -4279,6 +4402,7 @@
                 htmlParts.push('</div>');
                 container.innerHTML = htmlParts.join('');
                 
+                // 缓存元素引用
                 this.displayedPlates.forEach(plate => {
                     const element = container.querySelector(`[data-plate-id="${plate.id}"]`);
                     if (element) {
@@ -4473,7 +4597,7 @@
             
             getSortClass(field) {
                 if (this.currentSort.field === field) {
-                    return this.stockSort.direction === 'desc' ? 'sort-desc' : 'sort-asc';
+                    return this.currentSort.direction === 'desc' ? 'sort-desc' : 'sort-asc';
                 }
                 return '';
             }
@@ -4536,12 +4660,15 @@
                     'total_volume': '成交额', 
                     'total_large_net': '主力净额',
                     'rise_count': '上涨家数',
-                    'name': '名称'
+                    'name': '名称',
+                    'stock_count': '成分股数量',
+                    'advanced_1min': '1分钟涨速',
+                    'advanced_2min': '2分钟成交额'
                 };
                 
                 const direction = this.currentSort.direction === 'desc' ? '降序' : '升序';
                 document.getElementById('sortInfo').textContent = 
-                    `按${fieldNames[this.currentSort.field]}${direction}排序`;
+                    `按${fieldNames[this.currentSort.field] || this.currentSort.field}${direction}排序`;
             }
             
             updatePlateTypeButton() {

@@ -499,7 +499,7 @@ class LazyPlateUpdater:
         return sub_metrics
     
     def get_plate_stocks(self, plate_id: str) -> List[Dict]:
-        """获取板块个股数据 - 从Redis获取实际数据"""
+        """获取板块个股数据 - 从Redis获取实际数据，包含高级指标"""
         stock_ids = self.plate_to_stocks.get(plate_id, [])
         
         if not stock_ids:
@@ -508,10 +508,14 @@ class LazyPlateUpdater:
         stocks = []
         found_count = 0
         
+        # 批量获取股票基础数据
         for stock_id in stock_ids:
             stock_data = self.redis_storage.get_stock_data(stock_id)
             
             if stock_data:
+                # 获取高级指标
+                advanced_indicators = self.redis_storage.get_stock_advanced_indicators(stock_id)
+                
                 formatted_stock = {
                     'code': stock_id,
                     'name': stock_data.get('name', f"股票{stock_id}"),
@@ -520,7 +524,9 @@ class LazyPlateUpdater:
                     'volume': stock_data.get('volume', 0),
                     'market_cap': stock_data.get('market_cap', 0),
                     'large_net': stock_data.get('large_net', 0),
-                    'timestamp': stock_data.get('timestamp', 0)
+                    'timestamp': stock_data.get('timestamp', 0),
+                    # 添加高级指标
+                    'advanced_indicators': advanced_indicators
                 }
                 stocks.append(formatted_stock)
                 found_count += 1
@@ -528,6 +534,7 @@ class LazyPlateUpdater:
         # 按涨跌幅排序
         stocks.sort(key=lambda x: x.get('change_pct', 0), reverse=True)
         
+        logger.debug(f"📊 获取板块 {plate_id} 个股: {found_count}/{len(stock_ids)} 只股票, 包含高级指标: {len([s for s in stocks if s.get('advanced_indicators')])} 只")
         return stocks
     
     def get_plate_hierarchy(self):
@@ -558,8 +565,345 @@ class LazyPlateUpdater:
         
         stocks = self.get_plate_stocks(plate_id)
         logger.info(f"📊 最终返回: {len(stocks)} 只股票数据")
-
-
+class OptimizedPlateUpdater(LazyPlateUpdater):
+    """优化版板块更新器 - 批量获取数据"""
+    
+    def __init__(self, plate_file: str, relation_file: str, redis_url: str = "redis://localhost:6379"):
+        super().__init__(plate_file, relation_file, redis_url)
+        self.all_stocks_cache = {}  # 缓存所有个股数据
+        self.last_all_stocks_update = 0
+        self.cache_ttl = 5  # 缓存5秒
+    
+    def refresh_all_stocks_data(self) -> Dict[str, Dict]:
+        """批量刷新所有个股数据"""
+        current_time = time.time()
+        
+        # 检查缓存是否有效
+        if (current_time - self.last_all_stocks_update) < self.cache_ttl and self.all_stocks_cache:
+            return self.all_stocks_cache
+        
+        # 获取所有股票代码
+        all_stock_ids = list(self.stock_to_plates.keys())
+        
+        if not all_stock_ids:
+            return {}
+        
+        # 批量获取所有股票数据
+        all_stocks_data = {}
+        batch_size = 500  # 分批处理，避免内存过大
+        
+        for i in range(0, len(all_stock_ids), batch_size):
+            batch_ids = all_stock_ids[i:i + batch_size]
+            
+            # 批量获取基础数据
+            for stock_id in batch_ids:
+                stock_data = self.redis_storage.get_stock_data(stock_id)
+                if stock_data:
+                    all_stocks_data[stock_id] = {
+                        'basic': stock_data,
+                        'advanced': self.redis_storage.get_stock_advanced_indicators(stock_id)
+                    }
+        
+        self.all_stocks_cache = all_stocks_data
+        self.last_all_stocks_update = current_time
+        
+        logger.info(f"🔄 批量刷新 {len(all_stocks_data)} 只股票数据")
+        return all_stocks_data
+    
+    def get_all_plate_metrics_optimized(self) -> List[Dict]:
+        """优化版获取所有板块指标"""
+        # 先批量获取所有个股数据
+        all_stocks_data = self.refresh_all_stocks_data()
+        
+        # 初始化板块统计
+        plate_stats = {}
+        for plate_id in self.all_plates:
+            plate_stats[plate_id] = {
+                'total_change': 0.0,
+                'total_volume': 0,
+                'total_large_net': 0,
+                'rise_count': 0,
+                'fall_count': 0,
+                'stock_count': 0,
+                'valid_stocks': 0,
+                # 高级指标
+                'change_rates_1min': [],
+                'amounts_2min': []
+            }
+        
+        # 遍历所有个股，累加到对应板块
+        for stock_id, stock_data in all_stocks_data.items():
+            basic_data = stock_data.get('basic', {})
+            advanced_data = stock_data.get('advanced', {})
+            
+            # 获取该股票所属的所有板块
+            plate_ids = self.stock_to_plates.get(stock_id, [])
+            
+            for plate_id in plate_ids:
+                if plate_id not in plate_stats:
+                    continue
+                    
+                stats = plate_stats[plate_id]
+                
+                # 基础指标
+                change_pct = basic_data.get('change_pct', 0.0)
+                volume = basic_data.get('volume', 0)
+                large_net = basic_data.get('large_net', 0)
+                
+                stats['total_change'] += change_pct
+                stats['total_volume'] += volume
+                stats['total_large_net'] += large_net
+                stats['stock_count'] += 1
+                
+                if change_pct > 0:
+                    stats['rise_count'] += 1
+                elif change_pct < 0:
+                    stats['fall_count'] += 1
+                
+                # 高级指标
+                change_rate_1min = advanced_data.get('change_rate_1min')
+                amount_2min = advanced_data.get('amount_2min')
+                
+                if change_rate_1min is not None:
+                    stats['change_rates_1min'].append(change_rate_1min)
+                    stats['valid_stocks'] += 1
+                
+                if amount_2min is not None:
+                    stats['amounts_2min'].append(amount_2min)
+        
+        # 计算最终板块指标
+        plate_metrics = []
+        for plate_id, stats in plate_stats.items():
+            plate_info = self.all_plates.get(plate_id, {})
+            
+            # 计算平均涨跌幅
+            if stats['stock_count'] > 0:
+                avg_change = stats['total_change'] / stats['stock_count']
+            else:
+                avg_change = 0.0
+            
+            # 计算高级指标
+            if stats['change_rates_1min']:
+                avg_change_rate_1min = np.mean(stats['change_rates_1min'])
+                total_amount_2min = np.sum(stats['amounts_2min'])
+            else:
+                avg_change_rate_1min = 0.0
+                total_amount_2min = 0
+            
+            metrics = {
+                'id': plate_id,
+                'name': plate_info.get('name', '未知板块'),
+                'change_pct': avg_change,
+                'total_volume': stats['total_volume'],
+                'total_large_net': stats['total_large_net'],
+                'rise_count': stats['rise_count'],
+                'fall_count': stats['fall_count'],
+                'stock_count': stats['stock_count'],
+                'type': plate_info.get('type', 'unknown'),
+                'market_cap': plate_info.get('market_cap', 0),
+                'timestamp': int(time.time()),
+                'advanced_indicators': {
+                    'avg_change_rate_1min': round(avg_change_rate_1min, 4),
+                    'total_amount_2min': round(total_amount_2min, 2),
+                    'valid_stocks': stats['valid_stocks'],
+                    'data_source': 'batch_optimized'
+                }
+            }
+            plate_metrics.append(metrics)
+        
+        logger.info(f"📊 优化计算完成: {len(plate_metrics)} 个板块")
+        return plate_metrics
+    
+    def get_plate_stocks_optimized(self, plate_id: str) -> List[Dict]:
+        """优化版获取板块个股数据"""
+        # 使用缓存数据
+        all_stocks_data = self.refresh_all_stocks_data()
+        stock_ids = self.plate_to_stocks.get(plate_id, [])
+        
+        stocks = []
+        for stock_id in stock_ids:
+            if stock_id in all_stocks_data:
+                stock_data = all_stocks_data[stock_id]
+                basic_data = stock_data.get('basic', {})
+                advanced_data = stock_data.get('advanced', {})
+                
+                formatted_stock = {
+                    'code': stock_id,
+                    'name': basic_data.get('name', f"股票{stock_id}"),
+                    'change_pct': basic_data.get('change_pct', 0.0),
+                    'price': basic_data.get('price', 0.0),
+                    'volume': basic_data.get('volume', 0),
+                    'market_cap': basic_data.get('market_cap', 0),
+                    'large_net': basic_data.get('large_net', 0),
+                    'timestamp': basic_data.get('timestamp', 0),
+                    'advanced_indicators': advanced_data
+                }
+                stocks.append(formatted_stock)
+        
+        # 按涨跌幅排序
+        stocks.sort(key=lambda x: x.get('change_pct', 0), reverse=True)
+        
+        logger.debug(f"📊 优化获取板块 {plate_id} 个股: {len(stocks)} 只股票")
+        return stocks
+class OptimizedEnhancedPlateUpdater(OptimizedPlateUpdater):
+    """优化版增强板块更新器 - 整合高级指标到列表更新"""
+    
+    def __init__(self, plate_csv_path: str, stock_plate_csv_path: str, 
+                 redis_storage: RedisStorageManager):
+        super().__init__(plate_csv_path, stock_plate_csv_path)
+        self.redis_storage = redis_storage
+        self.plate_advanced_cache = {}  # 板块高级指标缓存
+        
+    def get_all_plate_metrics_with_integrated_advanced(self) -> List[Dict]:
+        """获取所有板块指标（整合高级指标）- 使用Redis聚合"""
+        try:
+            # 1. 批量获取所有个股数据
+            all_stocks_data = self.refresh_all_stocks_data()
+            
+            # 2. 初始化板块统计结构
+            plate_stats = {}
+            for plate_id in self.all_plates:
+                plate_stats[plate_id] = {
+                    'total_change': 0.0,
+                    'total_volume': 0,
+                    'total_large_net': 0,
+                    'rise_count': 0,
+                    'fall_count': 0,
+                    'stock_count': 0,
+                    'valid_stocks': 0,
+                    # 高级指标聚合
+                    'change_rates_1min': [],
+                    'amounts_2min': [],
+                    'total_amount_2min': 0
+                }
+            
+            # 3. 遍历所有个股，聚合到板块
+            for stock_id, stock_data in all_stocks_data.items():
+                basic_data = stock_data.get('basic', {})
+                advanced_data = stock_data.get('advanced', {})
+                
+                # 获取该股票所属的所有板块
+                plate_ids = self.stock_to_plates.get(stock_id, [])
+                
+                for plate_id in plate_ids:
+                    if plate_id not in plate_stats:
+                        continue
+                        
+                    stats = plate_stats[plate_id]
+                    
+                    # 基础指标聚合
+                    change_pct = basic_data.get('change_pct', 0.0)
+                    volume = basic_data.get('volume', 0)
+                    large_net = basic_data.get('large_net', 0)
+                    
+                    stats['total_change'] += change_pct
+                    stats['total_volume'] += volume
+                    stats['total_large_net'] += large_net
+                    stats['stock_count'] += 1
+                    
+                    if change_pct > 0:
+                        stats['rise_count'] += 1
+                    elif change_pct < 0:
+                        stats['fall_count'] += 1
+                    
+                    # 高级指标聚合
+                    change_rate_1min = advanced_data.get('change_rate_1min')
+                    amount_2min = advanced_data.get('amount_2min')
+                    
+                    if change_rate_1min is not None:
+                        stats['change_rates_1min'].append(change_rate_1min)
+                        stats['valid_stocks'] += 1
+                    
+                    if amount_2min is not None:
+                        stats['amounts_2min'].append(amount_2min)
+                        stats['total_amount_2min'] += amount_2min
+            
+            # 4. 计算最终板块指标（包含高级指标）
+            plate_metrics = []
+            for plate_id, stats in plate_stats.items():
+                plate_info = self.all_plates.get(plate_id, {})
+                
+                # 计算平均涨跌幅
+                if stats['stock_count'] > 0:
+                    avg_change = stats['total_change'] / stats['stock_count']
+                else:
+                    avg_change = 0.0
+                
+                # 计算高级指标
+                advanced_indicators = self._calculate_plate_advanced_from_stats(stats)
+                
+                # 构建完整的板块指标
+                metrics = {
+                    'id': plate_id,
+                    'name': plate_info.get('name', '未知板块'),
+                    'change_pct': round(avg_change, 4),
+                    'total_volume': stats['total_volume'],
+                    'total_large_net': stats['total_large_net'],
+                    'rise_count': stats['rise_count'],
+                    'fall_count': stats['fall_count'],
+                    'stock_count': stats['stock_count'],
+                    'type': plate_info.get('type', 'unknown'),
+                    'market_cap': plate_info.get('market_cap', 0),
+                    'timestamp': int(time.time()),
+                    # 直接整合高级指标
+                    'change_rate_1min': advanced_indicators.get('avg_change_rate_1min', 0),
+                    'total_amount_2min': advanced_indicators.get('total_amount_2min', 0),
+                    'valid_stocks': advanced_indicators.get('valid_stocks', 0),
+                    'data_source': 'integrated'
+                }
+                plate_metrics.append(metrics)
+            
+            # 5. 批量更新到Redis（一次性）
+            self._batch_update_plate_metrics_to_redis(plate_metrics)
+            
+            logger.info(f"📊 整合计算完成: {len(plate_metrics)} 个板块")
+            return plate_metrics
+            
+        except Exception as e:
+            logger.error(f"❌ 整合计算板块指标失败: {e}")
+            return []
+    
+    def _calculate_plate_advanced_from_stats(self, stats: Dict) -> Dict:
+        """从统计数据计算板块高级指标"""
+        if not stats['change_rates_1min']:
+            return {
+                'avg_change_rate_1min': 0.0,
+                'total_amount_2min': 0,
+                'valid_stocks': 0
+            }
+        
+        return {
+            'avg_change_rate_1min': round(np.mean(stats['change_rates_1min']), 4),
+            'total_amount_2min': round(stats['total_amount_2min'], 2),
+            'valid_stocks': stats['valid_stocks']
+        }
+    
+    def _batch_update_plate_metrics_to_redis(self, plate_metrics: List[Dict]):
+        """批量更新板块指标到Redis"""
+        try:
+            pipeline = self.redis_storage.redis.pipeline()
+            
+            for metrics in plate_metrics:
+                # 存储完整指标（包含高级指标）
+                key = f"plate:metrics:{metrics['id']}"
+                pipeline.hset(key, mapping={
+                    'change_pct': str(metrics['change_pct']),
+                    'total_volume': str(metrics['total_volume']),
+                    'total_large_net': str(metrics['total_large_net']),
+                    'rise_count': str(metrics['rise_count']),
+                    'fall_count': str(metrics['fall_count']),
+                    'stock_count': str(metrics['stock_count']),
+                    'change_rate_1min': str(metrics.get('change_rate_1min', 0)),
+                    'total_amount_2min': str(metrics.get('total_amount_2min', 0)),
+                    'timestamp': str(metrics['timestamp'])
+                })
+                pipeline.expire(key, 30)  # 30秒过期
+            
+            pipeline.execute()
+            logger.debug(f"💾 批量更新 {len(plate_metrics)} 个板块指标到Redis")
+            
+        except Exception as e:
+            logger.error(f"❌ 批量更新Redis失败: {e}")
 class PlateDataSimulator:
     """板块数据模拟器 - 适配优化版本"""
     

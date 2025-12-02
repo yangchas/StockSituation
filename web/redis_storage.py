@@ -4,7 +4,7 @@ import time
 import zlib
 from typing import Dict, List, Optional, Any
 import logging
-
+import numpy as np
 logger = logging.getLogger(__name__)
 
 class RedisStorageManager:
@@ -31,11 +31,29 @@ class RedisStorageManager:
         self.BASE_INFO_TTL = 86400 * 7 # 基础信息7天
         self.CACHE_TTL = 300           # 通用缓存5分钟
     
+    def _convert_numpy_types(self, obj):
+        """将numpy类型转换为Python原生类型"""
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        else:
+            return obj
+
     def _compress_data(self, data: Any) -> str:
         """压缩数据"""
+        # 先转换numpy类型为Python原生类型，确保可以JSON序列化
+        converted_data = self._convert_numpy_types(data)
+        
         if not self.compression:
-            return json.dumps(data, ensure_ascii=False)
-        return zlib.compress(json.dumps(data, ensure_ascii=False).encode()).hex()
+            return json.dumps(converted_data, ensure_ascii=False)
+        return zlib.compress(json.dumps(converted_data, ensure_ascii=False).encode()).hex()
     
     def _decompress_data(self, compressed_data: str) -> Any:
         """解压数据"""
@@ -43,19 +61,186 @@ class RedisStorageManager:
             return json.loads(compressed_data)
         return json.loads(zlib.decompress(bytes.fromhex(compressed_data)))
     
-    # ==================== 新增通用缓存方法 ====================
+    # ==================== 新增：个股高级指标获取方法 ====================
+    
+    def get_stock_advanced_indicators(self, symbol: str) -> Dict[str, Any]:
+        """
+        从Redis获取个股高级技术指标（包含1分钟涨速和2分钟成交额）
+        
+        Args:
+            symbol: 股票代码
+            
+        Returns:
+            Dict: 包含高级指标的字典
+        """
+        try:
+            # 使用C++存储的格式
+            key = f"stock:quote:{symbol}"
+            stock_data = self.redis.hgetall(key)
+            
+            if not stock_data:
+                return {}
+            
+            # 转换数据类型
+            indicators = {}
+            for field, value in stock_data.items():
+                field_str = field.decode('utf-8') if isinstance(field, bytes) else field
+                value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                
+                # 根据字段名转换数据类型
+                if field_str in ['price', 'change_pct', 'change_rate_1min']:
+                    indicators[field_str] = float(value_str) if value_str else 0.0
+                elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
+                    # amount_2min 可能是浮点数，但这里按整数处理，如果需要可单独处理
+                    indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
+                else:
+                    indicators[field_str] = value_str
+            
+            # 确保包含所有必需字段，提供默认值
+            required_fields = {
+                'change_rate_1min': 0.0,  # 1分钟涨速
+                'amount_2min': 0,         # 2分钟成交额
+                'price': 0.0,             # 当前价格
+                'change_pct': 0.0,        # 涨跌幅
+                'volume': 0,              # 成交量
+                'amount': 0,              # 成交额
+                'large_net': 0,           # 大单净额
+                'timestamp': 0,           # 时间戳
+                'name': f"股票{symbol}",   # 股票名称
+                'market_cap': 0           # 市值
+            }
+            
+            for field, default_value in required_fields.items():
+                if field not in indicators:
+                    indicators[field] = default_value
+            
+            logger.debug(f"✅ 获取个股高级指标: {symbol}, 1分钟涨速: {indicators.get('change_rate_1min', 0)}, 2分钟成交额: {indicators.get('amount_2min', 0)}")
+            return indicators
+            
+        except Exception as e:
+            logger.error(f"❌ 获取个股高级指标失败 {symbol}: {e}")
+            return {}
+    
+    def batch_get_stocks_advanced_indicators(self, symbols: List[str]) -> Dict[str, Dict]:
+        """
+        批量获取多个股票的高级指标
+        
+        Args:
+            symbols: 股票代码列表
+            
+        Returns:
+            Dict: {symbol: 高级指标字典}
+        """
+        try:
+            pipeline = self.redis.pipeline()
+            
+            # 批量获取
+            for symbol in symbols:
+                key = f"stock:quote:{symbol}"
+                pipeline.hgetall(key)
+            
+            results = pipeline.execute()
+            indicators_dict = {}
+            
+            for i, symbol in enumerate(symbols):
+                stock_data = results[i]
+                if stock_data:
+                    # 转换数据类型
+                    indicators = {}
+                    for field, value in stock_data.items():
+                        field_str = field.decode('utf-8') if isinstance(field, bytes) else field
+                        value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                        
+                        if field_str in ['price', 'change_pct', 'change_rate_1min']:
+                            indicators[field_str] = float(value_str) if value_str else 0.0
+                        elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
+                            indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
+                        else:
+                            indicators[field_str] = value_str
+                    
+                    # 确保包含高级指标字段
+                    if 'change_rate_1min' not in indicators:
+                        indicators['change_rate_1min'] = 0.0
+                    if 'amount_2min' not in indicators:
+                        indicators['amount_2min'] = 0
+                    
+                    indicators_dict[symbol] = indicators
+            
+            # logger.info(f"✅ 批量获取 {len(indicators_dict)}/{len(symbols)} 只股票的高级指标")
+            return indicators_dict
+            
+        except Exception as e:
+            logger.error(f"❌ 批量获取股票高级指标失败: {e}")
+            return {}
+    
+    # ==================== 新增：板块高级指标计算方法 ====================
+    
+    def calculate_plate_advanced_indicators(self, plate_stocks: List[str]) -> Dict[str, Any]:
+        """
+        计算板块的高级技术指标（基于板块内个股的Redis数据）
+        
+        Args:
+            plate_stocks: 板块成分股代码列表
+            
+        Returns:
+            Dict: 板块高级指标
+        """
+        try:
+            if not plate_stocks:
+                return {}
+            
+            # 批量获取板块内所有股票的高级指标
+            stocks_indicators = self.batch_get_stocks_advanced_indicators(plate_stocks)
+            
+            plate_change_rates = []
+            plate_amounts_2min = []
+            valid_stocks = 0
+            
+            for symbol, indicators in stocks_indicators.items():
+                change_rate = indicators.get('change_rate_1min', 0)
+                amount_2min = indicators.get('amount_2min', 0)
+                
+                # 只使用有效数据
+                if change_rate is not None:
+                    plate_change_rates.append(change_rate)
+                    plate_amounts_2min.append(amount_2min)
+                    valid_stocks += 1
+            
+            if not plate_change_rates:
+                return {}
+            
+            # 计算板块整体指标
+            
+            avg_change_rate = np.mean(plate_change_rates)
+            total_amount_2min = np.sum(plate_amounts_2min)
+            
+            # 计算涨跌家数
+            rise_count = sum(1 for rate in plate_change_rates if rate > 0)
+            fall_count = sum(1 for rate in plate_change_rates if rate < 0)
+            
+            result = {
+                'avg_change_rate_1min': round(avg_change_rate, 4),  # 板块平均1分钟涨速
+                'total_amount_2min': round(total_amount_2min, 2),   # 板块2分钟总成交额
+                'rise_count': rise_count,                           # 上涨家数
+                'fall_count': fall_count,                           # 下跌家数
+                'flat_count': valid_stocks - rise_count - fall_count, # 平盘家数
+                'total_stocks': valid_stocks,                       # 有效股票数量
+                'update_time': time.time(),
+                'data_source': 'redis_aggregated'
+            }
+            
+            logger.debug(f"✅ 计算板块高级指标: 股票数{valid_stocks}, 平均涨速{avg_change_rate:.4f}, 总成交额{total_amount_2min:.2f}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ 计算板块高级指标失败: {e}")
+            return {}
+    
+    # ==================== 原有的通用缓存方法 ====================
     
     def store_data(self, key: str, data: Any, expire_seconds: int = None) -> bool:
         """
         存储通用数据到缓存
-        
-        Args:
-            key: 缓存键
-            data: 要存储的数据（可序列化的任何数据）
-            expire_seconds: 过期时间（秒），默认使用CACHE_TTL
-            
-        Returns:
-            bool: 是否存储成功
         """
         try:
             if expire_seconds is None:
@@ -74,12 +259,6 @@ class RedisStorageManager:
     def get_data(self, key: str) -> Any:
         """
         从缓存获取通用数据
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            Any: 缓存的数据，如果不存在或出错返回None
         """
         try:
             cache_key = f"{self.CACHE_PREFIX}{key}"
@@ -97,12 +276,6 @@ class RedisStorageManager:
     def delete_data(self, key: str) -> bool:
         """
         删除缓存数据
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            bool: 是否删除成功
         """
         try:
             cache_key = f"{self.CACHE_PREFIX}{key}"
@@ -114,12 +287,6 @@ class RedisStorageManager:
     def exists_data(self, key: str) -> bool:
         """
         检查缓存数据是否存在
-        
-        Args:
-            key: 缓存键
-            
-        Returns:
-            bool: 是否存在
         """
         try:
             cache_key = f"{self.CACHE_PREFIX}{key}"
@@ -131,12 +298,6 @@ class RedisStorageManager:
     def get_cache_keys(self, pattern: str = "*") -> List[str]:
         """
         获取匹配模式的缓存键列表
-        
-        Args:
-            pattern: 匹配模式
-            
-        Returns:
-            List[str]: 缓存键列表
         """
         try:
             full_pattern = f"{self.CACHE_PREFIX}{pattern}"
@@ -150,12 +311,6 @@ class RedisStorageManager:
     def clear_cache_pattern(self, pattern: str = "*") -> int:
         """
         清除匹配模式的缓存数据
-        
-        Args:
-            pattern: 匹配模式
-            
-        Returns:
-            int: 删除的键数量
         """
         try:
             keys = self.get_cache_keys(pattern)
@@ -175,9 +330,6 @@ class RedisStorageManager:
     def get_cache_info(self) -> Dict[str, Any]:
         """
         获取缓存统计信息
-        
-        Returns:
-            Dict[str, Any]: 缓存统计信息
         """
         try:
             cache_keys = self.get_cache_keys()
@@ -193,7 +345,7 @@ class RedisStorageManager:
             logger.error(f"❌ 获取缓存统计信息失败: {e}")
             return {}
     
-    # ==================== 个股数据操作 ====================
+    # ==================== 原有的个股数据操作 ====================
     
     def start_pipeline(self):
         """开始批量操作"""
@@ -207,12 +359,6 @@ class RedisStorageManager:
                          pipeline: Optional[Any] = None) -> None:
         """
         更新个股数据和所属板块
-        
-        Args:
-            stock_id: 股票代码
-            data: 股票数据 {p:价格, c:涨跌幅, v:成交量, t:时间戳}
-            plates: 所属板块ID列表
-            pipeline: Redis管道对象
         """
         redis_client = pipeline or self.redis
         
@@ -346,16 +492,11 @@ class RedisStorageManager:
         plates_key = f"stock_plates:{stock_id}"
         return list(self.redis.smembers(plates_key))
     
-    # ==================== 板块数据操作 ====================
+    # ==================== 原有的板块数据操作 ====================
     
     def update_plate_metrics(self, plate_id: str, metrics: Dict, pipeline: Optional[Any] = None) -> None:
         """
         更新板块指标
-        
-        Args:
-            plate_id: 板块ID
-            metrics: 板块指标 {c:涨跌幅, v:总成交额, r:上涨家数, f:下跌家数, s:成分股数量, t:时间戳}
-            pipeline: Redis管道对象
         """
         redis_client = pipeline or self.redis
         
@@ -458,7 +599,7 @@ class RedisStorageManager:
         
         return stocks
     
-    # ==================== 板块层级关系操作 ====================
+    # ==================== 原有的板块层级关系操作 ====================
     
     def update_plate_hierarchy(self, main_plate_id: str, sub_plate_ids: List[str], 
                               pipeline: Optional[Any] = None) -> None:
@@ -510,7 +651,7 @@ class RedisStorageManager:
         self.execute_pipeline(pipeline)
         logger.info(f"✅ 初始化板块层级关系: {len(plate_hierarchy)} 个主板块")
     
-    # ==================== 工具方法 ====================
+    # ==================== 原有的工具方法 ====================
     
     def get_all_plate_metrics(self) -> List[Dict]:
         """获取所有板块指标（用于前端初始化）"""

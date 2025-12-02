@@ -12,9 +12,10 @@ import tablib
 from aiohttp import web
 from datetime import datetime, timedelta
 import baostock as bs
-# import taos  # 暂时注释以避免依赖问题
+import taos
+import numpy as np
 # 修改导入路径
-from plate_updater import LazyPlateUpdater, PlateDataSimulator
+from plate_updater import LazyPlateUpdater, PlateDataSimulator, OptimizedPlateUpdater, OptimizedEnhancedPlateUpdater
 from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,6 +27,209 @@ from typing import List, Set, Dict
 import holidays
 
 logger = logging.getLogger(__name__)
+
+class OptimizedAdvancedTechnicalIndicators:
+    """优化版高级技术指标服务 - 减少重复字段，降低计算频率"""
+    
+    def __init__(self, tdengine_service, redis_storage):
+        self.tdengine = tdengine_service
+        self.redis_storage = redis_storage
+        self.calculated_indicators = {}  # 缓存已计算的指标
+        self.last_calculation_time = {}  # 记录上次计算时间
+        
+    def get_stock_advanced_indicators_optimized(self, symbol: str, force_recalc: bool = False) -> Dict:
+        """获取个股的高级技术指标 - 优化版本"""
+        try:
+            # 检查缓存和是否需要重新计算
+            cache_key = f"advanced_indicators_{symbol}"
+            current_time = time.time()
+            
+            # 如果不在强制重算且缓存有效（5秒内），直接返回缓存
+            if not force_recalc and symbol in self.calculated_indicators:
+                last_time = self.last_calculation_time.get(symbol, 0)
+                if current_time - last_time < 5:  # 5秒缓存
+                    return self.calculated_indicators[symbol]
+            
+            # 从Redis获取基础数据
+            stock_data = self.redis_storage.get_stock_data(symbol)
+            if not stock_data:
+                return {}
+            
+            # 只计算必要的核心指标，避免重复字段
+            indicators = {
+                # 基础字段（直接从Redis获取）
+                'price': stock_data.get('price', 0),
+                'change_pct': stock_data.get('change_pct', 0),
+                'volume': stock_data.get('volume', 0),
+                'amount': stock_data.get('amount', 0),
+                
+                # 核心高级指标（避免重复计算）
+                'change_rate_1min': self._calculate_change_rate_1min(symbol),
+                'amount_2min': self._calculate_amount_2min(symbol),
+                
+                # 从Redis直接获取的大单净额
+                'large_net': stock_data.get('large_net', 0),
+                
+                # 元数据
+                'timestamp': current_time,
+                'update_count': 1  # 用于跟踪更新频率
+            }
+            
+            # 更新缓存
+            self.calculated_indicators[symbol] = indicators
+            self.last_calculation_time[symbol] = current_time
+            
+            # 存储到Redis（短期缓存）
+            self.redis_storage.store_data(
+                cache_key, indicators, expire_seconds=10
+            )
+            
+            return indicators
+            
+        except Exception as e:
+            logger.error(f"❌ 获取个股高级指标失败 {symbol}: {e}")
+            return {}
+    
+    def _calculate_change_rate_1min(self, symbol: str) -> float:
+        """计算1分钟涨速 - 优化版"""
+        try:
+            # 从TDengine获取最近2分钟的收盘价
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=2)
+            
+            # 使用更高效的查询
+            sql = f"""
+            SELECT LAST(lp) as current_price
+            FROM stock_data 
+            WHERE symbol = '{symbol}' 
+                AND ts >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
+                AND ts <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
+            """
+            
+            cursor = self.tdengine.execute_query(sql)
+            if not cursor:
+                return 0.0
+            
+            rows = cursor.fetchall()
+            if not rows or len(rows) < 2:
+                return 0.0
+            
+            # 计算涨速
+            if rows[0][0] and rows[1][0] and rows[1][0] > 0:
+                return ((rows[0][0] - rows[1][0]) / rows[1][0]) * 100
+            
+            return 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_amount_2min(self, symbol: str) -> float:
+        """计算2分钟成交额 - 优化版"""
+        try:
+            # 直接从Redis获取最近的数据，避免频繁查询数据库
+            cache_key = f"amount_2min_{symbol}"
+            cached = self.redis_storage.get_data(cache_key)
+            
+            if cached:
+                return float(cached)
+            
+            # 必要时从TDengine计算
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=2)
+            
+            sql = f"""
+            SELECT SUM(a) as total_amount
+            FROM stock_data 
+            WHERE symbol = '{symbol}' 
+                AND ts >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
+                AND ts <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
+            """
+            
+            cursor = self.tdengine.execute_query(sql)
+            if not cursor:
+                return 0.0
+            
+            rows = cursor.fetchall()
+            if rows and rows[0][0]:
+                amount = float(rows[0][0])
+                # 缓存结果
+                self.redis_storage.store_data(cache_key, amount, expire_seconds=60)
+                return amount
+            
+            return 0.0
+            
+        except Exception:
+            return 0.0
+    
+    def batch_get_stocks_advanced_indicators_optimized(self, symbols: List[str]) -> Dict[str, Dict]:
+        """批量获取个股高级指标 - 优化版本"""
+        try:
+            results = {}
+            
+            # 批量从Redis获取基础数据
+            pipeline = self.redis_storage.redis.pipeline()
+            for symbol in symbols:
+                pipeline.hgetall(f"stock:quote:{symbol}")
+            redis_results = pipeline.execute()
+            
+            # 批量计算必要的高级指标
+            for i, symbol in enumerate(symbols):
+                stock_data = redis_results[i]
+                if not stock_data:
+                    continue
+                
+                # 转换数据类型
+                decoded_data = {}
+                for field, value in stock_data.items():
+                    field_str = field.decode('utf-8') if isinstance(field, bytes) else field
+                    value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                    
+                    if field_str in ['price', 'change_pct', 'change_rate_1min']:
+                        decoded_data[field_str] = float(value_str) if value_str else 0.0
+                    elif field_str in ['volume', 'amount', 'large_net', 'timestamp']:
+                        decoded_data[field_str] = int(value_str) if value_str and '.' not in value_str else float(value_str) if value_str else 0
+                    else:
+                        decoded_data[field_str] = value_str
+                
+                # 构建结果（只包含核心字段）
+                results[symbol] = {
+                    'price': decoded_data.get('price', 0),
+                    'change_pct': decoded_data.get('change_pct', 0),
+                    'volume': decoded_data.get('volume', 0),
+                    'change_rate_1min': decoded_data.get('change_rate_1min', 0),
+                    'amount_2min': decoded_data.get('amount_2min', decoded_data.get('amount', 0)),
+                    'large_net': decoded_data.get('large_net', 0),
+                    'timestamp': int(time.time())
+                }
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ 批量获取个股高级指标失败: {e}")
+            return {}
+
+class EnhancedPlateUpdater(OptimizedPlateUpdater):
+    """增强的板块更新器 - 集成高级技术指标"""
+    
+    def __init__(self, plate_csv_path: str, stock_plate_csv_path: str, advanced_indicators_service: OptimizedAdvancedTechnicalIndicators):
+        super().__init__(plate_csv_path, stock_plate_csv_path)
+        self.advanced_indicators = advanced_indicators_service
+    
+    def get_all_plate_metrics_with_advanced(self) -> List[Dict]:
+        """获取所有板块指标（包含高级指标）- 使用优化版本"""
+        return self.get_all_plate_metrics_optimized()
+    
+    def get_main_plates_metrics_with_advanced(self) -> List[Dict]:
+        """获取主板块指标（包含高级指标）- 使用优化版本"""
+        all_metrics = self.get_all_plate_metrics_optimized()
+        main_metrics = [m for m in all_metrics if m.get('type') == 'main']
+        return main_metrics
+    
+    def get_plate_stocks(self, plate_id: str) -> List[Dict]:
+        """获取板块个股数据 - 使用优化版本"""
+        return self.get_plate_stocks_optimized(plate_id)
+        
+
 class F10DataService:
     """F10数据服务 - 按需加载和缓存"""
     
@@ -325,7 +529,6 @@ class TradingCalendarService:
         """判断是否为交易日"""
         try:
             date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            print(f"判断日期{date_str}是否为交易日")
             # 检查是否是周末
             if date_obj.weekday() >= 5:  # 5=周六, 6=周日
                 return False
@@ -668,6 +871,35 @@ class StockKLineService:
         key_str = f"kline_{code}_{frequency}_{start_date}_{end_date}"
         return key_str.encode()
     
+    def get_start_date_by_trading_days(self, end_date: str, trading_days_interval: int) -> str:
+        """
+        从结束日期向前计算指定交易日间隔的开始日期
+        
+        Args:
+            end_date: 结束日期，格式为 'YYYY-MM-DD'
+            trading_days_interval: 交易日间隔数
+            
+        Returns:
+            开始日期字符串，格式为 'YYYY-MM-DD'
+        """
+        current_date = datetime.strptime(end_date, '%Y-%m-%d')
+        found_trading_days = 0
+        
+        # 向前查找指定数量的交易日
+        while found_trading_days < trading_days_interval:
+            current_date = current_date - timedelta(days=1)
+            date_str = current_date.strftime('%Y-%m-%d')
+            
+            # 如果是交易日，计数加1
+            if self.trading_calendar.is_trading_day(date_str):
+                found_trading_days += 1
+            
+            # 防止无限循环
+            if (datetime.strptime(end_date, '%Y-%m-%d') - current_date).days > 365 * 2:
+                break
+        
+        return current_date.strftime('%Y-%m-%d')
+    
     def fetch_kline_data(self, code: str, frequency: str = "d", 
                         start_date: str = None, end_date: str = None) -> List[Dict]:
         """获取K线数据"""
@@ -681,21 +913,23 @@ class StockKLineService:
                 logger.info(f"📅 今日({today})非交易日，使用最近交易日: {end_date}")
             else:
                 end_date = today
-        if not start_date or start_date>end_date:
-            if frequency in ["1","5"]:
-                trading_days = self.trading_calendar.get_recent_trading_days(2)
-                if trading_days:
-                    start_date = trading_days[0]  # 最早的交易日
-                else:
-                    start_date = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d')
-            # elif frequency == "5":
-            #     start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            elif frequency == "60":
-                start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-            elif frequency == "d":
-                start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
-            elif frequency == "w":
-                start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')
+        
+        if 1:
+            # 为不同频率定义交易日间隔
+            trading_days_map = {
+                "1": 1,     # 1分钟线：5个交易日
+                "5": 1,     # 5分钟线：5个交易日
+                "60": 30,   # 60分钟线：30个交易日
+                "d": 60,   # 日线：120个交易日
+                "w": 100    # 周线：100个交易日（约2年）
+            }
+            
+            # 获取对应频率的交易日间隔
+            trading_days_interval = trading_days_map.get(frequency, 120)  # 默认120个交易日
+            
+            # 计算开始日期
+            start_date = self.get_start_date_by_trading_days(end_date, trading_days_interval)
+            logger.info(f"📅 基于交易日间隔计算: 频率={frequency}, 结束日期={end_date}, 开始日期={start_date}, 间隔={trading_days_interval}个交易日")
             
         cache_key = self.get_cache_key(code, frequency, start_date, end_date)
         
@@ -825,6 +1059,8 @@ class StockKLineService:
             # 缓存数据（5分钟缓存）- 使用现有的RedisStorageManager
             try:
                 cache_time = 300  # 5分钟
+                # 生成缓存键
+                cache_key = self.get_cache_key(code, frequency, start_date, end_date)
                 self.redis_storage.store_data(cache_key, json.dumps(data_list), expire_seconds=cache_time)
                 logger.info(f"💾 缓存K线数据: {code}_{frequency}, 数据点: {len(data_list)}")
             except Exception as e:
@@ -1053,65 +1289,81 @@ class StockKLineService:
             logger.error(f"❌ 计算RSI失败: {e}")
             return []
 
-class IntegratedWebService:
+class OptimizedIntegratedWebService:
     def __init__(self):
-        # 修改：使用LazyPlateUpdater替代原来的PlateUpdater
-        self.plate_updater = LazyPlateUpdater(
+        # 初始化Redis存储
+        self.redis_storage = RedisStorageManager()
+        
+        # 使用优化后的板块更新器（直接集成高级指标）
+        self.plate_updater = OptimizedEnhancedPlateUpdater(
             'data/板块.csv', 
-            'data/个股板块.csv'
+            'data/个股板块.csv',
+            self.redis_storage
         )
         
-        # 修改：使用新的PlateDataSimulator
-        # self.data_simulator = PlateDataSimulator(self.plate_updater, update_interval=10)
+        # 使用优化后的高级指标服务
+        self.advanced_indicators = OptimizedAdvancedTechnicalIndicators(
+            TDengineService(),
+            self.redis_storage
+        )
         
         # WebSocket连接管理
         self.plate_connections: Set = set()
-        self.volatile_connections: Set = set()
-        self.stock_connections: Dict[str, Set] = {}  # 新增：个股订阅连接 {plate_id: set(connections)}
+        self.plate_data_connections: Set = set()  # 新增：板块数据更新专用连接
+        self.stock_connections: Dict[str, Set] = {}  # 个股订阅连接 {plate_id: set(connections)}
+        
         # 新增：K线服务
         self.kline_service = StockKLineService()
         # 新增：F10数据服务
         self.f10_service = F10DataService('data/f10.csv')
+        
         # 更新统计
         self.update_count = 0
+        self.cached_plate_metrics = []  # 缓存的板块指标
     
-    async def start_services(self):
-        """启动所有服务"""
-        # 启动数据模拟
-        # asyncio.create_task(self.data_simulator.start_simulation())
-        asyncio.create_task(self.refresh_plate_data_periodically())
+    async def start_optimized_services(self):
+        """启动优化后的服务"""
+        # 启动板块数据更新
+        asyncio.create_task(self.refresh_plate_data_optimized())
+        
         # 启动板块数据广播
-        asyncio.create_task(self.broadcast_plate_updates())
+        asyncio.create_task(self.broadcast_plate_updates_optimized())
         
-        # 新增：启动个股数据广播
-        asyncio.create_task(self.broadcast_stock_updates())
+        # 启动板块数据更新专用广播
+        asyncio.create_task(self.broadcast_plate_data_updates())
         
-        logger.info("🚀 所有服务已启动")
-    async def refresh_plate_data_periodically(self):
-        """定期从Redis刷新板块数据（新增）"""
+        # 启动个股数据广播
+        asyncio.create_task(self.broadcast_stock_updates_optimized())
+
+        logger.info("🚀 优化版服务已启动")
+    
+    async def refresh_plate_data_optimized(self):
+        """优化版板块数据刷新"""
         while True:
             try:
-                # 从Redis刷新股票数据并计算板块指标
-                self.plate_updater.refresh_stock_data_from_redis()
+                # 使用整合计算获取板块数据（包含高级指标）
+                plate_metrics = self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
                 
-                # 记录刷新状态
-                logger.info("🔄 板块数据已从Redis刷新")
+                # 缓存到内存供快速访问
+                self.cached_plate_metrics = plate_metrics
                 
-                # 每10秒刷新一次
-                await asyncio.sleep(10)
+                # 每5秒刷新一次
+                await asyncio.sleep(5)
                 
             except Exception as e:
                 logger.error(f"❌ 刷新板块数据失败: {e}")
                 await asyncio.sleep(5)
     
-    async def broadcast_plate_updates(self):
-        """定期广播板块更新"""
+    async def broadcast_plate_updates_optimized(self):
+        """优化版广播板块更新"""
         while True:
             try:
                 if self.plate_connections:
-                    # 获取最新数据 - 现在从Redis获取
-                    all_metrics = self.plate_updater.get_all_plate_metrics()
-                    main_metrics = self.plate_updater.get_main_plates_metrics()
+                    # 使用缓存数据或实时获取
+                    all_metrics = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+                    
+                    # 筛选主板块
+                    main_metrics = [m for m in all_metrics if m.get('type') == 'main']
                     
                     update_msg = {
                         'type': 'plate_update',
@@ -1123,47 +1375,68 @@ class IntegratedWebService:
                         'update_count': self.update_count
                     }
                     
-                    # 广播给所有客户端 - 创建副本避免在迭代时修改集合
+                    # 广播给所有客户端
                     await self.broadcast_to_connections(update_msg, set(self.plate_connections))
                     
                     self.update_count += 1
                     
-                    if self.update_count % 30 == 0:  # 每30次更新记录一次
-                        logger.info(f"📤 广播板块更新 #{self.update_count}, 客户端: {len(self.plate_connections)}")
+                    if self.update_count % 10 == 0:  # 每10次更新记录一次
+                        logger.info(f"📤 广播板块更新 #{self.update_count}, 客户端: {len(self.plate_connections)}, 板块数: {len(all_metrics)}")
                 
-                await asyncio.sleep(3)  # 1秒广播一次
+                await asyncio.sleep(3)  # 3秒广播一次
                 
             except Exception as e:
                 logger.error(f"❌ 广播板块更新失败: {e}")
                 await asyncio.sleep(5)
     
-    async def broadcast_stock_updates(self):
-        """定期广播个股更新"""
+    async def broadcast_plate_data_updates(self):
+        """广播板块数据更新（专门的WebSocket）"""
+        while True:
+            try:
+                await asyncio.sleep(1)  # 1秒更新一次
+                
+                if self.plate_data_connections:
+                    # 获取最新板块数据（包含高级指标）
+                    all_plates = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+                    main_plates = [p for p in all_plates if p.get('type') == 'main']
+                    
+                    update_msg = {
+                        'type': 'plate_data_update',
+                        'timestamp': int(time.time() * 1000),
+                        'data': {
+                            'all_plates': all_plates,
+                            'main_plates': main_plates
+                        }
+                    }
+                    
+                    # 广播给所有订阅的客户端
+                    await self.broadcast_to_connections(update_msg, set(self.plate_data_connections))
+                    
+            except Exception as e:
+                logger.error(f"❌ 广播板块数据更新失败: {e}")
+                await asyncio.sleep(5)
+    
+    async def broadcast_stock_updates_optimized(self):
+        """优化版个股数据广播"""
         while True:
             try:
                 if self.stock_connections:
                     current_time = int(time.time() * 1000)
                     
-                    # 遍历所有被订阅的板块
-                    for plate_id, connections in list(self.stock_connections.items()):
-                        if not connections:
-                            continue
+                    # 获取所有活跃股票
+                    active_stocks = self._get_active_stocks()
+                    if active_stocks:
+                        # 使用优化后的批量获取方法
+                        indicators_dict = self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(active_stocks)
                         
-                        # 获取该板块的最新个股数据
-                        stocks = self.plate_updater.get_plate_stocks(plate_id)
-                        
-                        # 构建更新消息
-                        update_msg = {
-                            'type': 'stock_update',
-                            'plate_id': plate_id,
-                            'data': stocks,
-                            'timestamp': current_time
-                        }
-                        
-                        # 广播给订阅该板块的所有客户端 - 创建副本避免在迭代时修改集合
-                        await self.broadcast_to_connections(update_msg, set(connections))
+                        # 按板块分组广播
+                        for plate_id, connections in self.stock_connections.items():
+                            if connections and indicators_dict:
+                                # 构建优化后的消息
+                                update_msg = self._build_optimized_stock_update(plate_id, indicators_dict)
+                                await self.broadcast_to_connections(update_msg, set(connections))
                     
-                    # 每5秒记录一次日志
+                    # 每3秒记录一次日志
                     if int(time.time()) % 5 == 0:
                         active_subscriptions = sum(len(conns) for conns in self.stock_connections.values())
                         logger.info(f"📤 广播个股更新, 活跃订阅: {active_subscriptions}个连接")
@@ -1173,6 +1446,52 @@ class IntegratedWebService:
             except Exception as e:
                 logger.error(f"❌ 广播个股更新失败: {e}")
                 await asyncio.sleep(5)
+    
+    def _get_active_stocks(self) -> List[str]:
+        """获取活跃股票列表"""
+        active_stocks = []
+        for plate_id in self.stock_connections.keys():
+            stocks = self.plate_updater.plate_to_stocks.get(plate_id, [])
+            active_stocks.extend(stocks)
+        
+        # 去重
+        return list(set(active_stocks))
+    
+    def _build_optimized_stock_update(self, plate_id: str, indicators_dict: Dict[str, Dict]) -> Dict:
+        """构建优化后的个股更新消息"""
+        # 获取该板块的股票
+        stock_ids = self.plate_updater.plate_to_stocks.get(plate_id, [])
+        
+        stocks_data = []
+        for stock_id in stock_ids:
+            if stock_id in indicators_dict:
+                indicators = indicators_dict[stock_id]
+                
+                # 获取股票基础信息
+                stock_data = self.redis_storage.get_stock_data(stock_id) or {}
+                
+                # 构建完整的股票数据
+                stock_info = {
+                    'code': stock_id,
+                    'name': stock_data.get('name', f"股票{stock_id}"),
+                    'change_pct': indicators.get('change_pct', 0),
+                    'price': indicators.get('price', 0),
+                    'volume': indicators.get('volume', 0),
+                    'market_cap': stock_data.get('market_cap', 0),
+                    'large_net': indicators.get('large_net', 0),
+                    'timestamp': indicators.get('timestamp', 0),
+                    # 高级指标
+                    'change_rate_1min': indicators.get('change_rate_1min', 0),
+                    'amount_2min': indicators.get('amount_2min', 0)
+                }
+                stocks_data.append(stock_info)
+        
+        return {
+            'type': 'stock_update',
+            'plate_id': plate_id,
+            'data': stocks_data,
+            'timestamp': int(time.time() * 1000)
+        }
     
     async def broadcast_to_connections(self, message: Dict, connections: Set):
         """向连接集合广播消息"""
@@ -1198,10 +1517,10 @@ class IntegratedWebService:
         logger.info(f"🔗 板块客户端连接, 总数: {len(self.plate_connections)}")
         
         try:
-            # 发送初始数据 - 现在从Redis获取
+            # 发送初始数据
             hierarchy, main_plates = self.plate_updater.get_plate_hierarchy()
-            all_metrics = self.plate_updater.get_all_plate_metrics()
-            main_metrics = self.plate_updater.get_main_plates_metrics()
+            all_metrics = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+            main_metrics = [m for m in all_metrics if m.get('type') == 'main']
             
             init_data = {
                 'type': 'plate_init',
@@ -1242,6 +1561,43 @@ class IntegratedWebService:
         
         return ws
     
+    async def handle_plate_data_websocket(self, request):
+        """处理板块数据WebSocket连接（专门用于实时更新）"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        self.plate_data_connections.add(ws)
+        logger.info(f"🔗 板块数据更新客户端连接, 总数: {len(self.plate_data_connections)}")
+        
+        try:
+            # 发送初始数据
+            init_data = {
+                'type': 'plate_data_init',
+                'timestamp': int(time.time() * 1000),
+                'data': {
+                    'all_plates': self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced(),
+                    'main_plates': [p for p in (self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()) if p.get('type') == 'main']
+                }
+            }
+            await ws.send_str(json.dumps(init_data, ensure_ascii=False))
+            
+            # 保持连接
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data.get('type') == 'ping':
+                        await ws.send_str(json.dumps({'type': 'pong'}))
+                elif msg.type == web.WSMsgType.ERROR:
+                    break
+                    
+        except Exception as e:
+            logger.error(f"❌ 板块数据WebSocket错误: {e}")
+        finally:
+            self.plate_data_connections.remove(ws)
+            logger.info(f"🔌 板块数据更新客户端断开, 总数: {len(self.plate_data_connections)}")
+        
+        return ws
+    
     async def handle_plate_message(self, data: Dict, websocket):
         """处理板块相关消息"""
         msg_type = data.get('type')
@@ -1252,9 +1608,9 @@ class IntegratedWebService:
             plate_type = data.get('plate_type', 'all')  # all, main, sub
             
             if plate_type == 'main':
-                plates_data = self.plate_updater.get_main_plates_metrics()
+                plates_data = [p for p in (self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()) if p.get('type') == 'main']
             else:
-                plates_data = self.plate_updater.get_all_plate_metrics()
+                plates_data = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
             
             # 排序
             if sort_by == 'change_pct':
@@ -1265,6 +1621,10 @@ class IntegratedWebService:
                 sorted_plates = sorted(plates_data, key=lambda x: x['total_large_net'], reverse=True)
             elif sort_by == 'rise_count':
                 sorted_plates = sorted(plates_data, key=lambda x: x['rise_count'], reverse=True)
+            elif sort_by == 'change_rate_1min':
+                sorted_plates = sorted(plates_data, key=lambda x: x.get('change_rate_1min', 0), reverse=True)
+            elif sort_by == 'total_amount_2min':
+                sorted_plates = sorted(plates_data, key=lambda x: x.get('total_amount_2min', 0), reverse=True)
             else:
                 sorted_plates = plates_data
             
@@ -1296,6 +1656,27 @@ class IntegratedWebService:
             
             stocks = self.plate_updater.get_plate_stocks(plate_id)
             logger.info(f"📈 找到个股: {len(stocks)}只")
+            
+            # 使用优化后的批量获取高级指标
+            stock_codes = [stock.get('code') for stock in stocks if stock.get('code')]
+            if stock_codes:
+                try:
+                    # 使用优化后的批量获取方法
+                    advanced_indicators_dict = self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_codes)
+                    
+                    # 将高级指标合并到个股数据中
+                    for stock in stocks:
+                        stock_code = stock.get('code')
+                        if stock_code in advanced_indicators_dict:
+                            indicators = advanced_indicators_dict[stock_code]
+                            stock['advanced_indicators'] = {
+                                'change_rate_1min': indicators.get('change_rate_1min', 0),
+                                'amount_2min': indicators.get('amount_2min', 0),
+                                'timestamp': int(time.time() * 1000)
+                            }
+                            logger.debug(f"✅ 已合并股票 {stock_code} 的高级指标")
+                except Exception as e:
+                    logger.error(f"❌ 批量获取高级指标失败: {e}")
             
             response = {
                 'type': 'plate_stocks',
@@ -1357,6 +1738,7 @@ class IntegratedWebService:
         
         # 发送响应
         await websocket.send_str(json.dumps(response, ensure_ascii=False))
+    
     async def handle_stock_kline_api(self, request):
         """处理个股K线数据API请求"""
         try:
@@ -1425,15 +1807,195 @@ async def handle_plate_websocket(request):
     """板块WebSocket"""
     return await service.handle_plate_websocket(request)
 
+async def handle_plate_data_websocket(request):
+    """板块数据WebSocket（专门用于实时更新）"""
+    return await service.handle_plate_data_websocket(request)
+
+# 新增高级指标API路由
+async def advanced_indicators_stock_api(request):
+    """个股高级技术指标API"""
+    try:
+        service = request.app['service']
+        stock_code = request.query.get('code', '')
+        
+        if not stock_code:
+            return web.json_response({'error': '股票代码不能为空'}, status=400)
+        
+        logger.info(f"📊 请求个股高级指标: {stock_code}")
+        
+        # 尝试从缓存获取
+        cache_key = f"advanced_indicators_{stock_code}"
+        cached_data = service.redis_storage.get_data(cache_key)
+        
+        if cached_data:
+            return web.json_response({
+                'data': cached_data,
+                'code': stock_code,
+                'cached': True,
+                'timestamp': int(time.time() * 1000)
+            })
+        
+        # 实时计算
+        indicators = service.advanced_indicators.get_stock_advanced_indicators_optimized(stock_code)
+        
+        return web.json_response({
+            'data': indicators,
+            'code': stock_code,
+            'cached': False,
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 个股高级指标API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+async def advanced_indicators_plate_api(request):
+    """板块高级技术指标API"""
+    try:
+        service = request.app['service']
+        plate_id = request.query.get('plate_id', '')
+        
+        if not plate_id:
+            return web.json_response({'error': '板块ID不能为空'}, status=400)
+        
+        logger.info(f"📊 请求板块高级指标: {plate_id}")
+        
+        # 尝试从缓存获取
+        cache_key = f"advanced_indicators_plate_{plate_id}"
+        cached_data = service.redis_storage.get_data(cache_key)
+        
+        if cached_data:
+            return web.json_response({
+                'data': cached_data,
+                'plate_id': plate_id,
+                'cached': True,
+                'timestamp': int(time.time() * 1000)
+            })
+        
+        # 实时计算
+        plate_stocks = service.plate_updater.get_plate_stocks(plate_id)
+        stock_codes = [stock.get('code') for stock in plate_stocks if stock.get('code')]
+        
+        # 批量获取个股指标并聚合
+        if stock_codes:
+            stock_indicators = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_codes)
+            
+            # 聚合板块指标
+            change_rates = [ind.get('change_rate_1min', 0) for ind in stock_indicators.values()]
+            amounts_2min = [ind.get('amount_2min', 0) for ind in stock_indicators.values()]
+            
+            if change_rates:
+                indicators = {
+                    'avg_change_rate_1min': round(sum(change_rates) / len(change_rates), 4),
+                    'total_amount_2min': round(sum(amounts_2min), 2),
+                    'stock_count': len(stock_indicators),
+                    'update_time': time.time()
+                }
+            else:
+                indicators = {}
+        else:
+            indicators = {}
+        
+        return web.json_response({
+            'data': indicators,
+            'plate_id': plate_id,
+            'cached': False,
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 板块高级指标API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+# 添加批量查询API路由
+async def advanced_indicators_batch_stocks_api(request):
+    """批量获取个股高级技术指标API"""
+    try:
+        service = request.app['service']
+        
+        # 支持GET参数或POST JSON body
+        if request.method == 'POST':
+            data = await request.json()
+            stock_codes = data.get('codes', [])
+        else:
+            codes_str = request.query.get('codes', '')
+            stock_codes = codes_str.split(',') if codes_str else []
+        
+        if not stock_codes:
+            return web.json_response({'error': '股票代码列表不能为空'}, status=400)
+        
+        logger.info(f"📊 批量请求个股高级指标: {len(stock_codes)} 只股票")
+        
+        indicators = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_codes)
+        
+        return web.json_response({
+            'data': indicators,
+            'count': len(indicators),
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 批量个股高级指标API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+async def advanced_indicators_batch_plates_api(request):
+    """批量获取板块高级技术指标API"""
+    try:
+        service = request.app['service']
+        
+        # 支持GET参数或POST JSON body
+        if request.method == 'POST':
+            data = await request.json()
+            plate_ids = data.get('plate_ids', [])
+        else:
+            plates_str = request.query.get('plate_ids', '')
+            plate_ids = plates_str.split(',') if plates_str else []
+        
+        if not plate_ids:
+            return web.json_response({'error': '板块ID列表不能为空'}, status=400)
+        
+        logger.info(f"📊 批量请求板块高级指标: {len(plate_ids)} 个板块")
+        
+        indicators = {}
+        for plate_id in plate_ids:
+            plate_stocks = service.plate_updater.get_plate_stocks(plate_id)
+            stock_codes = [stock.get('code') for stock in plate_stocks if stock.get('code')]
+            
+            if stock_codes:
+                stock_indicators = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_codes)
+                
+                # 聚合板块指标
+                change_rates = [ind.get('change_rate_1min', 0) for ind in stock_indicators.values()]
+                amounts_2min = [ind.get('amount_2min', 0) for ind in stock_indicators.values()]
+                
+                if change_rates:
+                    indicators[plate_id] = {
+                        'avg_change_rate_1min': round(sum(change_rates) / len(change_rates), 4),
+                        'total_amount_2min': round(sum(amounts_2min), 2),
+                        'stock_count': len(stock_indicators),
+                        'update_time': time.time()
+                    }
+        
+        return web.json_response({
+            'data': indicators,
+            'count': len(indicators),
+            'timestamp': int(time.time() * 1000)
+        })
+        
+    except Exception as e:
+        logger.error(f"❌ 批量板块高级指标API错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
 async def plate_api(request):
     """板块数据API"""
     try:
         query_type = request.query.get('type', 'all_plates')
         
         if query_type == 'all_plates':
-            data = service.plate_updater.get_all_plate_metrics()
+            data = service.plate_updater.get_all_plate_metrics_with_integrated_advanced()
         elif query_type == 'main_plates':
-            data = service.plate_updater.get_main_plates_metrics()
+            all_data = service.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+            data = [d for d in all_data if d.get('type') == 'main']
         elif query_type == 'hierarchy':
             hierarchy, main_plates = service.plate_updater.get_plate_hierarchy()
             data = {'hierarchy': hierarchy, 'main_plates': main_plates}
@@ -1448,6 +2010,7 @@ async def plate_api(request):
     except Exception as e:
         logger.error(f"❌ 板块API错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
+
 # 添加F10数据API路由
 async def f10_data_api(request):
     """F10数据API"""
@@ -1475,6 +2038,7 @@ async def f10_data_api(request):
     # except Exception as e:
     #     logger.error(f"❌ F10数据API错误: {e}")
     #     return web.json_response({'error': str(e)}, status=500)
+
 async def f10_search_api(request):
     """F10搜索API"""
     try:
@@ -1497,6 +2061,7 @@ async def f10_search_api(request):
     except Exception as e:
         logger.error(f"❌ F10搜索API错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
+
 async def f10_cache_stats_api(request):
     """F10缓存统计API"""
     try:
@@ -1517,9 +2082,11 @@ async def health_check(request):
     return web.json_response({
         'status': 'healthy',
         'plate_connections': len(service.plate_connections),
+        'plate_data_connections': len(service.plate_data_connections),
         'update_count': service.update_count,
         'stock_count': len(service.plate_updater.stock_to_plates),
-        'plate_count': len(service.plate_updater.all_plates)
+        'plate_count': len(service.plate_updater.all_plates),
+        'cached_plate_metrics': len(service.cached_plate_metrics)
     })
 
 # Redis状态检查
@@ -1564,6 +2131,7 @@ async def debug_plate_stocks_api(request):
     except Exception as e:
         logger.error(f"❌ 调试接口错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
+
 # 新增：个股K线API路由
 async def stock_kline_api(request):
     """个股K线数据API"""
@@ -1571,10 +2139,10 @@ async def stock_kline_api(request):
 
 async def main():
     global service
-    service = IntegratedWebService()
+    service = OptimizedIntegratedWebService()
     
-    # 启动后台服务
-    await service.start_services()
+    # 启动优化后的服务
+    await service.start_optimized_services()
     
     # 创建HTTP应用
     app = web.Application()
@@ -1583,6 +2151,7 @@ async def main():
     app.router.add_get('/', handle_bankuai)
     app.router.add_get('/bankuai', handle_bankuai)
     app.router.add_get('/ws/plate', handle_plate_websocket)
+    app.router.add_get('/ws/plate/data', handle_plate_data_websocket)  # 新增：板块数据WebSocket
     app.router.add_get('/api/plate', plate_api)
     app.router.add_get('/api/stock/kline', stock_kline_api)  # 新增K线API
     app.router.add_get('/health', health_check)
@@ -1591,15 +2160,24 @@ async def main():
     app.router.add_get('/api/f10/data', f10_data_api)
     app.router.add_get('/api/f10/search', f10_search_api)
     app.router.add_get('/api/f10/cache-stats', f10_cache_stats_api)
+    app.router.add_get('/api/advanced/stock', advanced_indicators_stock_api)
+    app.router.add_get('/api/advanced/plate', advanced_indicators_plate_api)
+    app.router.add_get('/api/advanced/batch/stocks', advanced_indicators_batch_stocks_api)
+    app.router.add_get('/api/advanced/batch/plates', advanced_indicators_batch_plates_api)
+    
+    # 设置服务实例
+    app['service'] = service
+    
     # 启动服务器
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
     
-    logger.info("🚀 集成Web服务已启动")
+    logger.info("🚀 优化版集成Web服务已启动")
     logger.info("🌐 http://localhost:8080/bankuai - 板块监控")
     logger.info("🔌 ws://localhost:8080/ws/plate - 板块WebSocket")
+    logger.info("🔌 ws://localhost:8080/ws/plate/data - 板块数据WebSocket（实时更新）")
     logger.info("📊 http://localhost:8080/api/plate - 板块API")
     logger.info("❤️ http://localhost:8080/health - 健康检查")
     logger.info("💾 http://localhost:8080/redis-status - Redis状态")
