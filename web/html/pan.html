@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>💰 资金流向分析系统 - 流入流出可视化</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1800px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border: 1px solid #333;
+            backdrop-filter: blur(10px);
+        }
+        
+        .header h1 {
+            color: #d4af37;
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .legend {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            background: rgba(40, 40, 60, 0.8);
+            padding: 10px 15px;
+            border-radius: 8px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+        }
+        
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+        
+        .legend-inflow { background: #ff4757; }
+        .legend-outflow { background: #2ed573; }
+        .legend-net-inflow { background: #ff9f43; }
+        .legend-net-outflow { background: #1abc9c; }
+        
+        /* 主布局 */
+        .main-content {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .chart-section {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #333;
+            backdrop-filter: blur(10px);
+        }
+        
+        .chart-title {
+            font-size: 18px;
+            color: #d4af37;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chart-container {
+            width: 100%;
+            height: 400px;
+        }
+        
+        /* 侧边面板 */
+        .side-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .flow-summary {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #333;
+            backdrop-filter: blur(10px);
+        }
+        
+        .summary-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .summary-label {
+            color: #aaa;
+            font-size: 14px;
+        }
+        
+        .summary-value {
+            font-weight: bold;
+            font-size: 16px;
+        }
+        
+        .value-positive {
+            color: #ff4757;
+        }
+        
+        .value-negative {
+            color: #2ed573;
+        }
+        
+        /* 排行榜 */
+        .ranking-panel {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #333;
+            height: 300px;
+            overflow: hidden;
+            backdrop-filter: blur(10px);
+        }
+        
+        .ranking-title {
+            font-size: 16px;
+            color: #d4af37;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .ranking-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 240px;
+            overflow-y: auto;
+        }
+        
+        .ranking-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .ranking-item:hover {
+            background: rgba(50, 50, 70, 0.8);
+            transform: translateX(5px);
+        }
+        
+        .ranking-stock {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .stock-code {
+            font-size: 11px;
+            color: #aaa;
+        }
+        
+        .ranking-flow {
+            font-weight: bold;
+        }
+        
+        /* 底部分析 */
+        .bottom-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .analysis-panel {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #333;
+            height: 400px;
+            backdrop-filter: blur(10px);
+        }
+        
+        /* 响应式 */
+        @media (max-width: 1200px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .bottom-panel {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* 滚动条 */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(212, 175, 55, 0.5);
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>💰 资金流向分析系统</h1>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color legend-inflow"></div>
+                    <span>资金流入</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color legend-outflow"></div>
+                    <span>资金流出</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color legend-net-inflow"></div>
+                    <span>净流入</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color legend-net-outflow"></div>
+                    <span>净流出</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="main-content">
+            <!-- 桑基图 -->
+            <div class="chart-section">
+                <div class="chart-title">
+                    资金流向桑基图（双向）
+                    <span style="font-size: 12px; color: #aaa;">红色: 流入 | 绿色: 流出</span>
+                </div>
+                <div id="sankeyChart" class="chart-container"></div>
+            </div>
+            
+            <!-- 侧边面板 -->
+            <div class="side-panel">
+                <!-- 资金汇总 -->
+                <div class="flow-summary">
+                    <div class="chart-title">资金流向汇总</div>
+                    <div class="summary-item">
+                        <span class="summary-label">总流入金额</span>
+                        <span class="summary-value value-positive">156.8亿</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">总流出金额</span>
+                        <span class="summary-value value-negative">89.3亿</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">净流入</span>
+                        <span class="summary-value value-positive">+67.5亿</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">流入占比</span>
+                        <span class="summary-value">63.7%</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">大单净流入</span>
+                        <span class="summary-value value-positive">+42.1亿</span>
+                    </div>
+                    <div class="summary-item">
+                        <span class="summary-label">散户净流入</span>
+                        <span class="summary-value value-negative">-8.3亿</span>
+                    </div>
+                </div>
+                
+                <!-- 流入排行榜 -->
+                <div class="ranking-panel">
+                    <div class="ranking-title">
+                        资金流入TOP5
+                        <span style="font-size: 12px; color: #aaa;">今日</span>
+                    </div>
+                    <div class="ranking-list" id="inflowRanking">
+                        <!-- 动态生成 -->
+                    </div>
+                </div>
+                
+                <!-- 流出排行榜 -->
+                <div class="ranking-panel">
+                    <div class="ranking-title">
+                        资金流出TOP5
+                        <span style="font-size: 12px; color: #aaa;">今日</span>
+                    </div>
+                    <div class="ranking-list" id="outflowRanking">
+                        <!-- 动态生成 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 底部分析 -->
+        <div class="bottom-panel">
+            <!-- 个股分时资金流向 -->
+            <div class="analysis-panel">
+                <div class="chart-title">
+                    <span>个股分时资金流向</span>
+                    <select id="stockSelect" style="background: rgba(40,40,60,0.8); color: #fff; border: 1px solid #444; padding: 5px 10px; border-radius: 4px;">
+                        <option value="宁德时代">宁德时代</option>
+                        <option value="浙江建投">浙江建投</option>
+                        <option value="中际旭创">中际旭创</option>
+                        <option value="韦尔股份">韦尔股份</option>
+                        <option value="贵州茅台">贵州茅台</option>
+                    </select>
+                </div>
+                <div id="minuteFlowChart" class="chart-container"></div>
+            </div>
+            
+            <!-- 板块资金对比 -->
+            <div class="analysis-panel">
+                <div class="chart-title">
+                    板块资金流向对比
+                    <span style="font-size: 12px; color: #aaa;">流入 vs 流出</span>
+                </div>
+                <div id="sectorFlowChart" class="chart-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 初始化ECharts实例
+        let sankeyChart = null;
+        let minuteFlowChart = null;
+        let sectorFlowChart = null;
+        
+        // 模拟数据
+        const mockFlowData = {
+            stocks: [
+                {
+                    name: '宁德时代',
+                    code: '300750',
+                    themes: ['新能源', '锂电池', '锂矿'],
+                    minuteFlows: generateMinuteFlowData(),
+                    summary: {
+                        totalInflow: 12.8,
+                        totalOutflow: 4.2,
+                        netInflow: 8.6,
+                        largeInflow: 7.2,
+                        largeOutflow: 2.1
+                    }
+                },
+                {
+                    name: '浙江建投',
+                    code: '002761',
+                    themes: ['基建', '建筑装饰'],
+                    minuteFlows: generateMinuteFlowData(),
+                    summary: {
+                        totalInflow: 8.5,
+                        totalOutflow: 2.3,
+                        netInflow: 6.2,
+                        largeInflow: 5.8,
+                        largeOutflow: 1.5
+                    }
+                },
+                {
+                    name: '中际旭创',
+                    code: '300308',
+                    themes: ['通信', '光模块', 'CPO'],
+                    minuteFlows: generateMinuteFlowData(),
+                    summary: {
+                        totalInflow: 6.3,
+                        totalOutflow: 3.8,
+                        netInflow: 2.5,
+                        largeInflow: 4.1,
+                        largeOutflow: 2.6
+                    }
+                },
+                {
+                    name: '韦尔股份',
+                    code: '603501',
+                    themes: ['芯片', '半导体'],
+                    minuteFlows: generateMinuteFlowData(),
+                    summary: {
+                        totalInflow: 3.2,
+                        totalOutflow: 5.8,
+                        netInflow: -2.6,
+                        largeInflow: 1.8,
+                        largeOutflow: 3.5
+                    }
+                },
+                {
+                    name: '贵州茅台',
+                    code: '600519',
+                    themes: ['消费', '白酒'],
+                    minuteFlows: generateMinuteFlowData(),
+                    summary: {
+                        totalInflow: 4.5,
+                        totalOutflow: 3.2,
+                        netInflow: 1.3,
+                        largeInflow: 2.8,
+                        largeOutflow: 1.5
+                    }
+                }
+            ],
+            
+            themes: [
+                { name: '新能源', totalInflow: 28.5, totalOutflow: 12.3 },
+                { name: '基建', totalInflow: 15.2, totalOutflow: 6.8 },
+                { name: '通信', totalInflow: 22.1, totalOutflow: 14.5 },
+                { name: '芯片', totalInflow: 8.3, totalOutflow: 12.6 },
+                { name: '消费', totalInflow: 10.5, totalOutflow: 8.2 }
+            ],
+            
+            capitalTypes: [
+                { name: '机构资金', type: 'inflow', color: '#ff4757' },
+                { name: '主力资金', type: 'outflow', color: '#2ed573' },
+                { name: '散户资金', type: 'capital', color: '#1abc9c' }
+            ]
+        };
+        
+        // 生成分时资金流数据
+        function generateMinuteFlowData() {
+            const data = [];
+            const basePrice = 500 + Math.random() * 100;
+            
+            for (let i = 0; i < 30; i++) {
+                const time = `10:${i.toString().padStart(2, '0')}`;
+                const isInflow = Math.random() > 0.4;
+                const priceChange = (Math.random() - 0.5) * 2;
+                const price = basePrice + priceChange * i;
+                const amount = Math.random() * 0.8 + 0.2;
+                
+                data.push({
+                    time: time,
+                    price: price,
+                    volume: Math.floor(Math.random() * 50000) + 10000,
+                    amount: amount,
+                    type: isInflow ? 'inflow' : 'outflow'
+                });
+            }
+            
+            return data;
+        }
+        
+
+        
+        // 初始化桑基图
+        function initSankeyChart() {
+            var chartDom = document.getElementById('sankeyChart');
+            if (!chartDom) {
+                console.error('桑基图容器不存在！');
+                return;
+            }
+            
+            var myChart = echarts.init(chartDom);
+            
+            // 从mockFlowData生成桑基图数据
+            const sankeyData = generateSankeyData();
+            
+            var option = {
+                title: {
+                    text: '资金流向桑基图',
+                    left: 'center',
+                    textStyle: { color: '#fff', fontSize: 14 }
+                },
+                tooltip: {
+                    trigger: 'item',
+                    triggerOn: 'mousemove',
+                    formatter: function(params) {
+                        return params.data.name + '<br/>金额: ' + params.data.value + '亿';
+                    }
+                },
+                series: [
+                    {
+                        type: 'sankey',
+                        layout: 'none',
+                        emphasis: {
+                            focus: 'adjacency'
+                        },
+                        data: sankeyData.nodes,
+                        links: sankeyData.links,
+                        lineStyle: {
+                            color: 'gradient',
+                            curveness: 0.5
+                        }
+                    }
+                ]
+            };
+            
+            myChart.setOption(option);
+            
+            // 响应窗口大小变化
+            window.addEventListener('resize', function() {
+                myChart.resize();
+            });
+        }
+        
+        // 从mockFlowData生成桑基图数据
+        function generateSankeyData() {
+            const nodes = [];
+            const links = [];
+            
+            // 添加资金类型节点
+            const capitalTypes = ['机构资金', '主力资金', '散户资金'];
+            capitalTypes.forEach(type => {
+                nodes.push({ name: type });
+            });
+            
+            // 收集所有主题
+            const allThemes = new Set();
+            mockFlowData.stocks.forEach(stock => {
+                stock.themes.forEach(theme => {
+                    allThemes.add(theme);
+                });
+            });
+            
+            // 添加主题节点
+            allThemes.forEach(theme => {
+                nodes.push({ name: theme });
+            });
+            
+            // 添加股票节点
+            mockFlowData.stocks.forEach(stock => {
+                nodes.push({ name: stock.name });
+            });
+            
+            // 生成资金类型到主题的链接
+            const themeCapital = {};
+            allThemes.forEach(theme => {
+                // 随机生成各资金类型到主题的流向
+                const orgCapital = Math.random() * 10 + 5; // 5-15亿
+                const mainCapital = Math.random() * 8 + 3; // 3-11亿
+                const retailCapital = Math.random() * 5 + 1; // 1-6亿
+                
+                links.push({ source: '机构资金', target: theme, value: parseFloat(orgCapital.toFixed(1)) });
+                links.push({ source: '主力资金', target: theme, value: parseFloat(mainCapital.toFixed(1)) });
+                links.push({ source: '散户资金', target: theme, value: parseFloat(retailCapital.toFixed(1)) });
+                
+                themeCapital[theme] = { orgCapital, mainCapital, retailCapital };
+            });
+            
+            // 生成主题到股票的链接
+            mockFlowData.stocks.forEach(stock => {
+                stock.themes.forEach(theme => {
+                    const themeData = themeCapital[theme];
+                    // 根据主题的资金量和股票的净流入计算链接值
+                    const totalThemeCapital = themeData.orgCapital + themeData.mainCapital + themeData.retailCapital;
+                    const linkValue = Math.random() * totalThemeCapital * 0.3; // 随机分配主题资金的0-30%
+                    
+                    links.push({ source: theme, target: stock.name, value: parseFloat(linkValue.toFixed(1)) });
+                });
+            });
+            
+            return { nodes, links };
+        }
+        
+        // 初始化分时资金流向图
+        function initMinuteFlowChart() {
+            minuteFlowChart = echarts.init(document.getElementById('minuteFlowChart'));
+            updateMinuteFlowChart('宁德时代');
+        }
+        
+        // 更新分时资金流向图
+        function updateMinuteFlowChart(stockName) {
+            const stock = mockFlowData.stocks.find(s => s.name === stockName);
+            if (!stock) return;
+            
+            const option = {
+                tooltip: {
+                    trigger: 'axis',
+                    axisPointer: {
+                        type: 'cross'
+                    },
+                    formatter: function(params) {
+                        let result = `<div style="margin-bottom: 5px;">${params[0].axisValue}</div>`;
+                        
+                        params.forEach(param => {
+                            if (param.seriesName === '价格') {
+                                result += `
+                                    <div style="display: flex; align-items: center; margin: 2px 0;">
+                                        <span style="color: #ff9f43;">价格: ${param.value.toFixed(2)}</span>
+                                    </div>
+                                `;
+                            } else if (param.seriesName === '流入') {
+                                const minuteData = stock.minuteFlows.find(f => f.time === params[0].axisValue);
+                                if (minuteData && minuteData.type === 'inflow') {
+                                    result += `
+                                        <div style="display: flex; align-items: center; margin: 2px 0;">
+                                            <span style="color: #ff4757;">流入: ${minuteData.amount.toFixed(1)}亿</span>
+                                        </div>
+                                    `;
+                                }
+                            } else if (param.seriesName === '流出') {
+                                const minuteData = stock.minuteFlows.find(f => f.time === params[0].axisValue);
+                                if (minuteData && minuteData.type === 'outflow') {
+                                    result += `
+                                        <div style="display: flex; align-items: center; margin: 2px 0;">
+                                            <span style="color: #2ed573;">流出: ${minuteData.amount.toFixed(1)}亿</span>
+                                        </div>
+                                    `;
+                                }
+                            }
+                        });
+                        
+                        return result;
+                    }
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '15%',
+                    top: '10%'
+                },
+                xAxis: {
+                    type: 'category',
+                    data: stock.minuteFlows.map(f => f.time),
+                    axisLine: { lineStyle: { color: '#666' } },
+                    axisLabel: { 
+                        color: '#999',
+                        fontSize: 10,
+                        rotate: 45
+                    }
+                },
+                yAxis: [
+                    {
+                        type: 'value',
+                        name: '价格',
+                        position: 'left',
+                        axisLine: { lineStyle: { color: '#666' } },
+                        axisLabel: { color: '#999' },
+                        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } }
+                    },
+                    {
+                        type: 'value',
+                        name: '金额(亿)',
+                        position: 'right',
+                        axisLine: { lineStyle: { color: '#666' } },
+                        axisLabel: { color: '#999' },
+                        splitLine: { show: false }
+                    }
+                ],
+                series: [
+                    {
+                        name: '价格',
+                        type: 'line',
+                        data: stock.minuteFlows.map(f => f.price),
+                        smooth: true,
+                        lineStyle: {
+                            color: '#ff9f43',
+                            width: 2
+                        }
+                    },
+                    {
+                        name: '流入',
+                        type: 'bar',
+                        yAxisIndex: 1,
+                        data: stock.minuteFlows.map(f => f.type === 'inflow' ? f.amount : 0),
+                        itemStyle: {
+                            color: 'rgba(255, 71, 87, 0.6)',
+                            borderColor: '#ff4757',
+                            borderWidth: 1
+                        },
+                        barGap: '-100%'
+                    },
+                    {
+                        name: '流出',
+                        type: 'bar',
+                        yAxisIndex: 1,
+                        data: stock.minuteFlows.map(f => f.type === 'outflow' ? -f.amount : 0),
+                        itemStyle: {
+                            color: 'rgba(46, 213, 115, 0.6)',
+                            borderColor: '#2ed573',
+                            borderWidth: 1
+                        }
+                    }
+                ]
+            };
+            
+            minuteFlowChart.setOption(option);
+        }
+        
+        // 初始化板块资金对比图
+        function initSectorFlowChart() {
+            sectorFlowChart = echarts.init(document.getElementById('sectorFlowChart'));
+            
+            const categories = mockFlowData.themes.map(t => t.name);
+            const inflows = mockFlowData.themes.map(t => t.totalInflow);
+            const outflows = mockFlowData.themes.map(t => -t.totalOutflow);
+            const netFlows = mockFlowData.themes.map(t => t.totalInflow - t.totalOutflow);
+            
+            const option = {
+                tooltip: {
+                    trigger: 'axis',
+                    axisPointer: {
+                        type: 'shadow'
+                    },
+                    formatter: function(params) {
+                        const theme = mockFlowData.themes.find(t => t.name === params[0].name);
+                        const netFlow = theme.totalInflow - theme.totalOutflow;
+                        const netColor = netFlow >= 0 ? '#ff4757' : '#2ed573';
+                        
+                        return `
+                            <div style="margin-bottom: 5px;">${params[0].name}</div>
+                            <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                <span>流入:</span>
+                                <span style="color: #ff4757;">${theme.totalInflow.toFixed(1)}亿</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin: 3px 0;">
+                                <span>流出:</span>
+                                <span style="color: #2ed573;">${theme.totalOutflow.toFixed(1)}亿</span>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin: 3px 0; font-weight: bold;">
+                                <span>净流入:</span>
+                                <span style="color: ${netColor};">${netFlow >= 0 ? '+' : ''}${netFlow.toFixed(1)}亿</span>
+                            </div>
+                        `;
+                    }
+                },
+                legend: {
+                    data: ['流入', '流出', '净流入'],
+                    textStyle: { color: '#fff' }
+                },
+                grid: {
+                    left: '3%',
+                    right: '4%',
+                    bottom: '15%',
+                    top: '15%'
+                },
+                xAxis: {
+                    type: 'category',
+                    data: categories,
+                    axisLine: { lineStyle: { color: '#666' } },
+                    axisLabel: { 
+                        color: '#999',
+                        fontSize: 10,
+                        rotate: 45
+                    }
+                },
+                yAxis: {
+                    type: 'value',
+                    name: '金额(亿)',
+                    axisLine: { lineStyle: { color: '#666' } },
+                    axisLabel: { color: '#999' },
+                    splitLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } }
+                },
+                series: [
+                    {
+                        name: '流入',
+                        type: 'bar',
+                        stack: 'flow',
+                        data: inflows,
+                        itemStyle: {
+                            color: 'rgba(255, 71, 87, 0.7)',
+                            borderColor: '#ff4757',
+                            borderWidth: 1
+                        }
+                    },
+                    {
+                        name: '流出',
+                        type: 'bar',
+                        stack: 'flow',
+                        data: outflows,
+                        itemStyle: {
+                            color: 'rgba(46, 213, 115, 0.7)',
+                            borderColor: '#2ed573',
+                            borderWidth: 1
+                        }
+                    },
+                    {
+                        name: '净流入',
+                        type: 'line',
+                        symbol: 'circle',
+                        symbolSize: 8,
+                        data: netFlows,
+                        lineStyle: {
+                            color: '#ff9f43',
+                            width: 2
+                        },
+                        itemStyle: {
+                            color: function(params) {
+                                return params.value >= 0 ? '#ff4757' : '#2ed573';
+                            }
+                        }
+                    }
+                ]
+            };
+            
+            sectorFlowChart.setOption(option);
+            
+            window.addEventListener('resize', function() {
+                sectorFlowChart.resize();
+            });
+        }
+        
+        // 渲染排行榜
+        function renderRankings() {
+            // 流入排行榜
+            const inflowRanking = document.getElementById('inflowRanking');
+            const inflowStocks = [...mockFlowData.stocks]
+                .filter(s => s.summary.netInflow > 0)
+                .sort((a, b) => b.summary.netInflow - a.summary.netInflow)
+                .slice(0, 5);
+            
+            inflowRanking.innerHTML = inflowStocks.map(stock => `
+                <div class="ranking-item">
+                    <div class="ranking-stock">
+                        <span>${stock.name}</span>
+                        <span class="stock-code">${stock.code}</span>
+                    </div>
+                    <div class="ranking-flow" style="color: #ff4757;">
+                        +${stock.summary.netInflow.toFixed(1)}亿
+                    </div>
+                </div>
+            `).join('');
+            
+            // 流出排行榜
+            const outflowRanking = document.getElementById('outflowRanking');
+            const outflowStocks = [...mockFlowData.stocks]
+                .filter(s => s.summary.netInflow < 0)
+                .sort((a, b) => a.summary.netInflow - b.summary.netInflow)
+                .slice(0, 5);
+            
+            outflowRanking.innerHTML = outflowStocks.map(stock => `
+                <div class="ranking-item">
+                    <div class="ranking-stock">
+                        <span>${stock.name}</span>
+                        <span class="stock-code">${stock.code}</span>
+                    </div>
+                    <div class="ranking-flow" style="color: #2ed573;">
+                        ${stock.summary.netInflow.toFixed(1)}亿
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // 辅助函数
+        function interpolateColor(color1, color2, factor) {
+            // 将颜色转换为RGB数组
+            const hexToRgb = hex => {
+                const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+                return result ? [
+                    parseInt(result[1], 16),
+                    parseInt(result[2], 16),
+                    parseInt(result[3], 16)
+                ] : [0, 0, 0];
+            };
+            
+            const rgb1 = hexToRgb(color1);
+            const rgb2 = hexToRgb(color2);
+            
+            // 计算插值
+            const r = Math.round(rgb1[0] + (rgb2[0] - rgb1[0]) * factor);
+            const g = Math.round(rgb1[1] + (rgb2[1] - rgb1[1]) * factor);
+            const b = Math.round(rgb1[2] + (rgb2[2] - rgb1[2]) * factor);
+            
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+        
+        function findNodeIndex(nodes, category, name) {
+            return nodes.findIndex(node => 
+                node.category === category && 
+                node.name === name
+            );
+        }
+        
+        // 页面加载完成后自动初始化所有图表
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('页面DOM加载完成，开始初始化图表...');
+            
+            // 确保数据存在
+            console.log('mockFlowData存在:', !!mockFlowData);
+            if (mockFlowData) {
+                console.log('股票数据量:', mockFlowData.stocks ? mockFlowData.stocks.length : 0);
+            }
+            
+            try {
+                // 初始化所有图表
+                initSankeyChart();
+                initMinuteFlowChart();
+                initSectorFlowChart();
+                
+                // 渲染排行榜
+                renderRankings();
+                
+                // 添加股票选择事件
+                document.getElementById('stockSelect').addEventListener('change', function() {
+                    updateMinuteFlowChart(this.value);
+                });
+                
+                console.log('所有图表初始化完成');
+            } catch (error) {
+                console.error('图表初始化过程中发生错误:', error);
+            }
+        });
+    </script>
+</body>
+</html>
