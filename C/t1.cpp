@@ -883,6 +883,91 @@ public:
     //     }
     //     std::cout<<" cleanTickOldData 删除: "<<count<<" 最前:"<<min_timestamp<<" |最后"<<max_timestamp<<"||总共："<<count_stock<<std::endl;
     // }
+    // 新增：基于stock_states_计算1分钟涨速
+    double calculate_1min_change_rate(const std::string& symbol, long long current_timestamp, double current_price) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        
+        auto it = stock_states_.find(symbol);
+        if (it == stock_states_.end() || it->second.history.empty()) {
+            return 0.0;
+        }
+        
+        const auto& history = it->second.history;
+        long long one_min_ago = current_timestamp - 60 * 1000; // 1分钟前
+        
+        // 从后往前查找1分钟前的价格
+        double one_min_ago_price = 0.0;
+        bool found = false;
+        
+        for (auto rit = history.rbegin(); rit != history.rend(); ++rit) {
+            if (rit->timestamp <= one_min_ago) {
+                one_min_ago_price = rit->last_price;
+                found = true;
+                break;
+            }
+        }
+        
+        // 如果没找到1分钟前的数据，使用最早的数据
+        if (!found && !history.empty()) {
+            one_min_ago_price = history.front().last_price;
+            found = true;
+        }
+        
+        if (!found || one_min_ago_price == 0) {
+            return 0.0;
+        }
+        
+        // 计算涨速（百分比）
+        return (current_price - one_min_ago_price) / one_min_ago_price * 100.0;
+    }
+    
+    // 新增：基于stock_states_计算2分钟成交额
+    double calculate_2min_amount(const std::string& symbol, long long current_timestamp, double current_amount) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        
+        auto it = stock_states_.find(symbol);
+        if (it == stock_states_.end() || it->second.history.empty()) {
+            return 0.0;
+        }
+        
+        const auto& history = it->second.history;
+        long long two_min_ago = current_timestamp - 2 * 60 * 1000; // 2分钟前
+        
+        // 从后往前查找2分钟前的成交额
+        double two_min_ago_amount = 0.0;
+        bool found = false;
+        
+        for (auto rit = history.rbegin(); rit != history.rend(); ++rit) {
+            if (rit->timestamp <= two_min_ago) {
+                two_min_ago_amount = rit->amount;
+                found = true;
+                break;
+            }
+        }
+        
+        // 如果没找到2分钟前的数据，使用最早的数据
+        if (!found && !history.empty()) {
+            two_min_ago_amount = history.front().amount;
+            found = true;
+        }
+        
+        if (!found) {
+            return current_amount; // 没有历史数据，返回当前值
+        }
+        
+        // 计算2分钟成交额（累计值相减）
+        return current_amount - two_min_ago_amount;
+    }
+    
+    // 新增：获取1分钟和2分钟指标的便捷方法
+    std::pair<double, double> get_advanced_indicators(const std::string& symbol, long long current_timestamp, 
+                                                     double current_price, double current_amount) {
+        return std::make_pair(
+            calculate_1min_change_rate(symbol, current_timestamp, current_price),
+            calculate_2min_amount(symbol, current_timestamp, current_amount)
+        );
+    }
+
 private:
     void calculateAuctionLargeOrder(StockData& current_tick, StockTickState& state) {
         const auto& prev_tick = state.history.back();
@@ -2834,8 +2919,11 @@ public:
         bool is_auction = TimeUtils::isAuctionTime(time_str);
         
         tick_engine_->processTickData(data, is_auction);
+        // 然后基于更新后的stock_states_计算高级指标
+        auto [change_rate_1min, amount_2min] = tick_engine_->get_advanced_indicators(
+            data.symbol, data.timestamp, data.last_price, data.amount);
          // 存储股票数据到Redis（新增）
-        storeStockDataToRedis(data, change);
+        storeStockDataToRedis(data, change, change_rate_1min, amount_2min);
         if (is_auction) {
             auction_analyzer_->processAuctionData(data, change, bid_amount, ask_amount);
         } else{
@@ -2843,7 +2931,7 @@ public:
         }
     }
 private:
-    void storeStockDataToRedis(const StockData& data, double change) {
+    void storeStockDataToRedis(const StockData& data, double change, double change_rate_1min, double amount_2min) {
         if (!redis_client_->connect()) {
             return;
         }
@@ -2856,6 +2944,10 @@ private:
         redis_client_->hset(key, "change_pct", std::to_string(change));
         redis_client_->hset(key, "volume", Logger::amountToWan(data.amount));
         redis_client_->hset(key, "large_net", Logger::amountToWan(data.large_net));
+         
+        // 新增：存储高级指标
+        redis_client_->hset(key, "change_rate_1min", std::to_string(change_rate_1min));
+        redis_client_->hset(key, "amount_2min", Logger::amountToWan(amount_2min));
         // 修复：将时间戳转换为整数（毫秒）
         long long timestamp_ms = static_cast<long long>(data.timestamp);
         redis_client_->hset(key, "timestamp", std::to_string(timestamp_ms));
@@ -2864,7 +2956,7 @@ private:
         redis_client_->hset(key, "market_cap", std::to_string(market_cap));
         
         // 设置过期时间，与Python脚本一致
-        redis_client_->expire(key, 60*60*2); // 5分钟过期
+        redis_client_->expire(key, 60*60*24); // 5分钟过期
         
         // 可选：记录存储成功的日志
         static int stored_count = 0;
