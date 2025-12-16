@@ -1,0 +1,1851 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>📊 股票题材分类表</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+       
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 15px;
+        }
+       
+        .container {
+            max-width: 100%;
+            margin: 0 auto;
+            height: calc(100vh - 30px);
+            display: flex;
+            flex-direction: column;
+        }
+       
+        .header {
+            text-align: center;
+            margin-bottom: 15px;
+            padding: 12px;
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+       
+        .header h1 {
+            color: #d4af37;
+            font-size: 20px;
+            margin-bottom: 5px;
+        }
+       
+        .header p {
+            color: #aaa;
+            font-size: 12px;
+        }
+       
+        .main-content {
+            flex: 1;
+            display: flex;
+            gap: 15px;
+        }
+       
+        .chart-container {
+            flex: 1;
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        /* 加载状态样式 */
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(26, 26, 46, 0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+            border-radius: 8px;
+        }
+        
+        .loading-spinner {
+            border: 4px solid rgba(212, 175, 55, 0.3);
+            border-top: 4px solid #d4af37;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 15px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            color: #d4af37;
+            font-size: 14px;
+        }
+        
+        /* 错误信息样式 */
+        .error-message {
+            color: #ff6b6b;
+            font-size: 14px;
+            text-align: center;
+            margin: 10px 0;
+            padding: 10px;
+            background: rgba(255, 107, 107, 0.1);
+            border-radius: 4px;
+            border: 1px solid rgba(255, 107, 107, 0.3);
+        }
+        
+        .retry-button {
+            padding: 8px 16px;
+            background: #d4af37;
+            color: #0c0c0c;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-top: 10px;
+            transition: background 0.2s;
+        }
+        
+        .retry-button:hover {
+            background: #e6c264;
+        }
+       
+        .side-panel {
+            flex: 0.25;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            min-width: 200px;
+        }
+       
+        .panel {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+            padding: 12px;
+            overflow: hidden;
+        }
+       
+        .panel-title {
+            color: #d4af37;
+            font-size: 13px;
+            margin-bottom: 8px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+       
+        /* Excel样式表格 */
+        .excel-container {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            bottom: 10px;
+            overflow: auto;
+            background: rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+       
+        .excel-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            min-width: 1200px;
+        }
+       
+        .excel-table th, .excel-table td {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 0;
+            vertical-align: top;
+        }
+       
+        .theme-header-cell {
+            background: rgba(0, 0, 0, 0.8);
+            color: #d4af37;
+            font-size: 12px;
+            font-weight: bold;
+            padding: 8px;
+            text-align: center;
+            position: sticky;
+            left: 0;
+            z-index: 10;
+            width: 100px;
+        }
+       
+        .theme-header-cell .theme-name {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 14px;
+        }
+       
+        .theme-header-cell .theme-stats {
+            font-size: 10px;
+            color: #aaa;
+            display: flex;
+            justify-content: space-between;
+        }
+       
+        .column-header {
+            background: rgba(0, 0, 0, 0.7);
+            color: #d4af37;
+            font-size: 11px;
+            text-align: center;
+            vertical-align: middle;
+            padding: 6px 2px;
+            height: 40px;
+            position: sticky;
+            top: 0;
+            z-index: 5;
+        }
+       
+        .column-header .column-title {
+            display: block;
+            margin-bottom: 3px;
+            font-size: 13px;
+        }
+       
+        .column-header .column-stats {
+            font-size: 9px;
+            color: #aaa;
+        }
+       
+        /* 股票单元格 - 自适应高度 */
+        .stock-cell {
+            padding: 5px;
+            position: relative;
+            min-height: 40px;
+        }
+       
+        .stock-item {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 4px;
+            margin: 1px;
+            border-radius: 2px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+            max-width: 100%;
+            overflow: hidden;
+            height: 18px;
+            line-height: 1;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+       
+        .stock-item:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 8px rgba(212, 175, 55, 0.5);
+            z-index: 10;
+        }
+       
+        .stock-name {
+            font-weight: bold;
+            margin-right: 4px;
+            flex-shrink: 0;
+        }
+       
+        .stock-info {
+            display: flex;
+            gap: 4px;
+            font-size: 9px;
+            flex-shrink: 0;
+        }
+       
+        .stock-gain {
+            font-weight: bold;
+        }
+       
+        /* 统计面板 */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+        }
+       
+        .stat-item {
+            text-align: center;
+            padding: 6px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 4px;
+        }
+       
+        .stat-value {
+            font-size: 14px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+       
+        .stat-label {
+            font-size: 9px;
+            color: #aaa;
+            margin-top: 2px;
+        }
+       
+        /* 题材详情 */
+        .theme-details {
+            max-height: 150px;
+            overflow-y: auto;
+        }
+       
+        .theme-item {
+            padding: 6px 8px;
+            margin-bottom: 4px;
+            background: rgba(40, 40, 60, 0.4);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+       
+        .theme-item:hover {
+            background: rgba(212, 175, 55, 0.1);
+        }
+       
+        .theme-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3px;
+        }
+       
+        .theme-name {
+            font-size: 11px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+       
+        .theme-amount {
+            font-size: 10px;
+            color: #52c41a;
+        }
+       
+        .theme-stocks {
+            font-size: 9px;
+            color: #aaa;
+            display: flex;
+            justify-content: space-between;
+        }
+       
+        /* 连板票数量 */
+        .floor-counts {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 4px;
+            margin-top: 8px;
+        }
+       
+        .floor-count {
+            text-align: center;
+            padding: 4px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 3px;
+        }
+       
+        .floor-num {
+            font-size: 12px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+       
+        .floor-label-small {
+            font-size: 8px;
+            color: #aaa;
+        }
+       
+        /* 滚动条 */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+       
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+        }
+       
+        ::-webkit-scrollbar-thumb {
+            background: rgba(212, 175, 55, 0.5);
+            border-radius: 3px;
+        }
+        
+        /* 工具提示 */
+        .tooltip {
+            position: fixed;
+            background: rgba(0, 0, 0, 0.95);
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 10px;
+            font-size: 12px;
+            color: #fff;
+            pointer-events: none;
+            z-index: 1000;
+            max-width: 250px;
+            display: none;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+        
+        .tooltip-title {
+            color: #d4af37;
+            font-weight: bold;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+        
+        .tooltip-content {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .tooltip-row {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .tooltip-label {
+            color: #aaa;
+            min-width: 60px;
+        }
+        
+        .tooltip-value {
+            color: #fff;
+            text-align: right;
+        }
+        
+        /* 控制面板 - 可隐藏 */
+        .control-panel-container {
+            transition: all 0.3s ease;
+        }
+        
+        .control-panel-container.collapsed {
+            height: 40px;
+            overflow: hidden;
+        }
+        
+        .toggle-controls {
+            background: rgba(40, 40, 60, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 10px;
+        }
+        
+        .toggle-controls:hover {
+            background: rgba(212, 175, 55, 0.2);
+            border-color: #d4af37;
+        }
+        
+        .control-panel {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-top: 10px;
+        }
+       
+        .control-btn {
+            background: rgba(40, 40, 60, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            padding: 5px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 10px;
+            transition: all 0.2s;
+        }
+       
+        .control-btn:hover {
+            background: rgba(212, 175, 55, 0.2);
+            border-color: #d4af37;
+        }
+       
+        .control-btn.active {
+            background: rgba(212, 175, 55, 0.3);
+            border-color: #d4af37;
+            color: #d4af37;
+        }
+        
+        /* 闪烁效果 - 通过频率和亮度区分涨速 */
+        @keyframes blink-slow {
+            0%, 100% { opacity: 1; border-color: rgba(212, 175, 55, 0.5); box-shadow: 0 0 8px rgba(212, 175, 55, 0.3); }
+            50% { opacity: 0.5; border-color: rgba(212, 175, 55, 0.8); box-shadow: 0 0 12px rgba(212, 175, 55, 0.6); }
+        }
+        
+        @keyframes blink-medium {
+            0%, 100% { opacity: 1; border-color: rgba(212, 175, 55, 0.5); box-shadow: 0 0 8px rgba(212, 175, 55, 0.3); }
+            50% { opacity: 0.3; border-color: rgba(212, 175, 55, 1); box-shadow: 0 0 16px rgba(212, 175, 55, 0.8); }
+        }
+        
+        @keyframes blink-fast {
+            0%, 100% { opacity: 1; border-color: rgba(212, 175, 55, 0.5); box-shadow: 0 0 8px rgba(212, 175, 55, 0.3); }
+            25%, 75% { opacity: 0.2; border-color: rgba(212, 175, 55, 1); box-shadow: 0 0 20px rgba(212, 175, 55, 1); }
+            50% { opacity: 0.6; border-color: rgba(212, 175, 55, 0.8); box-shadow: 0 0 14px rgba(212, 175, 55, 0.7); }
+        }
+        
+        @keyframes blink-very-fast {
+            0%, 100% { opacity: 1; border-color: rgba(212, 175, 55, 0.5); box-shadow: 0 0 8px rgba(212, 175, 55, 0.3); }
+            12.5%, 37.5%, 62.5%, 87.5% { opacity: 0.1; border-color: rgba(212, 175, 55, 1); box-shadow: 0 0 24px rgba(212, 175, 55, 1); }
+            25%, 50%, 75% { opacity: 0.7; border-color: rgba(212, 175, 55, 0.8); box-shadow: 0 0 16px rgba(212, 175, 55, 0.8); }
+        }
+        
+        .blink-slow {
+            animation: blink-slow 2s infinite;
+        }
+        
+        .blink-medium {
+            animation: blink-medium 1s infinite;
+        }
+        
+        .blink-fast {
+            animation: blink-fast 0.75s infinite;
+        }
+        
+        .blink-very-fast {
+            animation: blink-very-fast 0.5s infinite;
+        }
+        
+        /* 统一的颜色方案 - 蓝红渐变 */
+        /* 使用蓝色系表示下跌，红色系表示上涨 */
+        /* 颜色深浅表示涨跌幅大小，透明度表示强度 */
+        
+        /* 列宽调整 */
+        .col-1 { width: 5%; }
+        .col-2 { width: 5%; }
+        .col-3 { width: 5%; }
+        .col-4 { width: 5%; }
+        .col-5 { width: 18%; }
+        .col-6 { width: 7%; }
+        .col-7 { width: 55%; }
+        
+        /* 列标题颜色 - 统一使用深色背景 */
+        .header-5, .header-4, .header-3, .header-2, .header-1,
+        .header-core, .header-other {
+            background: rgba(40, 40, 60, 0.7);
+        }
+        /* 原有样式保留，只添加几个新样式 */
+        .loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.9);
+            color: #d4af37;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #d4af37;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .ws-status {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            z-index: 100;
+            transition: all 0.3s;
+        }
+        
+        .ws-connected {
+            background: rgba(40, 167, 69, 0.2);
+            border: 1px solid #28a745;
+            color: #28a745;
+        }
+        
+        .ws-disconnected {
+            background: rgba(220, 53, 69, 0.2);
+            border: 1px solid #dc3545;
+            color: #dc3545;
+        }
+        
+        .ws-reconnecting {
+            background: rgba(255, 193, 7, 0.2);
+            border: 1px solid #ffc107;
+            color: #ffc107;
+        }
+    </style>
+</head>
+<body>
+    <!-- 原有HTML结构保留 -->
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>📊 股票题材分类表 - WebSocket实时版</h1>
+                <p>实时数据更新 | DOM优化渲染 | WebSocket连接</p>
+            </div>
+            <div>
+                <button class="control-btn" onclick="stockTable.reconnectWebSocket()">重新连接</button>
+                <button class="toggle-controls" onclick="stockTable.toggleSidePanel()">
+                    <span id="panelToggleText">隐藏侧边栏</span>
+                </button>
+            </div>
+        </div>
+       
+        <div class="main-content">
+            <div class="chart-container">
+                <!-- 加载状态指示器 -->
+                <div id="loadingOverlay" class="loading-overlay" style="display: none;">
+                    <div class="loading-spinner"></div>
+                    <div class="loading-text">数据加载中...</div>
+                    <button id="retryButton" class="retry-button" style="display: none;">重试</button>
+                </div>
+                <!-- Excel表格容器 -->
+                <div class="excel-container" id="excelContainer">
+                    <!-- Excel表格将通过JS动态生成 -->
+                </div>
+                <div class="tooltip" id="tooltip"></div>
+            </div>
+           
+            <div class="side-panel" id="sidePanel">
+                <!-- 原有侧边栏内容 -->
+                <div class="panel control-panel-container" id="controlPanel">
+                    <div class="panel-title">⚙️ 控制面板</div>
+                    <div class="control-panel">
+                        <button class="control-btn active" onclick="stockTable.showAll()">显示全部</button>
+                        <button class="control-btn" onclick="stockTable.filterByCapital(0)">抢跑</button>
+                        <button class="control-btn" onclick="stockTable.filterByCapital(1)">试错</button>
+                        <button class="control-btn" onclick="stockTable.filterByCapital(2)">梭哈</button>
+                        <button class="control-btn" onclick="stockTable.filterByCapital(3)">其他</button>
+                    </div>
+                </div>
+               
+                <div class="panel">
+                    <div class="panel-title">📊 统计概览</div>
+                    <div class="stats">
+                        <div class="stat-item">
+                            <div class="stat-value" id="totalStocks">0</div>
+                            <div class="stat-label">股票总数</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="totalThemes">0</div>
+                            <div class="stat-label">题材数量</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="totalFlow">0</div>
+                            <div class="stat-label">总资金(亿)</div>
+                        </div>
+                    </div>
+                    <div class="panel-title" style="margin-top: 10px;">💰 资金类型分布</div>
+                    <div class="floor-counts">
+                        <div class="floor-count">
+                            <div class="floor-num" id="capital0">0</div>
+                            <div class="floor-label-small">抢跑</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="capital1">0</div>
+                            <div class="floor-label-small">试错</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="capital2">0</div>
+                            <div class="floor-label-small">梭哈</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="capital3">0</div>
+                            <div class="floor-label-small">其他</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="blinkCount">0</div>
+                            <div class="floor-label-small">闪烁</div>
+                        </div>
+                    </div>
+                </div>
+               
+                <div class="panel">
+                    <div class="panel-title">📈 题材详情</div>
+                    <div class="theme-details" id="themeDetails">
+                        <!-- 动态生成 -->
+                    </div>
+                </div>
+               
+                <div class="panel">
+                    <div class="panel-title">🔥 连板分布</div>
+                    <div class="floor-counts">
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor5">0</div>
+                            <div class="floor-label-small">5+板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor4">0</div>
+                            <div class="floor-label-small">4板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor3">0</div>
+                            <div class="floor-label-small">3板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor2">0</div>
+                            <div class="floor-label-small">2板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor1">0</div>
+                            <div class="floor-label-small">1板</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 加载提示（已隐藏） -->
+    <div class="loading" id="loading" style="display: none;">
+        <div>连接WebSocket服务器...</div>
+        <div style="font-size: 12px; color: #aaa;" id="wsInfo"></div>
+    </div>
+    
+    <!-- WebSocket状态 -->
+    <div class="ws-status ws-disconnected" id="wsStatus">连接已断开</div>
+
+    <script>
+        // ========== WebSocket连接管理器 ==========
+
+        
+        // ========== 优化的股票表格管理 ==========
+        class OptimizedStockTable {
+            constructor() {
+                this.container = document.getElementById('excelContainer');
+                this.tooltip = document.getElementById('tooltip');
+                this.loading = document.getElementById('loading');
+                this.wsStatus = document.getElementById('wsStatus');
+                this.wsInfo = document.getElementById('wsInfo');
+                
+                // DOM缓存
+                this.tableCache = new Map(); // 缓存已经创建的DOM元素
+                this.cellCache = new Map();  // 单元格缓存 key: theme_column
+                this.stockCache = new Map(); // 股票元素缓存 key: stockId
+                
+                this.data = {
+                    stocks: [],
+                    themes: new Map(), // 使用Map提高查找性能
+                    capitalTypes: ['抢跑资金', '试错资金', '梭哈资金', '其他资金']
+                };
+                
+                this.filter = {
+                    capitalType: null,
+                    theme: null
+                };
+                
+                this.init();
+            }
+            
+            init() {
+                this.createTableStructure(); // 创建空的表格结构
+                this.setupEventListeners();
+            }
+            
+            // 数据解析和处理
+            processData(data) {
+                const startTime = performance.now();
+                
+                // 解析不同类型的消息
+                if (data.type === 'full') {
+                    // 全量数据更新
+                    this.processFullData(data.payload);
+                } else if (data.type === 'incremental') {
+                    // 增量数据更新
+                    this.processIncrementalData(data.payload);
+                } else if (data.type === 'heartbeat') {
+                    // 心跳包
+                    this.wsInfo.textContent = `心跳: ${new Date().toLocaleTimeString()}`;
+                    return;
+                } else {
+                    // 默认处理
+                    this.processFullData(data);
+                }
+                
+                const endTime = performance.now();
+                console.log(`数据处理耗时: ${endTime - startTime}ms`);
+            }
+            
+            processFullData(payload) {
+                console.log('进入processFullData方法，传入的数据:', payload);
+                
+                // 清空旧数据
+                this.data.stocks = [];
+                this.data.themes.clear();
+                
+                // 处理股票数据
+                if (payload.stocks && Array.isArray(payload.stocks)) {
+                    console.log('处理股票数量:', payload.stocks.length);
+                    payload.stocks.forEach((stock, index) => {
+                        this.addStock(stock);
+                    });
+                }
+                
+                // 处理主题数据
+                if (payload.themes && Array.isArray(payload.themes)) {
+                    console.log('处理主题数量:', payload.themes.length);
+                    payload.themes.forEach(theme => {
+                        this.data.themes.set(theme.name, theme);
+                    });
+                }
+                
+                console.log('处理后的股票数据:', this.data.stocks);
+                console.log('处理后的主题数据:', Array.from(this.data.themes.entries()));
+                
+                // 批量更新界面
+                this.batchUpdate();
+            }
+            
+            processIncrementalData(payload) {
+                const updates = payload.updates || [];
+                const removals = payload.removals || [];
+                
+                // 移除股票
+                removals.forEach(stockId => {
+                    this.removeStock(stockId);
+                });
+                
+                // 更新或添加股票
+                updates.forEach(stock => {
+                    this.updateOrAddStock(stock);
+                });
+                
+                // 增量更新界面
+                this.incrementalUpdate();
+            }
+            
+            addStock(stock) {
+                // 标准化股票数据
+                const normalizedStock = this.normalizeStockData(stock);
+                
+                // 检查是否已经存在相同ID的股票
+                const existingStockIndex = this.data.stocks.findIndex(s => s.id === normalizedStock.id);
+                if (existingStockIndex >= 0) {
+                    // 如果已经存在，更新它而不是添加新的
+                    this.updateOrAddStock(stock);
+                    return;
+                }
+                
+                // 添加到主股票列表
+                this.data.stocks.push(normalizedStock);
+                
+                // 更新主题数据
+                const theme = normalizedStock.theme;
+                if (!this.data.themes.has(theme)) {
+                    this.data.themes.set(theme, {
+                        name: theme,
+                        stocks: [],
+                        floorCounts: {1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+                        capitalCounts: {0: 0, 1: 0, 2: 0, 3: 0},
+                        totalAmount: 0
+                    });
+                }
+                
+                const themeData = this.data.themes.get(theme);
+                
+                // 检查主题中是否已经存在该股票
+                const existingThemeStockIndex = themeData.stocks.findIndex(s => s.id === normalizedStock.id);
+                if (existingThemeStockIndex >= 0) {
+                    // 如果已经存在，更新它
+                    themeData.stocks[existingThemeStockIndex] = normalizedStock;
+                } else {
+                    // 否则添加新的
+                    themeData.stocks.push(normalizedStock);
+                    themeData.totalAmount += normalizedStock.amount;
+                    themeData.capitalCounts[normalizedStock.capitalType]++;
+                    
+                    if (normalizedStock.floor > 0) {
+                        themeData.floorCounts[Math.min(normalizedStock.floor, 5)]++;
+                    }
+                }
+            }
+            
+            normalizeStockData(stock) {
+                // 确保数据有正确的格式和默认值
+                return {
+                    id: stock.id || `${stock.code}_${Date.now()}`,
+                    name: stock.name || '',
+                    code: stock.code || '',
+                    amount: Number(stock.amount) || 0,
+                    gain: Number(stock.gain) || 0,
+                    speed: Number(stock.speed) || 0,
+                    capitalType: Number(stock.capitalType) || 0,
+                    theme: stock.theme || '其他',
+                    floor: Number(stock.floor) || 0,
+                    category: stock.category || this.determineCategory(stock)
+                };
+            }
+            
+            determineCategory(stock) {
+                if (stock.floor > 0) return 'emotion';
+                if (stock.isCore) return 'core';
+                return 'other';
+            }
+            
+            updateOrAddStock(stock) {
+                const existingIndex = this.data.stocks.findIndex(s => s.id === stock.id);
+                if (existingIndex >= 0) {
+                    // 更新现有股票
+                    const oldStock = this.data.stocks[existingIndex];
+                    const newStock = this.normalizeStockData(stock);
+                    
+                    // 检查是否需要更新DOM
+                    const needsUpdate = 
+                        oldStock.gain !== newStock.gain ||
+                        oldStock.speed !== newStock.speed ||
+                        oldStock.amount !== newStock.amount ||
+                        oldStock.capitalType !== newStock.capitalType;
+                    
+                    this.data.stocks[existingIndex] = newStock;
+                    
+                    // 更新主题数据
+                    if (oldStock.theme !== newStock.theme) {
+                        this.moveStockBetweenThemes(oldStock, newStock);
+                    } else {
+                        this.updateThemeStock(oldStock, newStock);
+                    }
+                    
+                    // 如果需要，更新DOM
+                    if (needsUpdate) {
+                        this.updateStockElement(newStock);
+                    }
+                } else {
+                    // 添加新股票
+                    this.addStock(stock);
+                }
+            }
+            
+            moveStockBetweenThemes(oldStock, newStock) {
+                // 从旧主题移除
+                const oldTheme = this.data.themes.get(oldStock.theme);
+                if (oldTheme) {
+                    const stockIndex = oldTheme.stocks.findIndex(s => s.id === oldStock.id);
+                    if (stockIndex >= 0) {
+                        oldTheme.stocks.splice(stockIndex, 1);
+                        oldTheme.totalAmount -= oldStock.amount;
+                        oldTheme.capitalCounts[oldStock.capitalType]--;
+                    }
+                }
+                
+                // 添加到新主题
+                this.addStock(newStock);
+            }
+            
+            updateThemeStock(oldStock, newStock) {
+                const theme = this.data.themes.get(newStock.theme);
+                if (theme) {
+                    const stockIndex = theme.stocks.findIndex(s => s.id === newStock.id);
+                    if (stockIndex >= 0) {
+                        theme.stocks[stockIndex] = newStock;
+                        theme.totalAmount = theme.totalAmount - oldStock.amount + newStock.amount;
+                        theme.capitalCounts[oldStock.capitalType]--;
+                        theme.capitalCounts[newStock.capitalType]++;
+                    }
+                }
+            }
+            
+            removeStock(stockId) {
+                const stockIndex = this.data.stocks.findIndex(s => s.id === stockId);
+                if (stockIndex >= 0) {
+                    const stock = this.data.stocks[stockIndex];
+                    
+                    // 从主题数据中移除
+                    const theme = this.data.themes.get(stock.theme);
+                    if (theme) {
+                        const themeStockIndex = theme.stocks.findIndex(s => s.id === stockId);
+                        if (themeStockIndex >= 0) {
+                            theme.stocks.splice(themeStockIndex, 1);
+                            theme.totalAmount -= stock.amount;
+                            theme.capitalCounts[stock.capitalType]--;
+                        }
+                    }
+                    
+                    // 从主数组中移除
+                    this.data.stocks.splice(stockIndex, 1);
+                    
+                    // 从DOM中移除
+                    this.removeStockElement(stockId);
+                }
+            }
+            
+            // ========== DOM操作优化 ==========
+            
+            createTableStructure() {
+                const table = document.createElement('table');
+                table.className = 'excel-table';
+                table.id = 'stockTable';
+                
+                // 创建表头
+                const thead = document.createElement('thead');
+                const headerRow = document.createElement('tr');
+                
+                // 第一列：题材名称
+                const themeHeader = document.createElement('th');
+                themeHeader.className = 'theme-header-cell';
+                themeHeader.innerHTML = `
+                    <div class="column-title">题材</div>
+                    <div class="column-stats">股票/资金</div>
+                `;
+                headerRow.appendChild(themeHeader);
+                
+                // 列定义
+                const columns = [
+                    { name: '5+板', key: 5, class: 'col-1 header-5' },
+                    { name: '4板', key: 4, class: 'col-2 header-4' },
+                    { name: '3板', key: 3, class: 'col-3 header-3' },
+                    { name: '2板', key: 2, class: 'col-4 header-4' },
+                    { name: '1板', key: 1, class: 'col-5 header-1' },
+                    { name: '核心票', key: 'core', class: 'col-6 header-core' },
+                    { name: '其他个股', key: 'other', class: 'col-7 header-other' }
+                ];
+                
+                this.columns = columns;
+                
+                columns.forEach(col => {
+                    const colHeader = document.createElement('th');
+                    colHeader.className = `column-header ${col.class}`;
+                    colHeader.id = `header_${col.key}`;
+                    colHeader.innerHTML = `
+                        <div class="column-title">${col.name}</div>
+                        <div class="column-stats">0只/0亿</div>
+                    `;
+                    headerRow.appendChild(colHeader);
+                });
+                
+                thead.appendChild(headerRow);
+                table.appendChild(thead);
+                
+                // 创建空的表格主体
+                const tbody = document.createElement('tbody');
+                tbody.id = 'tableBody';
+                table.appendChild(tbody);
+                
+                this.container.innerHTML = '';
+                this.container.appendChild(table);
+                this.tableCache.set('mainTable', table);
+            }
+            
+            batchUpdate() {
+                console.log('进入batchUpdate方法');
+                
+                const tbody = document.getElementById('tableBody');
+                console.log('tbody元素:', tbody);
+                
+                if (!tbody) {
+                    console.error('tbody元素不存在，无法更新表格');
+                    return;
+                }
+                
+                // 清空现有行
+                tbody.innerHTML = '';
+                
+                // 创建新的行并填充数据
+                console.log('开始创建主题行并填充数据，主题数量:', this.data.themes.size);
+                this.data.themes.forEach((themeData, themeName) => {
+                    console.log('创建主题行并填充数据:', themeName, '股票数量:', themeData.stocks.length);
+                    const row = this.createThemeRow(themeName, themeData);
+                    tbody.appendChild(row);
+                    // 填充股票数据到单元格
+                    this.updateThemeRow(themeName, themeData);
+                });
+                
+                console.log('表格更新完成');
+                
+                // 更新统计信息
+                this.updateStats();
+                this.updateThemeDetails();
+                this.updateColumnHeaders();
+            }
+            
+            incrementalUpdate() {
+                // 更新列统计
+                this.updateColumnHeaders();
+                
+                // 更新主题行
+                this.data.themes.forEach((themeData, themeName) => {
+                    this.updateThemeRow(themeName, themeData);
+                });
+                
+                // 更新统计信息
+                this.updateStats();
+                this.updateThemeDetails();
+            }
+            
+            createThemeRow(themeName, themeData) {
+                const row = document.createElement('tr');
+                row.id = `row_${themeName}`;
+                
+                // 主题标题单元格
+                const themeCell = document.createElement('td');
+                themeCell.className = 'theme-header-cell';
+                themeCell.innerHTML = `
+                    <div class="theme-name">${themeName}</div>
+                    <div class="theme-stats">
+                        <span>${themeData.stocks.length}只</span>
+                        <span>${themeData.totalAmount.toFixed(1)}亿</span>
+                    </div>
+                `;
+                themeCell.addEventListener('click', () => {
+                    this.filterByTheme(themeName);
+                });
+                row.appendChild(themeCell);
+                
+                // 为每个列创建单元格
+                this.columns.forEach(col => {
+                    const cell = document.createElement('td');
+                    cell.className = 'stock-cell';
+                    cell.id = `cell_${themeName}_${col.key}`;
+                    row.appendChild(cell);
+                    
+                    // 缓存单元格
+                    this.cellCache.set(`${themeName}_${col.key}`, cell);
+                });
+                
+                return row;
+            }
+            
+            updateThemeRow(themeName, themeData) {
+                const row = document.getElementById(`row_${themeName}`);
+                if (!row) {
+                    // 如果行不存在，创建新行
+                    const tbody = document.getElementById('tableBody');
+                    const newRow = this.createThemeRow(themeName, themeData);
+                    tbody.appendChild(newRow);
+                    return;
+                }
+                
+                // 更新主题单元格
+                const themeCell = row.querySelector('.theme-header-cell');
+                if (themeCell) {
+                    themeCell.innerHTML = `
+                        <div class="theme-name">${themeName}</div>
+                        <div class="theme-stats">
+                            <span>${themeData.stocks.length}只</span>
+                            <span>${themeData.totalAmount.toFixed(1)}亿</span>
+                        </div>
+                    `;
+                }
+                
+                // 更新每个列的单元格
+                this.columns.forEach(col => {
+                    const cellId = `cell_${themeName}_${col.key}`;
+                    let cell = document.getElementById(cellId);
+                    
+                    if (!cell) {
+                        cell = document.createElement('td');
+                        cell.className = 'stock-cell';
+                        cell.id = cellId;
+                        row.appendChild(cell);
+                        this.cellCache.set(`${themeName}_${col.key}`, cell);
+                    }
+                    
+                    // 获取该列对应的股票
+                    let stocks = [];
+                    if (typeof col.key === 'number') {
+                        // 板数列：显示对应板数的股票
+                        if (col.key === 5) {
+                            // 5+板：显示5板及以上的股票
+                            stocks = themeData.stocks.filter(s => s.floor >= 5);
+                        } else {
+                            // 1-4板：显示对应板数的股票
+                            stocks = themeData.stocks.filter(s => s.floor === col.key);
+                        }
+                    } else if (col.key === 'core') {
+                        // 核心票：显示热门股票
+                        stocks = themeData.stocks.filter(s => s.category === 'core');
+                    } else if (col.key === 'other') {
+                        // 其他个股：显示非连板非热门的股票
+                        stocks = themeData.stocks.filter(s => s.floor === 0 && s.category !== 'core');
+                    }
+                    
+                    // 应用过滤器
+                    if (this.filter.capitalType !== null) {
+                        stocks = stocks.filter(s => s.capitalType === this.filter.capitalType);
+                    }
+                    
+                    // 更新单元格内容
+                    this.updateCellContent(cell, stocks, col.key);
+                });
+            }
+            
+            updateCellContent(cell, stocks, columnKey) {
+                // 如果没有股票数据，确保单元格为空
+                if (stocks.length === 0) {
+                    cell.innerHTML = '';
+                    return;
+                }
+                
+                // 根据列类型决定显示数量
+                let maxDisplay = 15;
+                if (columnKey === 1) maxDisplay = 25;
+                else if (columnKey === 'core') maxDisplay = 12;
+                else if (columnKey === 'other') maxDisplay = 80;
+                else maxDisplay = 10;
+                
+                // 限制显示数量
+                const displayStocks = stocks.slice(0, maxDisplay);
+                
+                // 清空单元格，只保留单元格本身
+                cell.innerHTML = '';
+                
+                // 显示股票数据
+                displayStocks.forEach((stock, index) => {
+                    // 创建新元素
+                    const stockElement = this.createStockElement(stock);
+                    cell.appendChild(stockElement);
+                    
+                    // 更新缓存
+                    this.stockCache.set(stock.id, stockElement);
+                });
+                
+                // 显示更多提示
+                if (stocks.length > maxDisplay) {
+                    const moreText = document.createElement('div');
+                    moreText.className = 'more-text'; // 添加类名以便后续移除
+                    moreText.textContent = `+${stocks.length - maxDisplay}只`;
+                    moreText.style.fontSize = '10px';
+                    moreText.style.color = '#aaa';
+                    moreText.style.marginTop = '5px';
+                    moreText.style.textAlign = 'center';
+                    cell.appendChild(moreText);
+                }
+            }
+            
+            createStockElement(stock) {
+                const element = document.createElement('div');
+                element.className = 'stock-item';
+                element.id = `stock_${stock.id}`;
+                
+                // 设置初始样式
+                this.updateStockElement(stock, element);
+                
+                // 添加事件监听器
+                element.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.showStockDetails(stock);
+                });
+                
+                element.addEventListener('mouseenter', (e) => {
+                    const rect = element.getBoundingClientRect();
+                    this.showTooltip(stock, rect.right, rect.top);
+                });
+                
+                element.addEventListener('mouseleave', () => {
+                    this.hideTooltip();
+                });
+                
+                return element;
+            }
+            
+            updateStockElement(stock, element) {
+                // 计算颜色
+                const backgroundColor = this.calculateStockColor(stock.gain);
+                const textColor = this.getTextColorForBackground(backgroundColor);
+                
+                // 更新样式
+                element.style.backgroundColor = backgroundColor;
+                element.style.color = textColor;
+                
+                // 更新闪烁效果
+                const blinkClass = this.getBlinkClass(stock.speed);
+                element.className = 'stock-item';
+                if (blinkClass) {
+                    element.classList.add(blinkClass);
+                }
+                
+                // 更新内容
+                const gainText = stock.gain >= 0 ? '+' : '';
+                element.innerHTML = `
+                    <div class="stock-name">${stock.name}</div>
+                    <div class="stock-info">
+                        <div class="stock-gain">${gainText}${stock.gain.toFixed(1)}</div>
+                    </div>
+                `;
+            }
+            
+            removeStockElement(stockId) {
+                const element = document.getElementById(`stock_${stockId}`);
+                if (element) {
+                    element.remove();
+                    this.stockCache.delete(stockId);
+                }
+            }
+            
+            // ========== 统计和更新方法 ==========
+            
+            updateStats() {
+                document.getElementById('totalStocks').textContent = this.data.stocks.length;
+                document.getElementById('totalThemes').textContent = this.data.themes.size;
+                
+                const totalFlow = this.data.stocks.reduce((sum, stock) => sum + stock.amount, 0);
+                document.getElementById('totalFlow').textContent = totalFlow.toFixed(1);
+                
+                // 资金类型分布
+                const capitalCounts = [0, 0, 0, 0];
+                this.data.stocks.forEach(stock => {
+                    capitalCounts[stock.capitalType]++;
+                });
+                
+                for (let i = 0; i < 4; i++) {
+                    document.getElementById(`capital${i}`).textContent = capitalCounts[i];
+                }
+                
+                // 闪烁股票数量
+                const blinkCount = this.data.stocks.filter(s => this.getBlinkClass(s.speed) !== null).length;
+                document.getElementById('blinkCount').textContent = blinkCount;
+                
+                // 连板分布
+                const floorCounts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0};
+                this.data.stocks.forEach(stock => {
+                    if (stock.floor > 0) {
+                        floorCounts[Math.min(stock.floor, 5)]++;
+                    }
+                });
+                
+                for (let i = 1; i <= 5; i++) {
+                    document.getElementById(`floor${i}`).textContent = floorCounts[i];
+                }
+            }
+            
+            updateThemeDetails() {
+                const container = document.getElementById('themeDetails');
+                container.innerHTML = '';
+                
+                this.data.themes.forEach((themeData, themeName) => {
+                    const item = document.createElement('div');
+                    item.className = 'theme-item';
+                    item.innerHTML = `
+                        <div class="theme-header">
+                            <span class="theme-name">${themeName}</span>
+                            <span class="theme-amount">${themeData.totalAmount.toFixed(1)}亿</span>
+                        </div>
+                        <div class="theme-stocks">
+                            <span>${themeData.stocks.length}只股票</span>
+                            <span>连板: ${themeData.floorCounts[5]}+${themeData.floorCounts[4]}+${themeData.floorCounts[3]}+${themeData.floorCounts[2]}+${themeData.floorCounts[1]}</span>
+                        </div>
+                    `;
+                    
+                    item.addEventListener('click', () => {
+                        this.filterByTheme(themeName);
+                    });
+                    
+                    container.appendChild(item);
+                });
+            }
+            
+            updateColumnHeaders() {
+                this.columns.forEach(col => {
+                    const header = document.getElementById(`header_${col.key}`);
+                    if (header) {
+                        let count = 0;
+                        let amount = 0;
+                        
+                        this.data.themes.forEach(themeData => {
+                            let stocks = [];
+                            if (typeof col.key === 'number') {
+                                stocks = themeData.stocks.filter(s => s.floor === col.key);
+                            } else {
+                                stocks = themeData.stocks.filter(s => s.category === col.key);
+                            }
+                            
+                            count += stocks.length;
+                            amount += stocks.reduce((sum, stock) => sum + stock.amount, 0);
+                        });
+                        
+                        header.querySelector('.column-stats').textContent = 
+                            `${count}只/${amount.toFixed(0)}亿`;
+                    }
+                });
+            }
+            
+            // ========== 工具方法 ==========
+            
+            calculateStockColor(gain) {
+                // 保持原有颜色计算逻辑
+                const absGain = Math.abs(gain);
+                const isPositive = gain >= 0;
+                let colorIndex = Math.floor((Math.min(absGain, 30) / 30) * 5);
+                colorIndex = Math.min(5, colorIndex);
+                
+                const positiveColors = [
+                    '#ffcccc', '#ff9999', '#ff6666', '#ff3333', '#ff0000', '#cc0000'
+                ];
+                
+                const negativeColors = [
+                    '#cce5ff', '#99ccff', '#66b2ff', '#3399ff', '#0080ff', '#0066cc'
+                ];
+                
+                const colorArray = isPositive ? positiveColors : negativeColors;
+                return colorArray[colorIndex];
+            }
+            
+            getTextColorForBackground(backgroundColor) {
+                const hex = backgroundColor.replace('#', '');
+                const r = parseInt(hex.substr(0, 2), 16);
+                const g = parseInt(hex.substr(2, 2), 16);
+                const b = parseInt(hex.substr(4, 2), 16);
+                const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+                return brightness > 155 ? '#000000' : '#ffffff';
+            }
+            
+            getBlinkClass(speed) {
+                const speedLevels = [
+                    { min: 0, max: 1, blinkClass: null },
+                    { min: 1, max: 2, blinkClass: 'blink-slow' },
+                    { min: 2, max: 4, blinkClass: 'blink-medium' },
+                    { min: 4, max: 8, blinkClass: 'blink-fast' },
+                    { min: 8, max: 100, blinkClass: 'blink-very-fast' }
+                ];
+                
+                for (const level of speedLevels) {
+                    if (speed >= level.min && speed < level.max) {
+                        return level.blinkClass;
+                    }
+                }
+                return null;
+            }
+            
+            showTooltip(stock, x, y) {
+                // 保持原有工具提示逻辑
+                let html = `<div class="tooltip-title">${stock.name} (${stock.code})</div>`;
+                html += '<div class="tooltip-content">';
+                
+                const gainColor = stock.gain >= 0 ? '#ff4d4f' : '#3399ff';
+                
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">涨幅:</span>
+                    <span class="tooltip-value" style="color: ${gainColor}">
+                        ${stock.gain >= 0 ? '+' : ''}${stock.gain.toFixed(2)}%
+                    </span>
+                </div>`;
+                
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">金额:</span>
+                    <span class="tooltip-value" style="color: #52c41a">${stock.amount.toFixed(2)}亿</span>
+                </div>`;
+                
+                let speedLevel = '';
+                const speed = stock.speed;
+                if (speed < 1) speedLevel = '无闪烁';
+                else if (speed < 2) speedLevel = '慢速闪烁';
+                else if (speed < 4) speedLevel = '中速闪烁';
+                else if (speed < 6) speedLevel = '快速闪烁';
+                else speedLevel = '极快闪烁';
+                
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">涨速:</span>
+                    <span class="tooltip-value" style="color: ${speed > 5 ? '#ff6b6b' : '#aaa'}">
+                        ${stock.speed.toFixed(2)} (${speedLevel})
+                    </span>
+                </div>`;
+                
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">资金类型:</span>
+                    <span class="tooltip-value">${this.data.capitalTypes[stock.capitalType]}</span>
+                </div>`;
+                
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">题材:</span>
+                    <span class="tooltip-value">${stock.theme}</span>
+                </div>`;
+                
+                if (stock.floor > 0) {
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">连板天数:</span>
+                        <span class="tooltip-value">${stock.floor}天</span>
+                    </div>`;
+                }
+                
+                html += '</div>';
+                
+                this.tooltip.innerHTML = html;
+                this.tooltip.style.display = 'block';
+                this.tooltip.style.left = `${x + 10}px`;
+                this.tooltip.style.top = `${y}px`;
+                
+                const tooltipRect = this.tooltip.getBoundingClientRect();
+                const windowWidth = window.innerWidth;
+                const windowHeight = window.innerHeight;
+                
+                if (tooltipRect.right > windowWidth) {
+                    this.tooltip.style.left = `${x - tooltipRect.width - 10}px`;
+                }
+                
+                if (tooltipRect.bottom > windowHeight) {
+                    this.tooltip.style.top = `${y - tooltipRect.height}px`;
+                }
+            }
+            
+            hideTooltip() {
+                this.tooltip.style.display = 'none';
+            }
+            
+            showStockDetails(stock) {
+                console.log('选中股票:', stock);
+            }
+            
+            setupEventListeners() {
+                document.addEventListener('click', (e) => {
+                    if (!e.target.closest('.stock-item')) {
+                        this.hideTooltip();
+                    }
+                });
+            }
+            
+            // ========== 过滤功能 ==========
+            
+            showAll() {
+                this.filter.capitalType = null;
+                this.filter.theme = null;
+                this.batchUpdate();
+                this.updateControlButtons('showAll');
+            }
+            
+            filterByCapital(capitalType) {
+                this.filter.capitalType = capitalType;
+                this.filter.theme = null;
+                this.batchUpdate();
+                this.updateControlButtons(capitalType);
+            }
+            
+            filterByTheme(theme) {
+                this.filter.theme = theme;
+                this.filter.capitalType = null;
+                this.batchUpdate();
+                
+                const themeCells = document.querySelectorAll('.theme-header-cell');
+                themeCells.forEach(cell => {
+                    if (cell.querySelector('.theme-name').textContent === theme) {
+                        cell.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                });
+            }
+            
+            updateControlButtons(activeType) {
+                const buttons = document.querySelectorAll('.control-btn');
+                buttons.forEach(btn => btn.classList.remove('active'));
+                
+                if (activeType === 'showAll') {
+                    document.querySelector('.control-panel button:first-child').classList.add('active');
+                } else {
+                    const buttonTexts = {
+                        '0': '抢跑',
+                        '1': '试错',
+                        '2': '梭哈',
+                        '3': '其他'
+                    };
+                    
+                    Array.from(buttons).forEach(btn => {
+                        if (btn.textContent === buttonTexts[activeType]) {
+                            btn.classList.add('active');
+                        }
+                    });
+                }
+            }
+            
+            // ========== 侧边栏控制 ==========
+            
+            toggleSidePanel() {
+                const sidePanel = document.getElementById('sidePanel');
+                const panelToggleText = document.getElementById('panelToggleText');
+                const isVisible = sidePanel.style.display !== 'none';
+                
+                if (isVisible) {
+                    sidePanel.style.display = 'none';
+                    panelToggleText.textContent = '显示侧边栏';
+                } else {
+                    sidePanel.style.display = 'flex';
+                    panelToggleText.textContent = '隐藏侧边栏';
+                }
+            }
+            
+            // ========== API数据获取 ==========
+            
+            loadDataFromAPI() {
+                // 显示加载状态
+                this.showLoading();
+                
+                // 获取综合数据
+                this.fetchComprehensiveData();
+                
+                // 可以根据需要添加其他API调用
+                // this.fetchLimitUpData();
+                // this.fetchFirstLimitData();
+                // this.fetchHotStocksData();
+            }
+            
+            async fetchComprehensiveData() {
+                try {
+                    const response = await fetch('http://115.190.156.240:8080/api/comprehensive');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    
+                    console.log('API返回的原始数据:', data);
+                    
+                    if (data.success && data.data) {
+                        console.log('处理前的综合数据:', data.data);
+                        this.processComprehensiveData(data.data);
+                        // 隐藏加载状态
+                        this.hideLoading();
+                    } else {
+                        console.error('获取综合数据失败:', data.error);
+                        this.hideLoading();
+                        this.showError('获取综合数据失败，请稍后重试。');
+                    }
+                } catch (error) {
+                    console.error('API调用失败:', error);
+                    this.hideLoading();
+                    this.showError('数据加载失败，请检查网络连接或稍后重试。');
+                }
+            }
+            
+            showLoading() {
+                const loadingOverlay = document.getElementById('loadingOverlay');
+                const loadingText = loadingOverlay.querySelector('.loading-text');
+                const retryButton = document.getElementById('retryButton');
+                
+                loadingText.textContent = '数据加载中...';
+                loadingText.style.color = '#d4af37';
+                loadingOverlay.style.display = 'flex';
+                retryButton.style.display = 'none';
+            }
+            
+            hideLoading() {
+                const loadingOverlay = document.getElementById('loadingOverlay');
+                loadingOverlay.style.display = 'none';
+            }
+            
+            showError(message) {
+                const loadingOverlay = document.getElementById('loadingOverlay');
+                const loadingText = loadingOverlay.querySelector('.loading-text');
+                const retryButton = document.getElementById('retryButton');
+                
+                loadingText.textContent = message;
+                loadingText.style.color = '#ff6b6b';
+                retryButton.style.display = 'block';
+                
+                // 添加重试事件监听
+                retryButton.onclick = () => {
+                    this.loadDataFromAPI();
+                };
+            }
+            
+            async fetchLimitUpData() {
+                try {
+                    const response = await fetch('http://115.190.156.240:8080/api/limit_up');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    
+                    if (data.success && data.data) {
+                        // 处理连板数据
+                        console.log('连板数据:', data.data);
+                    } else {
+                        console.error('获取连板数据失败:', data.error);
+                    }
+                } catch (error) {
+                    console.error('API调用失败:', error);
+                }
+            }
+            
+            async fetchFirstLimitData() {
+                try {
+                    const response = await fetch('http://115.190.156.240:8080/api/first_limit');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    
+                    if (data.success && data.data) {
+                        // 处理首板数据
+                        console.log('首板数据:', data.data);
+                    } else {
+                        console.error('获取首板数据失败:', data.error);
+                    }
+                } catch (error) {
+                    console.error('API调用失败:', error);
+                }
+            }
+            
+            async fetchHotStocksData() {
+                try {
+                    const response = await fetch('/api/hot_stocks');
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    const data = await response.json();
+                    
+                    if (data.success && data.data) {
+                        // 处理热门股票数据
+                        console.log('热门股票数据:', data.data);
+                    } else {
+                        console.error('获取热门股票数据失败:', data.error);
+                    }
+                } catch (error) {
+                    console.error('API调用失败:', error);
+                }
+            }
+            
+            processComprehensiveData(data) {
+                // 处理综合数据，转换为适合前端显示的格式
+                const stocks = [];
+                
+                console.log('开始处理综合数据:', data);
+                
+                // 处理连板股票
+                if (data.limit_up_stocks && Array.isArray(data.limit_up_stocks)) {
+                    console.log('连板股票数量:', data.limit_up_stocks.length);
+                    data.limit_up_stocks.forEach(stock => {
+                        stocks.push({
+                            id: `limit_${stock.code}_${Date.now()}`,
+                            name: stock.name,
+                            code: stock.code,
+                            amount: stock.trade_amount || stock.amount || 0,
+                            gain: stock.change_pct || 0,
+                            speed: stock.change_rate_1min || 0,
+                            capitalType: 0, // 默认资金类型
+                            theme: stock.plate || '其他',
+                            floor: stock.consecutive_days || 1,
+                            category: 'emotion'
+                        });
+                    });
+                }
+                
+                // 处理首板股票
+                if (data.first_limit_stocks && Array.isArray(data.first_limit_stocks)) {
+                    console.log('首板股票数量:', data.first_limit_stocks.length);
+                    data.first_limit_stocks.forEach(stock => {
+                        stocks.push({
+                            id: `first_${stock.code}_${Date.now()}`,
+                            name: stock.name,
+                            code: stock.code,
+                            amount: stock.trade_amount || stock.amount || 0,
+                            gain: stock.change_pct || 0,
+                            speed: stock.change_rate_1min || 0,
+                            capitalType: 0,
+                            theme: stock.plate || '其他',
+                            floor: 1,
+                            category: 'other'
+                        });
+                    });
+                }
+                
+                // 处理热门股票
+                if (data.hot_stocks && Array.isArray(data.hot_stocks)) {
+                    console.log('热门股票数量:', data.hot_stocks.length);
+                    data.hot_stocks.forEach(stock => {
+                        stocks.push({
+                            id: `hot_${stock.code}_${Date.now()}`,
+                            name: stock.name,
+                            code: stock.code,
+                            amount: stock.trade_amount || stock.amount || 0,
+                            gain: stock.change_pct || 0,
+                            speed: stock.change_rate_1min || 0,
+                            capitalType: 0,
+                            theme: stock.plate || '热门',
+                            floor: 0,
+                            category: 'core'
+                        });
+                    });
+                }
+                
+                console.log('转换后的股票数据:', stocks);
+                
+                // 使用现有的数据处理方法
+                this.processFullData({ stocks: stocks });
+            }
+            
+            // WebSocket相关方法
+            reconnectWebSocket() {
+                // 目前使用API获取数据，重新连接时刷新数据
+                this.loadDataFromAPI();
+            }
+            
+
+        }
+        
+        // 初始化股票表格
+        let stockTable;
+        
+        window.addEventListener('load', () => {
+            stockTable = new OptimizedStockTable();
+            
+            // 从API获取数据
+            stockTable.loadDataFromAPI();
+        });
+        
+        // 模拟数据生成函数（仅供测试）
+        window.generateMockData = function(count = 100) {
+            const themes = [
+                '通信', '人工智能', '芯片', '机器人',
+                '房地产', '金融', '消费',
+                '军工', '锂电池', '医药', '汽车', '软件'
+            ];
+            
+            const stocks = [];
+            for (let i = 0; i < count; i++) {
+                const theme = themes[Math.floor(Math.random() * themes.length)];
+                const gain = -30 + Math.random() * 60;
+                const speed = -4 + Math.random() * 8;
+                const amount = 0.5 + Math.random() * 15;
+                const capitalType = Math.floor(Math.random() * 4);
+                
+                let floor = 0;
+                let category;
+                const rand = Math.random();
+                if (rand < 0.15) {
+                    floor = Math.floor(Math.random() * 5) + 2;
+                    category = 'emotion';
+                } else if (rand < 0.25) {
+                    category = 'core';
+                } else {
+                    category = 'other';
+                }
+                
+                stocks.push({
+                    id: `stock_${i}_${Date.now()}`,
+                    name: `股票${i + 1}`,
+                    code: `000${(100 + i) % 900}`,
+                    amount: amount,
+                    gain: gain,
+                    speed: speed,
+                    capitalType: capitalType,
+                    theme: theme,
+                    floor: floor,
+                    category: category
+                });
+            }
+            
+            return {
+                type: 'full',
+                payload: {
+                    stocks: stocks,
+                    themes: themes.map(name => ({ name }))
+                }
+            };
+        };
+    </script>
+</body>
+</html>
