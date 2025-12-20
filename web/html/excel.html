@@ -533,13 +533,13 @@
         /* 颜色深浅表示涨跌幅大小，透明度表示强度 */
         
         /* 列宽调整 */
-        .col-1 { width: 5%; }
-        .col-2 { width: 5%; }
-        .col-3 { width: 5%; }
-        .col-4 { width: 5%; }
-        .col-5 { width: 18%; }
-        .col-6 { width: 7%; }
-        .col-7 { width: 55%; }
+        .col-1 { width: 8%; }
+        .col-2 { width: 8%; }
+        .col-3 { width: 8%; }
+        .col-4 { width: 8%; }
+        .col-5 { width: 16%; }
+        .col-6 { width: 8%; }
+        .col-7 { width: 52%; }
         
         /* 列标题颜色 - 统一使用深色背景 */
         .header-5, .header-4, .header-3, .header-2, .header-1,
@@ -726,7 +726,136 @@
 
     <script>
         // ========== WebSocket连接管理器 ==========
-
+        let ws;
+        let wsReconnectTimer;
+        let isWsConnected = false;
+        
+        // 初始化WebSocket连接
+        function initWebSocket() {
+            const wsUrl = 'ws://115.190.156.240:8080/ws';
+            
+            try {
+                ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {
+                    console.log('✅ WebSocket连接成功');
+                    isWsConnected = true;
+                    updateWSStatus(true, '连接成功');
+                    
+                    // 清除重连定时器
+                    if (wsReconnectTimer) {
+                        clearTimeout(wsReconnectTimer);
+                        wsReconnectTimer = null;
+                    }
+                    
+                    // 发送股票列表订阅请求
+                    if (stockTable && stockTable.data && stockTable.data.stocks) {
+                        const stockList = stockTable.data.stocks.map(stock => stock.code);
+                        if (stockList.length > 0) {
+                            const subscribeMessage = {
+                                type: 'subscribe',
+                                stocks: stockList
+                            };
+                            ws.send(JSON.stringify(subscribeMessage));
+                            console.log('📤 发送股票订阅请求:', stockList.length, '只股票');
+                        }
+                    }
+                };
+                
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('📡 收到WebSocket消息:', data);
+                        
+                        // 更新WebSocket状态信息
+                        updateWSInfo(new Date().toLocaleTimeString());
+                        
+                        // 处理不同类型的消息
+                        if (data.type === 'stock_update') {
+                            // 个股数据更新
+                            stockTable.handleStockUpdate(data.payload);
+                        } else if (data.type === 'incremental_update') {
+                            // 增量更新
+                            console.log('📈 收到增量更新:', data.data);
+                            stockTable.handleIncrementalUpdate(data.data);
+                        } else if (data.type === 'first_limit') {
+                            // 首板票推送
+                            console.log('🔥 收到首板票推送:', data.payload);
+                            stockTable.handleFirstLimitStock(data.payload);
+                        } else if (data.type === 'heartbeat') {
+                            // 心跳包
+                            console.log('💓 收到心跳包');
+                        }
+                    } catch (error) {
+                        console.error('❌ WebSocket消息解析失败:', error, event.data);
+                    }
+                };
+                
+                ws.onclose = (event) => {
+                    console.log('❌ WebSocket连接关闭:', event.code, event.reason);
+                    isWsConnected = false;
+                    updateWSStatus(false, '连接已断开');
+                    
+                    // 尝试重连
+                    scheduleReconnect();
+                };
+                
+                ws.onerror = (error) => {
+                    console.error('❌ WebSocket错误:', error);
+                    isWsConnected = false;
+                    updateWSStatus(false, '连接错误');
+                };
+            } catch (error) {
+                console.error('❌ WebSocket初始化失败:', error);
+                isWsConnected = false;
+                updateWSStatus(false, '初始化失败');
+                
+                // 尝试重连
+                scheduleReconnect();
+            }
+        }
+        
+        // 计划重连
+        function scheduleReconnect() {
+            if (wsReconnectTimer) {
+                clearTimeout(wsReconnectTimer);
+            }
+            
+            // 5秒后尝试重连
+            wsReconnectTimer = setTimeout(() => {
+                console.log('🔄 尝试重新连接WebSocket...');
+                updateWSStatus(false, '正在重连...');
+                initWebSocket();
+            }, 5000);
+        }
+        
+        // 更新WebSocket状态显示
+        function updateWSStatus(connected, message) {
+            const wsStatus = document.getElementById('wsStatus');
+            if (connected) {
+                wsStatus.className = 'ws-status ws-connected';
+            } else {
+                wsStatus.className = 'ws-status ws-disconnected';
+            }
+            wsStatus.textContent = message;
+        }
+        
+        // 更新WebSocket信息显示
+        function updateWSInfo(info) {
+            const wsInfo = document.getElementById('wsInfo');
+            wsInfo.textContent = `最后更新: ${info}`;
+        }
+        
+        // 重新连接WebSocket
+        function reconnectWebSocket() {
+            if (ws) {
+                ws.close();
+            }
+            
+            console.log('🔄 手动重新连接WebSocket...');
+            updateWSStatus(false, '正在重连...');
+            initWebSocket();
+        }
         
         // ========== 优化的股票表格管理 ==========
         class OptimizedStockTable {
@@ -1274,10 +1403,14 @@
                 
                 // 更新内容
                 const gainText = stock.gain >= 0 ? '+' : '';
+                const speedText = stock.speed >= 0 ? '+' : '';
                 element.innerHTML = `
                     <div class="stock-name">${stock.name}</div>
                     <div class="stock-info">
-                        <div class="stock-gain">${gainText}${stock.gain.toFixed(1)}</div>
+                        <div class="stock-gain">${gainText}${stock.gain.toFixed(1)}%</div>
+                        <div class="stock-speed">${speedText}${stock.speed.toFixed(1)}%</div>
+                        <div class="stock-amount">${this.formatAmount(stock.amount)}</div>
+                        <div class="stock-amount-2min">${this.formatAmount(stock.amount_2min || 0)}</div>
                     </div>
                 `;
             }
@@ -1581,43 +1714,57 @@
             // ========== API数据获取 ==========
             
             loadDataFromAPI() {
-                // 显示加载状态
-                this.showLoading();
-                
-                // 获取综合数据
-                this.fetchComprehensiveData();
-                
-                // 可以根据需要添加其他API调用
-                // this.fetchLimitUpData();
-                // this.fetchFirstLimitData();
-                // this.fetchHotStocksData();
+                return new Promise((resolve, reject) => {
+                    // 显示加载状态
+                    this.showLoading();
+                    
+                    // 获取综合数据
+                    this.fetchComprehensiveData().then(() => {
+                        resolve();
+                    }).catch((error) => {
+                        console.error('API数据加载失败:', error);
+                        reject(error);
+                    });
+                    
+                    // 可以根据需要添加其他API调用
+                    // this.fetchLimitUpData();
+                    // this.fetchFirstLimitData();
+                    // this.fetchHotStocksData();
+                });
             }
             
-            async fetchComprehensiveData() {
-                try {
-                    const response = await fetch('http://115.190.156.240:8080/api/comprehensive');
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    const data = await response.json();
-                    
-                    console.log('API返回的原始数据:', data);
-                    
-                    if (data.success && data.data) {
-                        console.log('处理前的综合数据:', data.data);
-                        this.processComprehensiveData(data.data);
-                        // 隐藏加载状态
-                        this.hideLoading();
-                    } else {
-                        console.error('获取综合数据失败:', data.error);
-                        this.hideLoading();
-                        this.showError('获取综合数据失败，请稍后重试。');
-                    }
-                } catch (error) {
-                    console.error('API调用失败:', error);
-                    this.hideLoading();
-                    this.showError('数据加载失败，请检查网络连接或稍后重试。');
-                }
+            fetchComprehensiveData() {
+                return new Promise((resolve, reject) => {
+                    fetch('http://115.190.156.240:8080/api/comprehensive')
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP error! status: ${response.status}`);
+                            }
+                            return response.json();
+                        })
+                        .then(data => {
+                            console.log('API返回的原始数据:', data);
+                            
+                            if (data.success && data.data) {
+                                console.log('处理前的综合数据:', data.data);
+                                this.processComprehensiveData(data.data);
+                                // 隐藏加载状态
+                                this.hideLoading();
+                                resolve(data.data);
+                            } else {
+                                console.error('获取综合数据失败:', data.error);
+                                this.hideLoading();
+                                this.showError('获取综合数据失败，请稍后重试。');
+                                reject(new Error(data.error || '获取综合数据失败'));
+                            }
+                        })
+                        .catch(error => {
+                            console.error('API调用失败:', error);
+                            this.hideLoading();
+                            this.showError('数据加载失败，请检查网络连接或稍后重试。');
+                            reject(error);
+                        });
+                });
             }
             
             showLoading() {
@@ -1723,11 +1870,11 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct || 0,
-                            speed: stock.change_rate_1min || 0,
+                            gain: stock.change_pct*100 || 0,
+                            speed: stock.change_rate_1min*100 || 0,
                             capitalType: 0, // 默认资金类型
                             theme: stock.plate || '其他',
-                            floor: stock.consecutive_days || 1,
+                            floor: stock.consecutive_days+1 || 1,
                             category: 'emotion'
                         });
                     });
@@ -1742,8 +1889,8 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct || 0,
-                            speed: stock.change_rate_1min || 0,
+                            gain: stock.change_pct*100 || 0,
+                            speed: stock.change_rate_1min*100 || 0,
                             capitalType: 0,
                             theme: stock.plate || '其他',
                             floor: 1,
@@ -1761,8 +1908,8 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct || 0,
-                            speed: stock.change_rate_1min || 0,
+                            gain: stock.change_pct*100 || 0,
+                            speed: stock.change_rate_1min*100 || 0,
                             capitalType: 0,
                             theme: stock.plate || '热门',
                             floor: 0,
@@ -1779,8 +1926,320 @@
             
             // WebSocket相关方法
             reconnectWebSocket() {
-                // 目前使用API获取数据，重新连接时刷新数据
-                this.loadDataFromAPI();
+                // 调用全局的WebSocket重新连接函数
+                window.reconnectWebSocket();
+            }
+            
+            // 处理WebSocket股票数据更新
+            handleStockUpdate(updates) {
+                if (!updates) return;
+                
+                // 确保是数组格式
+                const updateList = Array.isArray(updates) ? updates : [updates];
+                
+                console.log('🔄 处理股票更新:', updateList.length, '只股票');
+                
+                let hasChanges = false;
+                
+                updateList.forEach(update => {
+                    if (!update.code) return;
+                    
+                    // 查找需要更新的股票
+                    const stockIndex = this.data.stocks.findIndex(stock => stock.code === update.code);
+                    if (stockIndex === -1) return;
+                    
+                    const stock = this.data.stocks[stockIndex];
+                    const oldData = {...stock};
+                    
+                    // 更新实时指标
+                    let stockChanged = false;
+                    
+                    // 确保数据类型为数字
+                    const toNumber = (value) => {
+                        if (typeof value === 'string') {
+                            return parseFloat(value);
+                        }
+                        return typeof value === 'number' ? value : 0;
+                    };
+                    
+                    if (update.change_pct !== undefined) {
+                        const newGain = toNumber(update.change_pct);
+                        if (newGain !== stock.gain) {
+                            stock.gain = newGain;
+                            stockChanged = true;
+                        }
+                    }
+                    
+                    if (update.change_rate_1min !== undefined) {
+                        const newSpeed = toNumber(update.change_rate_1min);
+                        if (newSpeed !== stock.speed) {
+                            stock.speed = newSpeed;
+                            stockChanged = true;
+                        }
+                    }
+                    
+                    if (update.trade_amount !== undefined) {
+                        const newAmount = toNumber(update.trade_amount);
+                        if (newAmount !== stock.amount) {
+                            stock.amount = newAmount;
+                            stockChanged = true;
+                        }
+                    }
+                    
+                    // 更新2分钟成交额（如果有）
+                    if (update.amount_2min !== undefined) {
+                        stock.amount_2min = toNumber(update.amount_2min);
+                        stockChanged = true;
+                    }
+                    
+                    // 更新涨速（如果有其他涨速指标）
+                    if (update.change_rate_2min !== undefined) {
+                        stock.speed_2min = toNumber(update.change_rate_2min);
+                        stockChanged = true;
+                    }
+                    
+                    if (stockChanged) {
+                        hasChanges = true;
+                        
+                        // 更新主题数据中的对应股票
+                        const theme = stock.theme;
+                        if (this.data.themes.has(theme)) {
+                            const themeData = this.data.themes.get(theme);
+                            const themeStockIndex = themeData.stocks.findIndex(s => s.code === stock.code);
+                            if (themeStockIndex !== -1) {
+                                themeData.stocks[themeStockIndex] = stock;
+                            }
+                        }
+                        
+                        // 更新DOM显示
+                        this.updateStockDisplay(stock);
+                    }
+                });
+                
+                if (hasChanges) {
+                    console.log('✅ 股票数据更新完成');
+                }
+            }
+            
+            // 处理增量更新
+            handleIncrementalUpdate(updatedData) {
+                console.log('🔄 处理增量更新:', updatedData);
+                
+                if (!updatedData || typeof updatedData !== 'object') {
+                    console.error('增量更新数据格式错误:', updatedData);
+                    return;
+                }
+                
+                // 遍历所有更新的股票
+                Object.keys(updatedData).forEach(stockCode => {
+                    const update = updatedData[stockCode];
+                    
+                    // 查找对应股票
+                    const stockIndex = this.data.stocks.findIndex(stock => stock.code === stockCode);
+                    
+                    if (stockIndex !== -1) {
+                        const stock = this.data.stocks[stockIndex];
+                        
+                        // 确保是数字类型
+                        const toNumber = (value) => {
+                            if (typeof value === 'string') {
+                                return parseFloat(value);
+                            }
+                            return typeof value === 'number' ? value : 0;
+                        };
+                        
+                        let stockChanged = false;
+                        
+                        // 更新涨速
+                        if (update.change_rate_1min !== undefined) {
+                            const newSpeed = toNumber(update.change_rate_1min);
+                            if (newSpeed !== stock.speed) {
+                                stock.speed = newSpeed;
+                                stockChanged = true;
+                            }
+                        }
+                        
+                        // 更新涨跌幅
+                        if (update.change_pct !== undefined) {
+                            const newGain = toNumber(update.change_pct);
+                            if (newGain !== stock.gain) {
+                                stock.gain = newGain;
+                                stockChanged = true;
+                            }
+                        }
+                        
+                        // 更新成交额
+                        if (update.trade_amount !== undefined) {
+                            const newAmount = toNumber(update.trade_amount);
+                            if (newAmount !== stock.amount) {
+                                stock.amount = newAmount;
+                                stockChanged = true;
+                            }
+                        }
+                        
+                        // 更新2分钟成交额
+                        if (update.amount_2min !== undefined) {
+                            const newAmount2min = toNumber(update.amount_2min);
+                            if (newAmount2min !== stock.amount_2min) {
+                                stock.amount_2min = newAmount2min;
+                                stockChanged = true;
+                            }
+                        }
+                        
+                        // 如果股票是首板，确保相关字段正确
+                        if (stock.floor === 1 && stock.category === 'other') {
+                            // 更新板块信息
+                            if (update.plate !== undefined && update.plate !== stock.theme) {
+                                // 移除旧主题中的股票
+                                const oldThemeData = this.data.themes.get(stock.theme);
+                                if (oldThemeData) {
+                                    oldThemeData.stocks = oldThemeData.stocks.filter(s => s.code !== stock.code);
+                                }
+                                
+                                // 更新股票主题
+                                stock.theme = update.plate;
+                                stockChanged = true;
+                                
+                                // 添加到新主题
+                                if (!this.data.themes.has(stock.theme)) {
+                                    this.data.themes.set(stock.theme, { name: stock.theme, stocks: [] });
+                                }
+                                const newThemeData = this.data.themes.get(stock.theme);
+                                if (!newThemeData.stocks.find(s => s.code === stock.code)) {
+                                    newThemeData.stocks.push(stock);
+                                }
+                            }
+                        }
+                        
+                        if (stockChanged) {
+                            // 更新股票数据
+                            this.data.stocks[stockIndex] = stock;
+                            
+                            // 更新主题数据中的对应股票
+                            const theme = stock.theme;
+                            if (this.data.themes.has(theme)) {
+                                const themeData = this.data.themes.get(theme);
+                                const themeStockIndex = themeData.stocks.findIndex(s => s.code === stock.code);
+                                if (themeStockIndex !== -1) {
+                                    themeData.stocks[themeStockIndex] = stock;
+                                }
+                            }
+                            
+                            // 更新DOM显示
+                            this.updateStockDisplay(stock);
+                            console.log('📈 更新股票数据:', stock.code, update);
+                        }
+                    }
+                });
+            }
+            
+            // 处理首板票推送
+            handleFirstLimitStock(stockData) {
+                if (!stockData || !stockData.code) return;
+                
+                console.log('🔥 处理首板票推送:', stockData);
+                
+                // 检查股票是否已经存在
+                const existingStockIndex = this.data.stocks.findIndex(stock => stock.code === stockData.code);
+                
+                // 确保是数字类型
+                const toNumber = (value) => {
+                    if (typeof value === 'string') {
+                        return parseFloat(value);
+                    }
+                    return typeof value === 'number' ? value : 0;
+                };
+                
+                let stock;
+                
+                if (existingStockIndex !== -1) {
+                    // 更新现有股票的首板信息
+                    stock = this.data.stocks[existingStockIndex];
+                    stock.floor = 1; // 设置为1板
+                    stock.category = 'other'; // 首板票归类为other
+                    console.log('🔄 更新现有股票为1板:', stock.code);
+                } else {
+                    // 创建新的首板票数据
+                    stock = {
+                        id: `stock_${stockData.code}_${Date.now()}`,
+                        name: stockData.name,
+                        code: stockData.code,
+                        amount: toNumber(stockData.trade_amount || 0),
+                        gain: toNumber(stockData.change_pct || 0),
+                        speed: toNumber(stockData.change_rate_1min || 0),
+                        capitalType: 3, // 首板票默认资本类型为3（其他）
+                        theme: stockData.plate || '热门',
+                        floor: 1, // 1板
+                        category: 'other' // 归类为other
+                    };
+                    
+                    // 添加到股票列表
+                    this.data.stocks.push(stock);
+                    console.log('➕ 新增首板票:', stock.code);
+                }
+                
+                // 确保主题存在
+                if (!this.data.themes.has(stock.theme)) {
+                    this.data.themes.set(stock.theme, { name: stock.theme, stocks: [] });
+                }
+                
+                // 获取主题数据
+                const themeData = this.data.themes.get(stock.theme);
+                
+                // 检查股票是否已经在主题中
+                const themeStockIndex = themeData.stocks.findIndex(s => s.code === stock.code);
+                if (themeStockIndex === -1) {
+                    // 添加到主题股票列表
+                    themeData.stocks.push(stock);
+                } else {
+                    // 更新主题中的股票信息
+                    themeData.stocks[themeStockIndex] = stock;
+                }
+                
+                // 重新渲染主题表格
+                this.renderFullTable();
+            }
+            
+            // 更新单个股票的DOM显示
+            updateStockDisplay(stock) {
+                const stockElement = this.stockCache.get(stock.id);
+                if (!stockElement) return;
+                
+                // 更新涨幅
+                const gainElement = stockElement.querySelector('.gain');
+                if (gainElement) {
+                    gainElement.textContent = `${stock.gain.toFixed(2)}%`;
+                    gainElement.className = `gain ${stock.gain >= 0 ? 'positive' : 'negative'}`;
+                }
+                
+                // 更新涨速
+                const speedElement = stockElement.querySelector('.speed');
+                if (speedElement) {
+                    speedElement.textContent = `${stock.speed.toFixed(2)}%`;
+                    speedElement.className = `speed ${stock.speed >= 0 ? 'positive' : 'negative'}`;
+                }
+                
+                // 更新成交额
+                const amountElement = stockElement.querySelector('.amount');
+                if (amountElement) {
+                    amountElement.textContent = this.formatAmount(stock.amount);
+                }
+                
+                // 更新2分钟成交额（如果有）
+                const amount2minElement = stockElement.querySelector('.amount-2min');
+                if (amount2minElement && stock.amount_2min !== undefined) {
+                    amount2minElement.textContent = this.formatAmount(stock.amount_2min);
+                }
+            }
+            
+            // 格式化金额显示
+            formatAmount(amount) {
+                if (amount >= 100000000) {
+                    return `${(amount / 100000000).toFixed(2)}亿`;
+                } else if (amount >= 10000) {
+                    return `${(amount / 10000).toFixed(2)}万`;
+                }
+                return amount.toFixed(0);
             }
             
 
@@ -1792,9 +2251,33 @@
         window.addEventListener('load', () => {
             stockTable = new OptimizedStockTable();
             
-            // 从API获取数据
-            stockTable.loadDataFromAPI();
+            // 从API获取初始数据
+            stockTable.loadDataFromAPI().then(() => {
+                // 初始数据加载完成后，启动WebSocket连接
+                console.log('📊 初始数据加载完成，启动WebSocket实时更新');
+                initWebSocket();
+                
+                // 如果WebSocket已经连接，发送订阅请求
+                if (isWsConnected && ws) {
+                    const stockList = stockTable.data.stocks.map(stock => stock.code);
+                    if (stockList.length > 0) {
+                        const subscribeMessage = {
+                            type: 'subscribe',
+                            stocks: stockList
+                        };
+                        ws.send(JSON.stringify(subscribeMessage));
+                        console.log('📤 数据加载完成后发送股票订阅请求:', stockList.length, '只股票');
+                    }
+                }
+            }).catch(() => {
+                // 即使API加载失败，也尝试启动WebSocket
+                console.log('⚠️ 初始数据加载失败，尝试启动WebSocket实时更新');
+                initWebSocket();
+            });
         });
+        
+        // 暴露全局函数
+        window.reconnectWebSocket = reconnectWebSocket;
         
         // 模拟数据生成函数（仅供测试）
         window.generateMockData = function(count = 100) {

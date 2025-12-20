@@ -10,26 +10,38 @@ logger = logging.getLogger(__name__)
 class RedisStorageManager:
     """
     高效Redis存储管理器 - 针对内存使用优化
+    实现单例模式，确保整个应用只有一个Redis连接实例
     """
     
+    _instance = None
+    
+    def __new__(cls, redis_url: str = "redis://localhost:6379", compression: bool = True):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            # 初始化Redis连接和配置
+            cls._instance.redis = redis.Redis.from_url(redis_url, decode_responses=True)
+            cls._instance.compression = compression
+            
+            # Redis键前缀（精简）
+            cls._instance.STOCK_PREFIX = "s:"      # 个股实时数据
+            cls._instance.STOCK_INFO_PREFIX = "si:" # 个股基础信息  
+            cls._instance.PLATE_METRICS_PREFIX = "pm:" # 板块指标
+            cls._instance.PLATE_INFO_PREFIX = "pi:"   # 板块基础信息
+            cls._instance.PLATE_HIERARCHY_PREFIX = "ph:" # 板块层级
+            cls._instance.MAIN_PLATES_KEY = "main_plates" # 主板块列表
+            cls._instance.CACHE_PREFIX = "cache:"  # 通用缓存数据
+            
+            # 数据过期时间（秒）
+            cls._instance.STOCK_DATA_TTL = 300      # 5分钟
+            cls._instance.PLATE_METRICS_TTL = 600   # 10分钟
+            cls._instance.BASE_INFO_TTL = 86400 * 7 # 基础信息7天
+            cls._instance.CACHE_TTL = 300           # 通用缓存5分钟
+        return cls._instance
+    
     def __init__(self, redis_url: str = "redis://localhost:6379", compression: bool = True):
-        self.redis = redis.Redis.from_url(redis_url, decode_responses=True)
-        self.compression = compression
-        
-        # Redis键前缀（精简）
-        self.STOCK_PREFIX = "s:"      # 个股实时数据
-        self.STOCK_INFO_PREFIX = "si:" # 个股基础信息  
-        self.PLATE_METRICS_PREFIX = "pm:" # 板块指标
-        self.PLATE_INFO_PREFIX = "pi:"   # 板块基础信息
-        self.PLATE_HIERARCHY_PREFIX = "ph:" # 板块层级
-        self.MAIN_PLATES_KEY = "main_plates" # 主板块列表
-        self.CACHE_PREFIX = "cache:"  # 通用缓存数据
-        
-        # 数据过期时间（秒）
-        self.STOCK_DATA_TTL = 300      # 5分钟
-        self.PLATE_METRICS_TTL = 600   # 10分钟
-        self.BASE_INFO_TTL = 86400 * 7 # 基础信息7天
-        self.CACHE_TTL = 300           # 通用缓存5分钟
+        # 单例模式下，__init__会被调用多次，但我们已经在__new__中初始化了所有属性
+        # 所以这里不需要做任何事情
+        pass
     
     def _convert_numpy_types(self, obj):
         """将numpy类型转换为Python原生类型"""
@@ -57,6 +69,9 @@ class RedisStorageManager:
     
     def _decompress_data(self, compressed_data: str) -> Any:
         """解压数据"""
+        if isinstance(compressed_data, (dict, list)):
+            # 数据已经是Python对象，直接返回
+            return compressed_data
         if not self.compression:
             return json.loads(compressed_data)
         return json.loads(zlib.decompress(bytes.fromhex(compressed_data)))
@@ -120,6 +135,150 @@ class RedisStorageManager:
         except Exception as e:
             logger.error(f"❌ 获取个股高级指标失败 {symbol}: {e}")
             return {}
+    
+    def get_limit_up_stocks(self) -> List[Dict[str, Any]]:
+        """
+        从Redis获取涨停票列表
+        
+        Returns:
+            List[Dict]: 涨停票列表，包含股票代码、名称、价格等信息
+        """
+        try:
+            # 从volatile_pool中获取所有异动票
+            volatile_pool_key = "stock:volatile_pool"
+            
+            # 检查键是否存在
+            if not self.redis.exists(volatile_pool_key):
+                logger.warning("Redis键不存在: {volatile_pool_key}")
+                return []
+            
+            # 获取所有异动票
+            all_volatile_stocks = self.redis.zrange(volatile_pool_key, 0, -1)
+            limit_up_stocks = []
+            
+            # 遍历所有异动票，筛选出涨停票
+            for symbol in all_volatile_stocks:
+                # 获取股票详细数据
+                stock_data = self.get_stock_advanced_indicators(symbol)
+                
+                if not stock_data:
+                    continue
+                
+                # 检查是否为涨停票（涨跌幅接近10%或20%）
+                change_pct = stock_data.get('change_pct', 0.0)
+                
+                # 考虑10%和20%的涨停情况（创业板、科创板）
+                if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
+                    # 从Redis获取股票名称
+                    stock_info_key = f"stock:quote:{symbol}"
+                    stock_name = self.redis.hget(stock_info_key, 'name')
+                    if stock_name:
+                        stock_data['name'] = stock_name
+                    
+                    stock_data['symbol'] = symbol
+                    limit_up_stocks.append(stock_data)
+            
+            logger.info(f"✅ 从Redis获取涨停票: {len(limit_up_stocks)}只")
+            return limit_up_stocks
+            
+        except Exception as e:
+            logger.error(f"❌ 获取涨停票失败: {e}")
+            return []
+    
+    def get_first_limit_up_stocks(self) -> List[Dict[str, Any]]:
+        """
+        从Redis获取首板票列表（涨停但不是昨日涨停的个股）
+        逻辑：获取今日所有涨停票，然后排除昨日涨停的股票，剩下的就是今日首板票
+        
+        Returns:
+            List[Dict]: 首板票列表，包含股票代码、名称、价格等信息
+        """
+        try:
+            from datetime import datetime, timedelta
+            import datetime as dt
+            
+            # 步骤1: 获取今日所有涨停票
+            # 先尝试从异动池获取
+            volatile_pool_key = "stock:volatile_pool"
+            today_limit_up_stocks = []
+            
+            if self.redis.exists(volatile_pool_key):
+                # 从异动池获取涨停票
+                all_volatile_stocks = self.redis.zrange(volatile_pool_key, 0, -1)
+                
+                for symbol in all_volatile_stocks:
+                    # 获取股票详细数据
+                    stock_data = self.get_stock_advanced_indicators(symbol)
+                    
+                    if not stock_data:
+                        continue
+                    
+                    # 检查是否为涨停票（涨跌幅接近10%或20%）
+                    change_pct = stock_data.get('change_pct', 0.0)
+                    
+                    # 考虑10%和20%的涨停情况（创业板、科创板）
+                    if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
+                        # 从Redis获取股票名称
+                        stock_info_key = f"stock:quote:{symbol}"
+                        stock_name = self.redis.hget(stock_info_key, 'name')
+                        if stock_name:
+                            stock_data['name'] = stock_name
+                        
+                        stock_data['symbol'] = symbol
+                        today_limit_up_stocks.append(stock_data)
+            else:
+                # 异动池不存在时，直接返回空列表
+                logger.warning(f"⚠️ Redis键不存在: {volatile_pool_key}")
+                return []
+            
+            logger.info(f"📊 今日涨停票数量: {len(today_limit_up_stocks)}")
+            
+            # 步骤2: 获取昨日涨停的股票
+            today = datetime.now().strftime('%Y-%m-%d')
+            today_date = dt.datetime.strptime(today, '%Y-%m-%d')
+            prev_date = today_date - timedelta(days=1)
+            prev_day = prev_date.strftime('%Y-%m-%d')
+            
+            # 构造昨日涨停数据缓存键
+            prev_limit_up_key = f"limit_up_{prev_day}"
+            
+            # 从Redis缓存获取昨日涨停数据
+            prev_limit_up_data = self.get_data(prev_limit_up_key)
+            
+            # 提取昨日涨停的股票代码列表
+            prev_limit_up_symbols = set()
+            if prev_limit_up_data:
+                for stock in prev_limit_up_data:
+                    symbol = stock.get('code', '')
+                    if symbol:
+                        prev_limit_up_symbols.add(symbol)
+            
+            logger.info(f"📊 昨日涨停的股票数量: {len(prev_limit_up_symbols)}")
+            
+            # 步骤3: 筛选今日首板票（今日涨停但昨日未涨停的股票）
+            first_limit_stocks = []
+            for stock in today_limit_up_stocks:
+                symbol = stock.get('symbol', '')
+                if symbol and symbol not in prev_limit_up_symbols:
+                    # 转换数据格式，确保与原有方法返回格式一致
+                    formatted_stock = {
+                        'symbol': symbol,
+                        'name': stock.get('name', f"股票{symbol}"),
+                        'price': stock.get('price', 0.0),
+                        'change_pct': stock.get('change_pct', 0.0),
+                        'amount': stock.get('amount', 0.0),
+                        'timestamp': int(datetime.now().timestamp() * 1000),  # 当前时间戳
+                        'plate': stock.get('plate', '涨停板块'),
+                        'limit_time': stock.get('limit_time', '09:30:00')
+                    }
+                    first_limit_stocks.append(formatted_stock)
+            
+            logger.info(f"✅ 筛选出今日首板票: {len(first_limit_stocks)}只")
+            return first_limit_stocks
+            
+        except Exception as e:
+            logger.error(f"❌ 获取首板票失败: {e}")
+            return []
     
     def batch_get_stocks_advanced_indicators(self, symbols: List[str]) -> Dict[str, Dict]:
         """

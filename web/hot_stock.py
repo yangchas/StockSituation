@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import json
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
@@ -50,7 +51,15 @@ class ThsHotListAPI:
             "list_type": list_type
         }
         
+        # 写入日志到文件
+        def write_log(message):
+            with open('ths_hotlist_log.txt', 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        
         try:
+            write_log("开始获取同花顺热榜数据")
+            write_log(f"请求参数: {params}")
+            
             # 创建异步会话
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -60,12 +69,16 @@ class ThsHotListAPI:
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as response:
                     
+                    write_log(f"同花顺热榜请求URL: {response.url}")
+                    write_log(f"响应状态码: {response.status}")
+                    
                     # 检查响应状态
                     if response.status != 200:
                         raise Exception(f"请求失败，状态码: {response.status}")
                     
                     # 解析响应数据
                     data = await response.json()
+                    write_log(f"完整响应数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
                     
                     # 检查返回的数据结构
                     if not isinstance(data, dict):
@@ -77,6 +90,8 @@ class ThsHotListAPI:
                     
                     # 提取股票数据
                     stocks_data = data.get("data", {}).get("stock_list", [])
+                    write_log(f"提取的股票列表: {stocks_data}")
+                    write_log(f"股票列表长度: {len(stocks_data)}")
                     
                     if not isinstance(stocks_data, list):
                         raise Exception("stock_list字段格式不是列表")
@@ -167,8 +182,8 @@ class ThsHotListAPI:
                     "name": stock.get("name", ""),  # 股票名称
                     "rank": stock.get("display_order", 0),  # 显示排名
                     "order": stock.get("order", 0),  # 原始排序
-                    "rate": float(stock.get("rate", 0)),  # 热度值
-                    "rise_and_fall": float(stock.get("rise_and_fall", 0)),  # 涨跌幅
+                    "rate": float(stock.get("rate")) if stock.get("rate") is not None else 0.0,  # 热度值
+                    "rise_and_fall": float(stock.get("rise_and_fall")) if stock.get("rise_and_fall") is not None else 0.0,  # 涨跌幅
                     "hot_rank_chg": stock.get("hot_rank_chg", 0),  # 热度排名变化
                     "search_cnt": stock.get("search_cnt", 0),  # 搜索次数
                     "update_time": stock.get("update_time", "")  # 更新时间
@@ -443,6 +458,7 @@ async def main():
         # 方法2: 获取格式化后的热榜数据
         print("\n获取格式化热榜数据...")
         formatted_stocks = await api.get_formatted_trending_stocks(top_n=10)
+        print(formatted_stocks)
         print(f"前10个热榜股票:")
         for stock in formatted_stocks:
             print(f"  排名{stock['current_rank']}: {stock['stock_code']} "
@@ -512,5 +528,14 @@ def sync_get_trending_stocks(
 
 
 if __name__ == "__main__":
-    # 运行异步主函数
-    asyncio.run(main())
+    # 直接测试同花顺热榜
+    print("=== 直接测试同花顺热榜获取 ===")
+    api = ThsHotListAPI()
+    
+    try:
+        # 同步调用获取热榜
+        stocks = sync_get_trending_stocks()
+        print(f"\n获取到 {len(stocks)} 只热榜股票")
+        print(f"股票列表: {stocks}")
+    except Exception as e:
+        print(f"\n获取热榜失败: {str(e)}")
