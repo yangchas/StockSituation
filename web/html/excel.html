@@ -592,6 +592,260 @@
             border: 1px solid #ffc107;
             color: #ffc107;
         }
+
+        /* 手机端样式 */
+        @media screen and (max-width: 768px) {
+            /* 隐藏PC端容器 */
+            .container {
+                display: none;
+            }
+            
+            /* 显示移动端容器 */
+            #mobileContainer {
+                display: block;
+                width: 100%;
+                height: 100vh;
+                overflow: hidden;
+                background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 100%);
+            }
+            
+            /* 移动端头部（简化版） */
+            .mobile-header {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 44px;
+                background: rgba(26, 26, 46, 0.95);
+                border-bottom: 1px solid #333;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 0 10px;
+                z-index: 1000;
+            }
+            
+            .mobile-header h1 {
+                color: #d4af37;
+                font-size: 14px;
+                margin: 0;
+            }
+            
+            .mobile-controls {
+                display: flex;
+                gap: 8px;
+            }
+            
+            .mobile-control-btn {
+                padding: 4px 8px;
+                background: rgba(40, 40, 60, 0.9);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                color: #e0e0e0;
+                border-radius: 4px;
+                font-size: 10px;
+                cursor: pointer;
+            }
+            
+            /* 主内容区 */
+            .mobile-main-content {
+                margin-top: 44px;
+                height: calc(100vh - 44px);
+                overflow: hidden;
+                display: flex;
+                flex-direction: column;
+            }
+            
+            /* 表格容器 */
+            .mobile-table-container {
+                flex: 1;
+                overflow: auto;
+                position: relative;
+            }
+            
+            /* 简化的Excel表格 */
+            .mobile-excel-table {
+                width: 100%;
+                min-width: 1200px;
+                border-collapse: collapse;
+            }
+            
+            /* 主题行（垂直排列） */
+            .mobile-theme-row {
+                margin-bottom: 8px;
+                background: rgba(26, 26, 46, 0.95);
+                border: 1px solid #333;
+                border-radius: 6px;
+                overflow: hidden;
+            }
+            
+            .mobile-theme-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 10px;
+                background: rgba(0, 0, 0, 0.3);
+                border-bottom: 1px solid #333;
+            }
+            
+            .mobile-theme-name {
+                color: #d4af37;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            
+            .mobile-theme-stats {
+                color: #aaa;
+                font-size: 10px;
+                display: flex;
+                gap: 10px;
+            }
+            
+            /* 列容器 */
+            .mobile-columns-container {
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 4px;
+                padding: 8px;
+            }
+            
+            .mobile-column {
+                background: rgba(40, 40, 60, 0.6);
+                border: 1px solid #333;
+                border-radius: 4px;
+                padding: 6px;
+                min-height: 40px;
+            }
+            
+            .mobile-column-title {
+                color: #d4af37;
+                font-size: 10px;
+                margin-bottom: 4px;
+                text-align: center;
+                border-bottom: 1px solid #333;
+                padding-bottom: 2px;
+            }
+            
+            /* 移动端股票项 */
+            .mobile-stock-item {
+                display: flex;
+                align-items: center;
+                padding: 3px 5px;
+                margin: 2px 0;
+                border-radius: 3px;
+                font-size: 9px;
+                cursor: pointer;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            
+            .mobile-stock-name {
+                font-weight: bold;
+                margin-right: 4px;
+                flex-shrink: 0;
+            }
+            
+            .mobile-stock-info {
+                display: flex;
+                gap: 3px;
+                font-size: 8px;
+                flex-wrap: wrap;
+            }
+            
+            /* 底部控制栏 */
+            .mobile-bottom-bar {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 40px;
+                background: rgba(26, 26, 46, 0.95);
+                border-top: 1px solid #333;
+                display: flex;
+                align-items: center;
+                justify-content: space-around;
+                z-index: 1000;
+            }
+            
+            .mobile-tab-btn {
+                padding: 6px 12px;
+                background: transparent;
+                border: none;
+                color: #aaa;
+                font-size: 11px;
+                cursor: pointer;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 2px;
+            }
+            
+            .mobile-tab-btn.active {
+                color: #d4af37;
+            }
+            
+            /* 移动端统计面板 */
+            .mobile-stats-panel {
+                position: fixed;
+                bottom: 40px;
+                left: 0;
+                right: 0;
+                background: rgba(26, 26, 46, 0.98);
+                border-top: 1px solid #333;
+                padding: 10px;
+                transform: translateY(100%);
+                transition: transform 0.3s;
+                z-index: 999;
+                max-height: 60vh;
+                overflow-y: auto;
+            }
+            
+            .mobile-stats-panel.show {
+                transform: translateY(0);
+            }
+            
+            .mobile-stats-grid {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 6px;
+                margin-bottom: 10px;
+            }
+            
+            .mobile-stat-item {
+                text-align: center;
+                padding: 6px;
+                background: rgba(40, 40, 60, 0.6);
+                border-radius: 4px;
+            }
+            
+            /* 移动端主题详情 */
+            .mobile-theme-details-panel {
+                position: fixed;
+                bottom: 40px;
+                left: 0;
+                right: 0;
+                background: rgba(26, 26, 46, 0.98);
+                border-top: 1px solid #333;
+                padding: 10px;
+                transform: translateY(100%);
+                transition: transform 0.3s;
+                z-index: 999;
+                max-height: 60vh;
+                overflow-y: auto;
+            }
+            
+            /* 移动端工具提示 */
+            .mobile-tooltip {
+                position: absolute;
+                background: rgba(0, 0, 0, 0.95);
+                border: 1px solid #333;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 10px;
+                color: #fff;
+                max-width: 200px;
+                z-index: 1000;
+                pointer-events: none;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1598,8 +1852,16 @@
                 
                 html += `<div class="tooltip-row">
                     <span class="tooltip-label">题材:</span>
-                    <span class="tooltip-value">${stock.theme}</span>
+                    <span class="tooltip-value">${Array.isArray(stock.themes) && stock.themes.length > 0 ? stock.themes.join('、') : stock.theme || '其他'}</span>
                 </div>`;
+                
+                // 显示筛选分数（如果有）
+                if (stock.screening_score !== undefined && stock.screening_score > 0) {
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">筛选分数:</span>
+                        <span class="tooltip-value">${stock.screening_score.toFixed(2)}</span>
+                    </div>`;
+                }
                 
                 if (stock.floor > 0) {
                     html += `<div class="tooltip-row">
@@ -1718,8 +1980,15 @@
                     // 显示加载状态
                     this.showLoading();
                     
-                    // 获取综合数据
-                    this.fetchComprehensiveData().then(() => {
+                    // 获取综合数据和其他个股数据
+                    Promise.all([
+                        this.fetchComprehensiveData(),
+                        this.fetchOtherStocksData()
+                    ]).then((results) => {
+                        // 整合其他个股数据到综合数据中
+                        if (results[1]) {
+                            this.processOtherStocksData(results[1]);
+                        }
                         resolve();
                     }).catch((error) => {
                         console.error('API数据加载失败:', error);
@@ -1796,6 +2065,77 @@
                 retryButton.onclick = () => {
                     this.loadDataFromAPI();
                 };
+            }
+            
+            fetchOtherStocksData() {
+                return new Promise((resolve, reject) => {
+                    fetch('http://115.190.156.240:8080/api/other_stocks')
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP error! status: ${response.status}`);
+                            }
+                            return response.json();
+                        })
+                        .then(data => {
+                            console.log('其他个股API返回数据:', data);
+                            
+                            if (data.success && data.data) {
+                                resolve(data.data);
+                            } else {
+                                console.error('获取其他个股数据失败:', data.error);
+                                resolve([]);
+                            }
+                        })
+                        .catch(error => {
+                            console.error('其他个股API调用失败:', error);
+                            resolve([]); // 失败时返回空数组，不影响整体流程
+                        });
+                });
+            }
+            
+            processOtherStocksData(otherStocks) {
+                // 检查是否是包含stocks字段的对象，如果是则提取stocks数组
+                const stocksArray = otherStocks && typeof otherStocks === 'object' && 'stocks' in otherStocks ? otherStocks.stocks : otherStocks;
+                
+                if (!Array.isArray(stocksArray)) return;
+                
+                console.log('处理其他个股数据:', stocksArray.length, '条');
+                console.log('其他个股数据结构:', otherStocks);
+                
+                // 将其他个股数据转换为应用格式并添加到数据中
+                const formattedStocks = stocksArray.map(stock => ({
+                    id: `other_${stock.code}_${Date.now()}`,
+                    name: stock.name.slice(0,4),
+                    code: stock.code,
+                    amount: stock.amount || stock.trade_amount || 0,
+                    gain: stock.change_pct || stock.gain || 0,
+                    // 使用后端提供的涨速数据，优先使用speed，其次是change_rate_1min
+                    speed: parseFloat(stock.speed || stock.change_rate_1min || 0),
+                    capitalType: stock.capitalType === 'A' ? 0 : 1,
+                    // 使用themes数组的第一个元素作为主题，如果没有则使用plate或theme
+                    theme: (Array.isArray(stock.themes) && stock.themes.length > 0) ? stock.themes[0] : stock.plate || stock.theme || '其他',
+                    // 保存所有题材信息
+                    themes: Array.isArray(stock.themes) ? stock.themes : [stock.plate || stock.theme || '其他'],
+                    floor: 0, // 其他个股的板数为0
+                    category: 'other',
+                    // 保存筛选分数用于排序或显示
+                    screening_score: parseFloat(stock.screening_score || 0)
+                }));
+                
+                // 使用addStock方法将新数据添加到现有数据中
+                formattedStocks.forEach(stock => {
+                    this.addStock(stock);
+                });
+                
+                // 处理题材分组数据
+                if (otherStocks && typeof otherStocks === 'object' && 'theme_groups' in otherStocks) {
+                    console.log('题材分组数据:', otherStocks.theme_groups);
+                    // 可以在这里对题材分组数据进行进一步处理，比如用于UI展示或其他逻辑
+                }
+                
+                // 更新显示
+                this.batchUpdate();
+                console.log('其他个股数据已成功添加到应用中');
             }
             
             async fetchLimitUpData() {
@@ -1889,7 +2229,7 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct*100 || 0,
+                            gain: stock.change_pct || 0,
                             speed: stock.change_rate_1min*100 || 0,
                             capitalType: 0,
                             theme: stock.plate || '其他',

@@ -204,58 +204,11 @@ class LimitUpTDEngineStorage:
                 logger.warning(f"⚠️  查询{date_str}连板数据时cursor为空")
                 return []
                 
-            # 处理模拟和实际cursor的不同情况
+            # 处理实际cursor
             rows = []
             if hasattr(cursor, 'fetchall'):
                 # 实际cursor
                 rows = cursor.fetchall()
-            elif cursor == "mock_cursor":
-                # 模拟cursor，返回模拟数据
-                logger.info(f"✅ 模拟查询{date_str}连板数据，返回50条模拟数据")
-                # 模拟50条不同连板天数的数据，包含首板票
-                for i in range(50):
-                    # 根据索引模拟不同的连板天数（包含首板票）
-                    if i < 20:
-                        days = 0  # 首板票
-                    elif i < 40:
-                        days = 1  # 2板票
-                    elif i < 46:
-                        days = 2  # 3板票
-                    elif i < 49:
-                        days = 3  # 4板票
-                    else:
-                        days = 4  # 5板票
-                    
-                    # 生成不同日期的不同股票代码，便于测试首板票过滤
-                    if date_str == datetime.now().strftime('%Y-%m-%d'):
-                        # 今日数据：使用60001XX系列
-                        code = f"60001{i+1:02d}"
-                    else:
-                        # 昨日数据：使用60000XX系列
-                        code = f"60000{i+1:02d}"
-                    
-                    rows.append((
-                        datetime.now(),
-                        code,
-                        f"股票{i+1}",
-                        "09:30:00",
-                        "测试板块",
-                        1.0 + i * 0.1,
-                        2.0 + i * 0.2,
-                        0.5 + i * 0.05,
-                        3.0 + i * 0.3,
-                        2.5 + i * 0.25,
-                        10.0 + i * 1.0,
-                        "测试概念",
-                        1000000000 + i * 10000000,
-                        f"{5.0 + i * 0.5:.2f}%",
-                        days,
-                        5.0 + i * 0.1,
-                        1 if i < 10 else 2,
-                        0,
-                        date_str,  # date_tag
-                        "模拟题材"  # theme_tag
-                    ))
             else:
                 logger.error(f"❌ 未知的cursor类型: {type(cursor)}")
                 return []
@@ -417,11 +370,11 @@ class ZTBService:
                 return []
                 
             
-            # 处理数据
+            # 处理数据 - 调整为实际的21列
             columns = [
                 '股票代码', '股票简称', '2', '3', '涨停时间', '板块', '封单', '最大封单', 
                 '主力净额', '主力买入', '主力卖出', '成交额', '概念', '实际流通', 
-                '实际换手', '连板天数', '16', '振幅', '18', '19', '板块内涨停个数'
+                '实际换手', '连板天数', '16', '振幅', '连板描述', '板块ID', '21'
             ]
             
             # 创建DataFrame
@@ -581,22 +534,8 @@ class LimitUpDailyUpdater:
                 )
                 return True
             
-            # 如果没有数据，强制生成模拟数据
-            logger.warning(f"⚠️ 未找到上一个交易日 [{prev_day}] 的连板数据，开始生成模拟数据")
-            
-            # 生成模拟数据
-            mock_data = self.td_storage.query_limit_up_by_date(prev_day)
-            if mock_data and len(mock_data) > 0:
-                logger.info(f"✅ 生成模拟数据成功: {len(mock_data)}条")
-                # 缓存到Redis
-                self.redis_storage.store_data(
-                    cache_key, 
-                    mock_data, 
-                    expire_seconds=86400  # 24小时
-                )
-                return True
-            
-            logger.warning(f"⚠️ 生成模拟数据失败")
+            # 如果没有数据，直接返回False
+            logger.warning(f"⚠️ 未找到上一个交易日 [{prev_day}] 的连板数据")
             return False
             
         except Exception as e:
@@ -765,58 +704,85 @@ class IntegratedStockService:
             # 获取参数
             date_str = request.query.get('date', '')
             theme = request.query.get('theme', '')
-            min_days = int(request.query.get('min_days', 0))
+            
+            # 安全处理min_days参数
+            try:
+                min_days = int(request.query.get('min_days', 0))
+            except (ValueError, TypeError):
+                min_days = 0
+                logger.warning(f"⚠️ min_days参数格式错误，使用默认值0")
             
             # 如果没有指定日期，使用上一个交易日
             if not date_str:
-                today = datetime.now().strftime('%Y-%m-%d')
-                date_str = self.calendar.get_previous_trade_day(today)
+                try:
+                    today = datetime.now().strftime('%Y-%m-%d')
+                    date_str = self.calendar.get_previous_trade_day(today)
+                except Exception as e:
+                    logger.error(f"❌ 获取上一个交易日失败: {e}")
+                    return web.json_response({
+                        'success': False,
+                        'message': '获取上一个交易日失败'
+                    })
+            
+            logger.info(f"📊 获取连板数据: 日期={date_str}, 题材={theme}, 最小连板天数={min_days}")
             
             # 从Redis缓存获取
             cache_key = f"limit_up_{date_str}"
-            limit_up_data = self.redis_storage.get_data(cache_key)
-            
-            print(f"1. limit_up_data count: {len(limit_up_data) if limit_up_data else 0}")
+            limit_up_data = []
+            try:
+                limit_up_data = self.redis_storage.get_data(cache_key)
+                logger.debug(f"📦 从Redis缓存获取连板数据: {len(limit_up_data) if limit_up_data else 0}条")
+            except Exception as e:
+                logger.warning(f"⚠️ 从Redis获取连板数据失败: {e}")
             
             if not limit_up_data:
                 # 从TDEngine查询
-                limit_up_data = self.td_storage.query_limit_up_by_date(date_str)
-                
-                # 缓存到Redis
-                if limit_up_data:
-                    self.redis_storage.store_data(
-                        cache_key, 
-                        limit_up_data, 
-                        expire_seconds=86400
-                    )
+                try:
+                    limit_up_data = self.td_storage.query_limit_up_by_date(date_str)
+                    logger.debug(f"📥 从TDEngine查询连板数据: {len(limit_up_data) if limit_up_data else 0}条")
+                    
+                    # 缓存到Redis
+                    if limit_up_data:
+                        try:
+                            self.redis_storage.store_data(
+                                cache_key, 
+                                limit_up_data, 
+                                expire_seconds=86400
+                            )
+                            logger.debug(f"💾 连板数据已缓存到Redis")
+                        except Exception as e:
+                            logger.warning(f"⚠️ 将连板数据缓存到Redis失败: {e}")
+                except Exception as e:
+                    logger.error(f"❌ 从TDEngine查询连板数据失败: {e}")
+                    return web.json_response({
+                        'success': False,
+                        'message': '查询连板数据失败'
+                    })
             
             # 过滤数据
             filtered_data = []
-            for stock in limit_up_data:
-                # 按连板天数过滤
-                if min_days > 0 and stock.get('consecutive_days', 0) < min_days:
-                    continue
-                
-                # 按题材过滤
-                if theme and theme not in stock.get('plate', ''):
-                    continue
-                
-                filtered_data.append(stock)
+            if limit_up_data:
+                for stock in limit_up_data:
+                    # 按连板天数过滤
+                    if min_days > 0 and stock.get('consecutive_days', 0) < min_days:
+                        continue
+                    
+                    # 按题材过滤
+                    if theme and theme not in stock.get('plate', ''):
+                        continue
+                    
+                    filtered_data.append(stock)
             
-            print(f"2. filtered_data count: {len(filtered_data)}")
+            logger.debug(f"🔍 过滤后连板数据: {len(filtered_data)}条")
             
             # 直接使用过滤后的数据，不进行高级指标增强
             # enhanced_data = await self._enhance_with_advanced_indicators(filtered_data)
             enhanced_data = filtered_data
-            
-            print(f"3. enhanced_data count: {len(enhanced_data)}")
-            
+            print(enhanced_data)
             # 按题材分组
             grouped_data = self._group_by_theme(enhanced_data)
             
-            print(f"4. grouped_data type: {type(grouped_data)}")
-            print(f"5. grouped_data keys: {list(grouped_data.keys())}")
-            print(f"6. grouped_data size: {len(grouped_data)}")
+            logger.debug(f"📋 按题材分组后: {len(grouped_data)}个题材")
             
             # 获取统计数据
             stats = self._get_daily_stats(date_str, limit_up_data)
@@ -1230,13 +1196,616 @@ class IntegratedStockService:
         
         return merged
     
+    async def get_other_stocks_api(self, request):
+        """API接口：获取其他符合条件的个股"""
+        try:
+            # 获取查询参数
+            plate_name = request.query.get('plate', '')
+            min_speed = float(request.query.get('min_speed', 0.5))  # 涨速阈值（%）
+            min_amount = float(request.query.get('min_amount', 10))  # 成交额阈值（亿）
+            min_bidding_amount = float(request.query.get('min_bidding_amount', 1000))  # 竞价成交额阈值（万）
+            
+            # 获取符合条件的其他个股
+            other_stocks = await self.find_other_stocks_by_conditions(
+                plate_name=plate_name,
+                min_speed=min_speed,
+                min_amount=min_amount,
+                min_bidding_amount=min_bidding_amount
+            )
+            
+            return web.json_response({
+                'success': True,
+                'data': other_stocks,
+                'count': len(other_stocks),
+            })
+            
+        except Exception as e:
+            logger.error(f"❌ 获取其他个股失败: {e}")
+            return web.json_response({
+                'success': False,
+                'error': str(e)
+            }, status=500)
+    
+    async def find_other_stocks_by_conditions(self, plate_name='', min_speed=0.5, 
+                                      min_amount=10, min_bidding_amount=1000):
+        """
+        根据条件查找其他个股
+        
+        Args:
+            plate_name: 板块名称（可选）
+            min_speed: 最小涨速（%）
+            min_amount: 最小成交额（亿）
+            min_bidding_amount: 最小竞价成交额（万）
+            
+        Returns:
+            List[Dict]: 符合条件的个股列表，格式符合前端要求
+        """
+        try:
+            # 生成缓存键
+            cache_key = f"other_stocks_{plate_name}_{min_speed}_{min_amount}_{min_bidding_amount}"
+            
+            # 尝试从Redis获取缓存数据
+            cached_data = self.redis_storage.get_data(cache_key)
+            if cached_data:
+                logger.info(f"📦 从Redis缓存获取其他个股数据: {cache_key}")
+                return cached_data
+            
+            # 缓存不存在，执行原逻辑
+            # 1. 获取核心个股（涨停、核心）的题材（1对1）
+            core_stocks = await self._get_core_and_limit_up_stocks()
+            logger.debug(f"核心个股数据: {core_stocks}")
+            # 2. 获取核心个股的题材列表（去重）
+            target_themes = self._identify_target_plates(core_stocks, plate_name)
+            # print(target_themes,core_stocks)
+            # 3. 确定目标题材
+            # target_themes = [plate_name] if plate_name else list(core_themes)
+            if not target_themes:
+                target_themes = ['人工智能', '芯片', '通信']
+            # print(target_themes)
+            # 4. 根据题材获取对应个股，并计算筛选分数
+            theme_to_stocks = {}  # 题材->个股映射（1对多）
+            stock_to_data = {}    # 股票基础数据缓存
+            
+            for theme in target_themes:
+                # # 获取题材下的所有个股
+                # plate_id = self.web_service.plate_updater.plate_name_to_id.get(theme)
+                # if not plate_id:
+                #     logger.warning(f"⚠️ 未找到题材 '{theme}' 对应的板块ID")
+                #     continue
+                
+                theme_stocks = self.web_service.plate_updater.get_plate_stocks(theme)
+                
+                if not theme_stocks:
+                    continue
+                    
+                # 暂存1对多映射关系
+                theme_to_stocks[theme] = []
+                
+                for stock in theme_stocks:
+                    code = stock.get('code')
+                    if not code:
+                        continue
+
+                    # 缓存股票基础数据
+                    if code not in stock_to_data:
+                        # 获取高级指标
+                        advanced_data = self._get_stock_advanced_data(code)
+                        
+                        # 检查筛选条件
+                        if 0:#not self._check_stock_conditions(stock, advanced_data, min_speed, min_amount):
+                            stock_to_data[code] = None  # 标记为不符合条件
+                            continue
+                        
+                        # 获取涨速和成交额
+                        speed = advanced_data.get('change_rate_1min', 0)
+                        amount = advanced_data.get('amount_2min', 0)
+                        
+                        # 计算筛选分数
+                        screening_score = self._calculate_screening_score(stock, advanced_data, speed, amount)
+                        
+                        # 缓存数据
+                        stock_to_data[code] = {
+                            'stock_data': stock,
+                            'advanced_data': advanced_data,
+                            'screening_score': screening_score
+                        }
+                    
+                    # 如果股票符合条件，添加到题材映射
+                    if stock_to_data[code] is not None:
+                        theme_to_stocks[theme].append({
+                            'code': code,
+                            'screening_score': stock_to_data[code]['screening_score']
+                        })
+            
+            # 5. 每个题材只取前20个高评分个股
+            top_stocks_by_theme = {}
+            for theme, stocks_list in theme_to_stocks.items():
+                # 按筛选分数排序，取前20
+                sorted_stocks = sorted(stocks_list, 
+                                    key=lambda x: x['screening_score'], 
+                                    reverse=True)[:20]
+                top_stocks_by_theme[theme] = sorted_stocks
+            
+            # 6. 构建最终的个股列表（去重），并确定每个股票的themes字段
+            # 统计每个股票出现在哪些题材的前20中
+            stock_to_qualified_themes = {}
+            
+            for theme, stocks_list in top_stocks_by_theme.items():
+                # 将板块ID转换为中文名称
+                theme_name = theme
+                if theme in self.web_service.plate_updater.all_plates:
+                    theme_name = self.web_service.plate_updater.all_plates[theme]['name']
+                
+                for stock_info in stocks_list:
+                    code = stock_info['code']
+                    if code not in stock_to_qualified_themes:
+                        stock_to_qualified_themes[code] = []
+                    stock_to_qualified_themes[code].append(theme_name)
+            
+            # 7. 构建最终股票列表
+            final_stocks = []
+            for code, qualified_themes in stock_to_qualified_themes.items():
+                if code not in stock_to_data or stock_to_data[code] is None:
+                    continue
+                
+                stock_info = stock_to_data[code]
+                
+                # 格式化股票数据，只包含该股票出现在前20的题材
+                formatted_stock = self._format_stock_with_qualified_themes(
+                    stock_info['stock_data'],
+                    stock_info['advanced_data'],
+                    qualified_themes,
+                    stock_info['screening_score']
+                )
+                
+                final_stocks.append(formatted_stock)
+            
+            # 8. 返回数据
+            result = {
+                'stocks': final_stocks,  # 不重复的个股列表，每个有themes数组（仅包含前20的题材）
+                'theme_groups': {  # 每个题材的前20个股代码
+                    theme: [s['code'] for s in top_stocks_by_theme[theme]]
+                    for theme in top_stocks_by_theme
+                }
+            }
+            
+            # 将结果存入Redis，设置过期时间为5分钟
+            self.redis_storage.store_data(cache_key, result, expire_seconds=300)
+            logger.info(f"💾 其他个股数据已缓存到Redis: {cache_key}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ 查找其他个股失败: {e}")
+            return {'stocks': [], 'theme_groups': {}}
+
+    def _format_stock_with_qualified_themes(self, stock, advanced_data, qualified_themes, screening_score):
+        """
+        格式化股票数据，themes字段只包含该股票出现在前20的题材
+        """
+        code = stock.get('code', '')
+        
+        # 获取基础信息
+        name = stock.get('name', '')
+        if not name:
+            redis_data = self.redis_storage.get_stock_data(code)
+            name = redis_data.get('name', '') if redis_data else ''
+        
+        # 计算指标
+        change_pct = stock.get('change_pct', 0)
+        if isinstance(change_pct, (int, float)) and abs(change_pct) < 1:
+            change_pct = change_pct * 100
+        
+        speed = advanced_data.get('change_rate_1min', 0)
+        if isinstance(speed, (int, float)) and abs(speed) < 1:
+            speed = speed * 100
+        
+        amount = advanced_data.get('amount_2min', 0) or stock.get('amount', 0)
+        
+        # 按筛选分数对题材排序（分数高的题材在前）
+        # 这里需要获取每个题材下的具体分数，简化处理：按传入的顺序
+        sorted_themes = qualified_themes  # 默认顺序
+        
+        return {
+            # 'id': f"other_{code}_{int(time.time() * 1000)}",
+            'code': code,
+            'name': name,
+            'change_pct': round(float(change_pct), 2),
+            'change_rate_1min': round(float(speed), 2),
+            'amount': amount,
+            'trade_amount': amount,
+            'themes': sorted_themes,  # 只包含该股票出现在前20的题材
+            'primary_theme': sorted_themes[0] if sorted_themes else '其他',
+            'floor': 0,
+            'category': 'other',
+            'screening_score': screening_score  # 使用传入的筛选分数
+        }
+
+    
+    def _format_stock_for_frontend(self, stock, advanced_data):
+        """
+        格式化股票数据，使其符合前端期望的格式
+        
+        前端期望格式：
+        {
+            'id': `other_${stock.code}_${Date.now()}`,
+            'name': stock.name,
+            'code': stock.code,
+            'amount': stock.amount || 0,
+            'gain': stock.change_pct || 0,
+            'speed': 0, // 其他个股默认没有速度数据
+            'capitalType': stock.capitalType === 'A' ? 0 : 1,
+            'theme': stock.plate || '其他',
+            'floor': 0, // 其他个股的板数为0
+            'category': 'other'
+        }
+        """
+        try:
+            # 获取股票名称
+            name = stock.get('name', '')
+            if not name:
+                # 从Redis获取股票名称
+                stock_data = self.redis_storage.get_stock_data(stock.get('code', ''))
+                if stock_data:
+                    name = stock_data.get('name', '')
+            
+            # 获取板块信息
+            themes = ['其他']  # 默认题材为'其他'
+            code = stock.get('code', '')
+            if code:
+                # 从个股板块映射中获取所有板块ID
+                stock_plates = self.web_service.plate_updater.stock_to_plates.get(code, [])
+                if stock_plates:
+                    themes = []  # 如果有板块信息则清空默认值
+                    for plate_id in stock_plates:
+                        # 将板块ID转换为板块中文名称
+                        if plate_id in self.web_service.plate_updater.all_plates:
+                            themes.append(self.web_service.plate_updater.all_plates[plate_id]['name'])
+            
+            # 计算涨跌幅（确保是百分比形式）
+            change_pct = stock.get('change_pct', 0)
+            if isinstance(change_pct, (int, float)) and abs(change_pct) < 1:
+                # 如果是小数形式（如0.05），转换为百分比形式（5.0）
+                change_pct = change_pct * 100
+            
+            # 计算涨速（1分钟涨速）
+            speed = advanced_data.get('change_rate_1min', 0)
+            if isinstance(speed, (int, float)) and abs(speed) < 1:
+                speed = speed * 100
+            
+            # 获取成交额（确保单位是元）
+            amount = advanced_data.get('amount_2min', 0) or stock.get('amount', 0)
+            
+            # 转换为符合前端的格式
+            formatted_stock = {
+                'id': f"other_{code}_{int(time.time() * 1000)}",
+                'name': name,
+                'code': code,
+                'amount': amount,  # 单位：元
+                'change_pct': round(float(change_pct), 2),  # 涨跌幅（百分比）
+                'change_rate_1min': round(float(speed), 2),  # 1分钟涨速（百分比）
+                'capitalType': 'A',  # 默认资金类型为A
+                'plate': themes[0],  # 保留第一个板块用于兼容
+                'trade_amount': amount,  # 成交额（与amount相同）
+                'theme': themes[0],  # 保留第一个题材用于兼容
+                'themes': themes,  # 添加所有题材信息
+                'gain': round(float(change_pct), 2),  # 涨幅（与change_pct相同）
+                'speed': round(float(speed), 2),  # 涨速（与change_rate_1min相同）
+                'floor': 0,  # 其他个股板数为0
+                'category': 'other',  # 分类为其他
+                'screening_score': self._calculate_screening_score(stock, advanced_data, speed, amount)
+            }
+            
+            return formatted_stock
+            
+        except Exception as e:
+            logger.error(f"格式化股票数据失败: {e}")
+            return {}
+    
+    def _check_stock_conditions(self, stock, advanced_data, min_speed, min_amount):
+        """检查股票是否满足筛选条件"""
+        try:
+            # 1. 涨速快
+            change_rate_1min = advanced_data.get('change_rate_1min', 0)
+            if isinstance(change_rate_1min, (int, float)) and abs(change_rate_1min) < 1:
+                change_rate_1min = change_rate_1min * 100  # 转换为百分比
+            
+            if change_rate_1min < min_speed:
+                return False
+            
+            # 2. 成交额 > min_amount亿
+            amount = advanced_data.get('amount_2min', 0) or stock.get('amount', 0)
+            if amount < min_amount * 100000000:  # 转换为元
+                return False
+            
+            # 3. 今日异动（涨幅>2% 或 大单净流入>500万）
+            change_pct = stock.get('change_pct', 0)
+            if isinstance(change_pct, (int, float)) and abs(change_pct) < 1:
+                change_pct = change_pct * 100  # 转换为百分比
+            
+            large_net = advanced_data.get('large_net', 0)
+            
+            # 异动条件：涨幅>2% 或 大单净流入>500万
+            if not (abs(change_pct) > 2 or abs(large_net) > 5000000):
+                return False
+            
+            # 4. K线符合买点（简化检查，仅检查价格趋势）
+            # 这里可以调用更复杂的K线分析，简化版只检查近期涨跌幅
+            if change_pct < -5:  # 跌幅过大可能不是好买点
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.debug(f"检查股票条件失败: {e}")
+            return False
+    
+    def _calculate_screening_score(self, stock, advanced_data, speed, amount):
+        """计算筛选分数"""
+        try:
+            score = 0
+            
+            # 1. 涨速分数 (权重30%)
+            speed_score = min(abs(speed) * 10, 30)  # 每1%涨速得10分，最多30分
+            score += speed_score
+            
+            # 2. 成交额分数 (权重25%)
+            amount_in_100m = amount / 100000000  # 转换为亿
+            amount_score = min(amount_in_100m * 1.5, 25)  # 每亿得1.5分，最多25分
+            score += amount_score
+            
+            # 3. 涨幅分数 (权重20%)
+            change_pct = stock.get('change_pct', 0)
+            if isinstance(change_pct, (int, float)) and abs(change_pct) < 1:
+                change_pct = change_pct * 100  # 转换为百分比
+            
+            if change_pct > 0:  # 只给正涨幅加分
+                change_score = min(change_pct * 2, 20)  # 每1%涨幅得2分，最多20分
+                score += change_score
+            
+            # 4. 大单净流入分数 (权重15%)
+            large_net = advanced_data.get('large_net', 0)
+            large_net_in_10m = large_net / 10000000  # 转换为千万
+            if large_net > 0:  # 只给净流入加分
+                large_net_score = min(large_net_in_10m * 3, 15)  # 每千万净流入得3分，最多15分
+                score += large_net_score
+            
+            # 5. 竞价分数 (权重10%) - 简化处理
+            bidding_score = 5  # 基础分
+            score += bidding_score
+            
+            return round(score, 2)
+            
+        except Exception as e:
+            logger.debug(f"计算筛选分数失败: {e}")
+            return 0
+    
+    async def _get_core_and_limit_up_stocks(self):
+        """获取核心票和连板票"""
+        try:
+            from datetime import datetime
+            
+            # 获取连板票
+            limit_up_stocks = []#self.redis_storage.get_first_limit_up_stocks()
+            
+            # 获取热门票（作为核心票）
+            hot_stocks = await self._get_hot_stocks()
+            
+            # 获取昨日涨停票
+            yesterday_limit_up_stocks = []
+            try:
+                today = datetime.now().strftime('%Y-%m-%d')
+                yesterday = self.calendar.get_previous_trade_day(today)
+                # 从TDengine获取昨日涨停票数据
+                yesterday_limit_up_stocks = self.td_storage.query_limit_up_by_date(yesterday)
+            except Exception as e:
+                logger.error(f"⚠️ 获取昨日涨停票失败: {e}")
+            
+            # 合并去重
+            core_stocks = []
+            seen_codes = set()
+            
+            # 添加连板票
+            if limit_up_stocks and isinstance(limit_up_stocks, list):
+                for stock in limit_up_stocks:
+                    if isinstance(stock, dict):
+                        code = stock.get('code', '')
+                        if code and code not in seen_codes:
+                            stock['type'] = 'limit_up'
+                            core_stocks.append(stock)
+                            seen_codes.add(code)
+            
+            # 添加昨日涨停票
+            if yesterday_limit_up_stocks and isinstance(yesterday_limit_up_stocks, list):
+                for stock in yesterday_limit_up_stocks:
+                    if isinstance(stock, dict):
+                        code = stock.get('code', '')
+                        if code and code not in seen_codes:
+                            stock['type'] = 'yesterday_limit_up'
+                            core_stocks.append(stock)
+                            seen_codes.add(code)
+            
+            # 添加热门票
+            if hot_stocks and isinstance(hot_stocks, list):
+                for stock in hot_stocks:
+                    if isinstance(stock, dict):
+                        code = stock.get('code', '')
+                        if code and code not in seen_codes:
+                            stock['type'] = 'core'
+                            core_stocks.append(stock)
+                            seen_codes.add(code)
+            
+            logger.info(f"✅ 获取核心票和连板票完成，共{len(core_stocks)}只股票")
+            return core_stocks
+            
+        except Exception as e:
+            logger.error(f"❌ 获取核心票和连板票失败: {e}")
+            return []
+    
+    async def _get_hot_stocks(self, limit=50):
+        """获取热门股票"""
+        try:
+            from datetime import datetime
+            from hot_stock import ThsHotListAPI
+            
+            # 缓存相关配置
+            cache_key = "hot_stocks:ths"
+            cache_expire = 60*60  # 缓存过期时间（秒）
+            
+            # 尝试从Redis获取缓存数据
+            try:
+                cached_data = self.redis_storage.redis.get(cache_key)
+                if cached_data:
+                    import json
+                    hot_stocks = json.loads(cached_data)
+                    logger.info(f"✅ 从Redis缓存获取热门股票: {len(hot_stocks)}只")
+                    return hot_stocks
+            except Exception as e:
+                logger.warning(f"⚠️ 从Redis获取热门股票缓存失败: {e}")
+            
+            # 缓存不存在或已过期，从同花顺API获取
+            logger.info("🔍 从同花顺API获取热门股票数据")
+            
+            # 创建API实例并获取数据
+            api = ThsHotListAPI()
+            
+            # 获取原始热榜数据（直接异步调用）
+            raw_stocks = await api.get_formatted_trending_stocks(top_n=limit)
+            
+            # 格式化数据，确保与现有代码兼容
+            hot_stocks = []
+            for stock in raw_stocks:
+                # 提取需要的字段
+                formatted_stock = {
+                    'code': stock.get('code', ''),
+                    'name': stock.get('name', ''),
+                    'change_pct': stock.get('rise_and_fall', 0) / 100,  # 转换为小数
+                    'amount': 0,  # 同花顺API可能没有成交额，设置默认值
+                    'symbol': stock.get('full_code', ''),  # 完整股票代码
+                    'themes': stock.get('concept_tags', [])  # 题材信息
+                }
+                hot_stocks.append(formatted_stock)
+            
+            # 将数据存入Redis缓存
+            try:
+                import json
+                self.redis_storage.redis.setex(cache_key, cache_expire, json.dumps(hot_stocks))
+                logger.info(f"✅ 热门股票数据已存入Redis缓存，过期时间: {cache_expire}秒")
+            except Exception as e:
+                logger.warning(f"⚠️ 将热门股票数据存入Redis缓存失败: {e}")
+            
+            return hot_stocks
+            
+        except Exception as e:
+            logger.error(f"❌ 获取热门股票失败: {e}")
+            return []
+    
+    def _identify_target_plates(self, core_stocks, specified_plate=''):
+        """识别目标题材"""
+        try:
+            print(f"开始识别目标题材: core_stocks={len(core_stocks)}, specified_plate={specified_plate}")
+            target_plates = set()
+            # 如果指定了板块，则只使用该板块
+            if specified_plate:
+                target_plates.add(specified_plate)
+                # print(f"使用指定板块: {specified_plate}")
+                return list(target_plates)
+            
+            # 分析核心票的板块分布
+            plate_counts = {}
+            for stock in core_stocks:
+                code = stock.get('code', '') or stock.get('symbol', '')
+                if code:
+                    # 优先使用股票数据中已经包含的题材信息，避免网络请求
+                    related_theme = stock.get('themes', []) or stock.get('plate', '')
+                    
+                    # 如果没有themes字段，再调用get_stock_related_themes获取
+                    if not related_theme:
+                        related_theme = self.redis_storage.get_stock_related_themes(code)
+                    
+                    # 确保related_theme始终是字符串
+                    if isinstance(related_theme, list):
+                        related_theme = related_theme[0] if related_theme else ''
+                    
+                    # 通过板块中文名称查找对应的板块ID
+                    if related_theme:
+                        plate_id = self.web_service.plate_updater.plate_name_to_id.get(related_theme)
+                        if plate_id:
+                            plate_counts[plate_id] = plate_counts.get(plate_id, 0) + 1
+                        else:
+                            # 如果找不到对应的板块ID，记录日志
+                            logger.debug(f"⚠️ 未找到题材 '{related_theme}' 对应的板块ID")
+                        print("股票数据:", code, stock.get('name'), related_theme, plate_id)
+            # 选择出现频率最高的前5个板块
+            sorted_plates = sorted(plate_counts.items(), key=lambda x: x[1], reverse=True)
+            for plate, count in sorted_plates[:]:
+                if count >= 1:  # 至少有1只核心票
+                    target_plates.add(plate)
+            
+            # 如果没找到足够的板块，添加一些默认的热门板块
+            if len(target_plates) < 3:
+                default_plates = ['人工智能', '芯片', '通信', '机器人', '新能源汽车']
+                for plate in default_plates:
+                    # 查找默认板块的ID
+                    plate_id = self.web_service.plate_updater.plate_name_to_id.get(plate)
+                    if plate_id and len(target_plates) < 5:
+                        target_plates.add(plate_id)
+            
+            logger.info(f"🔍 识别出目标题材: {list(target_plates)}")
+            return list(target_plates)
+            
+        except Exception as e:
+            logger.error(f"❌ 识别目标题材失败: {e}")
+            return ['人工智能', '芯片', '通信']  # 返回默认题材
+    
+    def _get_plate_stocks_with_advanced_indicators(self, plate_name):
+        """获取板块个股及其高级指标"""
+        try:
+            # 获取板块个股
+            plate_stocks = self.web_service.plate_updater.get_plate_stocks(plate_name)
+            
+            # 获取高级指标
+            if plate_stocks:
+                stock_codes = [stock.get('code') for stock in plate_stocks if stock.get('code')]
+                if stock_codes:
+                    # 批量获取高级指标
+                    advanced_indicators = self.web_service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_codes)
+                    
+                    # 合并数据
+                    for stock in plate_stocks:
+                        code = stock.get('code')
+                        if code in advanced_indicators:
+                            indicators = advanced_indicators[code]
+                            # 添加基础指标
+                            stock['change_pct'] = indicators.get('change_pct', 0)
+                            stock['amount_2min'] = indicators.get('amount_2min', 0)
+                            stock['change_rate_1min'] = indicators.get('change_rate_1min', 0)
+                            stock['large_net'] = indicators.get('large_net', 0)
+                            stock['price'] = indicators.get('price', 0)
+            
+            return plate_stocks
+            
+        except Exception as e:
+            logger.error(f"❌ 获取板块 {plate_name} 个股失败: {e}")
+            return []
+    
+    def _get_stock_advanced_data(self, stock_code):
+        """获取股票高级数据"""
+        try:
+            if hasattr(self.web_service, 'advanced_indicators'):
+                return self.web_service.advanced_indicators.get_stock_advanced_indicators_optimized(stock_code)
+            return {}
+        except Exception:
+            return {}
+
+    
     async def get_comprehensive_view_api(self, request):
         """获取综合视图（所有类型股票）"""
         try:
             today = datetime.now().strftime('%Y-%m-%d')
             prev_day = self.calendar.get_previous_trade_day(today)
             
-            print(f"🔍 获取综合视图 - 查询日期: {today}")
+            logger.info(f"🔍 获取综合视图 - 查询日期: {today}")
             
             # 并行获取各类数据 - 昨日涨停和热门股票
             prev_limit_up_task = asyncio.create_task(
@@ -1250,8 +1819,8 @@ class IntegratedStockService:
             prev_limit_up_result = await prev_limit_up_task
             hot_stocks_result = await hot_stocks_task
             
-            print(f"📊 昨日涨停数据: {len(prev_limit_up_result) if prev_limit_up_result else 0}条")
-            print(f"🔥 热门股票数据: {len(hot_stocks_result.get('data', [])) if hot_stocks_result else 0}条")
+            logger.debug(f"📊 昨日涨停数据: {len(prev_limit_up_result) if prev_limit_up_result else 0}条")
+            logger.debug(f"🔥 热门股票数据: {len(hot_stocks_result.get('data', [])) if hot_stocks_result else 0}条")
             
             # 处理首板数据 - 使用redis_storage中的真实异动数据
             first_limit_data = []
@@ -1274,8 +1843,8 @@ class IntegratedStockService:
                     }
                     first_limit_data.append(formatted_stock)
                 
-                print(f"🔥 首板股票数据（真实异动数据）: {len(first_limit_data)}条")
-                print(f"💡 昨日涨停代码数: {len(prev_limit_up_result)}条")
+                logger.debug(f"🔥 首板股票数据（真实异动数据）: {len(first_limit_data)}条")
+                logger.debug(f"💡 昨日涨停代码数: {len(prev_limit_up_result)}条")
             except Exception as e:
                 logger.error(f"⚠️ 获取首板数据异常: {e}")
                 first_limit_data = []
@@ -1289,7 +1858,7 @@ class IntegratedStockService:
                 'update_time': datetime.now().isoformat()
             }
             
-            print(f"✅ 综合数据准备完成，返回连板: {len(comprehensive_data['limit_up_stocks'])}条，首板: {len(comprehensive_data['first_limit_stocks'])}条，热门: {len(comprehensive_data['hot_stocks'])}条")
+            logger.info(f"✅ 综合数据准备完成，返回连板: {len(comprehensive_data['limit_up_stocks'])}条，首板: {len(comprehensive_data['first_limit_stocks'])}条，热门: {len(comprehensive_data['hot_stocks'])}条")
             
             return web.json_response({
                 'success': True,

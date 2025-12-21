@@ -205,11 +205,11 @@ class OptimizedAdvancedTechnicalIndicators:
                 if not stock_data:
                     continue
                 
-                # 转换数据类型
+                # 转换数据类型，使用errors='replace'处理无法解码的字符
                 decoded_data = {}
                 for field, value in stock_data.items():
-                    field_str = field.decode('utf-8') if isinstance(field, bytes) else field
-                    value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                    field_str = field.decode('utf-8', errors='replace') if isinstance(field, bytes) else field
+                    value_str = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else str(value)
                     
                     if field_str in ['price', 'change_pct', 'change_rate_1min']:
                         decoded_data[field_str] = float(value_str) if value_str else 0.0
@@ -1973,8 +1973,8 @@ class StockVolatileMonitor:
             if exists:
                 key_type = await self.redis.type(self.volatile_pool_key)
                 count = await self.redis.zcard(self.volatile_pool_key)
-                if count > 0:  # 只在有数据时记录
-                    logger.info(f"✅ 找到键: {self.volatile_pool_key}, 类型: {key_type}, 数据量: {count}")
+                # if count > 0:  # 只在有数据时记录
+                    # logger.info(f"✅ 找到键: {self.volatile_pool_key}, 类型: {key_type}, 数据量: {count}")
                 return True
             else:
                 logger.warning(f"⚠️ Redis键不存在: {self.volatile_pool_key}")
@@ -2088,6 +2088,7 @@ class StockVolatileMonitor:
                                 data_str = data_str.decode('utf-8', errors='ignore')
                             
                             data = json.loads(data_str)
+                            print(data)
                             data['timestamp'] = int(score)
                             await self.broadcast_volatile_alert(data)
                             
@@ -2770,9 +2771,10 @@ async def handle_stock_subscription_websocket(request):
             if message.type == web.WSMsgType.TEXT:
                 try:
                     data = json.loads(message.data)
-                    logger.info(f"📨 收到Excel页面客户端消息: {data}")
+                    
                     
                     if data.get('type') == 'subscribe':
+                        logger.info(f"📨 收到Excel页面客户端消息: 处理订阅请求")
                         # 处理订阅请求
                         stock_list = data.get('stocks', [])
                         subscription_info['stocks'] = stock_list
@@ -2949,6 +2951,7 @@ async def main():
     app.router.add_get('/api/first_limit', stock_service.get_today_first_limit_api)
     app.router.add_get('/api/hot_stocks', stock_service.get_hot_stocks_api)
     app.router.add_get('/api/comprehensive', stock_service.get_comprehensive_view_api)
+    app.router.add_get('/api/other_stocks', stock_service.get_other_stocks_api)
     # 设置服务实例
     app['service'] = service
     
