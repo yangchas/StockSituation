@@ -101,16 +101,25 @@ class RedisStorageManager:
             # if not stock_data:
             # 从stock:volatile_pool中查找对应股票
             volatile_pool_key = "stock:volatile_pool"
-            all_volatile_stocks = self.redis.zrange(volatile_pool_key, 0, -1)
+            
+            # 优化查询方式：使用zrevrange获取最近的数据，减少遍历数量
+            recent_volatile_stocks = self.redis.zrevrange(volatile_pool_key, 0, 100)  # 只检查最近的100条数据
             stock_data={}
-            for stock_json in all_volatile_stocks:
+            
+            for stock_json in recent_volatile_stocks:
                 try:
                     # 确保股票JSON数据是字符串格式，并处理编码问题
                     if isinstance(stock_json, bytes):
                         stock_json = stock_json.decode('utf-8', errors='replace')
+                    
                     # 解析JSON数据
                     stock_info = json.loads(stock_json)
-                     # 解码base64字段
+                      
+                    # 检查股票代码是否匹配（先快速匹配，避免不必要的base64解码）
+                    if stock_info.get('symbol') != symbol:
+                        continue
+                    
+                    # 解码base64字段
                     if 'name_b64' in stock_info:
                         name_bytes = base64.b64decode(stock_info['name_b64'])
                         stock_info['name'] = name_bytes.decode('utf-8')
@@ -120,18 +129,19 @@ class RedisStorageManager:
                         reason_bytes = base64.b64decode(stock_info['reason_b64'])
                         stock_info['reason'] = reason_bytes.decode('utf-8')
                         del stock_info['reason_b64']
-                    if stock_info.get('symbol') == symbol:
-                        # 转换字段名以匹配预期格式
-                        stock_data = {
-                            'price': str(stock_info.get('price', 0)),
-                            'change_pct': str(stock_info.get('change', 0)),
-                            'amount': str(stock_info.get('amount', 0)),
-                            'timestamp': str(stock_info.get('timestamp', 0)),
-                            'name': stock_info.get('name', ''),
-                            'large_net': str(stock_info.get('large_net_5min', 0))
-                        }
-                        break
-                except json.JSONDecodeError:
+                    
+                    # 转换字段名以匹配预期格式
+                    stock_data = {
+                        'price': str(stock_info.get('price', 0)),
+                        'change_pct': str(stock_info.get('change', 0)),
+                        'amount': str(stock_info.get('amount', 0)),
+                        'timestamp': str(stock_info.get('timestamp', 0)),
+                        'name': stock_info.get('name', ''),
+                        'large_net': str(stock_info.get('large_net_5min', 0))
+                    }
+                    break  # 找到后立即退出循环
+                except Exception as e:
+                    logger.error(f"解析stock:volatile_pool数据错误: {e}")
                     continue
             
             if not stock_data:
@@ -216,26 +226,60 @@ class RedisStorageManager:
             limit_up_stocks = []
             
             # 遍历所有异动票，筛选出涨停票
-            for symbol in all_volatile_stocks:
-                # 获取股票详细数据
-                stock_data = self.get_stock_advanced_indicators(symbol)
-                
-                if not stock_data:
-                    continue
-                
-                # 检查是否为涨停票（涨跌幅接近10%或20%）
-                change_pct = stock_data.get('change_pct', 0.0)
-                
-                # 考虑10%和20%的涨停情况（创业板、科创板）
-                if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
-                    # 从Redis获取股票名称
-                    stock_info_key = f"stock:quote:{symbol}"
-                    stock_name = self.redis.hget(stock_info_key, 'name')
-                    if stock_name:
-                        stock_data['name'] = stock_name
+            for stock_item in all_volatile_stocks:
+                try:
+                    # 处理股票项（可能是JSON字符串或直接的股票代码）
+                    if isinstance(stock_item, bytes):
+                        stock_item = stock_item.decode('utf-8', errors='replace')
                     
-                    stock_data['symbol'] = symbol
-                    limit_up_stocks.append(stock_data)
+                    symbol = None
+                    stock_info = None
+                    
+                    # 尝试解析为JSON
+                    try:
+                        import json
+                        stock_info = json.loads(stock_item)
+                        symbol = stock_info.get('symbol')
+                    except (json.JSONDecodeError, AttributeError):
+                        # 如果不是JSON，直接作为股票代码
+                        symbol = stock_item
+                    
+                    if not symbol:
+                        continue
+                        
+                    # 获取股票详细数据
+                    stock_data = self.get_stock_advanced_indicators(symbol)
+                    # 如果get_stock_advanced_indicators没有获取到完整数据，使用直接解析的数据
+                    if not stock_data and stock_info:
+                        stock_data = stock_info
+                
+                    if not stock_data:
+                        continue
+                    
+                    # 检查是否为涨停票（涨跌幅接近10%或20%）
+                    # 注意字段名可能是'change_pct'或'change'
+                    change_pct = stock_data.get('change_pct', stock_data.get('change', 0.0))
+                    if isinstance(change_pct, str):
+                        try:
+                            change_pct = float(change_pct)
+                        except ValueError:
+                            change_pct = 0.0
+                    
+                    # 考虑10%和20%的涨停情况（创业板、科创板）
+                    if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
+                        # 确保股票名称存在
+                        if 'name' not in stock_data or not stock_data['name']:
+                            # 从Redis获取股票名称
+                            stock_info_key = f"stock:quote:{symbol}"
+                            stock_name = self.redis.hget(stock_info_key, 'name')
+                            if stock_name:
+                                stock_data['name'] = stock_name
+                        
+                        stock_data['symbol'] = symbol
+                        limit_up_stocks.append(stock_data)
+                except Exception as e:
+                    logger.error(f"❌ 处理涨停票数据失败: {e}")
+                    continue
             
             logger.info(f"✅ 从Redis获取涨停票: {len(limit_up_stocks)}只")
             return limit_up_stocks
@@ -246,10 +290,8 @@ class RedisStorageManager:
     
     def get_first_limit_up_stocks(self) -> List[Dict[str, Any]]:
         """
-        整理下今日首板接口获取的逻辑，把每次请求时才计算改为异动检测的时候，满足reason:Top|封单:*** 的时候主动和
-        
         从Redis获取首板票列表（涨停但不是昨日涨停的个股）
-        逻辑：获取今日所有涨停票，然后排除昨日涨停的股票，剩下的就是今日首板票
+        逻辑：从涨停专用存储获取今日所有涨停票，然后排除昨日涨停的股票，剩下的就是今日首板票
         
         Returns:
             List[Dict]: 首板票列表，包含股票代码、名称、价格等信息
@@ -259,78 +301,66 @@ class RedisStorageManager:
             import datetime as dt
             
             # 步骤1: 获取今日所有涨停票
-            # 先尝试从异动池获取
-            volatile_pool_key = "stock:volatile_pool"
+            # 从涨停专用存储获取（现在所有涨停数据都在这里）
+            limit_up_key = "stock:first_limit_up"
             today_limit_up_stocks = []
             
-            if self.redis.exists(volatile_pool_key):
-                # 从异动池获取涨停票
-                all_volatile_stocks = self.redis.zrange(volatile_pool_key, 0, -1)
+            if self.redis.exists(limit_up_key):
+                # 从涨停专用存储获取所有数据
+                limit_up_stocks = self.redis.zrevrange(limit_up_key, 0, -1)
                 
-                for stock_item in all_volatile_stocks:
+                for stock_item in limit_up_stocks:
                     try:
-                        # 处理股票项（可能是JSON字符串或直接的股票代码）
                         if isinstance(stock_item, bytes):
                             stock_item = stock_item.decode('utf-8', errors='replace')
                         
-                        symbol = None
-                        stock_info = None
+                        # 解析JSON数据
+                        stock_info = json.loads(stock_item)
                         
-                        # 尝试解析为JSON
-                        try:
-                            import json
-                            stock_info = json.loads(stock_item)
-                            symbol = stock_info.get('symbol')
-                        except (json.JSONDecodeError, AttributeError):
-                            # 如果不是JSON，直接作为股票代码
-                            symbol = stock_item
-                        
-                        if not symbol:
-                            continue
+                        # 验证数据完整性
+                        if 'symbol' in stock_info:
+                            # 确保change字段是数字类型
+                            change_pct = 0.0
                             
-                        # 获取股票详细数据
-                        stock_data = self.get_stock_advanced_indicators(symbol)
-                        # 如果get_stock_advanced_indicators没有获取到完整数据，使用直接解析的数据
-                        if not stock_data and stock_info:
-                            stock_data = stock_info
-                    
-                        if not stock_data:
-                            continue
-                        
-                        # 确保change字段是数字类型
-                        change_pct = 0.0
-                        
-                        # 首先从stock_data中获取（注意字段名可能是'change'或'change_pct'）
-                        change_pct = stock_data.get('change_pct', stock_data.get('change', 0.0))
-                        
-                        # 如果从stock_data中没有获取到有效数据，再尝试从股票JSON数据中获取
-                        if not change_pct and stock_info:
-                            change_pct = stock_info.get('change', 0.0)
-                        if isinstance(change_pct, str):
-                            try:
-                                change_pct = float(change_pct)
-                            except (ValueError, TypeError):
-                                change_pct = 0.0
-                        
-                        # 考虑10%和20%的涨停情况（创业板、科创板）
-                        if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
-                            # 从Redis获取股票名称
-                            # stock_info_key = f"stock:quote:{symbol}"
-                            # stock_name = self.redis.hget(stock_info_key, 'name')
-                            # if stock_name:
-                            if isinstance(stock_data.get('name'), str):
-                                stock_data['name'] = stock_data.get('name', '')[:4]
+                            # 从stock_info中获取涨幅数据，C++代码写入的是'change'字段（字符串类型，如"9.9"）
+                            change_str = stock_info.get('change', '')
+                            
+                            # 尝试将change字段转换为float类型
+                            if change_str and isinstance(change_str, str):
+                                try:
+                                    change_pct = float(change_str)
+                                except (ValueError, TypeError):
+                                    change_pct = 0.0
                             else:
-                                stock_data['name'] = ''
+                                # 如果change字段不存在或不是字符串，尝试从change_pct字段获取
+                                change_pct = stock_info.get('change_pct', 0.0)
+                                if isinstance(change_pct, str):
+                                    try:
+                                        change_pct = float(change_pct)
+                                    except (ValueError, TypeError):
+                                        change_pct = 0.0
                             
-                            stock_data['symbol'] = symbol
-                            today_limit_up_stocks.append(stock_data)
+                            # 考虑10%和20%的涨停情况（创业板、科创板）
+                            if (9.8 <= change_pct <= 10.2) or (19.8 <= change_pct <= 20.2):
+                                # 确保股票名称格式正确
+                                if isinstance(stock_info.get('name'), str):
+                                    stock_info['name'] = stock_info['name'][:4]
+                                else:
+                                    stock_info['name'] = ''
+                                
+                                # 确保symbol字段存在
+                                stock_info['symbol'] = stock_info.get('symbol', '')
+                                
+                                # 设置change_pct字段，确保是float类型
+                                stock_info['change_pct'] = change_pct
+                                
+                                today_limit_up_stocks.append(stock_info)
                     except Exception as e:
                         logger.error(f"❌ 处理异动池股票数据失败: {e}")
                         continue
-            else:
-                # 异动池不存在时，直接返回空列表
-                logger.warning(f"⚠️ Redis键不存在: {volatile_pool_key}")
+            # 如果涨停专用存储不存在，返回空列表
+            if not today_limit_up_stocks:
+                logger.warning(f"⚠️ Redis键不存在或无数据: {limit_up_key}")
                 return []
             
             logger.info(f"📊 今日涨停票数量: {len(today_limit_up_stocks)}")
@@ -364,11 +394,22 @@ class RedisStorageManager:
                 if symbol and symbol not in prev_limit_up_symbols:
                     # 获取股票最相近题材
                     stock_theme = self.get_stock_related_themes(symbol)
+                    # print(stock)
+                    # 获取股票名称
+                    stock_name = stock.get('name')
+                    if not stock_name and 'name_b64' in stock:
+                        # 解码base64编码的股票名称
+                        try:
+                            stock_name = base64.b64decode(stock['name_b64']).decode('utf-8')
+                        except:
+                            stock_name = f"股票{symbol}"
+                    if not stock_name:
+                        stock_name = f"股票{symbol}"
                     
                     # 转换数据格式，确保与原有方法返回格式一致
                     formatted_stock = {
                         'symbol': symbol,
-                        'name': stock.get('name', f"股票{symbol}"),
+                        'name': stock_name,
                         'price': stock.get('price', 0.0),
                         'change_pct': stock.get('change_pct', 0.0),
                         'amount': stock.get('amount', 0.0),
@@ -396,52 +437,66 @@ class RedisStorageManager:
         Returns:
             list: 最相关的题材数组，如['海峡两岸', '物流']
         """
+        # 定义缓存键名（符合项目命名规范，使用个股信息前缀si:）
+        cache_key = f"si:related_themes:{symbol}"
+        cache_expire = 48 * 60 * 60  # 48小时
+        
         try:
+            # 先尝试从Redis缓存获取
+            cached_themes = self.redis.get(cache_key)
+            if cached_themes:
+                import json
+                return json.loads(cached_themes)
+            
             # 使用pykaipan获取涨停原因
             reason_data = pykaipan.getBanReasons(symbol)
             
             # 检查返回数据结构
             if not reason_data or 'List' not in reason_data or not reason_data['List']:
-                return ['涨停板块']  # 默认返回数组
-            
-            # 获取第一个涨停原因
-            first_reason = reason_data['List'][0]
-            if 'Reason' not in first_reason:
-                return ['涨停板块']
-            
-            # 提取题材信息
-            reason_str = first_reason['Reason']
-            
-            # 提取最相关的题材
-            # 先尝试提取'：'之前的部分（如果有）
-            if '：' in reason_str:
-                theme_part = reason_str.split('：')[0]
-            elif ';' in reason_str:
-                theme_part = reason_str.split(';')[0]
+                result = ['涨停板块']  # 默认返回数组
             else:
-                theme_part = reason_str
-            
-            # 只保留中文字符和'+'
-            import re
-            themes = re.findall(r'[\u4e00-\u9fa5+]+', theme_part)
-            
-            if themes:
-                extracted_theme = themes[0].strip()
-                # 如果提取到的只是"涨停"两个字，返回默认的"涨停板块"
-                if extracted_theme == '涨停':
-                    return ['涨停板块']
-                
-                # 拆分带'+'号的题材为数组
-                if '+' in extracted_theme:
-                    return [theme.strip() for theme in extracted_theme.split('+')]
+                # 获取第一个涨停原因
+                first_reason = reason_data['List'][0]
+                if 'Reason' not in first_reason:
+                    result = ['涨停板块']
                 else:
-                    return [extracted_theme]
-            else:
-                return ['涨停板块']
-                
+                    # 提取题材信息
+                    reason_str = first_reason['Reason']
+                    
+                    # 提取最相关的题材
+                    # 先尝试提取'：'之前的部分（如果有）
+                    if '：' in reason_str:
+                        theme_part = reason_str.split('：')[0]
+                    elif ';' in reason_str:
+                        theme_part = reason_str.split(';')[0]
+                    else:
+                        theme_part = reason_str
+                    
+                    # 只保留中文字符和'+'
+                    import re
+                    themes = re.findall(r'[\u4e00-\u9fa5+]+', theme_part)
+                    
+                    if themes:
+                        extracted_theme = themes[0].strip()
+                        # 如果提取到的只是"涨停"两个字，返回默认的"涨停板块"
+                        if extracted_theme == '涨停':
+                            result = ['涨停板块']
+                        else:
+                            # 拆分带'+'号的题材为数组
+                            if '+' in extracted_theme:
+                                result = [theme.strip() for theme in extracted_theme.split('+')]
+                            else:
+                                result = [extracted_theme]
+                    else:
+                        result = ['涨停板块']
         except Exception as e:
             logger.error(f"❌ 获取股票{symbol}题材失败: {e}")
-            return ['涨停板块']
+            result = ['涨停板块']
+        
+        # 将结果缓存到Redis（无论请求是否成功都缓存）
+        import json
+        self.redis.setex(cache_key, cache_expire, json.dumps(result))
+        return result
     
     def batch_get_stocks_advanced_indicators(self, symbols: List[str]) -> Dict[str, Dict]:
         """

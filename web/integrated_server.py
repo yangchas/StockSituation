@@ -26,7 +26,7 @@ except Exception as e:
     logger = logging.getLogger(__name__)
     logger.warning(f"⚠️  无法导入TDengine库，将使用模拟实现: {e}")
 # 修改导入路径
-from plate_updater import LazyPlateUpdater, PlateDataSimulator, OptimizedPlateUpdater, OptimizedEnhancedPlateUpdater
+from plate_updater import LazyPlateUpdater,  OptimizedPlateUpdater, OptimizedEnhancedPlateUpdater
 from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 import json
@@ -1945,7 +1945,8 @@ class StockVolatileMonitor:
     def __init__(self):
         self.redis = None
         self.connections: Set = set()  # 移除类型注解以兼容两种WebSocket类型
-        self.volatile_pool_key = "stock:volatile_pool"
+        self.volatile_pool_key = "stock:volatile_pool"  # 修正键名，从真正的异动池获取数据
+        self.first_limit_key = "stock:first_limit_up"  # 涨停票存储键名
         self.last_check_timestamp = 0
         self.monitoring_active = False
         
@@ -2088,7 +2089,7 @@ class StockVolatileMonitor:
                                 data_str = data_str.decode('utf-8', errors='ignore')
                             
                             data = json.loads(data_str)
-                            print(data)
+                            # print(data)
                             data['timestamp'] = int(score)
                             await self.broadcast_volatile_alert(data)
                             
@@ -2107,11 +2108,29 @@ class StockVolatileMonitor:
                             symbol = data.get('symbol', '')
                             limit_up_threshold = 9.8 if symbol.startswith(('6', '0')) else 19.8
                             
-                            # 如果是涨停票，标记为first_limit类型并广播
+                            # 如果是涨停票，标记为first_limit类型并广播，同时写入Redis
                             if change >= limit_up_threshold:
                                 first_limit_data = data.copy()
                                 first_limit_data['type'] = 'first_limit'
+                                first_limit_data['change_pct'] = change  # 确保change_pct字段存在
+                                
+                                # 广播涨停警报
                                 await self.broadcast_first_limit_alert(first_limit_data)
+                                
+                                # 将涨停票写入Redis的stock:first_limit_up键中
+                                try:
+                                    # 将股票代码作为member，时间戳作为score写入zset
+                                    await self.redis.zadd(self.first_limit_key, {
+                                        json.dumps(first_limit_data): int(time.time())
+                                    })
+                                    
+                                    # 设置过期时间为24小时
+                                    await self.redis.expire(self.first_limit_key, 24 * 60 * 60)
+                                    
+                                    logger.info(f"✅ 成功写入Redis涨停票数据: {first_limit_data.get('symbol')} ({change}%)")
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ 写入Redis涨停票数据失败: {e}")
                             
                             # 更新最后检查时间戳
                             if int(score) > self.last_check_timestamp:
@@ -2744,6 +2763,91 @@ async def handle_excel(request):
 # 股票订阅WebSocket处理
 aiohttp_subscriptions = {}  # {websocket: {'stocks': [], 'last_data': {}}}
 
+async def broadcast_stock_updates():
+    """定期广播股票更新数据给所有订阅的客户端"""
+    while True:
+        try:
+            if aiohttp_subscriptions:
+                # 获取集成服务实例
+                service = OptimizedIntegratedWebService._instance
+                
+                # 检查服务是否有高级指标功能
+                if hasattr(service, 'advanced_indicators'):
+                    # 收集所有订阅的股票，避免重复请求
+                    all_subscribed_stocks = set()
+                    for subscription_info in aiohttp_subscriptions.values():
+                        all_subscribed_stocks.update(subscription_info['stocks'])
+                    
+                    if all_subscribed_stocks:
+                        # 批量获取所有订阅股票的高级指标
+                        indicators_dict = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(list(all_subscribed_stocks))
+                        
+                        # 为每个客户端推送其订阅的股票数据
+                        disconnected = []
+                        for ws, subscription_info in aiohttp_subscriptions.items():
+                            try:
+                                subscribed_stocks = subscription_info['stocks']
+                                if not subscribed_stocks:
+                                    continue
+                                
+                                # 筛选出该客户端订阅的股票数据
+                                client_data = {}
+                                for stock_code in subscribed_stocks:
+                                    if stock_code in indicators_dict:
+                                        client_data[stock_code] = indicators_dict[stock_code]
+                                
+                                # 检查数据是否有变化
+                                last_data = subscription_info['last_data']
+                                
+                                # 计算有变化的股票
+                                changed_stocks = {}
+                                for stock_code, data in client_data.items():
+                                    last = last_data.get(stock_code, {})
+                                    # 检查关键指标是否有变化
+                                    # 确保所有值都转换为浮点数后再进行比较
+                                    current_change_rate_1min = float(data.get('change_rate_1min', 0))
+                                    last_change_rate_1min = float(last.get('change_rate_1min', 0))
+                                    current_amount_2min = float(data.get('amount_2min', 0))
+                                    last_amount_2min = float(last.get('amount_2min', 0))
+                                    current_change_pct = float(data.get('change_pct', 0))
+                                    last_change_pct = float(last.get('change_pct', 0))
+                                    
+                                    if (abs(current_change_rate_1min - last_change_rate_1min) > 0.01 or
+                                        abs(current_amount_2min - last_amount_2min) > 0.1 or
+                                        abs(current_change_pct - last_change_pct) > 0.01):
+                                        changed_stocks[stock_code] = data
+                                
+                                # 如果有变化的数据，才推送更新
+                                if changed_stocks:
+                                    # 发送增量更新
+                                    update_msg = {
+                                        'type': 'incremental_update',
+                                        'data': changed_stocks,
+                                        'timestamp': int(time.time() * 1000)
+                                    }
+                                    
+                                    await ws.send_str(json.dumps(update_msg, ensure_ascii=False))
+                                    
+                                    # 更新最后数据记录
+                                    subscription_info['last_data'].update(changed_stocks)
+                                    
+                            except Exception as e:
+                                logger.error(f"❌ 推送股票更新失败: {e}")
+                                disconnected.append(ws)
+                        
+                        # 清理断开的连接
+                        for ws in disconnected:
+                            if ws in aiohttp_subscriptions:
+                                del aiohttp_subscriptions[ws]
+                        
+                await asyncio.sleep(3)  # 每3秒检查一次数据更新
+            else:
+                await asyncio.sleep(10)  # 没有连接时，降低检查频率
+        
+        except Exception as e:
+            logger.error(f"❌ 广播股票更新任务错误: {e}")
+            await asyncio.sleep(5)  # 出错后暂停5秒
+
 async def handle_stock_subscription_websocket(request):
     """处理股票订阅WebSocket连接 - 支持订阅特定股票列表"""
     ws = web.WebSocketResponse()
@@ -2771,7 +2875,6 @@ async def handle_stock_subscription_websocket(request):
             if message.type == web.WSMsgType.TEXT:
                 try:
                     data = json.loads(message.data)
-                    
                     
                     if data.get('type') == 'subscribe':
                         logger.info(f"📨 收到Excel页面客户端消息: 处理订阅请求")
@@ -2811,6 +2914,13 @@ async def handle_stock_subscription_websocket(request):
                                 'message': '未提供股票列表，等待更新...',
                                 'timestamp': int(time.time())
                             }))
+                    
+                    elif data.get('type') == 'ping':
+                        # 处理心跳请求
+                        await ws.send_str(json.dumps({
+                            'type': 'pong',
+                            'timestamp': int(time.time())
+                        }))
                     
                 except json.JSONDecodeError:
                     logger.error(f"❌ 解析客户端消息失败: {message.data}")
@@ -2920,6 +3030,9 @@ async def main():
     
     # 启动股票异动监控任务
     asyncio.create_task(monitor.monitor_volatile_stocks())
+    
+    # 启动WebSocket股票数据持续推送任务
+    asyncio.create_task(broadcast_stock_updates())
     
     # 创建HTTP应用
     app = web.Application()

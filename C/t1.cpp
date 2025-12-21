@@ -36,11 +36,21 @@
 #include <rabbitmq-c/amqp.h>
 #include <rabbitmq-c/tcp_socket.h>
 
+// TDengine字符串处理宏定义
+typedef int16_t VarDataLenT;
+#define TSDB_NCHAR_SIZE sizeof(int32_t)
+#define VARSTR_HEADER_SIZE sizeof(VarDataLenT)
+#define varDataLen(v) ((VarDataLenT *)(v))[0]
+
 // Protobuf schema (假设已定义，实际需包含生成的schema.pb.h)
 #include "schema.pb.h" // 假设存在
 
 // ==================== 配置管理 ====================
 struct Config {
+    // 数据源配置
+    std::string data_source = "rabbitmq"; // "rabbitmq" 或 "tdengine_replay"
+    
+    // RabbitMQ配置
     std::string rabbitmq_host = "localhost";
     int rabbitmq_port = 5672;
     std::string rabbitmq_user = "admin";
@@ -48,12 +58,15 @@ struct Config {
     std::string rabbitmq_vhost = "/";
     std::string queue_name = "stream2";
    
+    // Redis配置
     std::string redis_host = "localhost";
     int redis_port = 6379;
     int redis_db = 0;
    
     std::string volatile_pool_key = "stock:volatile_pool";
-    int volatile_expire = 300;//redis过期时间
+    std::string first_limit_up_key = "stock:first_limit_up"; // 首板涨停单独存储键名
+    int volatile_expire = 60*60;//redis过期时间
+    
     // 时间窗口配置
     int minute1_window_ms = 60000; // 1分钟窗口
     int minute5_window_ms = 300000; // 5分钟窗口
@@ -66,11 +79,19 @@ struct Config {
     // 异动提醒阈值配置
     int volatility_threshold_ms = 10000; // 10秒内不重复提醒
    
+    // TDengine配置
     std::string tdengine_host = "chaos";
     int tdengine_port = 6030;
     std::string tdengine_user = "root";
     std::string tdengine_password = "taosdata";
     std::string tdengine_database = "market_data1";
+    
+    // 回测配置（新增）
+    std::string replay_start_time = "2025-12-19 09:30:00"; // 回测开始时间
+    std::string replay_end_time = "2025-12-19 15:00:00";   // 回测结束时间
+    int replay_speed = 1;           // 回放速度倍数，1=实时
+    bool replay_loop = false;       // 是否循环回放
+    int replay_tick_interval_ms = 3000; // 回放时每3秒一个tick切片
    
     // 单线程处理配置
     int messages_per_batch = 1; // 每次处理1条消息
@@ -89,6 +110,10 @@ struct Config {
     bool enable_file_log = true;
     double large_order_threshold = 500000; // 50万元
     int volatility_tracking_minutes = 5;
+    
+    // 回测TDengine表配置（新增）
+    std::string tdengine_replay_table = "stock_data"; // 回放数据源表
+    int replay_batch_size = 5000; // 每次从TDengine读取的批大小
 };
 
 // 单例配置管理器
@@ -104,6 +129,11 @@ private:
         const char* env_messages_per_batch = std::getenv("MESSAGES_PER_BATCH");
         if (env_messages_per_batch) {
             config_.messages_per_batch = std::atoi(env_messages_per_batch);
+        }
+        // 新增：从环境变量加载数据源配置
+        const char* env_data_source = std::getenv("DATA_SOURCE");
+        if (env_data_source) {
+            config_.data_source = env_data_source;
         }
     }
 public:
@@ -145,6 +175,9 @@ struct StockData {
     double inst_amt = 0.0;
     double large_net = 0.0;
 };
+
+// TDengine行数据解析函数声明
+StockData parseTDengineRow(TAOS_ROW row, TAOS_FIELD* fields, int num_fields);
 
 // 简化的历史tick数据 (优化: 只保留关键字段)
 struct SimpleTickData {
@@ -349,6 +382,20 @@ public:
         oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
         return oss.str();
     }
+    
+    // 将字符串时间转换为时间戳
+    static long long parseTimestamp(const std::string& time_str) {
+        std::tm tm = {};
+        std::istringstream ss(time_str);
+        ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+        if (ss.fail()) {
+            return 0;
+        }
+        auto time_point = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            time_point.time_since_epoch()).count();
+    }
+    
     static bool isAuctionTime(const std::string& time_str) {
         return time_str >= "09:15:00" && time_str <= "09:26:00";
     }
@@ -787,6 +834,546 @@ public:
         } catch (const std::exception& e) {
             std::cerr << "Failed to insert batch: " << e.what() << std::endl;
             return false;
+        }
+    }
+};
+// ==================== TDengine回放消费者 ====================
+class TDengineReplayConsumer : public IMessageConsumer {
+private:
+    const Config& config_;
+    std::unique_ptr<TDengineConnection> connection_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> initialized_{false};
+    
+    // 回放状态
+    long long current_replay_time_ = 0;
+    long long replay_start_time_ = 0;
+    long long replay_end_time_ = 0;
+    std::string replay_symbol_filter_;
+    
+    // 数据缓冲区
+    std::queue<std::vector<StockData>> data_buffer_;
+    std::mutex buffer_mutex_;
+    std::condition_variable buffer_cv_;
+    std::thread replay_thread_;
+    
+    // 批量查询状态
+    bool has_more_data_ = true;
+    long long last_queried_time_ = 0;
+    
+public:
+    TDengineReplayConsumer(const Config& config) : config_(config) {
+        connection_ = std::make_unique<TDengineConnection>(
+            config.tdengine_host, config.tdengine_user,
+            config.tdengine_password, config.tdengine_database,
+            config.tdengine_port
+        );
+        
+        // 解析回放时间
+        replay_start_time_ = TimeUtils::parseTimestamp(config.replay_start_time);
+        replay_end_time_ = TimeUtils::parseTimestamp(config.replay_end_time);
+        
+        if (replay_start_time_ == 0 || replay_end_time_ == 0) {
+            std::cerr << "Invalid replay time range" << std::endl;
+        }
+        
+        current_replay_time_ = replay_start_time_;
+    }
+    
+    ~TDengineReplayConsumer() {
+        stop();
+        if (replay_thread_.joinable()) {
+            replay_thread_.join();
+        }
+    }
+    
+    bool connect() override {
+        if (!connection_->connect()) {
+            return false;
+        }
+        
+        if (!initialized_.load()) {
+            initializeReplay();
+        }
+        
+        return true;
+    }
+    
+    void disconnect() override {
+        running_.store(false);
+        if (connection_) {
+            connection_->close();
+        }
+        buffer_cv_.notify_all();
+    }
+    
+    bool consumeMessages(std::vector<PendingMessage>& messages, int count) override {
+        if (!running_.load() && !connect()) {
+            return false;
+        }
+        
+        // 等待数据准备好
+        std::vector<StockData> tick_slice;
+        {
+            std::unique_lock<std::mutex> lock(buffer_mutex_);
+            if (buffer_cv_.wait_for(lock, std::chrono::seconds(1),
+                [this]() { return !data_buffer_.empty() || !running_.load(); })) {
+                
+                if (!data_buffer_.empty()) {
+                    tick_slice = std::move(data_buffer_.front());
+                    data_buffer_.pop();
+                }
+            }
+        }
+        
+        if (tick_slice.empty()) {
+            return false;
+        }
+        
+        // 将StockData转换为模拟的RabbitMQ消息格式
+        // 注意：这里我们直接生成StockData，跳过了解析步骤
+        // 为了保持接口一致，我们创建一个虚拟的消息
+        std::vector<char> dummy_message;
+        createDummyMessage(tick_slice, dummy_message);
+        
+        messages.emplace_back(std::move(dummy_message), 0);
+        return true;
+    }
+    
+    void ackMessage(uint64_t delivery_tag) override {
+        // TDengine回放不需要确认
+    }
+    
+    void rejectMessage(uint64_t delivery_tag, bool requeue) override {
+        // TDengine回放不需要拒绝
+    }
+    
+    void stop() override {
+        running_.store(false);
+        buffer_cv_.notify_all();
+    }
+    
+private:
+    void initializeReplay() {
+        if (initialized_.load()) {
+            return;
+        }
+        
+        // 启动回放线程
+        running_.store(true);
+        replay_thread_ = std::thread([this]() { replayThread(); });
+        
+        initialized_.store(true);
+    }
+    
+    void replayThread() {
+        // 预加载第一批数据
+        loadNextBatch();
+        
+        while (running_.load() && current_replay_time_ <= replay_end_time_) {
+            // 获取当前时间切片的数据
+            auto tick_slice = getTickSlice(current_replay_time_);
+            
+            if (!tick_slice.empty()) {
+                // 将数据放入缓冲区
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex_);
+                    data_buffer_.push(std::move(tick_slice));
+                }
+                buffer_cv_.notify_one();
+            }
+            
+            // 等待下一个时间切片
+            int delay_ms = config_.replay_tick_interval_ms / config_.replay_speed;
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            
+            // 前进到下一个时间点
+            current_replay_time_ += config_.replay_tick_interval_ms;
+            
+            // 检查是否需要加载更多数据
+            if (current_replay_time_ > last_queried_time_ && has_more_data_) {
+                loadNextBatch();
+            }
+            
+            // 检查是否到达回放结束时间
+            if (current_replay_time_ > replay_end_time_) {
+                if (config_.replay_loop) {
+                    // 循环回放：重置到开始时间
+                    current_replay_time_ = replay_start_time_;
+                    resetReplayState();
+                } else {
+                    // 单次回放：结束
+                    running_.store(false);
+                }
+            }
+        }
+    }
+    
+    void loadNextBatch() {
+        try {
+            std::ostringstream sql;
+            sql << "SELECT ts, symbol, lp, o, h, l, lc, a, v, "
+                << "ap1, ap2, ap3, ap4, ap5, "
+                << "bp1, bp2, bp3, bp4, bp5, "
+                << "av1, av2, av3, av4, av5, "
+                << "bv1, bv2, bv3, bv4, bv5, "
+                << "inst_vol, inst_amt, large_net "
+                << "FROM " << config_.tdengine_replay_table << " "
+                << "WHERE ts >= " << current_replay_time_ << " "
+                << "AND ts <= " << replay_end_time_ << " "
+                << "ORDER BY ts ASC "
+                << "LIMIT " << config_.replay_batch_size;
+            
+            TAOS_RES* res = connection_->query(sql.str());
+            if (!res) {
+                std::cerr << "Failed to query TDengine" << std::endl;
+                return;
+            }
+            
+            int num_fields = taos_num_fields(res);
+            TAOS_FIELD* fields = taos_fetch_fields(res);
+            
+            // 清空当前缓冲区
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                // 不清空，因为可能有未消费的数据
+            }
+            
+            // 按时间戳分组数据
+            std::unordered_map<long long, std::vector<StockData>> time_slices;
+            
+            TAOS_ROW row;
+            int row_count = 0;
+            while ((row = taos_fetch_row(res))) {
+                StockData data = parseTDengineRow(row, fields, num_fields);
+                // row_count++;
+                // if(row_count>3) exit(0);
+                // 对齐到3秒的时间切片
+                long long slice_time = alignToTickInterval(data.timestamp);
+                
+                time_slices[slice_time].push_back(std::move(data));
+            }
+            
+            taos_free_result(res);
+            
+            // 按时间排序并存储
+            std::vector<long long> slice_times;
+            for (const auto& pair : time_slices) {
+                slice_times.push_back(pair.first);
+            }
+            std::sort(slice_times.begin(), slice_times.end());
+            
+            for (long long slice_time : slice_times) {
+                // 这里不直接放入缓冲区，由replayThread按时间顺序处理
+                // 只是更新最后查询时间
+                last_queried_time_ = std::max(last_queried_time_, slice_time);
+            }
+            
+            // 检查是否还有更多数据
+            has_more_data_ = (time_slices.size() >= config_.replay_batch_size);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading replay data: " << e.what() << std::endl;
+            has_more_data_ = false;
+        }
+    }
+    
+    std::vector<StockData> getTickSlice(long long slice_time) {
+        // 查询该时间切片的所有股票数据
+        try {
+            std::ostringstream sql;
+            sql << "SELECT ts, symbol, lp, o, h, l, lc, a, v, "
+                << "ap1, ap2, ap3, ap4, ap5, "
+                << "bp1, bp2, bp3, bp4, bp5, "
+                << "av1, av2, av3, av4, av5, "
+                << "bv1, bv2, bv3, bv4, bv5, "
+                << "inst_vol, inst_amt, large_net "
+                << "FROM " << config_.tdengine_replay_table << " "
+                << "WHERE ts >= " << slice_time << " "
+                << "AND ts < " << (slice_time + config_.replay_tick_interval_ms) << " "
+                << "ORDER BY symbol ASC";
+            //std::cout<<sql.str()<<std::endl;
+            
+            TAOS_RES* res = connection_->query(sql.str());
+            if (!res) {
+                return {};
+            }
+            
+            int num_fields = taos_num_fields(res);
+            TAOS_FIELD* fields = taos_fetch_fields(res);
+            
+            std::vector<StockData> slice_data;
+            
+            TAOS_ROW row;
+            while ((row = taos_fetch_row(res))) {
+                slice_data.push_back(parseTDengineRow(row, fields, num_fields));
+            }
+            taos_free_result(res);
+            return slice_data;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error getting tick slice: " << e.what() << std::endl;
+            return {};
+        }
+    }
+    
+
+    
+    long long alignToTickInterval(long long timestamp) {
+        // 将时间戳对齐到3秒的倍数
+        long long interval_ms = config_.replay_tick_interval_ms;
+        return (timestamp / interval_ms) * interval_ms;
+    }
+    
+    void createDummyMessage(const std::vector<StockData>& tick_slice, std::vector<char>& output) {
+        // 创建一个虚拟消息，只包含时间戳信息
+        // 在实际处理时，我们会直接使用tick_slice，跳过解析步骤
+        // 这里只是为了保持接口一致
+        
+        std::string dummy_json = "{\"timestamp\":" + std::to_string(current_replay_time_) + "}";
+        output.assign(dummy_json.begin(), dummy_json.end());
+    }
+    
+    void resetReplayState() {
+        // 重置回放状态，用于循环回放
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            while (!data_buffer_.empty()) {
+                data_buffer_.pop();
+            }
+        }
+        
+        current_replay_time_ = replay_start_time_;
+        last_queried_time_ = 0;
+        has_more_data_ = true;
+        
+        // 重新加载数据
+        loadNextBatch();
+    }
+};
+
+// TDengine行数据解析函数（全局函数，供多个类使用）
+StockData parseTDengineRow(TAOS_ROW row, TAOS_FIELD* fields, int num_fields) {
+    StockData data;
+    
+    for (int i = 0; i < num_fields; i++) {
+        std::string field_name = fields[i].name;
+        
+        if (row[i] == NULL) {
+            continue;
+        }
+        
+        // 根据字段类型进行转换
+        int field_type = fields[i].type;
+        
+        if (field_name == "symbol") {
+            // 处理字符串类型（BINARY/NCHAR）
+            if (field_type == TSDB_DATA_TYPE_BINARY || field_type == TSDB_DATA_TYPE_NCHAR) {
+                int32_t charLen = varDataLen((char *)row[i] - VARSTR_HEADER_SIZE);
+                data.symbol = std::string(static_cast<char*>(row[i]), charLen);
+            } else {
+                data.symbol = std::string(static_cast<char*>(row[i]));
+            }
+        } else if (field_name == "ts") {
+            // 时间戳直接赋值
+            if (field_type == TSDB_DATA_TYPE_TIMESTAMP) {
+                data.timestamp = *static_cast<long long*>(row[i]);
+            }
+        } else {
+            // 处理数值类型字段
+            double value = 0.0;
+            
+            // 根据字段类型获取正确的值
+            if (field_type == TSDB_DATA_TYPE_FLOAT) {
+                value = *static_cast<float*>(row[i]);
+            } else if (field_type == TSDB_DATA_TYPE_DOUBLE) {
+                value = *static_cast<double*>(row[i]);
+            } else if (field_type == TSDB_DATA_TYPE_INT) {
+                value = *static_cast<int32_t*>(row[i]);
+            } else if (field_type == TSDB_DATA_TYPE_BIGINT) {
+                value = *static_cast<int64_t*>(row[i]);
+            } else {
+                // 对于其他数值类型，可以根据需要扩展
+                continue;
+            }
+            
+            // 价格字段，单位是元
+            if (field_name == "lp" || field_name == "o" || field_name == "h" || 
+                    field_name == "l" || field_name == "lc" || 
+                    field_name == "ap1" || field_name == "ap2" || field_name == "ap3" || 
+                    field_name == "ap4" || field_name == "ap5" ||
+                    field_name == "bp1" || field_name == "bp2" || field_name == "bp3" || 
+                    field_name == "bp4" || field_name == "bp5") {
+                if (field_name == "lp") data.last_price = value;
+                else if (field_name == "o") data.open = value;
+                else if (field_name == "h") data.high = value;
+                else if (field_name == "l") data.low = value;
+                else if (field_name == "lc") data.close = value;
+                else if (field_name == "ap1") data.ask_prices[0] = value;
+                else if (field_name == "ap2") data.ask_prices[1] = value;
+                else if (field_name == "ap3") data.ask_prices[2] = value;
+                else if (field_name == "ap4") data.ask_prices[3] = value;
+                else if (field_name == "ap5") data.ask_prices[4] = value;
+                else if (field_name == "bp1") data.bid_prices[0] = value;
+                else if (field_name == "bp2") data.bid_prices[1] = value;
+                else if (field_name == "bp3") data.bid_prices[2] = value;
+                else if (field_name == "bp4") data.bid_prices[3] = value;
+                else if (field_name == "bp5") data.bid_prices[4] = value;
+            }
+            // 成交额字段，单位是元
+            else if (field_name == "a" || field_name == "inst_amt" || field_name == "large_net") {
+                if (field_name == "a") data.amount = value;
+                else if (field_name == "inst_amt") data.inst_amt = value;
+                else if (field_name == "large_net") data.large_net = value;
+            }
+            // 成交量字段，单位是股
+            else if (field_name == "v" || field_name == "inst_vol" ||
+                    field_name == "av1" || field_name == "av2" || field_name == "av3" || 
+                    field_name == "av4" || field_name == "av5" ||
+                    field_name == "bv1" || field_name == "bv2" || field_name == "bv3" || 
+                    field_name == "bv4" || field_name == "bv5") {
+                if (field_name == "v") data.volume = value;
+                else if (field_name == "inst_vol") data.inst_vol = value;
+                else if (field_name == "av1") data.ask_volumes[0] = value;
+                else if (field_name == "av2") data.ask_volumes[1] = value;
+                else if (field_name == "av3") data.ask_volumes[2] = value;
+                else if (field_name == "av4") data.ask_volumes[3] = value;
+                else if (field_name == "av5") data.ask_volumes[4] = value;
+                else if (field_name == "bv1") data.bid_volumes[0] = value;
+                else if (field_name == "bv2") data.bid_volumes[1] = value;
+                else if (field_name == "bv3") data.bid_volumes[2] = value;
+                else if (field_name == "bv4") data.bid_volumes[3] = value;
+                else if (field_name == "bv5") data.bid_volumes[4] = value;
+            }
+            // 其他字段
+            // else if (field_name == "p") {
+            //     data.pvolume = value;
+            // }
+        }
+    }
+    
+    // 设置默认的exchange和market
+    if (data.exchange.empty()) {
+        // 根据股票代码前缀判断
+        if (!data.symbol.empty()) {
+            if (data.symbol.substr(0, 1) == "6") {
+                data.exchange = "SH";
+                data.market = "sh";
+            } else if (data.symbol.substr(0, 1) == "0" || data.symbol.substr(0, 1) == "3") {
+                data.exchange = "SZ";
+                data.market = "sz";
+            } else if (data.symbol.substr(0, 2) == "68") {
+                data.exchange = "SH";
+                data.market = "kc";
+            } else {
+                data.exchange = "Unknown";
+                data.market = "Unknown";
+            }
+        }
+    }
+    // if(data.symbol=="000547")
+    // printf("symbol: %s, timestamp: %lld, last_price: %f, volume: %f, amount: %f, inst_vol: %f, inst_amt: %f, large_net: %f, ask_prices: %f, %f, %f, %f, %f, bid_prices: %f, %f, %f, %f, %f, ask_volumes: %f, %f, %f, %f, %f, bid_volumes: %f, %f, %f, %f, %f\n", 
+    //        data.symbol.c_str(), data.timestamp, data.last_price, data.volume, data.amount,
+    //        data.inst_vol, data.inst_amt, data.large_net,
+    //        data.ask_prices[0], data.ask_prices[1], data.ask_prices[2], data.ask_prices[3], data.ask_prices[4],
+    //        data.bid_prices[0], data.bid_prices[1], data.bid_prices[2], data.bid_prices[3], data.bid_prices[4],
+    //        data.ask_volumes[0], data.ask_volumes[1], data.ask_volumes[2], data.ask_volumes[3], data.ask_volumes[4],
+    //        data.bid_volumes[0], data.bid_volumes[1], data.bid_volumes[2], data.bid_volumes[3], data.bid_volumes[4]);
+    
+    return data;
+}
+
+// ==================== 回放消息处理器 ====================
+class ReplayMessageProcessor : public IMessageProcessor {
+private:
+    const Config& config_;
+    std::unique_ptr<TDengineReplayConsumer> replay_consumer_;
+    
+public:
+    ReplayMessageProcessor(const Config& config) : config_(config) {
+        replay_consumer_ = std::make_unique<TDengineReplayConsumer>(config);
+    }
+    
+    bool processMessage(const std::vector<char>& body, std::vector<StockData>& records) override {
+        // 对于回放模式，我们直接从TDengineReplayConsumer获取数据
+        // body参数实际上包含时间戳信息
+        
+        if (body.empty()) {
+            return false;
+        }
+        
+        // 解析时间戳
+        std::string body_str(body.begin(), body.end());
+        size_t ts_pos = body_str.find("\"timestamp\":");
+        if (ts_pos == std::string::npos) {
+            return false;
+        }
+        
+        ts_pos += 12; // "\"timestamp\":".length()
+        size_t end_pos = body_str.find("}", ts_pos);
+        if (end_pos == std::string::npos) {
+            return false;
+        }
+        
+        std::string ts_str = body_str.substr(ts_pos, end_pos - ts_pos);
+        long long timestamp = std::stoll(ts_str);
+        
+        // 直接从TDengine获取该时间切片的数据
+        // 注意：这里我们简化处理，实际上应该在消费者中缓存数据
+        records = getTickSliceFromTDengine(timestamp);
+        
+        return !records.empty();
+    }
+    
+private:
+    std::vector<StockData> getTickSliceFromTDengine(long long slice_time) {
+        // 这里简化实现，实际应该使用共享的连接
+        TDengineConnection connection(
+            config_.tdengine_host, config_.tdengine_user,
+            config_.tdengine_password, config_.tdengine_database,
+            config_.tdengine_port
+        );
+        
+        if (!connection.connect()) {
+            return {};
+        }
+        
+        try {
+            std::ostringstream sql;
+            sql << "SELECT ts, symbol, lp, o, h, l, lc, a, v, "
+                << "ap1, ap2, ap3, ap4, ap5, "
+                << "bp1, bp2, bp3, bp4, bp5, "
+                << "av1, av2, av3, av4, av5, "
+                << "bv1, bv2, bv3, bv4, bv5, "
+                << "inst_vol, inst_amt, large_net "
+                << "FROM " << config_.tdengine_replay_table << " "
+                << "WHERE ts >= " << slice_time << " "
+                << "AND ts < " << (slice_time + config_.replay_tick_interval_ms) << " "
+                << "ORDER BY symbol ASC";
+            
+            TAOS_RES* res = connection.query(sql.str());
+            if (!res) {
+                return {};
+            }
+            
+            int num_fields = taos_num_fields(res);
+            TAOS_FIELD* fields = taos_fetch_fields(res);
+            
+            std::vector<StockData> slice_data;
+            
+            TAOS_ROW row;
+            while ((row = taos_fetch_row(res))) {
+                // 使用修复后的parseTDengineRow函数进行解析
+                StockData data = parseTDengineRow(row, fields, num_fields);
+                slice_data.push_back(std::move(data));
+            }
+            
+            taos_free_result(res);
+            return slice_data;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error getting tick slice: " << e.what() << std::endl;
+            return {};
         }
     }
 };
@@ -1401,6 +1988,22 @@ public:
         freeReplyObject(reply);
         return success;
     }
+    
+    bool zremrangebyrank(const std::string& key, long long start, long long stop) {
+        if (!context_ && !connect()) return false;
+       
+        redisReply* reply = (redisReply*)redisCommand(context_,
+                                                    "ZREMRANGEBYRANK %s %lld %lld",
+                                                    key.c_str(), start, stop);
+        if (!reply) {
+            disconnect();
+            return false;
+        }
+       
+        bool success = (reply->type != REDIS_REPLY_ERROR);
+        freeReplyObject(reply);
+        return success;
+    }
      // 添加hset方法用于存储哈希表字段
     bool hset(const std::string& key, const std::string& field, const std::string& value) {
         if (!context_ && !connect()) return false;
@@ -1430,6 +2033,36 @@ public:
         if (!context_) return false;
         // 对于hiredis，不需要特殊处理，命令会立即发送
         return true;
+    }
+    
+    // 执行Lua脚本
+    bool eval(const std::string& script, const std::vector<std::string>& keys, const std::vector<std::string>& args) {
+        if (!context_ && !connect()) return false;
+        
+        // 构建命令
+        std::string cmd = "EVAL ";
+        cmd += script;
+        cmd += " " + std::to_string(keys.size());
+        
+        // 添加KEYS
+        for (const auto& key : keys) {
+            cmd += " " + key;
+        }
+        
+        // 添加ARGS
+        for (const auto& arg : args) {
+            cmd += " " + arg;
+        }
+        
+        redisReply* reply = (redisReply*)redisCommand(context_, cmd.c_str());
+        if (!reply) {
+            disconnect();
+            return false;
+        }
+        
+        bool success = (reply->type != REDIS_REPLY_ERROR);
+        freeReplyObject(reply);
+        return success;
     }
 };
 
@@ -2880,14 +3513,84 @@ private:
        
         global_logger->warnWithTickTime(log_msg.str(), data.timestamp);
     }
-    
+    std::string base64_encode(const std::string& in) {
+        static const char* codes = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+        
+        std::string out;
+        int val = 0;
+        int valb = -6;
+        
+        for (unsigned char c : in) {
+            val = (val << 8) + c;
+            valb += 8;
+            while (valb >= 0) {
+                out.push_back(codes[(val >> valb) & 0x3F]);
+                valb -= 6;
+            }
+        }
+        
+        if (valb > -6) {
+            out.push_back(codes[((val << 8) >> (valb + 8)) & 0x3F]);
+        }
+        
+        while (out.size() % 4) {
+            out.push_back('=');
+        }
+        
+        return out;
+    }
     void storeToRedis(const StockData& data, const std::string& reason, double strength, const TimeWindowStats& stats, const std::string& change) {
+        std::string reason_encoded = base64_encode(reason);
+        std::string name_encoded = base64_encode(stock_mapper_.getStockDisplayName(data.symbol));
         std::ostringstream json;
-        json << "{\"symbol\":\"" << data.symbol << "\",\"timestamp\":" << data.timestamp << ",\"name\":\"" <<  stock_mapper_.getStockDisplayName(data.symbol) << "\",\"price\":" << Logger::f2s(data.last_price) << ","
-             << "\"reason\":\"" << reason << "\",\"strength\":" << strength << ",\"change\":\"" << change<< "\",\"amount\":\"" << data.inst_amt<< "\","
-             << "\"large_net_5min\":" << Logger::f2s(stats.large_net_5min) << ",\"change_5min\":" << Logger::f2s(stats.change_5min) << ",\"amount_5min\":" << Logger::f2s(stats.amount_5min) << "}";
-        redis_->zadd(config_.volatile_pool_key, data.timestamp, json.str());
-        redis_->expire(config_.volatile_pool_key, config_.volatile_expire);
+        json << "{\"symbol\":\"" << data.symbol 
+            << "\",\"timestamp\":" << data.timestamp 
+            << ",\"name_b64\":\"" << name_encoded  // 使用base64编码的名称
+            << "\",\"price\":" << Logger::f2s(data.last_price) 
+            << ",\"reason_b64\":\"" << reason_encoded  // 使用base64编码的原因
+            << "\",\"strength\":" << strength 
+            << ",\"change\":\"" << change  // change通常是数字字符串，不需要编码
+            << "\",\"amount\":\"" << data.inst_amt << "\","
+            << "\"large_net_5min\":" << Logger::f2s(stats.large_net_5min) 
+            << ",\"change_5min\":" << Logger::f2s(stats.change_5min) 
+            << ",\"amount_5min\":" << Logger::f2s(stats.amount_5min) << "}";
+
+        // 判断是否是涨停（根据reason包含"涨停"或"Top"且涨幅为10%/20%）
+        bool is_limit_up = reason.find("Top") != std::string::npos;
+        
+        if (is_limit_up) {
+            // 先删除该股票的旧记录，确保每个股票只保留最新数据
+            // 使用Lua脚本原子操作：删除包含当前股票代码的所有记录
+            std::string lua_script = "local key = KEYS[1]; local symbol = ARGV[1]; local all_members = redis.call('ZRANGEBYSCORE', key, '-inf', '+inf'); for i, member in ipairs(all_members) do if string.find(member, '{\"symbol\":\"' .. symbol .. '\"') then redis.call('ZREM', key, member); end; end; return 1;";
+            redis_->eval(lua_script, {config_.first_limit_up_key}, {data.symbol});
+            
+            // 涨停数据单独存储到专门的有序集合（所有涨停，不区分首板）
+            redis_->zadd(config_.first_limit_up_key, data.timestamp, json.str());
+            redis_->expire(config_.first_limit_up_key, config_.volatile_expire);
+            
+            // 限制涨停集合的大小，只保留最近的200条数据
+            redis_->zremrangebyrank(config_.first_limit_up_key, 0, -201);
+            
+            // 同时清理涨停集合的过期数据
+            long long cutoff_time = data.timestamp - (config_.volatile_expire * 1000);
+            redis_->zremrangebyscore(config_.first_limit_up_key, 0, cutoff_time);
+        } else {
+            // 先删除该股票的旧记录，确保每个股票只保留最新数据
+            // 使用Lua脚本原子操作：删除包含当前股票代码的所有记录
+            std::string lua_script = "local key = KEYS[1]; local symbol = ARGV[1]; local all_members = redis.call('ZRANGEBYSCORE', key, '-inf', '+inf'); for i, member in ipairs(all_members) do if string.find(member, '{\"symbol\":\"' .. symbol .. '\"') then redis.call('ZREM', key, member); end; end; return 1;";
+            redis_->eval(lua_script, {config_.volatile_pool_key}, {data.symbol});
+            
+            // 普通异动存储到原来的集合
+            redis_->zadd(config_.volatile_pool_key, data.timestamp, json.str());
+            redis_->expire(config_.volatile_pool_key, config_.volatile_expire);
+            
+            // 限制有序集合的大小，只保留最近的500条数据
+            redis_->zremrangebyrank(config_.volatile_pool_key, 0, -501);
+            
+            // 同时清理过期数据
+            long long cutoff_time = data.timestamp - (config_.volatile_expire * 1000);
+            redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
+        }
     }
 };
 
@@ -3256,7 +3959,11 @@ public:
                 int retry_count = 0;
                
                 while (retry_count < config_.max_retry_count && !write_success) {
-                    write_success = writer_->writeBatch(all_records);
+                    if (config_.data_source == "tdengine_replay") {
+                        write_success = true;
+                    }else{   
+                        write_success = writer_->writeBatch(all_records);
+                    }
                     if (!write_success) {
                         retry_count++;
                         std::this_thread::sleep_for(std::chrono::milliseconds(config_.retry_delay_ms));
@@ -3388,6 +4095,37 @@ public:
     }
 };
 
+// ==================== 回放工厂类 ====================
+class ReplayStockDataFactory : public ComponentFactory {
+public:
+    std::unique_ptr<IDataWriter> createDataWriter(const Config& config) override {
+        // 回放模式下，我们可能不需要写入TDengine，或者仍然写入用于记录
+        return std::make_unique<OptimizedTDengineWriter>(config);
+    }
+   
+    std::unique_ptr<IMessageProcessor> createMessageProcessor(const Config& config) override {
+        // 创建回放消息处理器
+        return std::make_unique<ReplayMessageProcessor>(config);
+    }
+   
+    std::unique_ptr<IMessageConsumer> createMessageConsumer(const Config& config) override {
+        // 创建TDengine回放消费者
+        return std::make_unique<TDengineReplayConsumer>(config);
+    }
+};
+
+// ==================== 工厂创建器 ====================
+class ComponentFactoryCreator {
+public:
+    static std::unique_ptr<ComponentFactory> createFactory(const Config& config) {
+        if (config.data_source == "tdengine_replay") {
+            return std::make_unique<ReplayStockDataFactory>();
+        } else {
+            return std::make_unique<EnhancedStockDataFactory>();
+        }
+    }
+};
+
 // ==================== 应用主类 ====================
 class EnhancedSingleThreadedConsumerApplication {
 private:
@@ -3398,7 +4136,7 @@ private:
    
 public:
     EnhancedSingleThreadedConsumerApplication(const Config& config) : config_(config) {
-        auto factory = std::make_unique<EnhancedStockDataFactory>();
+        auto factory = ComponentFactoryCreator::createFactory(config);
         processor_ = std::make_unique<EnhancedSingleThreadedProcessor>(
             factory->createDataWriter(config),
             factory->createMessageProcessor(config),
@@ -3411,6 +4149,13 @@ public:
    
     void run() {
         std::cout << "Starting enhanced single-threaded application..." << std::endl;
+        std::cout << "Data source: " << config_.data_source << std::endl;
+        
+        if (config_.data_source == "tdengine_replay") {
+            std::cout << "Replay mode: " << config_.replay_start_time << " to " 
+                      << config_.replay_end_time << std::endl;
+            std::cout << "Replay speed: " << config_.replay_speed << "x" << std::endl;
+        }
        
         std::thread processor_thread([this]() {
             processor_->start();
@@ -3455,7 +4200,37 @@ std::atomic<bool> EnhancedSingleThreadedConsumerApplication::signal_received_{fa
 int main() {
     try {
         auto& configManager = ConfigManager::getInstance();
-        EnhancedSingleThreadedConsumerApplication app(configManager.getConfig());
+        Config config = configManager.getConfig();
+        
+        // 根据环境变量或命令行参数设置数据源
+        // 可以从命令行读取参数
+        int argc = 0;
+        char** argv = nullptr;
+        // 实际使用时，应该解析命令行参数
+        // 这里简化为检查环境变量
+        char* env_data_source = std::getenv("DATA_SOURCE");
+        if (env_data_source) {
+            std::string data_source_str = env_data_source;
+            if (data_source_str == "tdengine_replay" || data_source_str == "rabbitmq") {
+                config.data_source = data_source_str;
+            }
+        }
+        
+        // 检查是否传递了回放参数
+        char* env_replay_start = std::getenv("REPLAY_START_TIME");
+        if (env_replay_start) {
+            config.replay_start_time = env_replay_start;
+        }
+        
+        char* env_replay_end = std::getenv("REPLAY_END_TIME");
+        if (env_replay_end) {
+            config.replay_end_time = env_replay_end;
+        }
+        
+        // 更新配置
+        configManager.updateConfig(config);
+        
+        EnhancedSingleThreadedConsumerApplication app(config);
         app.run();
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << std::endl;

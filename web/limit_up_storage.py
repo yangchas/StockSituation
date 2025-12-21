@@ -778,7 +778,7 @@ class IntegratedStockService:
             # 直接使用过滤后的数据，不进行高级指标增强
             # enhanced_data = await self._enhance_with_advanced_indicators(filtered_data)
             enhanced_data = filtered_data
-            print(enhanced_data)
+            # print(enhanced_data)
             # 按题材分组
             grouped_data = self._group_by_theme(enhanced_data)
             
@@ -976,14 +976,13 @@ class IntegratedStockService:
     
     async def _get_hot_stocks_data(self, prev_day: str) -> Dict:
         """获取热门股票数据（内部方法，供API和综合视图使用）"""
-        # 从缓存获取
-        cache_key = f"hot_stocks_{prev_day}"
-        current_time = time.time()
+        # 从Redis缓存获取
+        cache_key = f"cache:hot_stocks:{prev_day}"
+        cached_data = self.redis_storage.get_data(cache_key)
         
-        if (cache_key in self.cached_hot_stocks and 
-            current_time - self.last_cache_time.get(cache_key, 0) < 300):  # 5分钟缓存
-            logger.info(f"📦 从缓存加载热门股票数据: {prev_day}")
-            return self.cached_hot_stocks[cache_key]
+        if cached_data:
+            logger.info(f"📦 从Redis缓存加载热门股票数据: {prev_day}")
+            return cached_data
         
         # 获取高成交额股票
         high_amount_stocks = []
@@ -1057,13 +1056,12 @@ class IntegratedStockService:
             'timestamp': int(time.time() * 1000)
         }
         
-        # 更新缓存
+        # 更新Redis缓存
         try:
-            self.cached_hot_stocks[cache_key] = response_data
-            self.last_cache_time[cache_key] = current_time
-            logger.info(f"💾 热门股票数据已缓存: {prev_day}")
+            self.redis_storage.store_data(cache_key, response_data, 300)  # 5分钟缓存
+            logger.info(f"💾 热门股票数据已缓存到Redis: {prev_day}")
         except Exception as e:
-            logger.error(f"⚠️ 缓存数据失败: {e}")
+            logger.error(f"⚠️ Redis缓存数据失败: {e}")
         
         return response_data
     
@@ -1735,7 +1733,7 @@ class IntegratedStockService:
                         else:
                             # 如果找不到对应的板块ID，记录日志
                             logger.debug(f"⚠️ 未找到题材 '{related_theme}' 对应的板块ID")
-                        print("股票数据:", code, stock.get('name'), related_theme, plate_id)
+                        # print("股票数据:", code, stock.get('name'), related_theme, plate_id)
             # 选择出现频率最高的前5个板块
             sorted_plates = sorted(plate_counts.items(), key=lambda x: x[1], reverse=True)
             for plate, count in sorted_plates[:]:
@@ -1807,20 +1805,29 @@ class IntegratedStockService:
             
             logger.info(f"🔍 获取综合视图 - 查询日期: {today}")
             
-            # 并行获取各类数据 - 昨日涨停和热门股票
-            prev_limit_up_task = asyncio.create_task(
-                self._get_enhanced_limit_up(prev_day)
-            )
-            hot_stocks_task = asyncio.create_task(
-                self._get_hot_stocks_data(today)
-            )
+            # 从Redis缓存获取昨日涨停数据
+            cache_key_prev_limit_up = f"cache:comprehensive:prev_limit_up:{prev_day}"
+            prev_limit_up_result = self.redis_storage.get_data(cache_key_prev_limit_up)
             
-            # 等待任务完成
-            prev_limit_up_result = await prev_limit_up_task
-            hot_stocks_result = await hot_stocks_task
+            if not prev_limit_up_result:
+                logger.info(f"📥 缓存未命中 - 计算昨日涨停数据: {prev_day}")
+                prev_limit_up_result = await self._get_enhanced_limit_up(prev_day)
+                # 缓存24小时
+                self.redis_storage.store_data(cache_key_prev_limit_up, prev_limit_up_result, 86400)
+            else:
+                logger.info(f"📤 缓存命中 - 昨日涨停数据: {len(prev_limit_up_result) if prev_limit_up_result else 0}条")
             
-            logger.debug(f"📊 昨日涨停数据: {len(prev_limit_up_result) if prev_limit_up_result else 0}条")
-            logger.debug(f"🔥 热门股票数据: {len(hot_stocks_result.get('data', [])) if hot_stocks_result else 0}条")
+            # 从Redis缓存获取热门股票数据
+            cache_key_hot_stocks = f"cache:comprehensive:hot_stocks:{today}"
+            hot_stocks_result = self.redis_storage.get_data(cache_key_hot_stocks)
+            
+            if not hot_stocks_result:
+                logger.info(f"📥 缓存未命中 - 计算热门股票数据: {today}")
+                hot_stocks_result = await self._get_hot_stocks_data(today)
+                # 缓存1小时
+                self.redis_storage.store_data(cache_key_hot_stocks, hot_stocks_result, 3600)
+            else:
+                logger.info(f"📤 缓存命中 - 热门股票数据: {len(hot_stocks_result.get('data', [])) if hot_stocks_result else 0}条")
             
             # 处理首板数据 - 使用redis_storage中的真实异动数据
             first_limit_data = []
@@ -1830,13 +1837,15 @@ class IntegratedStockService:
                 
                 # 转换为前端需要的格式
                 for stock in real_first_limit_stocks:
+                    change_pct = stock.get('change_pct', 0.0)
                     formatted_stock = {
                         'code': stock.get('symbol', ''),
                         'name': stock.get('name', f"股票{stock.get('symbol', '')}"),
                         'limit_time': stock.get('limit_time', '09:30:00'),
                         'plate': stock.get('plate', '涨停板块'),
                         'price': stock.get('price', 0.0),
-                        'change_pct': stock.get('change_pct', 0.0),
+                        'change_pct': change_pct,
+                        'gain': change_pct * 100,  # 与前端处理一致，乘以100显示百分比
                         'amount': stock.get('amount', 0.0),
                         'floor': 1,  # 首板
                         'category': 'other'  # 首板默认分类
@@ -1875,5 +1884,20 @@ class IntegratedStockService:
     
     async def _get_enhanced_limit_up(self, date_str: str) -> List[Dict]:
         """获取增强的连板数据"""
+        # 尝试从Redis缓存获取数据
+        cache_key = f"cache:enhanced_limit_up:{date_str}"
+        cached_data = self.redis_storage.get_data(cache_key)
+        
+        if cached_data:
+            logger.info(f"📤 从Redis缓存获取增强连板数据: {date_str}")
+            return cached_data
+        
+        logger.info(f"📥 计算增强连板数据: {date_str}")
         limit_up_data = self.td_storage.query_limit_up_by_date(date_str)
-        return await self._enhance_with_advanced_indicators(limit_up_data)
+        enhanced_data = await self._enhance_with_advanced_indicators(limit_up_data)
+        
+        # 将结果缓存到Redis，有效期24小时
+        self.redis_storage.store_data(cache_key, enhanced_data, 86400)
+        logger.info(f"💾 缓存增强连板数据到Redis: {date_str}")
+        
+        return enhanced_data
