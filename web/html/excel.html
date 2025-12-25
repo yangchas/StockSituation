@@ -1591,18 +1591,71 @@
                     element.classList.add(blinkClass);
                 }
                 
-                // 更新内容
+                // 更新内容 - 直接更新DOM元素，避免重新设置innerHTML移除事件监听器
                 const gainText = stock.gain >= 0 ? '+' : '';
                 const speedText = stock.speed >= 0 ? '+' : '';
-                element.innerHTML = `
-                    <div class="stock-name">${stock.name}</div>
-                    <div class="stock-info">
-                        <div class="stock-gain">${gainText}${stock.gain.toFixed(1)}%</div>
-                        <div class="stock-speed">${speedText}${stock.speed.toFixed(1)}%</div>
-                        <div class="stock-amount">${this.formatAmount(stock.amount)}</div>
-                        <div class="stock-amount-2min">${this.formatAmount(stock.amount_2min || 0)}</div>
-                    </div>
-                `;
+                
+                // 获取或创建DOM元素
+                let nameElement = element.querySelector('.stock-name');
+                let infoElement = element.querySelector('.stock-info');
+                
+                if (!nameElement || !infoElement) {
+                    // 如果元素不存在，则重新创建
+                    element.innerHTML = `
+                        <div class="stock-name">${stock.name}</div>
+                        <div class="stock-info">
+                            <div class="stock-gain">${gainText}${stock.gain.toFixed(1)}%</div>
+                            <div class="stock-speed">${speedText}${stock.speed.toFixed(1)}%</div>
+                            <div class="stock-amount">${this.formatAmount(stock.amount)}</div>
+                            <div class="stock-amount-2min">${this.formatAmount(stock.amount_2min || 0)}</div>
+                        </div>
+                    `;
+                } else {
+                    // 直接更新现有元素内容
+                    nameElement.textContent = stock.name;
+                    
+                    const gainElement = infoElement.querySelector('.stock-gain');
+                    const speedElement = infoElement.querySelector('.stock-speed');
+                    const amountElement = infoElement.querySelector('.stock-amount');
+                    const amount2minElement = infoElement.querySelector('.stock-amount-2min');
+                    
+                    if (gainElement) gainElement.textContent = `${gainText}${stock.gain.toFixed(1)}%`;
+                    if (speedElement) speedElement.textContent = `${speedText}${stock.speed.toFixed(1)}%`;
+                    if (amountElement) amountElement.textContent = this.formatAmount(stock.amount);
+                    if (amount2minElement) amount2minElement.textContent = this.formatAmount(stock.amount_2min || 0);
+                }
+                
+                // 更新事件监听器中的stock引用
+                this.updateEventListeners(element, stock);
+            }
+            
+            updateEventListeners(element, stock) {
+                // 克隆元素
+                const clonedElement = element.cloneNode(true);
+                
+                // 替换元素
+                element.replaceWith(clonedElement);
+                
+                // 直接使用克隆后的元素，避免DOM查询延迟
+                const newElement = clonedElement;
+                
+                // 重新绑定事件监听器
+                newElement.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.showStockChart(e, stock);
+                });
+                
+                newElement.addEventListener('mouseenter', (e) => {
+                    const rect = newElement.getBoundingClientRect();
+                    this.showTooltip(stock, rect.right, rect.top);
+                });
+                
+                newElement.addEventListener('mouseleave', () => {
+                    this.hideTooltip();
+                });
+                
+                // 更新缓存
+                this.stockCache.set(stock.id, newElement);
             }
             
             removeStockElement(stockId) {
@@ -1749,7 +1802,7 @@
             
             showTooltip(stock, x, y) {
                 // 保持原有工具提示逻辑
-                let html = `<div class="tooltip-title">${stock.name} (${stock.code})</div>`;
+                let html = `<div class="tooltip-title">${stock.name}</div>`;
                 html += '<div class="tooltip-content">';
                 
                 const gainColor = stock.gain >= 0 ? '#ff4d4f' : '#3399ff';
@@ -1783,7 +1836,7 @@
                 
                 html += `<div class="tooltip-row">
                     <span class="tooltip-label">资金类型:</span>
-                    <span class="tooltip-value">${this.data.capitalTypes[stock.capitalType]}</span>
+                    <span class="tooltip-value">${this.data.capitalTypes[stock.capitalType] || '未知'}</span>
                 </div>`;
                 
                 html += `<div class="tooltip-row">
@@ -2165,43 +2218,384 @@
             }
             
             processOtherStocksData(otherStocks) {
-                // 检查是否是包含stocks字段的对象，如果是则提取stocks数组
-                const stocksArray = otherStocks && typeof otherStocks === 'object' && 'stocks' in otherStocks ? otherStocks.stocks : otherStocks;
-                
-                if (!Array.isArray(stocksArray)) return;
-                
-                console.log('处理其他个股数据:', stocksArray.length, '条');
-                console.log('其他个股数据结构:', otherStocks);
-                
-                // 将其他个股数据转换为应用格式并添加到数据中
-                const formattedStocks = stocksArray.map(stock => ({
-                    id: `other_${stock.code}_${Date.now()}`,
-                    name: stock.name.slice(0,4),
-                    code: stock.code,
-                    amount: stock.amount || stock.trade_amount || 0,
-                    gain: stock.change_pct || stock.gain || 0,
-                    // 使用后端提供的涨速数据，优先使用speed，其次是change_rate_1min
-                    speed: parseFloat(stock.speed || stock.change_rate_1min || 0),
-                    capitalType: stock.capitalType === 'A' ? 0 : 1,
-                    // 使用themes数组的第一个元素作为主题，如果没有则使用plate或theme
-                    theme: (Array.isArray(stock.themes) && stock.themes.length > 0) ? stock.themes[0] : stock.plate || stock.theme || '其他',
-                    // 保存所有题材信息
-                    themes: Array.isArray(stock.themes) ? stock.themes : [stock.plate || stock.theme || '其他'],
-                    floor: 0, // 其他个股的板数为0
-                    category: 'other',
-                    // 保存筛选分数用于排序或显示
-                    screening_score: parseFloat(stock.screening_score || 0)
-                }));
-                
-                // 使用addStock方法将新数据添加到现有数据中
-                formattedStocks.forEach(stock => {
-                    this.addStock(stock);
-                });
-                
-                // 处理题材分组数据
+                // 优先处理题材分组数据
                 if (otherStocks && typeof otherStocks === 'object' && 'theme_groups' in otherStocks) {
                     console.log('题材分组数据:', otherStocks.theme_groups);
-                    // 可以在这里对题材分组数据进行进一步处理，比如用于UI展示或其他逻辑
+                    
+                    // 题材ID到名称的映射
+                    const themeIdToName = {
+                        '801040': '银行',
+                        '801050': '证券',
+                        '801060': '保险',
+                        '801070': '多元金融',
+                        '801080': '地产',
+                        '801110': '煤炭',
+                        '801120': '石油',
+                        '801130': '有色',
+                        '801140': '钢铁',
+                        '801150': '建材',
+                        '801160': '化工',
+                        '801170': '化纤',
+                        '801180': '纺织',
+                        '801190': '服装',
+                        '801200': '轻工制造',
+                        '801210': '医药',
+                        '801220': '生物',
+                        '801230': '医疗保健',
+                        '801240': '汽车',
+                        '801250': '家电',
+                        '801260': '食品饮料',
+                        '801270': '酿酒',
+                        '801280': '农林牧渔',
+                        '801290': '农业综合',
+                        '801300': '林业',
+                        '801310': '畜牧业',
+                        '801320': '渔业',
+                        '801330': '农产品加工',
+                        '801340': '饲料',
+                        '801350': '种植业',
+                        '801360': '其他农业',
+                        '801370': '民航机场',
+                        '801380': '港口水运',
+                        '801390': '公路铁路运输',
+                        '801400': '物流',
+                        '801410': '交运设备',
+                        '801420': '船舶制造',
+                        '801430': '航天航空',
+                        '801440': '国防军工',
+                        '801450': '工程机械',
+                        '801460': '电气设备',
+                        '801470': '电力',
+                        '801480': '燃气',
+                        '801490': '水务',
+                        '801500': '环保',
+                        '801510': '公共交通',
+                        '801520': '园区开发',
+                        '801530': '商业百货',
+                        '801540': '贸易',
+                        '801550': '旅游酒店',
+                        '801560': '餐饮',
+                        '801570': '景点',
+                        '801580': '文化传媒',
+                        '801590': '广告包装',
+                        '801600': '文教休闲',
+                        '801610': '珠宝首饰',
+                        '801620': '家具',
+                        '801630': '家居用品',
+                        '801640': '装修装饰',
+                        '801650': '建筑材料',
+                        '801660': '建筑装饰',
+                        '801670': '园林工程',
+                        '801680': '工程建设',
+                        '801690': '专业服务',
+                        '801700': '综合行业',
+                        '801710': '计算机设备',
+                        '801720': '软件开发',
+                        '801730': '互联网',
+                        '801740': '通信设备',
+                        '801750': '电信运营',
+                        '801760': '半导体',
+                        '801770': '元器件',
+                        '801780': 'IT设备',
+                        '801790': '电子信息',
+                        '801800': '仪器仪表',
+                        '801810': '电信运营',
+                        '801820': '通信服务',
+                        '801830': '互联网服务',
+                        '801840': '软件服务',
+                        '801850': 'IT服务',
+                        '801860': '云计算',
+                        '801870': '大数据',
+                        '801880': '人工智能',
+                        '801890': '区块链',
+                        '801900': '数字货币',
+                        '801910': '网络安全',
+                        '801920': '量子科技',
+                        '801930': '元宇宙',
+                        '801940': 'NFT',
+                        '801950': 'Web3.0',
+                        '801960': '数字经济',
+                        '801970': '信创',
+                        '801980': '国产软件',
+                        '801990': '操作系统',
+                        '802000': '芯片',
+                        '802010': '集成电路',
+                        '802020': '光刻胶',
+                        '802030': '半导体材料',
+                        '802040': '半导体设备',
+                        '802050': '封装测试',
+                        '802060': '第三代半导体',
+                        '802070': '碳化硅',
+                        '802080': '氮化镓',
+                        '802090': 'EDA软件',
+                        '802100': 'GPU',
+                        '802110': 'CPU',
+                        '802120': '存储器',
+                        '802130': '传感器',
+                        '802140': '射频元件',
+                        '802150': '被动元件',
+                        '802160': 'PCB',
+                        '802170': '面板',
+                        '802180': 'OLED',
+                        '802190': 'MiniLED',
+                        '802200': 'MicroLED',
+                        '802210': '显示器件',
+                        '802220': '光学光电子',
+                        '802230': '激光',
+                        '802240': 'LED',
+                        '802250': '光伏',
+                        '802260': 'HJT电池',
+                        '802270': 'TOPCon电池',
+                        '802280': '钙钛矿电池',
+                        '802290': '光伏设备',
+                        '802300': '光伏玻璃',
+                        '802310': '光伏胶膜',
+                        '802320': '光伏逆变器',
+                        '802330': '储能',
+                        '802340': '锂电池',
+                        '802350': '钠离子电池',
+                        '802360': '氢能源',
+                        '802370': '燃料电池',
+                        '802380': '充电桩',
+                        '802390': '换电概念',
+                        '802400': '新能源车',
+                        '802410': '汽车芯片',
+                        '802420': '汽车电子',
+                        '802430': '智能驾驶',
+                        '802440': '车联网',
+                        '802450': '汽车热管理',
+                        '802460': '汽车零部件',
+                        '802470': '一体化压铸',
+                        '802480': '人形机器人',
+                        '802490': '工业机器人',
+                        '802500': '工业母机',
+                        '802510': '数控机床',
+                        '802520': '工业软件',
+                        '802530': '工业互联网',
+                        '802540': '工业4.0',
+                        '802550': '专精特新',
+                        '802560': '小巨人',
+                        '802570': '国企改革',
+                        '802580': '央企改革',
+                        '802590': '地方国企改革',
+                        '802600': '重组',
+                        '802610': '借壳上市',
+                        '802620': '股权转让',
+                        '802630': '资产注入',
+                        '802640': 'ST股',
+                        '802650': '摘帽',
+                        '802660': '退市',
+                        '802670': '破发',
+                        '802680': '次新股',
+                        '802690': '新股',
+                        '802700': '北交所',
+                        '802710': '科创板',
+                        '802720': '创业板',
+                        '802730': '主板',
+                        '802740': 'A股',
+                        '802750': 'B股',
+                        '802760': 'H股',
+                        '802770': '红筹股',
+                        '802780': '蓝筹股',
+                        '802790': '白马股',
+                        '802800': '黑马股',
+                        '802810': '龙头股',
+                        '802820': '妖股',
+                        '802830': '强势股',
+                        '802840': '弱势股',
+                        '802850': '低价股',
+                        '802860': '高价股',
+                        '802870': '中价股',
+                        '802880': '大盘股',
+                        '802890': '中盘股',
+                        '802900': '小盘股',
+                        '802910': '微盘股',
+                        '802920': '次新股',
+                        '802930': '绩优股',
+                        '802940': '绩差股',
+                        '802950': '成长股',
+                        '802960': '价值股',
+                        '802970': '周期股',
+                        '802980': '防御股',
+                        '802990': '题材股',
+                        '803000': '概念股',
+                        '803010': '热点股',
+                        '803020': '冷门股',
+                        '803030': '活跃股',
+                        '803040': '非活跃股',
+                        '803050': '资金流入',
+                        '803060': '资金流出',
+                        '803070': '主力资金',
+                        '803080': '游资',
+                        '803090': '散户',
+                        '803100': '北向资金',
+                        '803110': '南向资金',
+                        '803120': '融资融券',
+                        '803130': '沪股通',
+                        '803140': '深股通',
+                        '803150': '沪港通',
+                        '803160': '深港通',
+                        '803170': 'QFII',
+                        '803180': 'RQFII',
+                        '803190': 'MSCI',
+                        '803200': '富时罗素',
+                        '803210': '标普道琼斯',
+                        '803220': '北向资金持股',
+                        '803230': '南向资金持股',
+                        '803240': '机构持股',
+                        '803250': '基金持股',
+                        '803260': '社保基金',
+                        '803270': '养老金',
+                        '803280': '保险资金',
+                        '803290': 'QFII持股',
+                        '803300': 'RQFII持股',
+                        '803310': '外资持股',
+                        '803320': '股东户数',
+                        '803330': '筹码集中度',
+                        '803340': '人均持股',
+                        '803350': '户均持股',
+                        '803360': '股权质押',
+                        '803370': '限售解禁',
+                        '803380': '高管持股',
+                        '803390': '高管增减持',
+                        '803400': '股东增减持',
+                        '803410': '大宗交易',
+                        '803420': '龙虎榜',
+                        '803430': '融资余额',
+                        '803440': '融券余额',
+                        '803450': '融资融券余额',
+                        '803460': '两融余额',
+                        '803470': '沪市两融余额',
+                        '803480': '深市两融余额',
+                        '803490': '两融标的',
+                        '803500': '融资买入',
+                        '803510': '融券卖出',
+                        '803520': '融资偿还',
+                        '803530': '融券偿还',
+                        '803540': '融资净买入',
+                        '803550': '融券净卖出',
+                        '803560': '两融差额',
+                        '803570': '融资融券差额',
+                        '803580': '两融余额占比',
+                        '803590': '融资余额占比',
+                        '803600': '融券余额占比',
+                        '803610': '融资买入额',
+                        '803620': '融券卖出量',
+                        '803630': '融资偿还额',
+                        '803640': '融券偿还量',
+                        '803650': '融资净买入额',
+                        '803660': '融券净卖出量',
+                        '803670': '两融交易金额',
+                        '803680': '两融交易占比',
+                        '803690': '融资交易占比',
+                        '803700': '融券交易占比',
+                        '803710': '融资融券标的',
+                        '803720': '融资融券余额',
+                        '803730': '两融余额',
+                        '803740': '融资余额',
+                        '803750': '融券余额',
+                        '803760': '融资买入',
+                        '803770': '融券卖出',
+                        '803780': '融资偿还',
+                        '803790': '融券偿还',
+                        '803800': '融资净买入',
+                        '803810': '融券净卖出',
+                        '803820': '两融差额',
+                        '803830': '融资融券差额',
+                        '803840': '两融余额占比',
+                        '803850': '融资余额占比',
+                        '803860': '融券余额占比',
+                        '803870': '融资买入额',
+                        '803880': '融券卖出量',
+                        '803890': '融资偿还额',
+                        '803900': '融券偿还量',
+                        '803910': '融资净买入额',
+                        '803920': '融券净卖出量',
+                        '803930': '两融交易金额',
+                        '803940': '两融交易占比',
+                        '803950': '融资交易占比',
+                        '803960': '融券交易占比',
+                        '803970': '融资融券标的',
+                        '803980': '融资融券余额',
+                        '803990': '两融余额'
+                    };
+                    
+                    // 遍历题材分组
+                    Object.keys(otherStocks.theme_groups).forEach(themeId => {
+                        const group = otherStocks.theme_groups[themeId];
+                        const themeName = themeIdToName[themeId] || themeId;
+                        console.log(`处理题材分组: ${themeId} (${themeName}), 包含 ${Array.isArray(group) ? group.length : (group.stocks ? group.stocks.length : 0)} 只股票`);
+                        
+                        // 处理两种格式：直接是股票数组或包含stocks字段的对象
+                        const stocks = Array.isArray(group) ? group : (group.stocks || []);
+                        
+                        // 将题材分组中的股票转换为应用格式
+                        const formattedStocks = stocks.map(stockCode => {
+                            // 如果是字符串，说明只有股票代码，需要从stocks数组中查找完整信息
+                            const stock = typeof stockCode === 'string' ? otherStocks.stocks.find(s => s.code === stockCode) : stockCode;
+                            if (!stock) return null;
+                            
+                            return {
+                                id: `other_${stock.code}_${Date.now()}`,
+                                name: stock.name.slice(0,4),
+                                code: stock.code,
+                                amount: stock.amount || stock.trade_amount || 0,
+                                gain: stock.change_pct || stock.gain || 0,
+                                // 使用后端提供的涨速数据，优先使用speed，其次是change_rate_1min
+                                speed: parseFloat(stock.speed || stock.change_rate_1min || 0),
+                                capitalType: stock.capitalType === 'A' ? 0 : 1,
+                                // 使用题材名称作为主题
+                                theme: themeName,
+                                // 保存所有题材信息
+                                themes: Array.isArray(stock.themes) ? stock.themes : [themeName],
+                                floor: 0, // 其他个股的板数为0
+                                category: 'other',
+                                // 保存筛选分数用于排序或显示
+                                screening_score: parseFloat(stock.screening_score || 0)
+                            };
+                        });
+                        
+                        // 过滤掉null值
+                        const validStocks = formattedStocks.filter(stock => stock !== null);
+                        
+                        // 使用addStock方法将新数据添加到现有数据中
+                        validStocks.forEach(stock => {
+                            this.addStock(stock);
+                        });
+                    });
+                } else {
+                    // 备用方案：检查是否是包含stocks字段的对象，如果是则提取stocks数组
+                    const stocksArray = otherStocks && typeof otherStocks === 'object' && 'stocks' in otherStocks ? otherStocks.stocks : otherStocks;
+                    
+                    if (!Array.isArray(stocksArray)) return;
+                    
+                    console.log('处理其他个股数据:', stocksArray.length, '条');
+                    console.log('其他个股数据结构:', otherStocks);
+                    
+                    // 将其他个股数据转换为应用格式并添加到数据中
+                    const formattedStocks = stocksArray.map(stock => ({
+                        id: `other_${stock.code}_${Date.now()}`,
+                        name: stock.name.slice(0,4),
+                        code: stock.code,
+                        amount: stock.amount || stock.trade_amount || 0,
+                        gain: stock.change_pct || stock.gain || 0,
+                        // 使用后端提供的涨速数据，优先使用speed，其次是change_rate_1min
+                        speed: parseFloat(stock.speed || stock.change_rate_1min || 0),
+                        capitalType: stock.capitalType === 'A' ? 0 : 1,
+                        // 使用themes数组的第一个元素作为主题，如果没有则使用plate或theme
+                        theme: (Array.isArray(stock.themes) && stock.themes.length > 0) ? stock.themes[0] : stock.plate || stock.theme || '其他',
+                        // 保存所有题材信息
+                        themes: Array.isArray(stock.themes) ? stock.themes : [stock.plate || stock.theme || '其他'],
+                        floor: 0, // 其他个股的板数为0
+                        category: 'other',
+                        // 保存筛选分数用于排序或显示
+                        screening_score: parseFloat(stock.screening_score || 0)
+                    }));
+                    
+                    // 使用addStock方法将新数据添加到现有数据中
+                    formattedStocks.forEach(stock => {
+                        this.addStock(stock);
+                    });
                 }
                 
                 // 更新显示
@@ -2301,7 +2695,7 @@
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
                             gain: stock.change_pct || 0,
-                            speed: stock.change_rate_1min*100 || 0,
+                            speed: stock.change_rate_1min || 0,
                             capitalType: 0,
                             theme: stock.plate || '其他',
                             floor: 1,
@@ -2467,6 +2861,7 @@
                         
                         // 更新涨速
                         if (update.change_rate_1min !== undefined) {
+                            // 涨速不需要乘以100，直接使用原始值
                             const newSpeed = toNumber(update.change_rate_1min);
                             if (newSpeed !== stock.speed) {
                                 stock.speed = newSpeed;
@@ -2526,6 +2921,32 @@
                                     newThemeData.stocks.push(stock);
                                 }
                             }
+                            
+                            // 更新首板股票的其他字段，确保hover弹出框数据完整
+                            if (update.name !== undefined && update.name !== stock.name) {
+                                stock.name = update.name;
+                                stockChanged = true;
+                            }
+                            
+                            if (update.capital_type !== undefined && update.capital_type !== stock.capitalType) {
+                    stock.capitalType = update.capital_type;
+                    stockChanged = true;
+                }
+                // 兼容capitalType字段（如果数据源直接提供capitalType）
+                if (update.capitalType !== undefined && update.capitalType !== stock.capitalType) {
+                    stock.capitalType = update.capitalType;
+                    stockChanged = true;
+                }
+                            
+                            if (update.screening_score !== undefined && update.screening_score !== stock.screening_score) {
+                                stock.screening_score = update.screening_score;
+                                stockChanged = true;
+                            }
+                            
+                            if (update.themes !== undefined && update.themes !== stock.themes) {
+                                stock.themes = update.themes;
+                                stockChanged = true;
+                            }
                         }
                         
                         if (stockChanged) {
@@ -2546,6 +2967,57 @@
                             this.updateStockDisplay(stock);
                             console.log('📈 更新股票数据:', stock.code, update);
                         }
+                    } else {
+                        // 股票不存在，创建新股票
+                        console.log('➕ 新增股票:', stockCode);
+                        
+                        // 确保是数字类型
+                        const toNumber = (value) => {
+                            if (typeof value === 'string') {
+                                return parseFloat(value);
+                            }
+                            return typeof value === 'number' ? value : 0;
+                        };
+                        
+                        // 创建新股票
+                        const newStock = {
+                            id: `stock_${stockCode}`,
+                            name: update.name ? update.name.slice(0,4) : '未知',
+                            code: stockCode,
+                            amount: toNumber(update.trade_amount || update.amount || 0),
+                            gain: toNumber(update.change_pct || 0), // 直接使用原始值
+                            speed: toNumber(update.change_rate_1min || 0), // 直接使用原始值
+                            capitalType: update.capitalType === 'A' ? 0 : 1,
+                            theme: update.plate || '其他',
+                            floor: 0, // 新增股票默认板数为0
+                            category: 'other' // 归类为other
+                        };
+                        
+                        // 添加到股票列表
+                        this.data.stocks.push(newStock);
+                        
+                        // 确保主题存在
+                        if (!this.data.themes.has(newStock.theme)) {
+                            this.data.themes.set(newStock.theme, { name: newStock.theme, stocks: [] });
+                        }
+                        
+                        // 获取主题数据
+                        const themeData = this.data.themes.get(newStock.theme);
+                        
+                        // 检查股票是否已经在主题中
+                const themeStockIndex = themeData.stocks.findIndex(s => s.code === newStock.code);
+                if (themeStockIndex === -1) {
+                    // 添加到主题股票列表
+                    themeData.stocks.push(newStock);
+                } else {
+                    // 更新主题中的股票数据
+                    themeData.stocks[themeStockIndex] = newStock;
+                    console.log('🔄 更新主题中的股票数据:', newStock.code);
+                }
+                        
+                        // 重新渲染主题表格
+                        this.batchUpdate();
+                        console.log('✅ 新增股票成功:', newStock.code);
                     }
                 });
                 
@@ -2577,20 +3049,64 @@
                     stock.floor = 1; // 设置为1板
                     stock.category = 'other'; // 首板票归类为other
                     
-                    // 更新涨跌幅为正确的百分比形式
+                    // 更新涨跌幅
                     if (stockData.change_pct !== undefined) {
-                        stock.gain = toNumber(stockData.change_pct * 100);
+                        stock.gain = toNumber(stockData.change_pct);
                     }
+                    
+                    // 更新涨速
+                    if (stockData.change_rate_1min !== undefined) {
+                        stock.speed = toNumber(stockData.change_rate_1min);
+                    }
+                    
+                    // 更新成交额
+                    if (stockData.trade_amount !== undefined) {
+                        stock.amount = toNumber(stockData.trade_amount);
+                    }
+                    
+                    // 更新2分钟成交额
+                    if (stockData.amount_2min !== undefined) {
+                        stock.amount_2min = toNumber(stockData.amount_2min);
+                    }
+                    
+                    // 更新主题
+                    if (stockData.plate !== undefined) {
+                        stock.theme = stockData.plate;
+                    }
+                    
+                    // 更新其他可能的字段
+                    if (stockData.name !== undefined) {
+                        stock.name = stockData.name;
+                    }
+                    if (stockData.capitalType !== undefined) {
+                        stock.capitalType = toNumber(stockData.capitalType);
+                    }
+                    if (stockData.screening_score !== undefined) {
+                        stock.screening_score = toNumber(stockData.screening_score);
+                    }
+                    // 兼容themes字段（如果数据源使用themes数组）
+                    if (stockData.themes !== undefined) {
+                        stock.themes = Array.isArray(stockData.themes) ? stockData.themes : [stockData.themes];
+                    }
+                    
+                    // 确保弹出框相关字段有值（重要修复）
+                    if (!stock.themes) {
+                        stock.themes = [stock.theme || '热门'];
+                    }
+                    if (!stock.capitalType) {
+                        stock.capitalType = 3; // 首板票默认资本类型
+                    }
+                    
                     console.log('🔄 更新现有股票为1板:', stock.code);
                 } else {
                     // 创建新的首板票数据
                     stock = {
-                        id: `stock_${stockData.code}_${Date.now()}`,
+                        id: `stock_${stockData.code}`,
                         name: stockData.name,
                         code: stockData.code,
                         amount: toNumber(stockData.trade_amount || 0),
-                        gain: toNumber(stockData.change_pct*100 || 0),
-                        speed: toNumber(stockData.change_rate_1min*100 || 0),
+                        gain: toNumber(stockData.change_pct || 0),
+                        speed: toNumber(stockData.change_rate_1min || 0),
                         capitalType: 3, // 首板票默认资本类型为3（其他）
                         theme: stockData.plate || '热门',
                         floor: 1, // 1板
@@ -2620,49 +3136,28 @@
                     themeData.stocks[themeStockIndex] = stock;
                 }
                 
+                // 更新DOM显示，确保弹出框数据也更新
+                this.updateStockDisplay(stock);
+                
                 // 重新渲染主题表格
                 this.batchUpdate();
             }
             
             // 更新单个股票的DOM显示
             updateStockDisplay(stock) {
-                const stockElement = this.stockCache.get(stock.id);
-                if (!stockElement) return;
+                // 查找所有包含该股票的DOM元素
+                const stockElements = document.querySelectorAll(`[id*="${stock.code}"]`);
                 
-                // 更新涨幅
-                const gainElement = stockElement.querySelector('.stock-gain');
-                if (gainElement) {
-                    const gainText = stock.gain >= 0 ? '+' : '';
-                    gainElement.textContent = `${gainText}${stock.gain.toFixed(1)}%`;
-                }
+                if (stockElements.length === 0) return;
                 
-                // 更新涨速
-                const speedElement = stockElement.querySelector('.stock-speed');
-                if (speedElement) {
-                    const speedText = stock.speed >= 0 ? '+' : '';
-                    speedElement.textContent = `${speedText}${stock.speed.toFixed(1)}%`;
-                }
-                
-                // 更新成交额
-                const amountElement = stockElement.querySelector('.stock-amount');
-                if (amountElement) {
-                    amountElement.textContent = this.formatAmount(stock.amount);
-                }
-                
-                // 更新2分钟成交额（如果有）
-                const amount2minElement = stockElement.querySelector('.stock-amount-2min');
-                if (amount2minElement && stock.amount_2min !== undefined) {
-                    amount2minElement.textContent = this.formatAmount(stock.amount_2min);
-                }
-                
-                // 更新闪烁效果
-                const blinkClass = this.getBlinkClass(stock.speed);
-                // 移除所有闪烁类
-                stockElement.classList.remove('blink-slow', 'blink-medium', 'blink-fast', 'blink-very-fast');
-                // 添加当前应该有的闪烁类
-                if (blinkClass) {
-                    stockElement.classList.add(blinkClass);
-                }
+                // 更新所有找到的股票元素
+                stockElements.forEach(stockElement => {
+                    // 更新缓存
+                    this.stockCache.set(stock.id, stockElement);
+                    
+                    // 关键修复：调用updateStockElement方法更新颜色和所有样式
+                    this.updateStockElement(stock, stockElement);
+                });
             }
             
             // 格式化金额显示

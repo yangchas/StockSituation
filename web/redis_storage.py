@@ -91,94 +91,27 @@ class RedisStorageManager:
             Dict: 包含高级指标的字典
         """
         try:
-            import json
-            
-            # 先尝试使用C++存储的格式
-            # key = f"stock:quote:{symbol}"
-            # stock_data = self.redis.hgetall(key)
-            
-            # # 如果找不到，从stock:volatile_pool中查找
-            # if not stock_data:
-            # 从stock:volatile_pool中查找对应股票
-            volatile_pool_key = "stock:volatile_pool"
-            
-            # 优化查询方式：使用zrevrange获取最近的数据，减少遍历数量
-            recent_volatile_stocks = self.redis.zrevrange(volatile_pool_key, 0, 100)  # 只检查最近的100条数据
-            stock_data={}
-            
-            for stock_json in recent_volatile_stocks:
-                try:
-                    # 确保股票JSON数据是字符串格式，并处理编码问题
-                    if isinstance(stock_json, bytes):
-                        stock_json = stock_json.decode('utf-8', errors='replace')
-                    
-                    # 解析JSON数据
-                    stock_info = json.loads(stock_json)
-                      
-                    # 检查股票代码是否匹配（先快速匹配，避免不必要的base64解码）
-                    if stock_info.get('symbol') != symbol:
-                        continue
-                    
-                    # 解码base64字段
-                    if 'name_b64' in stock_info:
-                        name_bytes = base64.b64decode(stock_info['name_b64'])
-                        stock_info['name'] = name_bytes.decode('utf-8')
-                        del stock_info['name_b64']
-                    
-                    if 'reason_b64' in stock_info:
-                        reason_bytes = base64.b64decode(stock_info['reason_b64'])
-                        stock_info['reason'] = reason_bytes.decode('utf-8')
-                        del stock_info['reason_b64']
-                    
-                    # 转换字段名以匹配预期格式
-                    stock_data = {
-                        'price': str(stock_info.get('price', 0)),
-                        'change_pct': str(stock_info.get('change', 0)),
-                        'amount': str(stock_info.get('amount', 0)),
-                        'timestamp': str(stock_info.get('timestamp', 0)),
-                        'name': stock_info.get('name', ''),
-                        'large_net': str(stock_info.get('large_net_5min', 0))
-                    }
-                    break  # 找到后立即退出循环
-                except Exception as e:
-                    logger.error(f"解析stock:volatile_pool数据错误: {e}")
-                    continue
+            # 使用C++存储的格式
+            key = f"stock:quote:{symbol}"
+            stock_data = self.redis.hgetall(key)
             
             if not stock_data:
                 return {}
             
             # 转换数据类型
             indicators = {}
-            
-            # 如果是从stock:volatile_pool获取的（字典格式）
-            if isinstance(stock_data, dict):
-                for field, value in stock_data.items():
-                    # 转换数据类型
-                    field_str = str(field)
-                    value_str = str(value)
-                    
-                    # 根据字段名转换数据类型
-                    if field_str in ['price', 'change_pct', 'change_rate_1min']:
-                        indicators[field_str] = float(value_str) if value_str else 0.0
-                    elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
-                        # amount_2min 可能是浮点数，但这里按整数处理，如果需要可单独处理
-                        indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
-                    else:
-                        indicators[field_str] = value_str
-            else:  # 原始的字节格式
-                for field, value in stock_data.items():
-                    # 使用errors='replace'处理无法解码的字符
-                    field_str = field.decode('utf-8', errors='replace') if isinstance(field, bytes) else field
-                    value_str = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else str(value)
-                    
-                    # 根据字段名转换数据类型
-                    if field_str in ['price', 'change_pct', 'change_rate_1min']:
-                        indicators[field_str] = float(value_str) if value_str else 0.0
-                    elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
-                        # amount_2min 可能是浮点数，但这里按整数处理，如果需要可单独处理
-                        indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
-                    else:
-                        indicators[field_str] = value_str
+            for field, value in stock_data.items():
+                field_str = field.decode('utf-8') if isinstance(field, bytes) else field
+                value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
+                
+                # 根据字段名转换数据类型
+                if field_str in ['price', 'change_pct', 'change_rate_1min']:
+                    indicators[field_str] = float(value_str) if value_str else 0.0
+                elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
+                    # amount_2min 可能是浮点数，但这里按整数处理，如果需要可单独处理
+                    indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
+                else:
+                    indicators[field_str] = value_str
             
             # 确保包含所有必需字段，提供默认值
             required_fields = {

@@ -2805,10 +2805,10 @@ async def broadcast_stock_updates():
                                     last = last_data.get(stock_code, {})
                                     # 检查关键指标是否有变化
                                     # 确保所有值都转换为浮点数后再进行比较
-                                    current_change_rate_1min = float(data.get('change_rate_1min', 0))
-                                    last_change_rate_1min = float(last.get('change_rate_1min', 0))
-                                    current_amount_2min = float(data.get('amount_2min', 0))
-                                    last_amount_2min = float(last.get('amount_2min', 0))
+                                    current_change_rate_1min = float(data.get('change_5min', data.get('change_rate_1min', 0)))
+                                    last_change_rate_1min = float(last.get('change_5min', last.get('change_rate_1min', 0)))
+                                    current_amount_2min = float(data.get('amount_5min', data.get('amount_2min', 0)))
+                                    last_amount_2min = float(last.get('amount_5min', last.get('amount_2min', 0)))
                                     current_change_pct = float(data.get('change_pct', 0))
                                     last_change_pct = float(last.get('change_pct', 0))
                                     
@@ -2886,26 +2886,45 @@ async def handle_stock_subscription_websocket(request):
                         if stock_list:
                             logger.info(f"📤 全量推送 {len(stock_list)} 只股票数据")
                             
-                            # 使用集成服务获取股票数据
-                            service = OptimizedIntegratedWebService._instance
-                            
-                            # 获取所有订阅股票的高级指标
-                            if hasattr(service, 'advanced_indicators'):
-                                indicators_dict = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_list)
+                            try:
+                                # 使用全局的service实例获取股票数据
+                                global service
+                                if service is None:
+                                    logger.error("❌ 全局service实例未初始化")
+                                    await ws.send_str(json.dumps({
+                                        'type': 'error',
+                                        'message': '服务未初始化',
+                                        'timestamp': int(time.time())
+                                    }))
+                                    continue
                                 
-                                # 全量推送数据
-                                await ws.send_str(json.dumps({
-                                    'type': 'full_update',
-                                    'data': indicators_dict,
-                                    'timestamp': int(time.time())
-                                }))
-                                
-                                # 更新最后数据记录
-                                subscription_info['last_data'] = indicators_dict
-                            else:
+                                # 获取所有订阅股票的高级指标
+                                if hasattr(service, 'advanced_indicators'):
+                                    indicators_dict = service.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(stock_list)
+                                    
+                                    logger.info(f"📊 获取到的股票指标数据: {len(indicators_dict)}")
+                                    
+                                    # 全量推送数据
+                                    await ws.send_str(json.dumps({
+                                        'type': 'full_update',
+                                        'data': indicators_dict,
+                                        'timestamp': int(time.time())
+                                    }))
+                                    
+                                    # 更新最后数据记录
+                                    subscription_info['last_data'] = indicators_dict
+                                else:
+                                    logger.error("❌ 高级指标服务不可用")
+                                    await ws.send_str(json.dumps({
+                                        'type': 'error',
+                                        'message': '高级指标服务不可用',
+                                        'timestamp': int(time.time())
+                                    }))
+                            except Exception as e:
+                                logger.error(f"❌ 处理订阅请求失败: {e}")
                                 await ws.send_str(json.dumps({
                                     'type': 'error',
-                                    'message': '高级指标服务不可用',
+                                    'message': f'处理订阅请求失败: {str(e)}',
                                     'timestamp': int(time.time())
                                 }))
                         else:

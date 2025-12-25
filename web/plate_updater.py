@@ -607,7 +607,7 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
         self.all_stocks_cache = all_stocks_data
         self.last_all_stocks_update = current_time
         
-        logger.info(f"🔄 批量刷新 {len(all_stocks_data)} 只股票数据")
+        logger.debug(f"🔄 批量刷新 {len(all_stocks_data)} 只股票数据")
         return all_stocks_data
     
     def get_all_plate_metrics_optimized(self) -> List[Dict]:
@@ -856,7 +856,7 @@ class OptimizedEnhancedPlateUpdater(OptimizedPlateUpdater):
             # 5. 批量更新到Redis（一次性）
             self._batch_update_plate_metrics_to_redis(plate_metrics)
             
-            logger.info(f"📊 整合计算完成: {len(plate_metrics)} 个板块")
+            logger.debug(f"📊 整合计算完成: {len(plate_metrics)} 个板块")
             return plate_metrics
             
         except Exception as e:

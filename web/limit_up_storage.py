@@ -144,7 +144,7 @@ class LimitUpTDEngineStorage:
                 VALUES ({', '.join(values)})
                 """
                 
-                print(f"插入SQL: {insert_sql}")
+                # print(f"插入SQL: {insert_sql}")
                 
                 cursor = self.td_service.execute_query(insert_sql)
                 if cursor:
@@ -374,7 +374,7 @@ class ZTBService:
             columns = [
                 '股票代码', '股票简称', '2', '3', '涨停时间', '板块', '封单', '最大封单', 
                 '主力净额', '主力买入', '主力卖出', '成交额', '概念', '实际流通', 
-                '实际换手', '连板天数', '16', '振幅', '连板描述', '板块ID', '21'
+                '实际换手', '连板天数', '16', '振幅', '连板描述', '板块ID', '21','22','23'
             ]
             
             # 创建DataFrame
@@ -1058,7 +1058,7 @@ class IntegratedStockService:
         
         # 更新Redis缓存
         try:
-            self.redis_storage.store_data(cache_key, response_data, 300)  # 5分钟缓存
+            self.redis_storage.store_data(cache_key, response_data, 3600)  # 1小时缓存（与综合视图保持一致）
             logger.info(f"💾 热门股票数据已缓存到Redis: {prev_day}")
         except Exception as e:
             logger.error(f"⚠️ Redis缓存数据失败: {e}")
@@ -1089,20 +1089,13 @@ class IntegratedStockService:
         # 这里需要调用您的历史成交额接口
         # 返回模拟数据
         return [
-            {
-                'code': '000001',
-                'name': '高成交股票1',
-                'amount': 50.5,
-                'plate': '金融',
-                'category': 'core'
-            },
-            {
-                'code': '000002',
-                'name': '高成交股票2',
-                'amount': 42.3,
-                'plate': '科技',
-                'category': 'core'
-            }
+            # {
+            #     'code': '000001',
+            #     'name': '高成交股票1',
+            #     'amount': 50.5,
+            #     'plate': '金融',
+            #     'category': 'core'
+            # },
         ]
     
     async def _get_trending_stocks(self) -> List[Dict]:
@@ -1113,15 +1106,15 @@ class IntegratedStockService:
             logger.info("🔄 开始获取同花顺热榜数据")
             # 创建同花顺API实例
             ths_api = ThsHotListAPI()
-            # 获取同花顺热榜数据
-            logger.info("📞 调用同花顺API获取原始热榜数据")
-            raw_stocks = await ths_api._get_trending_stocks()
+            # 获取同花顺热榜数据（带重试）
+            logger.info("📞 调用同花顺API获取原始热榜数据（带重试）")
+            raw_stocks = await ths_api._get_trending_stocks(max_retries=3, retry_delay=1.0)
             logger.info(f"📊 同花顺原始数据: {len(raw_stocks)} 只股票")
             if raw_stocks:
                 logger.info(f"📋 前5只股票: {[stock.get('name') for stock in raw_stocks[:5]]}")
             
-            logger.info("🔄 调用格式化方法处理热榜数据")
-            ths_stocks = await ths_api.get_formatted_trending_stocks(top_n=50)
+            logger.info("🔄 调用格式化方法处理热榜数据（带重试）")
+            ths_stocks = await ths_api.get_formatted_trending_stocks(top_n=50, max_retries=3, retry_delay=1.0)
             logger.info(f"✅ 格式化后同花顺热榜数据: {len(ths_stocks)} 只股票")
             if ths_stocks:
                 logger.info(f"📋 前5只格式化股票: {[stock.get('name') for stock in ths_stocks[:5]]}")
@@ -1362,7 +1355,8 @@ class IntegratedStockService:
             result = {
                 'stocks': final_stocks,  # 不重复的个股列表，每个有themes数组（仅包含前20的题材）
                 'theme_groups': {  # 每个题材的前20个股代码
-                    theme: [s['code'] for s in top_stocks_by_theme[theme]]
+                    self.web_service.plate_updater.all_plates.get(theme, {}).get('name', theme): 
+                    [s['code'] for s in top_stocks_by_theme[theme]]
                     for theme in top_stocks_by_theme
                 }
             }
@@ -1596,6 +1590,36 @@ class IntegratedStockService:
                 yesterday = self.calendar.get_previous_trade_day(today)
                 # 从TDengine获取昨日涨停票数据
                 yesterday_limit_up_stocks = self.td_storage.query_limit_up_by_date(yesterday)
+                
+                # 如果TDengine中没有数据，调用连板API获取数据并存储
+                if not yesterday_limit_up_stocks:
+                    logger.info(f"📥 TDengine中未找到{yesterday}的连板数据，调用连板API获取")
+                    # 调用ZTBService获取连板数据
+                    all_limit_up = []
+                    for ban_type in ["1", "2", "3", "4", "5"]:
+                        data = self.ztb_service.get_ztb_data(
+                            date_str=yesterday.replace('-', ''), 
+                            ban_type=ban_type, 
+                            count="200"
+                        )
+                        if data:
+                            all_limit_up.extend(data)
+                    
+                    if all_limit_up:
+                        # 存储到TDengine
+                        self.td_storage.store_limit_up_data(yesterday, all_limit_up)
+                        # 缓存到Redis
+                        cache_key = f"limit_up_{yesterday}"
+                        self.redis_storage.store_data(
+                            cache_key, 
+                            all_limit_up, 
+                            expire_seconds=86400  # 24小时
+                        )
+                        logger.info(f"✅ 连板API数据已存储到TDengine和Redis: {yesterday}, 数量: {len(all_limit_up)}")
+                        # 更新本地变量
+                        yesterday_limit_up_stocks = all_limit_up
+                    else:
+                        logger.warning(f"⚠️ 连板API也未获取到{yesterday}的连板数据")
             except Exception as e:
                 logger.error(f"⚠️ 获取昨日涨停票失败: {e}")
             
@@ -1817,14 +1841,14 @@ class IntegratedStockService:
             else:
                 logger.info(f"📤 缓存命中 - 昨日涨停数据: {len(prev_limit_up_result) if prev_limit_up_result else 0}条")
             
-            # 从Redis缓存获取热门股票数据
-            cache_key_hot_stocks = f"cache:comprehensive:hot_stocks:{today}"
+            # 从Redis缓存获取热门股票数据（使用昨日数据）
+            cache_key_hot_stocks = f"cache:comprehensive:hot_stocks:{prev_day}"
             hot_stocks_result = self.redis_storage.get_data(cache_key_hot_stocks)
             
             if not hot_stocks_result:
-                logger.info(f"📥 缓存未命中 - 计算热门股票数据: {today}")
-                hot_stocks_result = await self._get_hot_stocks_data(today)
-                # 缓存1小时
+                logger.info(f"📥 缓存未命中 - 计算热门股票数据: {prev_day}")
+                hot_stocks_result = await self._get_hot_stocks_data(prev_day)
+                # 缓存1小时（与独立接口保持一致）
                 self.redis_storage.store_data(cache_key_hot_stocks, hot_stocks_result, 3600)
             else:
                 logger.info(f"📤 缓存命中 - 热门股票数据: {len(hot_stocks_result.get('data', [])) if hot_stocks_result else 0}条")

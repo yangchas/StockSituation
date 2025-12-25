@@ -28,21 +28,25 @@ class ThsHotListAPI:
         self, 
         stock_type: str = "a",
         period: str = "day",
-        list_type: str = "tech"
+        list_type: str = "tech",
+        max_retries: int = 3,
+        retry_delay: float = 1.0
     ) -> List[Dict]:
         """
-        获取同花顺热榜股票数据
+        获取同花顺热榜股票数据（带重试功能）
         
         Args:
             stock_type: 股票类型，默认为a（A股）
             period: 时间周期，默认为day（日榜）
             list_type: 榜单类型，默认为tech（技术榜单）
+            max_retries: 最大重试次数，默认为3次
+            retry_delay: 重试延迟时间（秒），默认为1秒
             
         Returns:
             List[Dict]: 股票数据列表
             
         Raises:
-            Exception: 当请求失败或返回数据格式异常时抛出
+            Exception: 当所有重试都失败时抛出
         """
         # 构建请求参数
         params = {
@@ -56,53 +60,70 @@ class ThsHotListAPI:
             with open('ths_hotlist_log.txt', 'a', encoding='utf-8') as f:
                 f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
         
-        try:
-            write_log("开始获取同花顺热榜数据")
-            write_log(f"请求参数: {params}")
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                write_log(f"开始获取同花顺热榜数据 (第{attempt + 1}次尝试)")
+                write_log(f"请求参数: {params}")
+                
+                # 创建异步会话
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        self.base_url,
+                        headers=self.headers,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as response:
+                        
+                        write_log(f"同花顺热榜请求URL: {response.url}")
+                        write_log(f"响应状态码: {response.status}")
+                        
+                        # 检查响应状态
+                        if response.status != 200:
+                            raise Exception(f"请求失败，状态码: {response.status}")
+                        
+                        # 解析响应数据
+                        data = await response.json()
+                        write_log(f"完整响应数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
+                        
+                        # 检查返回的数据结构
+                        if not isinstance(data, dict):
+                            raise Exception(f"返回数据格式异常: {data}")
+                        
+                        if data.get("status_code") != 0:
+                            error_msg = data.get("status_msg", "未知错误")
+                            raise Exception(f"接口返回错误: {error_msg}")
+                        
+                        # 提取股票数据
+                        stocks_data = data.get("data", {}).get("stock_list", [])
+                        write_log(f"提取的股票列表: {stocks_data}")
+                        write_log(f"股票列表长度: {len(stocks_data)}")
+                        
+                        if not isinstance(stocks_data, list):
+                            raise Exception("stock_list字段格式不是列表")
+                        
+                        write_log(f"✅ 第{attempt + 1}次尝试成功获取热榜数据")
+                        # 返回股票数据
+                        return stocks_data
+                        
+            except aiohttp.ClientError as e:
+                last_exception = Exception(f"网络请求错误: {str(e)}")
+                write_log(f"❌ 第{attempt + 1}次尝试失败: {str(e)}")
+                
+            except Exception as e:
+                last_exception = Exception(f"获取热榜数据失败: {str(e)}")
+                write_log(f"❌ 第{attempt + 1}次尝试失败: {str(e)}")
             
-            # 创建异步会话
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    self.base_url,
-                    headers=self.headers,
-                    params=params,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    
-                    write_log(f"同花顺热榜请求URL: {response.url}")
-                    write_log(f"响应状态码: {response.status}")
-                    
-                    # 检查响应状态
-                    if response.status != 200:
-                        raise Exception(f"请求失败，状态码: {response.status}")
-                    
-                    # 解析响应数据
-                    data = await response.json()
-                    write_log(f"完整响应数据: {json.dumps(data, ensure_ascii=False, indent=2)}")
-                    
-                    # 检查返回的数据结构
-                    if not isinstance(data, dict):
-                        raise Exception(f"返回数据格式异常: {data}")
-                    
-                    if data.get("status_code") != 0:
-                        error_msg = data.get("status_msg", "未知错误")
-                        raise Exception(f"接口返回错误: {error_msg}")
-                    
-                    # 提取股票数据
-                    stocks_data = data.get("data", {}).get("stock_list", [])
-                    write_log(f"提取的股票列表: {stocks_data}")
-                    write_log(f"股票列表长度: {len(stocks_data)}")
-                    
-                    if not isinstance(stocks_data, list):
-                        raise Exception("stock_list字段格式不是列表")
-                    
-                    # 返回股票数据
-                    return stocks_data
-                    
-        except aiohttp.ClientError as e:
-            raise Exception(f"网络请求错误: {str(e)}")
-        except Exception as e:
-            raise Exception(f"获取热榜数据失败: {str(e)}")
+            # 如果不是最后一次尝试，等待后重试
+            if attempt < max_retries - 1:
+                write_log(f"⏳ 等待{retry_delay}秒后重试...")
+                await asyncio.sleep(retry_delay)
+                # 指数退避策略，每次重试延迟时间加倍
+                retry_delay *= 2
+        
+        # 所有重试都失败
+        write_log(f"❌ 所有{max_retries}次尝试都失败，抛出异常")
+        raise last_exception if last_exception else Exception("获取热榜数据失败")
     
     def _parse_market_code(self, market_code: int) -> str:
         """
@@ -149,72 +170,92 @@ class ThsHotListAPI:
         self, 
         top_n: Optional[int] = None,
         include_tags: bool = True,
-        include_topic: bool = True
+        include_topic: bool = True,
+        max_retries: int = 3,
+        retry_delay: float = 1.0
     ) -> List[Dict]:
         """
-        获取格式化后的热榜股票数据
+        获取格式化后的热榜股票数据（带重试功能）
         
         Args:
             top_n: 返回前N个股票，None表示返回所有
             include_tags: 是否包含标签信息
             include_topic: 是否包含话题信息
+            max_retries: 最大重试次数，默认为3次
+            retry_delay: 重试延迟时间（秒），默认为1秒
             
         Returns:
             List[Dict]: 格式化后的股票数据
         """
-        try:
-            # 获取原始数据
-            stocks = await self._get_trending_stocks()
-            
-            # 如果需要限制数量
-            if top_n is not None and top_n > 0:
-                stocks = stocks[:top_n]
-            
-            # 格式化数据
-            formatted_stocks = []
-            for stock in stocks:
-                # 基础信息
-                formatted_stock = {
-                    "code": stock.get("code", ""),  # 股票代码
-                    "market_code": stock.get("market", 0),  # 市场代码
-                    "market": self._parse_market_code(stock.get("market", 0)),  # 市场名称
-                    "full_code": self._add_market_prefix(stock.get("code", ""), stock.get("market", 0)),  # 带市场前缀的完整代码
-                    "name": stock.get("name", ""),  # 股票名称
-                    "rank": stock.get("display_order", 0),  # 显示排名
-                    "order": stock.get("order", 0),  # 原始排序
-                    "rate": float(stock.get("rate")) if stock.get("rate") is not None else 0.0,  # 热度值
-                    "rise_and_fall": float(stock.get("rise_and_fall")) if stock.get("rise_and_fall") is not None else 0.0,  # 涨跌幅
-                    "hot_rank_chg": stock.get("hot_rank_chg", 0),  # 热度排名变化
-                    "search_cnt": stock.get("search_cnt", 0),  # 搜索次数
-                    "update_time": stock.get("update_time", "")  # 更新时间
-                }
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                # 获取原始数据（带重试）
+                stocks = await self._get_trending_stocks(
+                    max_retries=1,  # 内部方法已经处理重试，这里只调用一次
+                    retry_delay=retry_delay
+                )
                 
-                # 标签信息
-                if include_tags:
-                    tag_info = stock.get("tag", {})
-                    formatted_stock["concept_tags"] = tag_info.get("concept_tag", [])
-                    formatted_stock["popularity_tag"] = tag_info.get("popularity_tag")
+                # 如果需要限制数量
+                if top_n is not None and top_n > 0:
+                    stocks = stocks[:top_n]
                 
-                # 话题信息
-                if include_topic:
-                    topic_info = stock.get("topic")
-                    if topic_info:
-                        formatted_stock["topic"] = {
-                            "code": topic_info.get("topic_code"),
-                            "title": topic_info.get("title"),
-                            "ios_url": topic_info.get("ios_jump_url"),
-                            "android_url": topic_info.get("android_jump_url")
-                        }
-                    else:
-                        formatted_stock["topic"] = None
+                # 格式化数据
+                formatted_stocks = []
+                for stock in stocks:
+                    # 基础信息
+                    formatted_stock = {
+                        "code": stock.get("code", ""),  # 股票代码
+                        "market_code": stock.get("market", 0),  # 市场代码
+                        "market": self._parse_market_code(stock.get("market", 0)),  # 市场名称
+                        "full_code": self._add_market_prefix(stock.get("code", ""), stock.get("market", 0)),  # 带市场前缀的完整代码
+                        "name": stock.get("name", ""),  # 股票名称
+                        "rank": stock.get("display_order", 0),  # 显示排名
+                        "order": stock.get("order", 0),  # 原始排序
+                        "rate": float(stock.get("rate")) if stock.get("rate") is not None else 0.0,  # 热度值
+                        "rise_and_fall": float(stock.get("rise_and_fall")) if stock.get("rise_and_fall") is not None else 0.0,  # 涨跌幅
+                        "hot_rank_chg": stock.get("hot_rank_chg", 0),  # 热度排名变化
+                        "search_cnt": stock.get("search_cnt", 0),  # 搜索次数
+                        "update_time": stock.get("update_time", "")  # 更新时间
+                    }
+                    
+                    # 标签信息
+                    if include_tags:
+                        tag_info = stock.get("tag", {})
+                        formatted_stock["concept_tags"] = tag_info.get("concept_tag", [])
+                        formatted_stock["popularity_tag"] = tag_info.get("popularity_tag")
+                    
+                    # 话题信息
+                    if include_topic:
+                        topic_info = stock.get("topic")
+                        if topic_info:
+                            formatted_stock["topic"] = {
+                                "code": topic_info.get("topic_code"),
+                                "title": topic_info.get("title"),
+                                "ios_url": topic_info.get("ios_jump_url"),
+                                "android_url": topic_info.get("android_jump_url")
+                            }
+                        else:
+                            formatted_stock["topic"] = None
+                    
+                    formatted_stocks.append(formatted_stock)
                 
-                formatted_stocks.append(formatted_stock)
-            
-            return formatted_stocks
-            
-        except Exception as e:
-            print(f"获取格式化热榜数据失败: {str(e)}")
-            return []
+                return formatted_stocks
+                
+            except Exception as e:
+                last_exception = e
+                print(f"第{attempt + 1}次尝试获取格式化热榜数据失败: {str(e)}")
+                
+                # 如果不是最后一次尝试，等待后重试
+                if attempt < max_retries - 1:
+                    print(f"等待{retry_delay}秒后重试...")
+                    await asyncio.sleep(retry_delay)
+                    # 指数退避策略，每次重试延迟时间加倍
+                    retry_delay *= 2
+        
+        # 所有重试都失败
+        print(f"所有{max_retries}次尝试都失败，返回空列表")
+        return []
     
     async def get_stocks_by_concept(
         self, 
