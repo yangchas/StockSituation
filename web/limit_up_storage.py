@@ -1241,6 +1241,41 @@ class IntegratedStockService:
                 logger.info(f"📦 从Redis缓存获取其他个股数据: {cache_key}")
                 return cached_data
             
+            # 获取连板和首板数据用于去重
+            today = datetime.now().strftime('%Y-%m-%d')
+            prev_day = self.calendar.get_previous_trade_day(today)
+            
+            # 获取连板个股代码集合
+            limit_up_codes = set()
+            try:
+                # 从Redis获取昨日涨停数据
+                cache_key_prev_limit_up = f"cache:comprehensive:prev_limit_up:{prev_day}"
+                prev_limit_up_result = self.redis_storage.get_data(cache_key_prev_limit_up)
+                if not prev_limit_up_result:
+                    prev_limit_up_result = await self._get_enhanced_limit_up(prev_day)
+                
+                if prev_limit_up_result:
+                    for stock in prev_limit_up_result:
+                        code = stock.get('code', '')
+                        if code:
+                            limit_up_codes.add(code)
+                logger.info(f"🔍 获取连板个股代码: {len(limit_up_codes)}只")
+            except Exception as e:
+                logger.warning(f"⚠️ 获取连板数据失败: {e}")
+            
+            # 获取首板个股代码集合
+            first_limit_codes = set()
+            try:
+                # 获取今日首板票（从异动数据中筛选）
+                real_first_limit_stocks = self.redis_storage.get_first_limit_up_stocks()
+                for stock in real_first_limit_stocks:
+                    code = stock.get('symbol', '')
+                    if code:
+                        first_limit_codes.add(code)
+                logger.info(f"🔍 获取首板个股代码: {len(first_limit_codes)}只")
+            except Exception as e:
+                logger.warning(f"⚠️ 获取首板数据失败: {e}")
+            
             # 缓存不存在，执行原逻辑
             # 1. 获取核心个股（涨停、核心）的题材（1对1）
             core_stocks = await self._get_core_and_limit_up_stocks()
@@ -1281,7 +1316,6 @@ class IntegratedStockService:
                     if code not in stock_to_data:
                         # 获取高级指标
                         advanced_data = self._get_stock_advanced_data(code)
-                        
                         # 检查筛选条件
                         if 0:#not self._check_stock_conditions(stock, advanced_data, min_speed, min_amount):
                             stock_to_data[code] = None  # 标记为不符合条件
@@ -1308,17 +1342,32 @@ class IntegratedStockService:
                             'screening_score': stock_to_data[code]['screening_score']
                         })
             
-            # 5. 每个题材只取前20个高评分个股
+            # 5. 每个题材取高评分个股，根据题材热度动态调整数量
             top_stocks_by_theme = {}
             for theme, stocks_list in theme_to_stocks.items():
-                # 按筛选分数排序，取前20
+                # 计算题材热度：涨停个股个数
+                theme_stock_codes = [stock['code'] for stock in stocks_list]
+                theme_limit_up_count = len([code for code in theme_stock_codes if code in limit_up_codes])
+                
+                # 根据涨停个数动态调整取股数量
+                if theme_limit_up_count >= 4:  # 涨停个数>=4，热门题材
+                    take_count = 60  # 取40个
+                    logger.info(f"🔥 热门题材 '{theme}' 涨停{theme_limit_up_count}只，取{take_count}只个股")
+                elif theme_limit_up_count >= 1:  # 涨停个数>=1，较热门
+                    take_count = 50  # 取30个
+                    logger.info(f"🔸 较热门题材 '{theme}' 涨停{theme_limit_up_count}只，取{take_count}只个股")
+                else:  # 无涨停个股，普通题材
+                    take_count = 40  # 取20个
+                    logger.info(f"📊 普通题材 '{theme}' 无涨停个股，取{take_count}只个股")
+                
+                # 按筛选分数排序，取动态数量的个股
                 sorted_stocks = sorted(stocks_list, 
                                     key=lambda x: x['screening_score'], 
-                                    reverse=True)[:20]
+                                    reverse=True)[:take_count]
                 top_stocks_by_theme[theme] = sorted_stocks
             
             # 6. 构建最终的个股列表（去重），并确定每个股票的themes字段
-            # 统计每个股票出现在哪些题材的前20中
+            # 统计每个股票出现在哪些题材的前40中
             stock_to_qualified_themes = {}
             
             for theme, stocks_list in top_stocks_by_theme.items():
@@ -1333,15 +1382,58 @@ class IntegratedStockService:
                         stock_to_qualified_themes[code] = []
                     stock_to_qualified_themes[code].append(theme_name)
             
-            # 7. 构建最终股票列表
+            # 7. 构建最终股票列表（去重处理）
             final_stocks = []
+            skipped_limit_up_count = 0
+            
             for code, qualified_themes in stock_to_qualified_themes.items():
                 if code not in stock_to_data or stock_to_data[code] is None:
                     continue
                 
+                # 动态调整筛选策略：当涨停个股过多时，适当放宽筛选条件
+                # 计算当前题材中涨停个股的比例
+                total_candidates = len(stock_to_qualified_themes)
+                if total_candidates > 0:
+                    limit_up_ratio = len(limit_up_codes) / total_candidates
+                else:
+                    limit_up_ratio = 0
+                
+                # 如果涨停个股比例过高（超过50%），适当放宽筛选条件
+                if code in limit_up_codes:
+                    skipped_limit_up_count += 1
+                    
+                    # 当涨停个股比例过高时，保留部分高评分的涨停个股
+                    if limit_up_ratio > 0.5:
+                        # 只保留筛选分数排名前30%的涨停个股
+                        stock_info = stock_to_data[code]
+                        screening_score = stock_info['screening_score']
+                        
+                        # 计算该个股在所有候选股中的分数排名
+                        all_scores = [stock_to_data[c]['screening_score'] 
+                                    for c in stock_to_qualified_themes.keys() 
+                                    if c in stock_to_data and stock_to_data[c] is not None]
+                        all_scores_sorted = sorted(all_scores, reverse=True)
+                        
+                        if len(all_scores_sorted) > 0:
+                            score_rank = all_scores_sorted.index(screening_score) + 1
+                            rank_percentile = score_rank / len(all_scores_sorted)
+                            
+                            # 保留排名前30%的涨停个股
+                            if rank_percentile <= 0.3:
+                                logger.debug(f"🔍 保留高评分涨停个股: {code}, 排名: {score_rank}/{len(all_scores_sorted)}")
+                            else:
+                                logger.debug(f"🔍 跳过低评分涨停个股: {code}")
+                                continue
+                        else:
+                            continue
+                    else:
+                        # 正常情况：跳过连板票
+                        logger.debug(f"🔍 跳过连板个股: {code}")
+                        continue
+                
                 stock_info = stock_to_data[code]
                 
-                # 格式化股票数据，只包含该股票出现在前20的题材
+                # 格式化股票数据，只包含该股票出现在前40的题材
                 formatted_stock = self._format_stock_with_qualified_themes(
                     stock_info['stock_data'],
                     stock_info['advanced_data'],
@@ -1351,14 +1443,87 @@ class IntegratedStockService:
                 
                 final_stocks.append(formatted_stock)
             
-            # 8. 返回数据
+            logger.info(f"📊 筛选统计: 总候选股{len(stock_to_qualified_themes)}只, 涨停股{len(limit_up_codes)}只, 跳过{skipped_limit_up_count}只, 最终保留{len(final_stocks)}只")
+            
+            # 确保有足够的股票数据
+            if len(final_stocks) < 10:  # 如果最终个股数量太少
+                logger.warning(f"⚠️ 最终股票列表数量过少: {len(final_stocks)}只，将放宽筛选条件")
+                
+                # 放宽条件：保留更多涨停个股
+                final_stocks = []
+                for code, qualified_themes in stock_to_qualified_themes.items():
+                    if code not in stock_to_data or stock_to_data[code] is None:
+                        continue
+                    
+                    # 放宽筛选：只跳过评分较低的涨停个股
+                    if code in limit_up_codes:
+                        stock_info = stock_to_data[code]
+                        screening_score = stock_info['screening_score']
+                        
+                        # 计算该个股在所有候选股中的分数排名
+                        all_scores = [stock_to_data[c]['screening_score'] 
+                                    for c in stock_to_qualified_themes.keys() 
+                                    if c in stock_to_data and stock_to_data[c] is not None]
+                        all_scores_sorted = sorted(all_scores, reverse=True)
+                        
+                        if len(all_scores_sorted) > 0:
+                            score_rank = all_scores_sorted.index(screening_score) + 1
+                            rank_percentile = score_rank / len(all_scores_sorted)
+                            
+                            # 放宽条件：保留排名前50%的涨停个股
+                            if rank_percentile > 0.5:
+                                logger.debug(f"🔍 放宽条件跳过低评分涨停个股: {code}")
+                                continue
+                        else:
+                            continue
+                    
+                    stock_info = stock_to_data[code]
+                    
+                    formatted_stock = self._format_stock_with_qualified_themes(
+                        stock_info['stock_data'],
+                        stock_info['advanced_data'],
+                        qualified_themes,
+                        stock_info['screening_score']
+                    )
+                    
+                    final_stocks.append(formatted_stock)
+                    
+                    # 如果已经达到最小数量要求，可以提前结束
+                    if len(final_stocks) >= 20:
+                        break
+            
+            # 8. 确保theme_groups中的个股都能在stocks中找到对应数据
+            # 构建有效的theme_groups，只包含最终stocks中存在的个股
+            valid_theme_groups = {}
+            for theme, theme_stocks in top_stocks_by_theme.items():
+                theme_name = self.web_service.plate_updater.all_plates.get(theme, {}).get('name', theme)
+                valid_stocks_in_theme = []
+                
+                # 只添加在final_stocks中存在的个股，并且应用相同的筛选条件
+                # 根据题材热度动态调整取股数量
+                theme_take_count = min(len(theme_stocks), 30)  # 最多取30个
+                
+                for stock_info in theme_stocks[:theme_take_count]:
+                    code = stock_info['code']
+                    
+                    # 应用与stocks相同的筛选条件：跳过连板票
+                    if code in limit_up_codes:
+                        continue
+                    
+                    # 检查该个股是否在final_stocks中
+                    if any(stock['code'] == code for stock in final_stocks):
+                        valid_stocks_in_theme.append(code)
+                
+                # 去重处理
+                valid_stocks_in_theme = list(dict.fromkeys(valid_stocks_in_theme))
+                
+                if valid_stocks_in_theme:  # 只添加有有效个股的题材
+                    valid_theme_groups[theme_name] = valid_stocks_in_theme
+            
+            # 返回数据
             result = {
                 'stocks': final_stocks,  # 不重复的个股列表，每个有themes数组（仅包含前20的题材）
-                'theme_groups': {  # 每个题材的前20个股代码
-                    self.web_service.plate_updater.all_plates.get(theme, {}).get('name', theme): 
-                    [s['code'] for s in top_stocks_by_theme[theme]]
-                    for theme in top_stocks_by_theme
-                }
+                'theme_groups': valid_theme_groups  # 每个题材的前20个股代码（去重处理），确保与stocks对应
             }
             
             # 将结果存入Redis，设置过期时间为5分钟
@@ -1377,11 +1542,19 @@ class IntegratedStockService:
         """
         code = stock.get('code', '')
         
-        # 获取基础信息
+        # 获取基础信息 - 修复股票名称获取逻辑
         name = stock.get('name', '')
         if not name:
+            # 尝试从Redis获取股票数据
             redis_data = self.redis_storage.get_stock_data(code)
-            name = redis_data.get('name', '') if redis_data else ''
+            if redis_data:
+                name = redis_data.get('name', '')
+                # 如果仍然没有名称，使用股票代码作为名称
+                if not name:
+                    name = f"股票{code}"
+            else:
+                # Redis中没有数据，使用股票代码作为名称
+                name = f"股票{code}"
         
         # 计算指标
         change_pct = stock.get('change_pct', 0)
@@ -1747,7 +1920,7 @@ class IntegratedStockService:
                     
                     # 确保related_theme始终是字符串
                     if isinstance(related_theme, list):
-                        related_theme = related_theme[0] if related_theme else ''
+                        related_theme = related_theme[1] if related_theme else ''
                     
                     # 通过板块中文名称查找对应的板块ID
                     if related_theme:
@@ -1882,16 +2055,53 @@ class IntegratedStockService:
                 logger.error(f"⚠️ 获取首板数据异常: {e}")
                 first_limit_data = []
             
-            # 整合数据 - limit_up_stocks使用昨日的涨停数据，符合用户期望
+            # 去重逻辑：确保不同区域的个股不重复
+            # 1. 首板数据 = 今日涨停个股 - 昨日连板个股
+            # 2. 热门个股 = 同花顺热门个股 - 首板个股 - 连板个股
+            
+            # 获取连板个股代码集合
+            limit_up_codes = set()
+            if prev_limit_up_result:
+                for stock in prev_limit_up_result:
+                    code = stock.get('code', '')
+                    if code:
+                        limit_up_codes.add(code)
+            
+            # 获取首板个股代码集合
+            first_limit_codes = set()
+            for stock in first_limit_data:
+                code = stock.get('code', '')
+                if code:
+                    first_limit_codes.add(code)
+            
+            # 获取热门个股数据
+            hot_stocks_data = hot_stocks_result.get('data', []) if hot_stocks_result else []
+            
+            # 去重处理：热门个股去除与首板、连板重复的个股
+            filtered_hot_stocks = []
+            for stock in hot_stocks_data:
+                code = stock.get('code', '')
+                if code and code not in first_limit_codes and code not in limit_up_codes:
+                    filtered_hot_stocks.append(stock)
+            
+            # 首板数据需要去除昨日连板的个股（首板 = 今日涨停 - 昨日连板）
+            filtered_first_limit_data = []
+            for stock in first_limit_data:
+                code = stock.get('code', '')
+                if code and code not in limit_up_codes:
+                    filtered_first_limit_data.append(stock)
+            
+            # 整合数据 - 确保不同区域个股不重复
             comprehensive_data = {
                 'date': today,  # 使用今日日期，修复之前的日期错误
                 'limit_up_stocks': prev_limit_up_result if prev_limit_up_result else [],
-                'first_limit_stocks': first_limit_data,
-                'hot_stocks': hot_stocks_result.get('data', []) if hot_stocks_result else [],
+                'first_limit_stocks': filtered_first_limit_data,
+                'hot_stocks': filtered_hot_stocks,
                 'update_time': datetime.now().isoformat()
             }
             
             logger.info(f"✅ 综合数据准备完成，返回连板: {len(comprehensive_data['limit_up_stocks'])}条，首板: {len(comprehensive_data['first_limit_stocks'])}条，热门: {len(comprehensive_data['hot_stocks'])}条")
+            logger.info(f"🔍 去重统计 - 连板个股: {len(limit_up_codes)}只，首板个股: {len(filtered_first_limit_data)}只，热门个股: {len(filtered_hot_stocks)}只")
             
             return web.json_response({
                 'success': True,

@@ -735,6 +735,128 @@
             color: #ffc107;
         }
         
+        /* 模态对话框样式 */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+        }
+        
+        .modal-content {
+            background: rgba(30, 30, 45, 0.95);
+            border: 1px solid #d4af37;
+            border-radius: 8px;
+            padding: 20px;
+            width: 400px;
+            max-width: 90vw;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 1px solid rgba(212, 175, 55, 0.3);
+            padding-bottom: 10px;
+        }
+        
+        .modal-header h3 {
+            margin: 0;
+            color: #d4af37;
+            font-size: 18px;
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            color: #aaa;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .modal-close:hover {
+            color: #d4af37;
+        }
+        
+        .modal-body {
+            margin-bottom: 20px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+        
+        .form-control {
+            width: 100%;
+            padding: 8px 12px;
+            background: rgba(40, 40, 60, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+        
+        .form-control:focus {
+            outline: none;
+            border-color: #d4af37;
+            box-shadow: 0 0 5px rgba(212, 175, 55, 0.3);
+        }
+        
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+        
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: #d4af37;
+            color: #1a1a2e;
+        }
+        
+        .btn-primary:hover {
+            background: #c19b30;
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
         /* ========== 移动端适配 (max-width: 768px) ========== */
         /* 移动端容器 */
         /* 减少动画选项 */
@@ -760,6 +882,13 @@
             <div class="header-info">
                 <span>📊 股票题材分类表 - WebSocket实时版</span>
                 <span class="header-buttons">
+                    <!-- T1进程控制 -->
+                    <span id="t1Status" style="margin-right: 10px; font-size: 12px; color: #aaa;">
+                        T1状态: <span id="t1StatusText">检测中...</span>
+                    </span>
+                    <button class="control-btn" id="t1StartBtn" onclick="t1Controller.startT1()">启动T1</button>
+                    <button class="control-btn" id="t1ReplayBtn" onclick="t1Controller.showReplayDialog()">回放模式</button>
+                    <button class="control-btn" id="t1StopBtn" onclick="t1Controller.stopT1()" style="display: none;">停止T1</button>
                     <button class="control-btn" onclick="stockTable.reconnectWebSocket()">重新连接</button>
                     <button class="toggle-controls" onclick="stockTable.toggleSidePanel()">
                         <span id="panelToggleText">显示侧边栏</span>
@@ -768,6 +897,39 @@
             </div>
         </div>
        
+        <!-- 回放模式对话框 -->
+        <div id="replayDialog" class="modal-overlay" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>🎯 T1回放模式</h3>
+                    <button class="modal-close" onclick="t1Controller.hideReplayDialog()">×</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label for="replayDate">回放日期:</label>
+                        <input type="date" id="replayDate" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label for="replayTime">回放时间:</label>
+                        <input type="time" id="replayTime" class="form-control" value="09:30">
+                    </div>
+                    <div class="form-group">
+                        <label for="replaySpeed">回放速度:</label>
+                        <select id="replaySpeed" class="form-control">
+                            <option value="1">1倍速</option>
+                            <option value="2">2倍速</option>
+                            <option value="5">5倍速</option>
+                            <option value="10">10倍速</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="t1Controller.hideReplayDialog()">取消</button>
+                    <button class="btn btn-primary" onclick="t1Controller.startReplay()">开始回放</button>
+                </div>
+            </div>
+        </div>
+        
         <div class="main-content">
             <div class="chart-container">
                 <!-- 加载状态指示器 -->
@@ -947,7 +1109,7 @@
                             stockTable.handleStockUpdate(data.payload);
                         } else if (data.type === 'incremental_update') {
                             // 增量更新
-                            console.log('📈 收到增量更新:', data.data);
+                            // console.log('📈 收到增量更新:', data.data);
                             stockTable.handleIncrementalUpdate(data.data);
                         } else if (data.type === 'first_limit') {
                             // 首板票推送
@@ -1061,12 +1223,16 @@
                     theme: null
                 };
                 
+                // 涨速超时检查定时器
+                this.speedTimeoutTimer = null;
+                
                 this.init();
             }
             
             init() {
                 this.createTableStructure(); // 创建空的表格结构
                 this.setupEventListeners();
+                this.startSpeedTimeoutCheck(); // 启动涨速超时检查
             }
             
             // 数据解析和处理
@@ -1199,7 +1365,8 @@
                     capitalType: Number(stock.capitalType) || 0,
                     theme: stock.theme || '其他',
                     floor: Number(stock.floor) || 0,
-                    category: stock.category || this.determineCategory(stock)
+                    category: stock.category || this.determineCategory(stock),
+                    lastSpeedUpdate: Date.now() // 添加涨速更新时间戳
                 };
             }
             
@@ -1584,11 +1751,21 @@
                 element.style.backgroundColor = backgroundColor;
                 element.style.color = textColor;
                 
-                // 更新闪烁效果
+                // 更新闪烁效果（添加超时控制）
                 const blinkClass = this.getBlinkClass(stock.speed);
                 element.className = 'stock-item';
-                if (blinkClass) {
+                
+                // 检查涨速是否超过10秒没有更新
+                const currentTime = Date.now();
+                const timeSinceLastUpdate = currentTime - (stock.lastSpeedUpdate || currentTime);
+                const isSpeedTimeout = timeSinceLastUpdate > 10000; // 10秒超时
+                
+                // 只有当涨速有值且未超时时才应用闪烁效果
+                if (blinkClass && stock.speed !== 0 && !isSpeedTimeout) {
                     element.classList.add(blinkClass);
+                } else {
+                    // 移除所有闪烁类
+                    element.classList.remove('blink-slow', 'blink-medium', 'blink-fast', 'blink-very-fast');
                 }
                 
                 // 更新内容 - 直接更新DOM元素，避免重新设置innerHTML移除事件监听器
@@ -1663,6 +1840,38 @@
                 if (element) {
                     element.remove();
                     this.stockCache.delete(stockId);
+                }
+            }
+            
+            // 涨速超时检查
+            startSpeedTimeoutCheck() {
+                // 每2秒检查一次涨速超时状态
+                this.speedTimeoutTimer = setInterval(() => {
+                    this.checkSpeedTimeouts();
+                }, 5000);
+            }
+            
+            checkSpeedTimeouts() {
+                const currentTime = Date.now();
+                let hasTimeoutStocks = false;
+                
+                // 检查所有股票的涨速超时状态
+                this.data.stocks.forEach(stock => {
+                    if (stock.speed !== 0) {
+                        const timeSinceLastUpdate = currentTime - (stock.lastSpeedUpdate || currentTime);
+                        const isSpeedTimeout = timeSinceLastUpdate > 10000; // 10秒超时
+                        
+                        if (isSpeedTimeout) {
+                            // 如果涨速超时，更新显示
+                            this.updateStockDisplay(stock);
+                            hasTimeoutStocks = true;
+                        }
+                    }
+                });
+                
+                // 如果有超时股票，更新统计信息
+                if (hasTimeoutStocks) {
+                    this.updateStats();
                 }
             }
             
@@ -2694,12 +2903,12 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct || 0,
-                            speed: stock.change_rate_1min || 0,
+                            gain: stock.change_pct*100 || 0,  // 统一乘以100转换为百分比
+                            speed: stock.change_rate_1min*100 || 0,  // 统一乘以100转换为百分比
                             capitalType: 0,
                             theme: stock.plate || '其他',
                             floor: 1,
-                            category: 'other'
+                            category: 'first_limit'  // 明确标识为首板
                         });
                     });
                 }
@@ -2722,6 +2931,8 @@
                         });
                     });
                 }
+                
+
                 
                 console.log('转换后的股票数据:', stocks);
                 
@@ -2832,7 +3043,7 @@
             
             // 处理增量更新
             handleIncrementalUpdate(updatedData) {
-                console.log('🔄 处理增量更新:', updatedData);
+                // console.log('🔄 处理增量更新:', updatedData);
                 
                 if (!updatedData || typeof updatedData !== 'object') {
                     console.error('增量更新数据格式错误:', updatedData);
@@ -2865,6 +3076,7 @@
                             const newSpeed = toNumber(update.change_rate_1min);
                             if (newSpeed !== stock.speed) {
                                 stock.speed = newSpeed;
+                                stock.lastSpeedUpdate = Date.now(); // 更新涨速时间戳
                                 stockChanged = true;
                             }
                         }
@@ -2965,7 +3177,7 @@
                             
                             // 更新DOM显示
                             this.updateStockDisplay(stock);
-                            console.log('📈 更新股票数据:', stock.code, update);
+                            // console.log('📈 更新股票数据:', stock.code, update);
                         }
                     } else {
                         // 股票不存在，创建新股票
@@ -2990,7 +3202,8 @@
                             capitalType: update.capitalType === 'A' ? 0 : 1,
                             theme: update.plate || '其他',
                             floor: 0, // 新增股票默认板数为0
-                            category: 'other' // 归类为other
+                            category: 'other', // 归类为other
+                            lastSpeedUpdate: Date.now() // 添加涨速更新时间戳
                         };
                         
                         // 添加到股票列表
@@ -3057,6 +3270,7 @@
                     // 更新涨速
                     if (stockData.change_rate_1min !== undefined) {
                         stock.speed = toNumber(stockData.change_rate_1min);
+                        stock.lastSpeedUpdate = Date.now(); // 更新涨速时间戳
                     }
                     
                     // 更新成交额
@@ -3110,7 +3324,8 @@
                         capitalType: 3, // 首板票默认资本类型为3（其他）
                         theme: stockData.plate || '热门',
                         floor: 1, // 1板
-                        category: 'other' // 归类为other
+                        category: 'other', // 归类为other
+                        lastSpeedUpdate: Date.now() // 添加涨速更新时间戳
                     };
                     
                     // 添加到股票列表
@@ -3171,10 +3386,216 @@
             }
         }
         
+        // T1进程控制器
+        class T1Controller {
+            constructor() {
+                this.statusCheckInterval = null;
+                this.init();
+            }
+            
+            init() {
+                // 页面加载时立即检查T1状态
+                this.checkT1Status();
+                
+                // 优化：设置定时检查T1状态（每30秒，减少频繁请求）
+                this.statusCheckInterval = setInterval(() => {
+                    this.checkT1Status();
+                }, 30000);
+                
+                // 设置默认回放日期为今天
+                const today = new Date().toISOString().split('T')[0];
+                document.getElementById('replayDate').value = today;
+            }
+            
+            async checkT1Status() {
+                try {
+                    const response = await fetch('/api/t1/status');
+                    const status = await response.json();
+                    
+                    this.updateUI(status);
+                    
+                    // 智能优化：如果T1未运行，延长下次检查间隔
+                    if (!status.running) {
+                        // 清除原有的定时器
+                        if (this.statusCheckInterval) {
+                            clearInterval(this.statusCheckInterval);
+                        }
+                        // 设置更长的检查间隔（2分钟）
+                        this.statusCheckInterval = setInterval(() => {
+                            this.checkT1Status();
+                        }, 120000);
+                    } else {
+                        // 如果T1正在运行，保持正常检查间隔（30秒）
+                        if (this.statusCheckInterval) {
+                            clearInterval(this.statusCheckInterval);
+                        }
+                        this.statusCheckInterval = setInterval(() => {
+                            this.checkT1Status();
+                        }, 30000);
+                    }
+                } catch (error) {
+                    console.error('❌ 检查T1状态失败:', error);
+                    this.updateUI({ running: false, error: '连接失败' });
+                }
+            }
+            
+            updateUI(status) {
+                const statusText = document.getElementById('t1StatusText');
+                const startBtn = document.getElementById('t1StartBtn');
+                const replayBtn = document.getElementById('t1ReplayBtn');
+                const stopBtn = document.getElementById('t1StopBtn');
+                
+                if (status.running) {
+                    statusText.innerHTML = `<span style="color: #52c41a;">运行中 (PID: ${status.pid})</span>`;
+                    startBtn.style.display = 'none';
+                    replayBtn.style.display = 'none';
+                    stopBtn.style.display = 'inline-block';
+                } else {
+                    statusText.innerHTML = `<span style="color: #ff4d4f;">未运行</span>`;
+                    startBtn.style.display = 'inline-block';
+                    replayBtn.style.display = 'inline-block';
+                    stopBtn.style.display = 'none';
+                    
+                    if (status.error) {
+                        statusText.innerHTML = `<span style="color: #ff6b6b;">错误: ${status.error}</span>`;
+                    }
+                }
+            }
+            
+            async startT1() {
+                try {
+                    const response = await fetch('/api/t1/start', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            mode: 'live' // 实盘模式
+                        })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        console.log('🚀 T1启动成功:', result.message);
+                        // 优化：延迟3秒后检查状态，避免立即频繁请求
+                        setTimeout(() => {
+                            this.checkT1Status();
+                        }, 3000);
+                    } else {
+                        console.error('❌ T1启动失败:', result.message);
+                        alert('T1启动失败: ' + result.message);
+                    }
+                } catch (error) {
+                    console.error('❌ T1启动请求失败:', error);
+                    alert('T1启动请求失败: ' + error.message);
+                }
+            }
+            
+            showReplayDialog() {
+                document.getElementById('replayDialog').style.display = 'flex';
+            }
+            
+            hideReplayDialog() {
+                document.getElementById('replayDialog').style.display = 'none';
+            }
+            
+            async startReplay() {
+                const date = document.getElementById('replayDate').value;
+                const time = document.getElementById('replayTime').value;
+                const speed = document.getElementById('replaySpeed').value;
+                
+                if (!date) {
+                    alert('请选择回放日期');
+                    return;
+                }
+                
+                if (!time) {
+                    alert('请选择回放时间');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/t1/start', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            mode: 'replay',
+                            replay_date: date,
+                            replay_time: time,
+                            replay_speed: parseInt(speed)
+                        })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        console.log('🎯 T1回放模式启动成功:', result.message);
+                        this.hideReplayDialog();
+                        // 优化：延迟3秒后检查状态，避免立即频繁请求
+                        setTimeout(() => {
+                            this.checkT1Status();
+                        }, 3000);
+                    } else {
+                        console.error('❌ T1回放模式启动失败:', result.message);
+                        alert('T1回放模式启动失败: ' + result.message);
+                    }
+                } catch (error) {
+                    console.error('❌ T1回放模式启动请求失败:', error);
+                    alert('T1回放模式启动请求失败: ' + error.message);
+                }
+            }
+            
+            async stopT1() {
+                if (!confirm('确定要停止T1进程吗？')) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/t1/stop', {
+                        method: 'POST'
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        console.log('⏹️ T1停止成功:', result.message);
+                        // 优化：延迟2秒后检查状态，避免立即频繁请求
+                        setTimeout(() => {
+                            this.checkT1Status();
+                        }, 2000);
+                    } else {
+                        console.error('❌ T1停止失败:', result.message);
+                        alert('T1停止失败: ' + result.message);
+                    }
+                } catch (error) {
+                    console.error('❌ T1停止请求失败:', error);
+                    alert('T1停止请求失败: ' + error.message);
+                }
+            }
+        }
+        
+        // 初始化T1控制器
+        let t1Controller;
+        
         // 初始化股票表格
         let stockTable;
         
         window.addEventListener('load', () => {
+            // 初始化T1控制器
+            t1Controller = new T1Controller();
+            
+            // 为T1控制按钮添加事件监听器
+            document.getElementById('t1StartBtn').addEventListener('click', () => {
+                t1Controller.startT1();
+            });
+            
+            document.getElementById('t1StopBtn').addEventListener('click', () => {
+                t1Controller.stopT1();
+            });
+            
             stockTable = new OptimizedStockTable();
             
             // 从API获取初始数据
@@ -3207,56 +3628,7 @@
         // 暴露全局函数
         window.reconnectWebSocket = reconnectWebSocket;
         
-        // 模拟数据生成函数（仅供测试）
-        window.generateMockData = function(count = 100) {
-            const themes = [
-                '通信', '人工智能', '芯片', '机器人',
-                '房地产', '金融', '消费',
-                '军工', '锂电池', '医药', '汽车', '软件'
-            ];
-            
-            const stocks = [];
-            for (let i = 0; i < count; i++) {
-                const theme = themes[Math.floor(Math.random() * themes.length)];
-                const gain = -30 + Math.random() * 60;
-                const speed = -4 + Math.random() * 8;
-                const amount = 0.5 + Math.random() * 15;
-                const capitalType = Math.floor(Math.random() * 4);
-                
-                let floor = 0;
-                let category;
-                const rand = Math.random();
-                if (rand < 0.15) {
-                    floor = Math.floor(Math.random() * 5) + 2;
-                    category = 'emotion';
-                } else if (rand < 0.25) {
-                    category = 'core';
-                } else {
-                    category = 'other';
-                }
-                
-                stocks.push({
-                    id: `stock_${i}_${Date.now()}`,
-                    name: `股票${i + 1}`,
-                    code: `000${(100 + i) % 900}`,
-                    amount: amount,
-                    gain: gain,
-                    speed: speed,
-                    capitalType: capitalType,
-                    theme: theme,
-                    floor: floor,
-                    category: category
-                });
-            }
-            
-            return {
-                    type: 'full',
-                    payload: {
-                        stocks: stocks,
-                        themes: themes.map(name => ({ name }))
-                    }
-                };
-        };
+
     </script>
     
     <!-- 股票详情面板 -->

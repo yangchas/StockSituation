@@ -3,257 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>实时板块监控系统 - 优化版</title>
+    <title>实时板块监控系统 - 集成优化版</title>
     <style>
-        
-        /* 个股详情面板 */
-        .indicator-tabs {
-            z-index: 999;
-            /* position: absolute; */
-            left: 50px;
-            display: none;
-            gap: 10px;
-            margin-bottom: 8px;
-            padding: 6px;
-            background: rgba(40, 40, 60, 0.6);
-            border-radius: 6px;
-            border: 1px solid rgba(255,255,255,0.1);
-        }
-
-        .indicator-tab {
-            padding: 4px 10px;
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 4px;
-            color: #aaa;
-            cursor: pointer;
-            font-size: 11px;
-            transition: all 0.3s;
-        }
-
-        .indicator-tab:hover {
-            background: rgba(255, 255, 255, 0.15);
-        }
-
-        .indicator-tab.active {
-            background: linear-gradient(135deg, #d4af37, #f7ef8a);
-            color: #000;
-            border-color: #d4af37;
-        }
-        .stock-detail-panel {
-            position: fixed;
-            top: 0;
-            right: -600px;
-            width: 600px;
-            height: 100vh;
-            background: rgba(26, 26, 46, 0.95);
-            border-left: 1px solid #333;
-            box-shadow: -5px 0 15px rgba(0, 0, 0, 0.5);
-            transition: right 0.3s ease;
-            z-index: 1000;
-            display: flex;
-            flex-direction: column;
-            backdrop-filter: blur(10px);
-        }
-        
-        .stock-detail-panel.open {
-            right: 0;
-        }
-        
-        .stock-detail-header {
-            padding: 20px;
-            background: rgba(40, 40, 60, 0.9);
-            border-bottom: 1px solid #333;
-        }
-        
-        .stock-detail-title {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        
-        .stock-basic-info {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .stock-name-large {
-            font-size: 24px;
-            font-weight: bold;
-            color: #d4af37;
-        }
-        
-        .stock-code-large {
-            font-size: 16px;
-            color: #aaa;
-        }
-        
-        .stock-price-large {
-            font-size: 28px;
-            font-weight: bold;
-        }
-        
-        .stock-change-info {
-            display: flex;
-            gap: 20px;
-            margin-top: 10px;
-        }
-        
-        .close-detail-btn {
-            background: none;
-            border: none;
-            color: #fff;
-            font-size: 20px;
-            cursor: pointer;
-            padding: 5px;
-        }
-        
-        .stock-detail-content {
-            flex: 1;
-            overflow-y: auto;
-            padding: 0 20px;
-        }
-        
-        /* 图表容器 */
-        .chart-container {
-            height: 400px; /* 增加图表高度 */
-            top:-20px;
-            margin-bottom: 10px;
-            background: transparent;
-            border-radius: 8px;
-            padding: 5px;
-        }
-        
-        /* 图表选项卡优化 */
-        .chart-tabs {
-            z-index: 99;
-            display: flex;
-            gap: 8px;
-            margin-bottom: 8px;
-            padding: 8px;
-            background: rgba(40, 40, 60, 0.6);
-            border-radius: 6px;
-            border: 1px solid rgba(255,255,255,0.1);
-        }
-        
-        .chart-tab {
-            padding: 6px 12px;
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            border-radius: 4px;
-            color: #aaa;
-            cursor: pointer;
-            font-size: 12px;
-            transition: all 0.3s;
-        }
-        
-        .chart-tab.active {
-            background: linear-gradient(135deg, #d4af37, #f7ef8a);
-            color: #000;
-        }
-        .chart-tab:hover {
-            background: rgba(255, 255, 255, 0.12);
-            border-color: rgba(255,255,255,0.3);
-        }
-
-        .chart-tab.active {
-            background: linear-gradient(135deg, #d4af37, #f7ef8a);
-            color: #000;
-            border-color: #d4af37;
-        }
-        /* F10信息 */
-        .f10-section {
-            /* margin-top: 20px; */
-        }
-        
-        .f10-section-title {
-            font-size: 18px;
-            color: #d4af37;
-            margin-bottom: 15px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #333;
-        }
-
-        
-        .f10-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .f10-label {
-            color: #aaa;
-        }
-        
-        .f10-value {
-            font-weight: 500;
-        }
-        
-        /* 遮罩层 */
-        .detail-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 999;
-            display: none;
-        }
-        
-        .detail-overlay.show {
-            display: block;
-        }
-        
-        /* 响应式调整 */
-        @media (max-width: 768px) {
-            .stock-detail-panel {
-                width: 100%;
-                right: -100%;
-            }
-            
-            .f10-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        /* 加载状态 */
-        .chart-loading {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100%;
-            color: #666;
-        }
-        /* 样式保持不变，只添加虚拟滚动相关样式 */
-        .virtual-scroll-container {
-            position: relative;
-            overflow-y: auto;
-            height: 100%;
-        }
-        
-        .virtual-scroll-content {
-            position: relative;
-        }
-        
-        .stock-row {
-            position: absolute;
-            width: 100%;
-            left: 0;
-            display: grid;
-            gap: 8px;
-            padding: 10px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            transition: all 0.3s;
-            align-items: center;
-            font-size: 13px;
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
-        }
-        
-        /* 其他样式保持不变 */
+        /* 基础样式保持不变，添加异动区域相关样式 */
         * {
             margin: 0;
             padding: 0;
@@ -267,10 +19,11 @@
             line-height: 1.6;
             padding: 10px;
             min-height: 100vh;
+            overflow-x: hidden;
         }
         
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
             display: flex;
             flex-direction: column;
@@ -340,7 +93,7 @@
         
         .control-panel {
             display: flex;
-            gap: 8px;
+            gap: 0px;
         }
         
         .control-btn {
@@ -433,6 +186,7 @@
             flex: 1;
             min-height: 500px;
             overflow: hidden;
+            position: relative;
         }
         
         .section {
@@ -447,6 +201,7 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
+            transition: all 0.3s ease;
         }
         
         .section-header {
@@ -457,6 +212,7 @@
             padding-bottom: 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             flex-shrink: 0;
+            position: relative;
         }
         
         .section-header h2 {
@@ -475,6 +231,625 @@
             background: rgba(0, 0, 0, 0.2);
         }
         
+        /* 异动区域特定样式 */
+        .volatile-section {
+            width: 350px;
+            min-width: 350px;
+            max-width: 350px;
+            background: rgba(21, 21, 21, 0.9) !important;
+            border-color: #444 !important;
+        }
+        
+        .volatile-section.collapsed {
+            width: 40px !important;
+            min-width: 40px !important;
+            max-width: 40px !important;
+            overflow: hidden;
+            padding: 0 !important;
+            background: rgba(30, 30, 30, 0.9) !important;
+            border: 1px solid #444 !important;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+        .volatile-section.collapsed:hover {
+            background: rgba(40, 40, 40, 0.95) !important;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+            border-color: #d4af37 !important;
+        }
+        .volatile-section.collapsed .volatile-content {
+            display: none;
+        }
+        
+        .volatile-section.collapsed .section-header {
+            justify-content: center;
+            align-items: center;
+            border-bottom: none;
+            padding: 0;
+            height: 100%;
+            margin-bottom: 0;
+            position: relative;
+        }
+        
+        .volatile-section.collapsed .section-header h2 {
+            display: none;
+        }
+        
+        .volatile-toggle-btn {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            border-radius: 4px;
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+        
+        .volatile-toggle-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+       .volatile-section.collapsed .volatile-toggle-btn {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: transparent;
+            border: none;
+            color: #d4af37;
+            font-size: 16px;
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        .volatile-section.collapsed .volatile-toggle-btn:hover {
+            background: rgba(212, 175, 55, 0.1);
+            transform: translateY(-50%) scale(1.1);
+        }
+        .volatile-section.collapsed::before {
+            content: '异动监控';
+            position: absolute;
+            top: 50%;
+            left: -70px;
+            transform: translateY(-50%) rotate(-90deg);
+            color: #d4af37;
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+            opacity: 0.8;
+            pointer-events: none;
+        }
+        /* 确保异动区域在折叠时不会影响其他区域 */
+        .volatile-section.collapsed + .section:last-child {
+            flex: 1;
+        }
+        .volatile-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        /* 异动筛选面板 */
+        .volatile-filter-panel {
+            background: #222;
+            padding: 4px;
+            border-bottom: 1px solid #333;
+            display: none;
+        }
+        
+        /* 标题栏控制按钮 */
+        .section-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        
+        /* 筛选按钮样式 */
+        .volatile-filter-toggle-btn {
+            padding: 6px 12px;
+            background: #333;
+            border: none;
+            color: #e0e0e0;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background-color 0.2s ease;
+        }
+        
+        .volatile-filter-toggle-btn:hover {
+            background: #444;
+        }
+        
+        .volatile-filter-toggle-btn:active {
+            background: #555;
+        }
+        
+        .volatile-filter-panel.show {
+            display: block;
+        }
+        
+        .volatile-filter-group {
+            margin-bottom: 10px;
+        }
+        
+        .volatile-filter-title {
+            font-size: 14px;
+            margin-bottom: 2px;
+            color: #d4af37;
+        }
+        
+        .volatile-filter-options {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        
+        .volatile-filter-option {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        .volatile-filter-option input {
+            margin: 0;
+        }
+        
+        .volatile-strength-filter {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .volatile-strength-slider {
+            flex: 1;
+        }
+        
+        .volatile-strength-value {
+            min-width: 30px;
+            text-align: center;
+        }
+        
+        .volatile-control-buttons {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        
+        .volatile-control-btn {
+            flex: 1;
+            padding: 6px;
+            background: #333;
+            border: none;
+            color: #e0e0e0;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+        
+        .volatile-control-btn:hover {
+            background: #444;
+        }
+        
+        .volatile-control-btn.active {
+            background: #d4af37;
+            color: #000;
+        }
+        
+        /* 异动统计 */
+        .volatile-stats {
+            background: rgba(34, 34, 34, 0.9);
+            padding: 8px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .volatile-stat-item {
+            text-align: center;
+            padding: 4px;
+            background: rgba(42, 42, 42, 0.8);
+            border-radius: 6px;
+        }
+        
+        .volatile-stat-value {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 2px;
+        }
+        
+        .volatile-stat-label {
+            font-size: 10px;
+            color: #888;
+        }
+        
+        .volatile-high-count { color: #ff4444; }
+        .volatile-medium-count { color: #ffaa00; }
+        .volatile-low-count { color: #00aa00; }
+        .volatile-total-count { color: #ffffff; }
+        
+        /* 异动列表容器 */
+        .volatile-alerts-container {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 5px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+        }
+        
+        .volatile-no-alerts {
+            text-align: center;
+            color: #666;
+            padding: 20px;
+            font-size: 12px;
+        }
+        
+        /* 异动项目样式 */
+        .volatile-alert-item {
+            background: rgba(30, 30, 30, 0.8);
+            padding: 8px 10px;
+            border-radius: 6px;
+            border-left: 4px solid #444;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1.3;
+            animation: volatileSlideDown 0.3s ease-out;
+        }
+        
+        .volatile-alert-item.low { border-left-color: #00aa00; background: rgba(26, 42, 26, 0.8); }
+        .volatile-alert-item.medium { border-left-color: #ffaa00; background: rgba(42, 42, 26, 0.8); }
+        .volatile-alert-item.high { border-left-color: #ff4444; background: rgba(42, 26, 26, 0.8); }
+        
+        .volatile-alert-item:hover {
+            background: rgba(40, 40, 40, 0.9);
+            transform: translateY(-1px);
+            box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
+        }
+        
+        .volatile-alert-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 6px;
+        }
+        
+        .volatile-stock-info {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .volatile-stock-symbol {
+            font-size: 14px;
+            font-weight: bold;
+            color: #fff;
+        }
+        
+        .volatile-alert-reason {
+            font-size: 11px;
+            font-weight: bold;
+            color: #d4af37;
+            background: rgba(212, 175, 55, 0.1);
+            padding: 2px 5px;
+            border-radius: 4px;
+        }
+        
+        .volatile-alert-meta {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 2px;
+        }
+        
+        .volatile-alert-level {
+            font-size: 10px;
+            padding: 1px 5px;
+            border-radius: 8px;
+            background: #444;
+            color: white;
+        }
+        
+        .volatile-alert-level.high { background: #ff4444; }
+        .volatile-alert-level.medium { background: #ffaa00; color: black; }
+        .volatile-alert-level.low { background: #00aa00; }
+        
+        .volatile-alert-time {
+            font-size: 10px;
+            color: #888;
+        }
+        
+        .volatile-alert-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+        
+        .volatile-price-section {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        
+        .volatile-price-label {
+            font-size: 10px;
+            color: #aaa;
+        }
+        
+        .volatile-price-value {
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+        }
+        
+        .volatile-change-5min {
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
+        .volatile-data-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+        
+        .volatile-data-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+        }
+        
+        .volatile-data-label {
+            color: #aaa;
+        }
+        
+        .volatile-data-value {
+            color: #fff;
+            font-weight: bold;
+        }
+        
+        /* 异动设置对话框 */
+        .volatile-settings-dialog {
+            display: none;
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            z-index: 1000;
+            min-width: 300px;
+        }
+        
+        .volatile-settings-dialog h3 {
+            margin-bottom: 15px;
+            color: #d4af37;
+        }
+        
+        .volatile-settings-dialog label {
+            display: block;
+            margin-bottom: 5px;
+            color: #e0e0e0;
+        }
+        
+        .volatile-settings-dialog input {
+            width: 100%;
+            padding: 5px;
+            background: #333;
+            border: 1px solid #555;
+            color: #e0e0e0;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+        
+        .volatile-settings-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        
+        .volatile-settings-btn {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+        
+        .volatile-settings-btn.cancel {
+            background: rgba(85, 85, 85, 0.8);
+            color: #e0e0e0;
+        }
+        
+        .volatile-settings-btn.apply {
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
+            font-weight: 600;
+        }
+        
+        .volatile-dialog-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            backdrop-filter: blur(3px);
+        }
+        /* 【新增】异动区域悬浮按钮样式 */
+.volatile-float-btn {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    width: 60px;
+    height: 60px;
+    background: linear-gradient(135deg, #d4af37, #f7ef8a);
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 4px 15px rgba(212, 175, 55, 0.4);
+    transition: all 0.3s ease;
+    z-index: 1000;
+    overflow: hidden;
+}
+
+.volatile-float-btn:hover {
+    transform: translateY(-3px) scale(1.05);
+    box-shadow: 0 6px 20px rgba(212, 175, 55, 0.6);
+}
+
+.volatile-float-btn:active {
+    transform: translateY(-1px) scale(0.98);
+}
+
+.float-btn-icon {
+    font-size: 24px;
+    color: #000;
+    margin-bottom: 2px;
+}
+
+.float-btn-text {
+    font-size: 10px;
+    color: #000;
+    font-weight: bold;
+    text-align: center;
+    white-space: nowrap;
+}
+
+/* 【修改】异动区域默认隐藏 */
+/* .volatile-section {
+    width: 350px;
+    min-width: 350px;
+    max-width: 350px;
+    background: rgba(21, 21, 21, 0.95) !important;
+    border-color: #444 !important;
+    display: none; 
+    position: relative;
+} */
+
+/* .volatile-section.expanded {
+    display: flex;
+} */
+
+/* 【修改】调整异动区域位置 */
+/* .volatile-section {
+    position: fixed;
+    top: 100px;
+    right: 20px;
+    z-index: 999;
+    height: calc(100vh - 120px);
+    border-radius: 10px;
+    box-shadow: 0 5px 25px rgba(0, 0, 0, 0.5);
+} */
+
+/* 【修改】异动区域关闭按钮 */
+.volatile-close-btn {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.3s;
+    z-index: 10;
+}
+
+.volatile-close-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+    transform: rotate(90deg);
+}
+
+/* 【新增】异动区域加载状态 */
+.volatile-loading {
+    text-align: center;
+    padding: 20px;
+    color: #d4af37;
+    font-size: 14px;
+}
+
+.volatile-loading-spinner {
+    width: 30px;
+    height: 30px;
+    border: 3px solid rgba(212, 175, 55, 0.2);
+    border-top: 3px solid #d4af37;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 10px;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* 【修改】调整主内容区域，移除异动区域占位 */
+.content {
+    display: flex;
+    gap: 15px;
+    flex: 1;
+    min-height: 500px;
+    overflow: hidden;
+    position: relative;
+}
+
+.content > .section:not(.volatile-section) {
+    flex: 1;
+}
+        @keyframes volatileSlideDown {
+            0% {
+                transform: translateY(-20px);
+                opacity: 0;
+                max-height: 0;
+            }
+            100% {
+                transform: translateY(0);
+                opacity: 1;
+                max-height: 200px;
+            }
+        }
+        
+        /* 子板块相关样式保持不变 */
         .plates-flex-container {
             display: flex;
             flex-direction: column;
@@ -745,25 +1120,242 @@
             to { transform: translateX(0); opacity: 1; }
         }
         
-        ::-webkit-scrollbar {
-            width: 6px;
+        /* 虚拟滚动相关样式 */
+        .virtual-scroll-container {
+            position: relative;
+            overflow-y: auto;
+            height: 100%;
         }
         
-        ::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.05);
+        .virtual-scroll-content {
+            position: relative;
+        }
+        
+        .stock-row {
+            position: absolute;
+            width: 100%;
+            left: 0;
+            display: grid;
+            gap: 8px;
+            padding: 10px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.3s;
+            align-items: center;
+            font-size: 13px;
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
+            /* 禁止文字选中，特别是手机端长按选中 */
+            -webkit-touch-callout: none; /* 禁止iOS长按时弹出菜单 */
+            -webkit-user-select: none; /* 禁止iOS和Android选择文字 */
+            -khtml-user-select: none; /* 禁止Konqueror浏览器选择文字 */
+            -moz-user-select: none; /* 禁止Firefox浏览器选择文字 */
+            -ms-user-select: none; /* 禁止IE浏览器选择文字 */
+            user-select: none; /* 标准属性 */
+        }
+        
+        /* 个股详情面板样式 */
+        .detail-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 999;
+            display: none;
+        }
+        
+        .detail-overlay.show {
+            display: block;
+        }
+        
+        .stock-detail-panel {
+            position: fixed;
+            top: 0;
+            right: -600px;
+            width: 600px;
+            height: 100vh;
+            background: rgba(26, 26, 46, 0.95);
+            border-left: 1px solid #333;
+            box-shadow: -5px 0 15px rgba(0, 0, 0, 0.5);
+            transition: right 0.3s ease;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            backdrop-filter: blur(10px);
+        }
+        
+        .stock-detail-panel.open {
+            right: 0;
+        }
+        
+        .stock-detail-header {
+            padding: 20px;
+            background: rgba(40, 40, 60, 0.9);
+            border-bottom: 1px solid #333;
+        }
+        
+        .stock-detail-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .stock-basic-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .stock-name-large {
+            font-size: 24px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+        
+        .stock-code-large {
+            font-size: 16px;
+            color: #aaa;
+        }
+        
+        .stock-price-large {
+            font-size: 28px;
+            font-weight: bold;
+        }
+        
+        .stock-change-info {
+            display: flex;
+            gap: 20px;
+            margin-top: 10px;
+        }
+        
+        .close-detail-btn {
+            background: none;
+            border: none;
+            color: #fff;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 5px;
+        }
+        
+        .stock-detail-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0 20px;
+        }
+        
+        /* 图表容器 */
+        .chart-container {
+            height: 400px;
+            top: -20px;
+            margin-bottom: 10px;
+            background: transparent;
             border-radius: 8px;
+            padding: 5px;
         }
         
-        ::-webkit-scrollbar-thumb {
-            background: rgba(212, 175, 55, 0.5);
-            border-radius: 8px;
+        /* 图表选项卡优化 */
+        .chart-tabs {
+            z-index: 99;
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+            padding: 8px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.1);
         }
         
-        ::-webkit-scrollbar-thumb:hover {
-            background: rgba(212, 175, 55, 0.7);
+        .chart-tab {
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 4px;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
         }
         
-        /* 响应式设计 */
+        .chart-tab.active {
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
+        }
+        
+        .chart-tab:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255,255,255,0.3);
+        }
+        
+        .indicator-tabs {
+            z-index: 999;
+            display: none;
+            gap: 10px;
+            margin-bottom: 8px;
+            padding: 6px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .indicator-tab {
+            padding: 4px 10px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-radius: 4px;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.3s;
+        }
+        
+        .indicator-tab:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+        
+        .indicator-tab.active {
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
+            border-color: #d4af37;
+        }
+        
+        /* F10信息 */
+        .f10-section {
+            margin-top: 20px;
+        }
+        
+        .f10-section-title {
+            font-size: 18px;
+            color: #d4af37;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #333;
+        }
+        
+        .f10-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .f10-label {
+            color: #aaa;
+        }
+        
+        .f10-value {
+            font-weight: 500;
+        }
+        
+        .chart-loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            color: #666;
+        }
+        
+        /* 响应式调整 */
         @media (max-width: 768px) {
             body {
                 padding: 5px;
@@ -776,6 +1368,10 @@
             .header {
                 padding: 2px 10px;
                 margin-bottom: 2px;
+                height: 12vh;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
             }
             
             .header-top {
@@ -791,20 +1387,23 @@
             
             .stats-bar {
                 width: 100%;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 5px;
+                grid-template-columns: repeat(6, 1fr);
+                gap: 2px;
+                padding: 2px;
             }
             
             .stat-item {
-                padding: 6px 3px;
+                padding: 4px 2px;
+                border-radius: 4px;
             }
             
             .stat-value {
-                font-size: 14px;
+                font-size: 12px;
+                margin-bottom: 1px;
             }
             
             .stat-label {
-                font-size: 10px;
+                font-size: 8px;
             }
             
             .content {
@@ -816,6 +1415,10 @@
             .section {
                 min-width: 280px;
                 padding: 10px;
+            }
+            
+            .volatile-section {
+                min-width: 300px;
             }
             
             .section-header h2 {
@@ -848,7 +1451,7 @@
             }
             
             .control-btn, .refresh-btn {
-                padding: 6px 10px;
+                padding: 2px 10px;
                 font-size: 12px;
             }
             
@@ -856,14 +1459,177 @@
                 flex-direction: column;
                 gap: 6px;
             }
+            
+            /* 个股详情面板手机适配 */
+            .stock-detail-panel {
+                width: 100%;
+                right: -100%;
+            }
+            
+            .stock-detail-header {
+                padding: 15px;
+            }
+            
+            .stock-name-large {
+                font-size: 20px;
+            }
+            
+            .stock-price-large {
+                font-size: 24px;
+            }
+            
+            .stock-change-info {
+                flex-direction: column;
+                gap: 5px;
+            }
+            
+            .stock-detail-content {
+                padding: 0 15px;
+            }
+            
+            .chart-container {
+                height: 300px;
+            }
+            
+            .chart-tabs {
+                flex-wrap: wrap;
+                gap: 5px;
+            }
+            
+            .chart-tab {
+                font-size: 11px;
+                padding: 5px 10px;
+            }
+            
+            .indicator-tabs {
+                flex-wrap: wrap;
+                gap: 5px;
+            }
+            
+            .indicator-tab {
+                font-size: 10px;
+                padding: 4px 8px;
+            }
+            
+            .f10-section {
+                margin-top: 15px;
+            }
+            
+            .f10-section-title {
+                font-size: 16px;
+            }
         }
         
         @media (max-width: 480px) {
             .section {
                 min-width: 260px;
             }
+            
+            .volatile-section {
+                min-width: 280px;
+            }
+            
+            /* 极小屏幕股票详情面板适配 */
+            .stock-detail-header {
+                padding: 10px;
+            }
+            
+            .stock-name-large {
+                font-size: 18px;
+            }
+            
+            .stock-price-large {
+                font-size: 22px;
+            }
+            
+            .chart-container {
+                height: 250px;
+            }
+            
+            .chart-tab {
+                font-size: 10px;
+                padding: 4px 8px;
+            }
+            
+            .indicator-tab {
+                font-size: 9px;
+                padding: 3px 6px;
+            }
         }
-        /* F10数据样式 - 新布局 */
+        
+        /* 高级指标样式 */
+        .advanced-value {
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .advanced-value.change-positive {
+            color: #ff5252;
+        }
+        
+        .advanced-value.change-negative {
+            color: #4caf50;
+        }
+        
+        /* 调整网格布局以适应新增列 */
+        .plate-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+        
+        .stocks-header {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
+        }
+        
+        .plate-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
+        }
+        
+        .stock-row {
+            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
+        }
+        
+        /* 响应式调整 */
+        @media (max-width: 768px) {
+            .plate-header, .stocks-header {
+                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            }
+            
+            .plate-row, .stock-row {
+                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            }
+            
+            /* 在移动端隐藏部分列 */
+            .plate-header-item:nth-child(6),
+            .plate-row > div:nth-child(6),
+            .plate-header-item:nth-child(7),
+            .plate-row > div:nth-child(7),
+            .stock-header-item:nth-child(6),
+            .stock-row > div:nth-child(6),
+            .stock-header-item:nth-child(7),
+            .stock-row > div:nth-child(7) {
+                display: none;
+            }
+        }
+        
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(212, 175, 55, 0.5);
+            border-radius: 8px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(212, 175, 55, 0.7);
+        }
+          /* F10数据样式 - 新布局 */
         .f10-data {
             padding: 0 16px;
             height: 100%;
@@ -887,20 +1653,20 @@
 
         /* 卡片样式 */
         .f10-card {
-            background: #fff;
-            border: 1px solid #e1e4e8;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 8px;
             padding: 16px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
             height: fit-content;
         }
 
         .f10-card-title {
-            /* margin: 0 0 12px 0; */
+            margin: 0 0 12px 0;
             font-size: 14px;
             font-weight: 600;
-            color: #24292e;
-            border-bottom: 1px solid #eaecef;
+            color: #d4af37;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
             padding-bottom: 8px;
         }
 
@@ -916,18 +1682,19 @@
             justify-content: space-between;
             align-items: center;
             padding: 4px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
         }
 
         .f10-info-label {
             font-size: 12px;
-            color: #586069;
+            color: #aaa;
             font-weight: 500;
             flex-shrink: 0;
         }
 
         .f10-info-value {
             font-size: 12px;
-            color: #24292e;
+            color: #fff;
             font-weight: 400;
             text-align: right;
             flex: 1;
@@ -950,7 +1717,7 @@
 
         .f10-section-label {
             font-size: 12px;
-            color: #586069;
+            color: #aaa;
             font-weight: 500;
             margin-bottom: 6px;
         }
@@ -985,10 +1752,10 @@
         }
 
         .f10-product-tag {
-            background: #f6f8fa;
-            color: #24292e;
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
             padding: 2px 6px;
-            border: 1px solid #e1e4e8;
+            border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 6px;
             font-size: 10px;
             line-height: 1.2;
@@ -997,54 +1764,18 @@
         }
 
         .f10-product-tag:hover {
-            background: #e1e4e8;
+            background: rgba(255, 255, 255, 0.2);
             transform: translateY(-1px);
         }
 
         /* 无数据提示 */
         .f10-no-data {
             font-size: 10px;
-            color: #959da5;
+            color: #666;
             font-style: italic;
         }
 
-        /* 滚动条样式 */
-        .f10-products-container::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .f10-products-container::-webkit-scrollbar-track {
-            background: #f1f1f1;
-            border-radius: 2px;
-        }
-
-        .f10-products-container::-webkit-scrollbar-thumb {
-            background: #c1c1c1;
-            border-radius: 2px;
-        }
-
-        .f10-products-container::-webkit-scrollbar-thumb:hover {
-            background: #a8a8a8;
-        }
-
-        /* 响应式设计 */
-        @media (max-width: 768px) {
-            .f10-top-section {
-                grid-template-columns: 1fr;
-                gap: 12px;
-            }
-            
-            .f10-data {
-                padding: 12px;
-                gap: 12px;
-            }
-            
-            .f10-card {
-                padding: 12px;
-            }
-        }
-
-        /* 加载和错误状态样式保持不变 */
+        /* F10加载和错误状态样式 */
         .f10-loading, .f10-error {
             display: flex;
             flex-direction: column;
@@ -1058,8 +1789,8 @@
         .loading-spinner {
             width: 40px;
             height: 40px;
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #007bff;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top: 4px solid #d4af37;
             border-radius: 50%;
             animation: spin 1s linear infinite;
             margin-bottom: 16px;
@@ -1079,74 +1810,689 @@
             margin-bottom: 16px;
             text-align: center;
             font-size: 14px;
+            color: #e0e0e0;
         }
 
         .retry-btn {
             padding: 8px 16px;
-            background: #007bff;
-            color: white;
+            background: linear-gradient(135deg, #d4af37, #f7ef8a);
+            color: #000;
             border: none;
             border-radius: 4px;
             cursor: pointer;
             font-size: 12px;
+            font-weight: 600;
         }
 
         .retry-btn:hover {
-            background: #0056b3;
-        }
-        /* 高级指标样式 */
-        .advanced-value {
-            font-size: 12px;
-            font-weight: 500;
+            transform: translateY(-1px);
+            box-shadow: 0 3px 10px rgba(212, 175, 55, 0.3);
         }
 
-        .advanced-value.change-positive {
-            color: #ff5252;
-        }
-
-        .advanced-value.change-negative {
-            color: #4caf50;
-        }
-
-        /* 调整网格布局以适应新增列 */
-        .plate-header {
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
-        }
-
-        .stocks-header {
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
-        }
-
-        .plate-row {
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 0.8fr;
-        }
-
-        .stock-row {
-            grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr;
-        }
-
-        /* 响应式调整 */
+        /* 响应式设计 */
         @media (max-width: 768px) {
-            .plate-header, .stocks-header {
-                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            .f10-top-section {
+                grid-template-columns: 1fr;
+                gap: 12px;
             }
             
-            .plate-row, .stock-row {
-                grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr;
+            .f10-data {
+                padding: 12px;
+                gap: 12px;
             }
             
-            /* 在移动端隐藏部分列 */
-            .plate-header-item:nth-child(6),
-            .plate-row > div:nth-child(6),
-            .plate-header-item:nth-child(7),
-            .plate-row > div:nth-child(7),
-            .stock-header-item:nth-child(6),
-            .stock-row > div:nth-child(6),
-            .stock-header-item:nth-child(7),
-            .stock-row > div:nth-child(7) {
-                display: none;
+            .f10-card {
+                padding: 12px;
             }
         }
+        /* 【完整】异动区域相关CSS样式 */
+
+/* 基础异动区域样式 */
+.volatile-section {
+    width: 350px;
+    min-width: 350px;
+    max-width: 350px;
+    background: rgba(21, 21, 21, 0.95) !important;
+    border-color: #444 !important;
+    display: none; /* 默认隐藏 */
+    /* position: fixed; */
+    /* top: 100px; */
+    /* right: 20px; */
+    z-index: 999; 
+    height: calc(100vh - 120px);
+    border-radius: 10px;
+    box-shadow: 0 5px 25px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+    backdrop-filter: blur(10px);
+}
+
+.volatile-section.expanded {
+    display: flex; /* 展开时显示 */
+    flex-direction: column;
+}
+
+/* 悬浮按钮样式 */
+.volatile-float-btn {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    width: 60px;
+    height: 60px;
+    background: linear-gradient(135deg, #59513a, #aaa45a);
+    border-radius: 50%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 4px 15px rgba(212, 175, 55, 0.4);
+    transition: all 0.3s ease;
+    z-index: 1000;
+    overflow: hidden;
+}
+
+.volatile-float-btn:hover {
+    transform: translateY(-3px) scale(1.05);
+    box-shadow: 0 6px 20px rgba(212, 175, 55, 0.6);
+}
+
+.volatile-float-btn:active {
+    transform: translateY(-1px) scale(0.98);
+}
+
+.float-btn-icon {
+    font-size: 14%;
+    color: #000;
+    margin-bottom: 2px;
+}
+
+.float-btn-text {
+    font-size: 10px;
+    color: #000;
+    font-weight: bold;
+    text-align: center;
+    white-space: nowrap;
+}
+
+/* 异动区域头部 */
+.volatile-section .section-header {
+    padding: 12px 15px;
+    background: rgba(30, 30, 30, 0.9);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    flex-shrink: 0;
+}
+
+.volatile-section .section-header h2 {
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.volatile-status {
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    background: rgba(255, 68, 68, 0.2);
+    color: #ff4444;
+}
+
+.volatile-status.connected {
+    background: rgba(0, 200, 83, 0.2);
+    color: #00c853;
+}
+
+/* 关闭按钮 */
+.volatile-close-btn {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #e0e0e0;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.3s;
+    z-index: 10;
+}
+
+.volatile-close-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+    transform: rotate(90deg);
+}
+
+/* 异动内容区域 */
+.volatile-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 10px;
+}
+
+/* 异动筛选面板 */
+.volatile-filter-panel {
+    background: rgba(34, 34, 34, 0.9);
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    display: none;
+}
+
+.volatile-filter-panel.show {
+    display: block;
+}
+
+.volatile-filter-group {
+    margin-bottom: 10px;
+}
+
+.volatile-filter-group:last-child {
+    margin-bottom: 0;
+}
+
+.volatile-filter-title {
+    font-size: 12px;
+    margin-bottom: 6px;
+    color: #d4af37;
+    font-weight: 600;
+}
+
+.volatile-filter-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.volatile-filter-option {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.volatile-filter-option:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.volatile-filter-option input {
+    margin: 0;
+    accent-color: #d4af37;
+}
+
+/* 强度筛选 */
+.volatile-strength-filter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.volatile-strength-slider {
+    flex: 1;
+    height: 4px;
+    background: #444;
+    border-radius: 2px;
+    outline: none;
+    -webkit-appearance: none;
+}
+
+.volatile-strength-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    background: #d4af37;
+    border-radius: 50%;
+    cursor: pointer;
+    border: 2px solid rgba(255, 255, 255, 0.8);
+}
+
+.volatile-strength-value {
+    min-width: 25px;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: #d4af37;
+}
+
+/* 控制按钮 */
+.volatile-control-buttons {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.volatile-control-btn {
+    padding: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #e0e0e0;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: all 0.3s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+.volatile-control-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    transform: translateY(-1px);
+}
+
+.volatile-control-btn.active {
+    background: linear-gradient(135deg, #d4af37, #f7ef8a);
+    color: #000;
+    border-color: #d4af37;
+}
+
+/* 异动统计 */
+.volatile-stats {
+    background: rgba(34, 34, 34, 0.9);
+    padding: 8px;
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    border-radius: 8px;
+    margin-bottom: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.volatile-stat-item {
+    text-align: center;
+    padding: 8px 4px;
+    background: rgba(42, 42, 42, 0.8);
+    border-radius: 6px;
+    transition: all 0.3s;
+}
+
+.volatile-stat-item:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.volatile-stat-value {
+    font-size: 18px;
+    font-weight: bold;
+    margin-bottom: 2px;
+    font-family: 'Courier New', monospace;
+}
+
+.volatile-stat-label {
+    font-size: 10px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.volatile-high-count { color: #ff4444; }
+.volatile-medium-count { color: #ffaa00; }
+.volatile-low-count { color: #00aa00; }
+.volatile-total-count { color: #ffffff; }
+
+/* 异动列表容器 */
+.volatile-alerts-container {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 5px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 8px;
+    min-height: 200px;
+}
+
+/* 无数据/等待消息 */
+.volatile-no-alerts {
+    text-align: center;
+    color: #666;
+    padding: 40px 20px;
+    font-size: 12px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.volatile-no-alerts div:first-child {
+    margin-bottom: 10px;
+}
+
+/* 点击加载状态 */
+.volatile-click-to-load {
+    text-align: center;
+    padding: 30px 20px;
+    color: #e0e0e0;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.click-to-load-icon {
+    font-size: 32px;
+    margin-bottom: 15px;
+    opacity: 0.8;
+}
+
+.click-to-load-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 5px;
+    color: #d4af37;
+}
+
+.click-to-load-subtitle {
+    font-size: 12px;
+    color: #aaa;
+    margin-bottom: 10px;
+}
+
+.click-to-load-hint {
+    font-size: 11px;
+    color: #666;
+    margin-bottom: 20px;
+    max-width: 200px;
+    line-height: 1.4;
+}
+
+.click-to-load-btn {
+    padding: 8px 20px;
+    background: linear-gradient(135deg, #d4af37, #f7ef8a);
+    color: #000;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s;
+    margin-top: 10px;
+}
+
+.click-to-load-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 3px 10px rgba(212, 175, 55, 0.3);
+}
+
+/* 加载状态 */
+.volatile-loading {
+    text-align: center;
+    padding: 40px 20px;
+    color: #d4af37;
+    font-size: 14px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.volatile-loading-spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid rgba(212, 175, 55, 0.2);
+    border-top: 3px solid #d4af37;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 0 auto 15px;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* 异动项目样式 */
+.volatile-alert-item {
+    background: rgba(30, 30, 30, 0.9);
+    padding: 10px 12px;
+    border-radius: 6px;
+    border-left: 4px solid #444;
+    transition: all 0.3s ease;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1.3;
+    animation: volatileSlideDown 0.3s ease-out;
+    backdrop-filter: blur(5px);
+}
+
+.volatile-alert-item.low { 
+    border-left-color: #00aa00; 
+    background: rgba(26, 42, 26, 0.9); 
+}
+.volatile-alert-item.medium { 
+    border-left-color: #ffaa00; 
+    background: rgba(42, 42, 26, 0.9); 
+}
+.volatile-alert-item.high { 
+    border-left-color: #ff4444; 
+    background: rgba(42, 26, 26, 0.9); 
+}
+
+.volatile-alert-item:hover {
+    background: rgba(40, 40, 40, 0.95);
+    transform: translateY(-1px);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+}
+
+.volatile-alert-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 8px;
+}
+
+.volatile-stock-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+}
+
+.volatile-stock-symbol {
+    font-size: 14px;
+    font-weight: bold;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.volatile-alert-reason {
+    font-size: 11px;
+    font-weight: bold;
+    color: #d4af37;
+    background: rgba(212, 175, 55, 0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.volatile-alert-meta {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.volatile-alert-level {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    background: #444;
+    color: white;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.volatile-alert-level.high { background: #ff4444; }
+.volatile-alert-level.medium { background: #ffaa00; color: black; }
+.volatile-alert-level.low { background: #00aa00; }
+
+.volatile-alert-time {
+    font-size: 10px;
+    color: #888;
+    white-space: nowrap;
+}
+
+.volatile-alert-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.volatile-price-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.volatile-price-label {
+    font-size: 10px;
+    color: #aaa;
+}
+
+.volatile-price-value {
+    font-size: 18px;
+    font-weight: bold;
+    color: #fff;
+    font-family: 'Courier New', monospace;
+}
+
+.volatile-change-5min {
+    font-size: 11px;
+    font-weight: bold;
+    display: flex;
+    gap: 8px;
+}
+
+.volatile-data-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.volatile-data-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+}
+
+.volatile-data-label {
+    color: #aaa;
+    white-space: nowrap;
+}
+
+.volatile-data-value {
+    color: #fff;
+    font-weight: bold;
+    font-family: 'Courier New', monospace;
+}
+
+/* 动画效果 */
+@keyframes volatileSlideDown {
+    0% {
+        transform: translateY(-10px);
+        opacity: 0;
+    }
+    100% {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+/* 平滑过渡效果 */
+.smooth-transition {
+    transition: all 0.3s ease !important;
+}
+
+.animate-in {
+    animation: volatileSlideDown 0.3s ease-out;
+}
+
+/* 响应式调整 */
+@media (max-width: 768px) {
+    .volatile-section {
+        width: calc(100vw - 40px);
+        min-width: auto;
+        position: fixed;
+        
+        max-width: none;
+        right: 10px;
+        left: 10px;
+        top: 80px;
+        height: calc(100vh - 100px);
+    }
+    
+    .volatile-float-btn {
+        right: 15px;
+        bottom: 15px;
+        width: 55px;
+        height: 55px;
+    }
+    
+    .volatile-control-buttons {
+        grid-template-columns: 1fr;
+    }
+    
+    .volatile-alert-content {
+        grid-template-columns: 1fr;
+        gap: 6px;
+    }
+}
+
+@media (max-width: 480px) {
+    .volatile-section {
+        width: calc(100vw - 20px);
+        right: 10px;
+        left: 10px;
+    }
+    
+    .volatile-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    
+    .volatile-filter-options {
+        flex-direction: column;
+        gap: 6px;
+    }
+}
+
+/* 滚动条样式 */
+.volatile-alerts-container::-webkit-scrollbar {
+    width: 6px;
+}
+
+.volatile-alerts-container::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+}
+
+.volatile-alerts-container::-webkit-scrollbar-thumb {
+    background: rgba(212, 175, 55, 0.5);
+    border-radius: 8px;
+}
+
+.volatile-alerts-container::-webkit-scrollbar-thumb:hover {
+    background: rgba(212, 175, 55, 0.7);
+}
     </style>
 </head>
 <body>
@@ -1167,6 +2513,9 @@
                     </button>
                     <button class="control-btn active" onclick="plateMonitor.toggleAutoUpdate()" id="autoUpdateBtn">
                         <span>🔄</span> 自动更新:开
+                    </button>
+                    <button class="control-btn" onclick="toggleVolatileSection()" id="volatileToggleBtn">
+                        <span>🚀</span> 异动监控
                     </button>
                     <button class="refresh-btn" onclick="plateMonitor.refreshData()">
                         <span>🔄</span> 刷新数据
@@ -1227,80 +2576,188 @@
                     <div class="no-data">请从左侧板块列表中选择一个板块查看其详细信息</div>
                 </div>
             </div>
-        </div>
-    </div>
-  <!-- 个股详情面板 -->
-    <div class="detail-overlay" id="detailOverlay"></div>
-    <!-- 修改后的个股详情面板HTML结构 -->
-<div class="stock-detail-panel" id="stockDetailPanel">
-    <div class="stock-detail-header">
-        <div class="stock-detail-title">
-            <div class="stock-basic-info">
-                <div>
-                    <div class="stock-name-large" id="detailStockName">--</div>
-                    <div class="stock-code-large" id="detailStockCode">--</div>
+            
+            <!-- 异动区域 - 修改为固定定位，默认隐藏 -->
+            <div class="section volatile-section" id="volatileSection">
+                <div class="section-header">
+                    <h2>🚀 短线精灵 <span id="volatileConnectionStatus" class="volatile-status">● 离线</span></h2>
+                    <div class="section-controls">
+                        <button class="volatile-filter-toggle-btn" onclick="toggleVolatileFilterPanel()" title="显示/隐藏筛选条件">
+                            ⚡ 筛选
+                        </button>
+                        <div class="volatile-close-btn" onclick="collapseVolatileSection()" title="关闭异动监控">×</div>
+                    </div>
                 </div>
-                <div class="stock-price-large" id="detailStockPrice">--</div>
-            </div>
-            <button class="close-detail-btn" onclick="plateMonitor.closeStockDetail()">×</button>
-        </div>
-        <div class="stock-change-info">
-            <div>
-                <span>涨跌: </span>
-                <span id="detailStockChange">--</span>
-            </div>
-            <div>
-                <span>涨跌幅: </span>
-                <span id="detailStockChangePct">--</span>
-            </div>
-            <div>
-                <span>成交量: </span>
-                <span id="detailStockVolume">--</span>
+                <div class="volatile-content">
+                    <!-- 异动筛选面板 -->
+                    <div class="volatile-filter-panel" id="volatileFilterPanel">
+                        <div class="volatile-filter-group">
+                            <!-- <div class="volatile-filter-title">异动级别</div> -->
+                            <div class="volatile-filter-options">
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="level" value="high" checked> 强烈异动
+                                </label>
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="level" value="medium" checked> 中度异动
+                                </label>
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="level" value="low" checked> 轻微异动
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="volatile-filter-group">
+                            <!-- <div class="volatile-filter-title">异动类型</div> -->
+                            <div class="volatile-filter-options">
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="type" value="封单异动" checked> 封单异动
+                                </label>
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="type" value="成交额异动" checked> 成交额异动
+                                </label>
+                                <label class="volatile-filter-option">
+                                    <input type="checkbox" name="type" value="其他" checked> 其他异动
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="volatile-filter-group">
+                            <!-- <div class="volatile-filter-title">强度筛选</div> -->
+                            <div class="volatile-strength-filter">
+                                <span>最小强度:</span>
+                                <input type="range" id="volatileStrengthSlider" min="0" max="10" value="0" class="volatile-strength-slider">
+                                <span id="volatileStrengthValue" class="volatile-strength-value">0</span>
+                            </div>
+                        </div>
+                        
+                        <div class="volatile-control-buttons">
+                            <button class="volatile-control-btn" onclick="volatileMonitor.applyFilters()">应用筛选</button>
+                            <button class="volatile-control-btn" onclick="volatileMonitor.resetFilters()">重置筛选</button>
+                            <button class="volatile-control-btn" id="volatileAutoScrollBtn" onclick="volatileMonitor.toggleAutoScroll()">🔒 暂停滚动</button>
+                            <button class="volatile-control-btn" onclick="volatileMonitor.clearAllData()">清空数据</button>
+                            <button class="volatile-control-btn" onclick="volatileMonitor.toggleDataPersistence()" id="volatilePersistenceBtn">💾 持久化:开</button>
+                            <button class="volatile-control-btn" onclick="volatileMonitor.showSettings()">⚙️ 设置</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 异动统计 -->
+                    <div class="volatile-stats">
+                        <div class="volatile-stat-item">
+                            <div class="volatile-stat-value volatile-high-count" id="volatileHighCount">0</div>
+                            <div class="volatile-stat-label">强烈异动</div>
+                        </div>
+                        <div class="volatile-stat-item">
+                            <div class="volatile-stat-value volatile-medium-count" id="volatileMediumCount">0</div>
+                            <div class="volatile-stat-label">中度异动</div>
+                        </div>
+                        <div class="volatile-stat-item">
+                            <div class="volatile-stat-value volatile-low-count" id="volatileLowCount">0</div>
+                            <div class="volatile-stat-label">轻微异动</div>
+                        </div>
+                        <div class="volatile-stat-item">
+                            <div class="volatile-stat-value volatile-total-count" id="volatileTotalCount">0</div>
+                            <div class="volatile-stat-label">总计</div>
+                        </div>
+                    </div>
+                    
+                    <!-- 异动列表 -->
+                    <div class="volatile-alerts-container" id="volatileAlertsContainer">
+                        <div class="volatile-no-alerts">
+                            <div style="font-size: 16px; margin-bottom: 10px;">🚀</div>
+                            <div>点击下方连接按钮开始异动监控</div>
+                            <div style="font-size: 12px; color: #666; margin-top: 5px;">实时接收股票异动警报</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
     
-    <div class="stock-detail-content">
-        <div class="chart-tabs">
-            <button class="chart-tab active" onclick="plateMonitor.switchChart('minute')">分时</button>
-             <button class="chart-tab" onclick="plateMonitor.switchChart('1min')">1分钟</button>
-              <button class="chart-tab" onclick="plateMonitor.switchChart('60min')">60分钟</button>
-            <button class="chart-tab" onclick="plateMonitor.switchChart('daily')">日K</button>
-            <button class="chart-tab" onclick="plateMonitor.switchChart('weekly')">周K</button>
-            <!-- <button class="chart-tab" onclick="plateMonitor.switchChart('monthly')">月K</button> -->
+    <!-- 个股详情面板 -->
+    <div class="detail-overlay" id="detailOverlay"></div>
+    <div class="stock-detail-panel" id="stockDetailPanel">
+        <div class="stock-detail-header">
+            <div class="stock-detail-title">
+                <div class="stock-basic-info">
+                    <div>
+                        <div class="stock-name-large" id="detailStockName">--</div>
+                        <div class="stock-code-large" id="detailStockCode">--</div>
+                    </div>
+                    <div class="stock-price-large" id="detailStockPrice">--</div>
+                </div>
+                <button class="close-detail-btn" onclick="plateMonitor.closeStockDetail()">×</button>
+            </div>
+            <div class="stock-change-info">
+                <div>
+                    <span>涨跌: </span>
+                    <span id="detailStockChange">--</span>
+                </div>
+                <div>
+                    <span>涨跌幅: </span>
+                    <span id="detailStockChangePct">--</span>
+                </div>
+                <div>
+                    <span>成交量: </span>
+                    <span id="detailStockVolume">--</span>
+                </div>
+            </div>
         </div>
         
-        <!-- 新增指标选择器 -->
-        <div class="indicator-tabs">
-            <button class="indicator-tab active" data-indicator="volume" onclick="plateMonitor.switchSubIndicator('volume')">成交量</button>
-            <button class="indicator-tab" data-indicator="macd" onclick="plateMonitor.switchSubIndicator('macd')">MACD</button>
-            <button class="indicator-tab" data-indicator="kdj" onclick="plateMonitor.switchSubIndicator('kdj')">KDJ</button>
-            <button class="indicator-tab" data-indicator="rsi" onclick="plateMonitor.switchSubIndicator('rsi')">RSI</button>
-        </div>
-        
-        <div class="chart-container" id="chartContainer">
-            <div class="chart-loading">图表加载中...</div>
-        </div>
-        
-        <!-- <div class="chart-controls">
-            <button class="control-btn small" onclick="plateMonitor.zoomChart(-10)">放大</button>
-            <button class="control-btn small" onclick="plateMonitor.zoomChart(10)">缩小</button>
-            <button class="control-btn small" onclick="plateMonitor.panChart(-1)">←</button>
-            <button class="control-btn small" onclick="plateMonitor.panChart(1)">→</button>
-        </div> -->
-        
-        <div class="f10-section">
-            <div class="f10-section-title">F10 基本信息</div>
-            <div class="f10-grid" id="f10InfoGrid">
-                <!-- F10信息将通过JS动态填充 -->
+        <div class="stock-detail-content">
+            <div class="chart-tabs">
+                <button class="chart-tab active" onclick="plateMonitor.switchChart('minute')">分时</button>
+                <button class="chart-tab" onclick="plateMonitor.switchChart('1min')">1分钟</button>
+                <button class="chart-tab" onclick="plateMonitor.switchChart('60min')">60分钟</button>
+                <button class="chart-tab" onclick="plateMonitor.switchChart('daily')">日K</button>
+                <button class="chart-tab" onclick="plateMonitor.switchChart('weekly')">周K</button>
+            </div>
+            
+            <div class="indicator-tabs">
+                <button class="indicator-tab active" data-indicator="volume" onclick="plateMonitor.switchSubIndicator('volume')">成交量</button>
+                <button class="indicator-tab" data-indicator="macd" onclick="plateMonitor.switchSubIndicator('macd')">MACD</button>
+                <button class="indicator-tab" data-indicator="kdj" onclick="plateMonitor.switchSubIndicator('kdj')">KDJ</button>
+                <button class="indicator-tab" data-indicator="rsi" onclick="plateMonitor.switchSubIndicator('rsi')">RSI</button>
+            </div>
+            
+            <div class="chart-container" id="chartContainer">
+                <div class="chart-loading">图表加载中...</div>
+            </div>
+            
+            <div class="f10-section">
+                <div class="f10-section-title">F10 基本信息</div>
+                <div class="f10-grid" id="f10InfoGrid">
+                    <!-- F10信息将通过JS动态填充 -->
+                </div>
             </div>
         </div>
     </div>
-</div>
-
+    
+    <!-- 异动设置对话框 -->
+    <div id="volatileSettingsDialog" class="volatile-settings-dialog">
+        <h3>显示设置</h3>
+        <div>
+            <label for="volatileStorageLimit">存储最大数量:</label>
+            <input type="number" id="volatileStorageLimit" min="50" max="1000" value="200">
+        </div>
+        <div>
+            <label for="volatileDisplayLimit">显示最大数量:</label>
+            <input type="number" id="volatileDisplayLimit" min="20" max="500" value="100">
+        </div>
+        <div class="volatile-settings-buttons">
+            <button class="volatile-settings-btn cancel" onclick="volatileMonitor.hideSettings()">取消</button>
+            <button class="volatile-settings-btn apply" onclick="volatileMonitor.applySettings()">应用</button>
+        </div>
+    </div>
+    <!-- <div id="volatileDialogOverlay" class="volatile-dialog-overlay"></div> -->
+     <!-- 悬浮按钮 -->
+    <div id="volatileFloatBtn" class="volatile-float-btn" onclick="expandVolatileSection()">
+        <div class="float-btn-icon">🚀</div>
+        <div class="float-btn-text">异动监控</div>
+    </div>
     <!-- 引入ECharts库 -->
     <script src="https://unpkg.com/echarts@6.0.0/dist/echarts.min.js"></script>
-    <script>
+<script>
+        // 优化LRU缓存类
         class OptimizedLRUCache {
             constructor(maxSize = 10) {
                 this.maxSize = maxSize;
@@ -1339,6 +2796,7 @@
             }
         }
 
+        // 板块监控类
         class PlateMonitor {
             constructor() {
                 this.ws = null;
@@ -1395,7 +2853,11 @@
                     platesContainer: null,
                     plateDetails: null,
                     connectionStatus: null,
-                    realTimeBadge: null
+                    realTimeBadge: null,
+                    stockDetailPanel: null,
+                    detailOverlay: null,
+                    chartContainer: null,
+                    f10InfoGrid: null
                 };
 
                 // 虚拟滚动相关
@@ -1408,12 +2870,16 @@
                     container: null,
                     content: null
                 };
-                 // 个股详情相关
+                
+                // 个股详情相关
                 this.currentChart = null;
                 this.currentChartType = 'minute';
+                this.currentSubIndicator = 'volume'; // 默认副图指标
+                this.resizeHandler = null;
                 this.selectedStock = null;
                 this.stockDetailCache = new OptimizedLRUCache(20); // 缓存个股详情数据
                 this.chartData = null; // 存储当前图表数据
+                
                 // 技术指标配置
                 this.indicatorConfig = {
                     volume: { name: '成交量', gridIndex: 1 },
@@ -1421,6 +2887,7 @@
                     kdj: { name: 'KDJ', gridIndex: 2 },
                     rsi: { name: 'RSI', gridIndex: 2 }
                 };
+                
                 this.stats = {
                     total: 0,
                     rise: 0,
@@ -1445,10 +2912,20 @@
                 this.domCache.detailOverlay = document.getElementById('detailOverlay');
                 this.domCache.chartContainer = document.getElementById('chartContainer');
                 this.domCache.f10InfoGrid = document.getElementById('f10InfoGrid');
-                 // 修复：初始化遮罩层点击事件
+                
+                // 初始化遮罩层点击事件
                 this.setupDetailOverlayClick();
+                
+                // 初始化筛选面板控制
+                this.initFilterPanelControl();
+                
+                // 连接WebSocket
                 this.connect();
+                
+                // 设置事件监听器
                 this.setupEventListeners();
+                
+                // 设置滚动加载
                 this.setupScrollLoading();
             }
             
@@ -1535,7 +3012,8 @@
                     this.showMessage(`服务器错误: ${data.message}`);
                 }
             }
-             // ==================== 个股详情功能 ====================
+            
+            // ==================== 个股详情功能 ====================
             
             // 显示个股详情
             showStockDetail(stock) {
@@ -1564,6 +3042,7 @@
                 this.loadChartData('minute');
                 this.loadF10Data();
             }
+            
             // 新增方法：设置遮罩层点击事件
             setupDetailOverlayClick() {
                 this.domCache.detailOverlay.addEventListener('click', (e) => {
@@ -1573,6 +3052,7 @@
                     }
                 });
             }
+            
             // 关闭个股详情
             closeStockDetail() {
                 this.domCache.stockDetailPanel.classList.remove('open');
@@ -1582,6 +3062,12 @@
                 if (this.currentChart) {
                     this.currentChart.dispose();
                     this.currentChart = null;
+                }
+                
+                // 移除resize事件监听器
+                if (this.resizeHandler) {
+                    window.removeEventListener('resize', this.resizeHandler);
+                    this.resizeHandler = null;
                 }
             }
             
@@ -1633,7 +3119,7 @@
                     this.domCache.chartContainer.innerHTML = '<div class="chart-loading">图表加载失败</div>';
                 }
             }
-             // 获取K线数据
+            
             // 获取K线数据
             async fetchKLineData(stockCode, frequency) {
                 // 计算开始日期（默认获取最近100个数据点）
@@ -1674,6 +3160,7 @@
                 const data = await response.json();
                 return data;
             }
+            
             // 获取频率参数
             getFrequencyByChartType(chartType) {
                 const frequencyMap = {
@@ -1686,84 +3173,6 @@
                     'monthly': 'm'
                 };
                 return frequencyMap[chartType] || 'd';
-            }
-            // 模拟获取图表数据
-            async fetchChartData(stockCode, chartType) {
-                // 模拟网络延迟
-                await new Promise(resolve => setTimeout(resolve, 500));
-                
-                // 生成模拟数据
-                if (chartType === 'minute') {
-                    return this.generateMinuteData();
-                } else {
-                    return this.generateKLineData(chartType);
-                }
-            }
-            
-            // 生成分时数据
-            generateMinuteData() {
-                const data = [];
-                const basePrice = this.selectedStock.price || 10;
-                const baseTime = new Date();
-                baseTime.setHours(9, 30, 0, 0); // 股市开盘时间
-                
-                for (let i = 0; i < 241; i++) { // 4小时 * 60分钟 + 1
-                    const time = new Date(baseTime.getTime() + i * 60000);
-                    // 模拟价格波动
-                    const change = (Math.random() - 0.5) * 0.02;
-                    const price = basePrice * (1 + change);
-                    
-                    data.push({
-                        time: time.toTimeString().substring(0, 5),
-                        price: price,
-                        volume: Math.floor(Math.random() * 10000)
-                    });
-                }
-                
-                return { type: 'minute', data: data };
-            }
-            
-            // 生成K线数据
-            generateKLineData(chartType) {
-                const data = [];
-                const basePrice = this.selectedStock.price || 10;
-                const baseDate = new Date();
-                
-                // 根据图表类型确定数据点数
-                let pointCount = 30;
-                if (chartType === 'weekly') pointCount = 52;
-                if (chartType === 'monthly') pointCount = 24;
-                
-                for (let i = pointCount - 1; i >= 0; i--) {
-                    const date = new Date(baseDate);
-                    
-                    // 调整日期
-                    if (chartType === 'daily') {
-                        date.setDate(date.getDate() - i);
-                    } else if (chartType === 'weekly') {
-                        date.setDate(date.getDate() - i * 7);
-                    } else if (chartType === 'monthly') {
-                        date.setMonth(date.getMonth() - i);
-                    }
-                    
-                    // 生成OHLC数据
-                    const open = basePrice * (0.95 + Math.random() * 0.1);
-                    const close = open * (0.98 + Math.random() * 0.04);
-                    const high = Math.max(open, close) * (1 + Math.random() * 0.02);
-                    const low = Math.min(open, close) * (1 - Math.random() * 0.02);
-                    const volume = Math.floor(Math.random() * 1000000);
-                    
-                    data.push({
-                        time: date.toISOString().split('T')[0],
-                        open: open,
-                        close: close,
-                        high: high,
-                        low: low,
-                        volume: volume
-                    });
-                }
-                
-                return { type: 'kline', data: data };
             }
             
             // 渲染图表
@@ -1793,262 +3202,23 @@
                 // 添加图表事件
                 this.bindChartEvents();
 
-                // 响应窗口大小变化
-                window.addEventListener('resize', () => {
-                    this.currentChart.resize();
-                });
+                // 移除旧的resize事件监听器（如果存在）
+                if (this.resizeHandler) {
+                    window.removeEventListener('resize', this.resizeHandler);
+                }
+                
+                // 创建新的resize事件监听器
+                this.resizeHandler = () => {
+                    if (this.currentChart) {
+                        this.currentChart.resize();
+                    }
+                };
+                
+                // 添加resize事件监听器
+                window.addEventListener('resize', this.resizeHandler);
             }
             
-            // // 修改 createMinuteChartOption 方法中的配色
-            // createMinuteChartOption(chartData) {
-            //     const klineData = chartData.data;
-                
-            //     const times = klineData.map(item => item.time);
-            //     const prices = klineData.map(item => item.close);
-            //     const volumes = klineData.map(item => item.volume);
-            //     const tradingStartIndex = this.findTradingStartIndex(times);
-            //     // 使用相同的色弱友好配色
-            //     const upColor = '#00a8ff';
-            //     const downColor = '#ff9f43';
-                
-            //     // 计算均价
-            //     const totalValue = prices.reduce((sum, price, index) => 
-            //         sum + price * volumes[index], 0);
-            //     const totalVolume = volumes.reduce((sum, vol) => sum + vol, 0);
-            //     const avgPrice = totalValue / totalVolume;
-
-            //     return {
-            //         backgroundColor: 'transparent',
-            //         animation: false,
-            //         grid: [
-            //             {
-            //                 left: '3%',
-            //                 right: '3%',
-            //                 top: '10%',
-            //                 height: '60%',
-            //                 backgroundColor: 'rgba(0,0,0,0.1)',
-            //                 borderColor: 'rgba(255,255,255,0.05)',
-            //                 show: true
-            //             },
-            //             {
-            //                 left: '3%',
-            //                 right: '3%',
-            //                 top: '75%',
-            //                 height: '15%',
-            //                 backgroundColor: 'rgba(0,0,0,0.1)',
-            //                 borderColor: 'rgba(255,255,255,0.05)',
-            //                 show: true
-            //             }
-            //         ],
-            //         // 使用与K线相同的坐标轴样式
-            //         xAxis: [
-            //             {
-            //                 type: 'category',
-            //                 data: times,
-            //                 boundaryGap: false,
-            //                 axisLine: {
-            //                     onZero: false,
-            //                     lineStyle: {
-            //                         color: '#666',
-            //                         width: 1
-            //                     }
-            //                 },
-            //                 axisTick: {
-            //                     show: true,
-            //                     inside: true,
-            //                     length: 3,
-            //                     lineStyle: {
-            //                         color: '#666'
-            //                     }
-            //                 },
-            //                 axisLabel: {
-            //                     color: '#999',
-            //                     fontSize: 11,
-            //                     margin: 8
-            //                 },
-            //                 splitLine: {
-            //                     show: true,
-            //                     lineStyle: {
-            //                         color: 'rgba(255,255,255,0.05)',
-            //                         type: 'dashed'
-            //                     }
-            //                 },
-            //                 splitArea: {
-            //                     show: true,
-            //                     areaStyle: {
-            //                         color: ['rgba(255,255,255,0.02)', 'rgba(0,0,0,0.02)']
-            //                     }
-            //                 }
-            //             },
-            //             {
-            //                 type: 'category',
-            //                 gridIndex: 1,
-            //                 data: times,
-            //                 show: false // 隐藏成交量时间轴
-            //             }
-            //         ],
-            //         yAxis: [
-            //             {
-            //                 scale: true,
-            //                 axisLine: {
-            //                     lineStyle: {
-            //                         color: '#666'
-            //                     }
-            //                 },
-            //                 axisLabel: {
-            //                     color: '#999',
-            //                     fontSize: 11
-            //                 },
-            //                 splitLine: { 
-            //                     show: true,
-            //                     lineStyle: {
-            //                         color: 'rgba(255,255,255,0.1)',
-            //                         type: 'dashed'
-            //                     }
-            //                 },
-            //                 splitArea: { show: false }
-            //             },
-            //             {
-            //                 scale: true,
-            //                 gridIndex: 1,
-            //                 splitNumber: 2,
-            //                 axisLabel: { 
-            //                     show: true,
-            //                     color: '#999',
-            //                     fontSize: 10
-            //                 },
-            //                 axisLine: { show: false },
-            //                 axisTick: { show: false },
-            //                 splitLine: { 
-            //                     show: true,
-            //                     lineStyle: {
-            //                         color: 'rgba(255,255,255,0.05)'
-            //                     }
-            //                 }
-            //             }
-            //         ],
-            //         dataZoom: [
-            //             {
-            //                 type: 'inside',
-            //                 xAxisIndex: [0, 1],
-            //                 start: tradingStartIndex,
-            //                 end: 100
-            //             },
-            //             {
-            //                 show: true,
-            //                 xAxisIndex: [0, 1],
-            //                 type: 'slider',
-            //                 bottom: '2%',
-            //                 height: 20,
-            //                 start:  tradingStartIndex,
-            //                 end: 100,
-            //                 borderColor: 'rgba(255,255,255,0.1)',
-            //                 backgroundColor: 'rgba(40,40,60,0.8)',
-            //                 textStyle: {
-            //                     color: '#999'
-            //                 },
-            //                 handleStyle: {
-            //                     color: 'rgba(212,175,55,0.8)',
-            //                     borderColor: '#d4af37'
-            //                 }
-            //             }
-            //         ],
-            //         series: [
-            //             {
-            //                 name: '分时',
-            //                 type: 'line',
-            //                 data: prices,
-            //                 smooth: true,
-            //                 lineStyle: {
-            //                     color: upColor,
-            //                     width: 1.5
-            //                 },
-            //                 areaStyle: {
-            //                     color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-            //                         { offset: 0, color: 'rgba(0,168,255,0.3)' },
-            //                         { offset: 1, color: 'rgba(0,168,255,0.05)' }
-            //                     ])
-            //                 },
-            //                 markLine: {
-            //                     silent: true,
-            //                     data: [
-            //                         {
-            //                             yAxis: avgPrice,
-            //                             lineStyle: {
-            //                                 color: '#ff9f43',
-            //                                 type: 'dashed',
-            //                                 width: 1
-            //                             },
-            //                             label: {
-            //                                 formatter: '均价: ' + avgPrice.toFixed(2),
-            //                                 color: '#999',
-            //                                 fontSize: 10
-            //                             }
-            //                         }
-            //                     ]
-            //                 }
-            //             },
-            //             {
-            //                 name: '成交量',
-            //                 type: 'bar',
-            //                 xAxisIndex: 1,
-            //                 yAxisIndex: 1,
-            //                 data: volumes.map((volume, index) => ({
-            //                     value: volume,
-            //                     itemStyle: {
-            //                         color: index > 0 ? 
-            //                             (prices[index] >= prices[index - 1] ? upColor : downColor) 
-            //                             : upColor
-            //                     }
-            //                 })),
-            //                 barWidth: '60%'
-            //             }
-            //         ]
-            //     };
-            // }
-            // 辅助方法：找到当天交易开始的位置
-            findTradingStartIndex(times) {
-                // 假设时间格式为 "HH:MM" 或 "YYYY-MM-DD HH:MM"
-                if (!times || times.length === 0) {
-                    return { position: 0, index: -1 };
-                }
-                
-                // 去掉最后几分钟的数据，避免影响查找
-                // 假设每天最多240分钟交易数据，去掉最后5分钟
-                const trimmedTimes = times.slice(0, Math.max(0, times.length - 5));
-                
-                // 从后往前查找最近的15:00或14:59时间点
-                for (let i = trimmedTimes.length - 1; i >= 0; i--) {
-                    const timeStr = trimmedTimes[i].toString();
-                    if (timeStr.includes(' 15:00') || timeStr.includes(' 14:59')) {
-                        // 计算相对于原始times数组的位置
-                        const originalIndex = i;
-                        // 返回百分比位置和索引，稍微往前一点以包含更多上下文
-                        return {
-                            position: Math.max(0, (originalIndex / times.length) * 100 - 3),
-                            index: originalIndex
-                        };
-                    }
-                }
-                
-                // 如果没找到15:00/14:59，尝试查找14:55左右的数据作为结束点的参考
-                // for (let i = trimmedTimes.length - 1; i >= Math.max(0, trimmedTimes.length - 10); i--) {
-                //     const timeStr = trimmedTimes[i].toString();
-                //     if (timeStr.includes(' 14:5')) {
-                //         const originalIndex = i;
-                //         return {
-                //             position: Math.max(0, (originalIndex / times.length) * 100 - 2),
-                //             index: originalIndex
-                //         };
-                //     }
-                // }
-                
-                // 默认返回最后30%的数据位置（与原来逻辑不同，这里关注最近数据）
-                return { position: 0, index: -1 }; // 默认显示最后30%的数据
-            }
             // 创建K线图配置
-             // 创建K线图配置
-            // 修改 createKLineChartOption 方法中的配色和工具栏配置
             createKLineChartOption(chartData) {
                 const klineData = chartData.data;
                 const indicators = chartData.indicators || {};
@@ -2315,7 +3485,7 @@
                     backgroundColor: 'transparent',
                     animation: false,
                     legend: {
-                        data: ['K线', '成交量', 'MA5', 'MA10', 'MA20', 'MA30'],//, 'BOLL上轨', 'BOLL中轨', 'BOLL下轨'],
+                        data: ['K线', '成交量', 'MA5', 'MA10', 'MA20', 'MA30'],
                         selected: {
                             '成交量': true,
                             'MA5': true,
@@ -2366,8 +3536,6 @@
                                 };
                                 
                                 if (seriesName === 'K线' && Array.isArray(value) && value.length >= 4) {
-                                    // console.log(value)
-                                    // 确保开盘价不为0或无效值
                                     const openPrice = value[1] || 1;
                                     const change = ((value[2] - openPrice) / openPrice * 100);
                                     const changeColor = (value[2] !== undefined && value[2] !== null) && value[2] >= openPrice ? upColor : downColor;
@@ -2495,8 +3663,6 @@
                         start: 40,
                         end: 100,
                         minValueSpan: 10,
-                        // zoomOnMouseWheel: false,
-                        // moveOnMouseMove: false,
                         preventDefaultMouseMove: true
                     },
                     {
@@ -2508,7 +3674,6 @@
                         start: 70,
                         end: 100,
                         minValueSpan: 10,
-                        // 关键配置：完全禁用所有hover效果
                         handleStyle: {
                             color: '#d4af37',
                             borderColor: '#d4af37',
@@ -2551,9 +3716,8 @@
                             fontSize: 10
                         },
                         brushSelect: false,
-                        // 关键：禁用所有hover效果
                         emphasis: {
-                            disabled: true, // 完全禁用emphasis状态
+                            disabled: true,
                             handleStyle: {
                                 color: '#d4af37',
                                 borderColor: '#d4af37',
@@ -2564,13 +3728,8 @@
                                 opacity: 1
                             }
                         },
-                        // 禁用所有提示
                         showDetail: false,
-                        // 禁用数据阴影
-                        showDataShadow: false,
-                        // 实时更新设为false，减少交互反馈
-                        // realtime: false,
-                        // animation: false
+                        showDataShadow: false
                     }
                 ],
                     series: series
@@ -2578,9 +3737,8 @@
 
                 return option;
             }
-
+            
             // 添加技术指标副图
-            // 修改 addTechnicalIndicator 方法中的配色
             addTechnicalIndicator(series, indicators, indicatorType) {
                 if (!indicators[indicatorType]) return;
 
@@ -2714,7 +3872,8 @@
                         break;
                 }
             }
-             // 创建分时图配置（基于真实数据）
+            
+            // 创建分时图配置（基于真实数据）
             createMinuteChartOption(chartData) {
                 const klineData = chartData.data;
                 
@@ -2740,7 +3899,6 @@
                 // 遍历所有数据点
                 for (let i = 0; i < prices.length; i++) {
                     // 获取当前数据点的日期部分
-                    // 假设time格式为"HH:MM"或包含日期的格式
                     const timeStr = times[i];
                     let dateStr = 'current'; // 默认日期标识
                     
@@ -2750,9 +3908,7 @@
                         dateStr = timeStr.split(' ')[0];
                     } else if (tradingStartIndex && i >= tradingStartIndex && i > 0) {
                         // 对于没有日期信息的数据，通过tradingStartIndex来识别不同的交易日
-                        // 这里简化处理，实际可能需要更复杂的逻辑来判断是否跨天
                         const prevIndex = i - 1;
-                        // 如果当前点与前一个点的时间差超过一定阈值（例如1小时），则认为是新的一天
                         if (times[prevIndex]) {
                             const [prevHour, prevMin] = times[prevIndex].split(':').map(Number);
                             const [currHour, currMin] = timeStr.split(':').map(Number);
@@ -2888,14 +4044,11 @@
                     yAxis: [
                         {
                             scale: true,
-                            // 如果找到了中轴价格，设置合适的min和max使该价格位于中轴
                             min: function(value) {
                                 if (midPrice !== null && !isNaN(midPrice)) {
-                                    // 计算价格范围，确保中轴价格在中间位置
                                     const range = value.max - value.min;
                                     return midPrice - (range * 1.001).toFixed(2);
                                 }
-                                // 默认使用原始值
                                 return value.min;
                             },
                             max: function(value) {
@@ -2903,7 +4056,6 @@
                                     const range = value.max - value.min;
                                     return midPrice + (range * 1.001).toFixed(2);
                                 }
-                                // 默认使用原始值
                                 return value.max;
                             },
                             axisLine: {
@@ -2923,7 +4075,7 @@
                                 }
                             },
                             splitArea: { 
-                                show: false // 关闭背景色块
+                                show: false
                             }
                         },
                         {
@@ -2945,12 +4097,11 @@
                             }
                         }
                     ],
-                    // 添加数据区域缩放，便于查看细节
                     dataZoom: [
                         {
                             type: 'inside',
                             xAxisIndex: [0, 1],
-                            start: tradingStartIndex, // 默认显示最后30%的数据（当天）
+                            start: tradingStartIndex,
                             end: 100,
                             zoomOnMouseWheel: false,
                             moveOnMouseMove: true,
@@ -2964,7 +4115,6 @@
                             height: 20,
                             start: tradingStartIndex,
                             end: 100,
-                            // 关键配置：与K线图一致的样式
                             handleStyle: {
                                 color: '#d4af37',
                                 borderColor: '#d4af37',
@@ -3007,9 +4157,8 @@
                                 fontSize: 10
                             },
                             brushSelect: false,
-                            // 关键：禁用所有hover效果
                             emphasis: {
-                                disabled: true, // 完全禁用emphasis状态
+                                disabled: true,
                                 handleStyle: {
                                     color: '#d4af37',
                                     borderColor: '#d4af37',
@@ -3020,9 +4169,7 @@
                                     opacity: 1
                                 }
                             },
-                            // 禁用所有提示
                             showDetail: false,
-                            // 禁用数据阴影
                             showDataShadow: false
                         }
                     ],
@@ -3050,11 +4197,7 @@
                             lineStyle: {
                                 color: '#00cc99',
                                 width: 1.5
-                            },
-                            // 不显示点
-                            // showSymbol: false,
-                            // 不显示区域填充
-                            // areaStyle: {}
+                            }
                         },
                         {
                             name: '成交量',
@@ -3074,6 +4217,30 @@
                     ]
                 };
             }
+            
+            // 辅助方法：找到当天交易开始的位置
+            findTradingStartIndex(times) {
+                if (!times || times.length === 0) {
+                    return { position: 0, index: -1 };
+                }
+                
+                const trimmedTimes = times.slice(0, Math.max(0, times.length - 5));
+                
+                // 从后往前查找最近的15:00或14:59时间点
+                for (let i = trimmedTimes.length - 1; i >= 0; i--) {
+                    const timeStr = trimmedTimes[i].toString();
+                    if (timeStr.includes(' 15:00') || timeStr.includes(' 14:59')) {
+                        const originalIndex = i;
+                        return {
+                            position: Math.max(0, (originalIndex / times.length) * 100 - 3),
+                            index: originalIndex
+                        };
+                    }
+                }
+                
+                return { position: 0, index: -1 };
+            }
+            
             // 绑定图表事件
             bindChartEvents() {
                 if (!this.currentChart) return;
@@ -3161,7 +4328,6 @@
             // ==================== 副图指标切换 ====================
 
             // 切换副图指标
-            // 修改 switchSubIndicator 方法
             switchSubIndicator(indicatorType) {
                 this.currentSubIndicator = indicatorType;
                 
@@ -3184,7 +4350,8 @@
                     }
                 }
             }
-            // 在 PlateMonitor 类中添加方法
+            
+            // 确保图表数据可用
             ensureChartData() {
                 if (!this.chartData && this.selectedStock && this.currentChartType) {
                     const cacheKey = `${this.selectedStock.code}_${this.currentChartType}`;
@@ -3195,6 +4362,7 @@
                 }
                 return !!this.chartData;
             }
+            
             // 加载F10数据
             async loadF10Data() {
                 if (!this.selectedStock) return;
@@ -3251,11 +4419,6 @@
                 } else {
                     console.warn('F10容器元素未找到');
                 }
-            }
-
-            // 重试加载F10
-            retryLoadF10() {
-                this.loadF10Data();
             }
 
             // 渲染F10数据 - 新布局
@@ -3366,12 +4529,12 @@
                 
                 f10Container.innerHTML = html;
             }
+            
             // 格式化上市日期
             formatListingDate(dateStr) {
                 if (!dateStr) return '--';
                 
                 try {
-                    // 假设日期格式为 YYYYMMDD
                     const year = dateStr.substring(0, 4);
                     const month = dateStr.substring(4, 6);
                     const day = dateStr.substring(6, 8);
@@ -3399,6 +4562,30 @@
                 if (!value) return '--';
                 return value.toFixed(2) + '%';
             }
+            
+            // 初始化筛选面板控制
+            initFilterPanelControl() {
+                // 监听设置按钮点击，显示筛选面板
+                const volatileToggleBtn = document.querySelector('.volatile-toggle-btn');
+                const volatileFilterPanel = document.getElementById('volatileFilterPanel');
+                
+                // 双击异动区域标题显示筛选面板
+                const volatileSection = document.getElementById('volatileSection');
+                const volatileHeader = volatileSection.querySelector('.section-header h2');
+                
+                volatileHeader.addEventListener('dblclick', () => {
+                    volatileFilterPanel.classList.toggle('show');
+                });
+                
+                // 初始化强度滑块
+                const strengthSlider = document.getElementById('volatileStrengthSlider');
+                const strengthValue = document.getElementById('volatileStrengthValue');
+                
+                strengthSlider.addEventListener('input', function() {
+                    strengthValue.textContent = this.value;
+                });
+            }
+            
             // 修复1: 增量更新个股数据，不重新创建DOM
             handleStockUpdate(data) {
                 if (!data || !data.plate_id || !data.data || !Array.isArray(data.data)) {
@@ -3634,6 +4821,7 @@
                     }
                 }, 0);
             }
+            
             // 新增方法：清理重复的DOM元素
             cleanupDuplicateStockRows() {
                 if (!this.virtualScroll.content) return 0;
@@ -3660,6 +4848,7 @@
                 
                 return duplicates.length;
             }
+            
             // 修改 createVirtualStockRow 方法
             createVirtualStockRow(stock, index) {
                 const row = document.createElement('div');
@@ -3668,9 +4857,114 @@
                 row.style.top = `${index * this.virtualScroll.rowHeight}px`;
                 row.style.height = `${this.virtualScroll.rowHeight}px`;
                 
-                // 添加点击事件
-                row.addEventListener('click', () => {
+                // 统一处理单击和双击事件
+                let clickTimer = null;
+                let isDoubleClick = false;
+                
+                // 通用的单击处理函数
+                const handleSingleClick = (e) => {
+                    // 显示分时图片
+                    this.showStockChart(e, stock);
+                    // 延迟隐藏，让用户有时间查看
+                    setTimeout(() => {
+                        this.hideStockChart();
+                    }, 2000);
+                };
+                
+                // 通用的双击处理函数
+                const handleDoubleClick = () => {
+                    // 进入原流程（显示股票详情）
                     this.showStockDetail(stock);
+                };
+                
+                // 鼠标点击事件处理
+                row.addEventListener('click', (e) => {
+                    if (isDoubleClick) {
+                        isDoubleClick = false;
+                        return;
+                    }
+                    
+                    clearTimeout(clickTimer);
+                    clickTimer = setTimeout(() => {
+                        if (!isDoubleClick) {
+                            handleSingleClick(e);
+                        }
+                    }, 300);
+                });
+                
+                // 鼠标双击事件处理
+                row.addEventListener('dblclick', (e) => {
+                    e.preventDefault(); // 阻止默认双击行为
+                    isDoubleClick = true;
+                    clearTimeout(clickTimer);
+                    handleDoubleClick();
+                });
+                
+                // 触摸事件处理（统一单击和双击）
+                let lastTapTime = 0;
+                let lastTapX = 0;
+                let lastTapY = 0;
+                let isSwiping = false;
+                
+                // 阻止触摸事件默认行为，避免触发click事件
+                row.addEventListener('touchstart', (e) => {
+                    // 记录触摸位置
+                    lastTapX = e.touches[0].clientX;
+                    lastTapY = e.touches[0].clientY;
+                    // 重置滑动标志
+                    isSwiping = false;
+                });
+                
+                row.addEventListener('touchend', (e) => {
+                    // 只有当事件可取消时才阻止默认行为，避免触发click事件
+                    if (e.cancelable) {
+                        e.preventDefault();
+                    }
+                    
+                    // 如果发生了滑动，则不执行任何操作
+                    if (isSwiping) {
+                        lastTapTime = 0;
+                        return;
+                    }
+                    
+                    const currentTime = new Date().getTime();
+                    const tapLength = currentTime - lastTapTime;
+                    const currentX = e.changedTouches[0].clientX;
+                    const currentY = e.changedTouches[0].clientY;
+                    const distanceX = Math.abs(currentX - lastTapX);
+                    const distanceY = Math.abs(currentY - lastTapY);
+                    
+                    // 判断是否是双击（时间间隔<300ms，距离<10px）
+                    if (tapLength < 300 && tapLength > 0 && distanceX < 10 && distanceY < 10) {
+                        clearTimeout(clickTimer);
+                        handleDoubleClick();
+                    } else {
+                        // 单击处理
+                        clearTimeout(clickTimer);
+                        clickTimer = setTimeout(() => {
+                            handleSingleClick(e);
+                        }, 200); // 短暂延迟确认是单击
+                    }
+                    
+                    lastTapTime = currentTime;
+                });
+                
+                row.addEventListener('touchmove', (e) => {
+                    // 检测滑动距离
+                    const currentX = e.touches[0].clientX;
+                    const currentY = e.touches[0].clientY;
+                    const distanceX = Math.abs(currentX - lastTapX);
+                    const distanceY = Math.abs(currentY - lastTapY);
+                    
+                    // 如果移动距离超过一定阈值，认为是滑动操作
+                    if (distanceX > 10 || distanceY > 10) {
+                        isSwiping = true;
+                        // 移动时隐藏图片
+                        this.hideStockChart();
+                        // 重置双击检测
+                        lastTapTime = 0;
+                        clearTimeout(clickTimer);
+                    }
                 });
                 
                 const changeClass = stock.change_pct >= 0 ? 'change-positive' : 'change-negative';
@@ -3917,6 +5211,7 @@
                     }
                 }
             }
+            
             // 新增方法：移除重复股票
             removeDuplicateStocks(stocks) {
                 const stockMap = new Map();
@@ -3933,6 +5228,7 @@
                 
                 return uniqueStocks;
             }
+            
             // 修复handlePlateStocks方法
             handlePlateStocks(data) {
                 if (data.plate_id && data.data) {
@@ -4217,7 +5513,6 @@
                     
                     // 处理特殊字段 - 修复部分
                     if (this.currentSort.field === 'advanced_1min') {
-                        // 直接使用plate对象的属性，而不是advanced_indicators
                         aVal = a.avg_change_rate_1min || a.change_rate_1min || 0;
                         bVal = b.avg_change_rate_1min || b.change_rate_1min || 0;
                     } else if (this.currentSort.field === 'advanced_2min') {
@@ -4774,13 +6069,1371 @@
                     this.showMessage(`❌ 已关闭 ${data.plate_id} 个股实时更新`);
                 }
             }
+            
+            // 显示股票分时图片
+            showStockChart(e, stock) {
+                // 确保图表容器已创建
+                this.createChartContainer();
+                
+                // 确定股票是沪市(1)还是深市(0)
+                const marketCode = stock.code.startsWith('6') ? '1' : '0';
+                const nid = `${marketCode}.${stock.code}`;
+                
+                // 构建分时图片URL
+                const chartUrl = `https://webquotepic.eastmoney.com/GetPic.aspx?nid=${nid}&imageType=r`;
+                
+                // 设置图片源
+                const chartImg = this.domCache.stockChartContainer.querySelector('img');
+                chartImg.src = chartUrl;
+                
+                // 计算图表位置（优化：显示在屏幕右侧中间位置，避免偏右下）
+                // 同时支持鼠标事件和触摸事件
+                let x, y;
+                
+                // 优先考虑将图表显示在屏幕右侧中间位置
+                x = window.innerWidth - 350; // 距离右侧有一定间距
+                y = (window.innerHeight - 250) / 2; // 垂直居中
+                
+                // 如果是鼠标事件，可以考虑显示在鼠标附近，但仍需优化
+                if (!e.touches) {
+                    // 鼠标事件：确保图片不会超出屏幕
+                    x = Math.min(e.pageX + 10, window.innerWidth - 350);
+                    y = Math.max(10, Math.min(e.pageY - 100, window.innerHeight - 250));
+                }
+                
+                // 设置图表容器位置和显示
+                this.domCache.stockChartContainer.style.left = `${x}px`;
+                this.domCache.stockChartContainer.style.top = `${y}px`;
+                this.domCache.stockChartContainer.style.display = 'block';
+                
+                // 显示加载中提示
+                chartImg.style.display = 'none';
+                this.domCache.stockChartContainer.querySelector('.chart-loading').style.display = 'block';
+                
+                // 图片加载完成后显示图片
+                chartImg.onload = () => {
+                    chartImg.style.display = 'block';
+                    this.domCache.stockChartContainer.querySelector('.chart-loading').style.display = 'none';
+                };
+                
+                // 图片加载失败处理
+                chartImg.onerror = () => {
+                    chartImg.style.display = 'none';
+                    const errorMsg = this.domCache.stockChartContainer.querySelector('.chart-error');
+                    errorMsg.style.display = 'block';
+                    this.domCache.stockChartContainer.querySelector('.chart-loading').style.display = 'none';
+                };
+            }
+            
+            // 隐藏股票分时图片
+            hideStockChart() {
+                if (this.domCache.stockChartContainer) {
+                    this.domCache.stockChartContainer.style.display = 'none';
+                }
+            }
+            
+            // 创建分时图片容器
+            createChartContainer() {
+                if (this.domCache.stockChartContainer) return;
+                
+                const container = document.createElement('div');
+                container.id = 'stockChartContainer';
+                container.style.cssText = `
+                    position: fixed;
+                    background: rgba(42, 42, 42, 0.95);
+                    border: 1px solid #444;
+                    border-radius: 8px;
+                    padding: 10px;
+                    z-index: 10000;
+                    display: none;
+                    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+                    backdrop-filter: blur(10px);
+                `;
+                
+                // 创建图片元素
+                const img = document.createElement('img');
+                img.style.cssText = `
+                    width: 300px;
+                    height: 200px;
+                    border-radius: 4px;
+                    display: none;
+                `;
+                
+                // 创建加载中提示
+                const loading = document.createElement('div');
+                loading.className = 'chart-loading';
+                loading.style.cssText = `
+                    width: 300px;
+                    height: 200px;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    color: #ccc;
+                    font-size: 12px;
+                `;
+                loading.textContent = '正在加载分时图...';
+                
+                // 创建加载失败提示
+                const error = document.createElement('div');
+                error.className = 'chart-error';
+                error.style.cssText = `
+                    width: 300px;
+                    height: 200px;
+                    display: none;
+                    justify-content: center;
+                    align-items: center;
+                    color: #ff6b6b;
+                    font-size: 12px;
+                `;
+                error.textContent = '分时图加载失败，请稍后再试';
+                
+                // 添加元素到容器
+                container.appendChild(img);
+                container.appendChild(loading);
+                container.appendChild(error);
+                
+                // 添加到DOM
+                document.body.appendChild(container);
+                
+                // 存储到domCache
+                this.domCache.stockChartContainer = container;
+            }
         }
         
+        // 创建板块监控实例
         const plateMonitor = new PlateMonitor();
+
+
+        // 完整的VolatileMonitor类
+        class VolatileMonitor {
+            constructor() {
+                this.ws = null;
+                this.allAlerts = []; // 存储所有警报
+                this.filteredAlerts = []; // 存储筛选后的警报
+                this.alertCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                this.cumulativeCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                this.maxStorageAlerts = 200; // 存储的最大警报数量
+                this.maxDisplayAlerts = 100; // 显示的最大警报数量
+                this.reconnectDelay = 1000;
+                this.messageCount = 0;
+                this.autoScroll = true;
+                this.dataPersistence = true;
+                this.sessionId = this.generateSessionId();
+                this.lastProcessedTimestamps = new Set();
+                this.isFiltering = false;
+                this.pendingAlerts = [];
+                
+                // 筛选条件
+                this.filters = {
+                    levels: ['high', 'medium', 'low'],
+                    types: ['封单异动', '成交额异动', '其他'],
+                    minStrength: 0
+                };
+                
+                // UI状态
+                this.uiState = {
+                    autoScroll: true,
+                    dataPersistence: true,
+                    filters: this.filters
+                };
+                
+                // 连接状态
+                this.connectionState = {
+                    connected: false,
+                    connecting: false,
+                    lastConnectAttempt: 0,
+                    manualExpand: false // 用户手动展开标记
+                };
+                
+                this.init();
+            }
+            
+            // 初始化
+            init() {
+                this.loadFromStorage();
+                this.applyUIFilters();
+                this.updateStatsDisplay();
+                
+                // 如果有历史数据，显示"点击加载"提示
+                if (this.allAlerts.length > 0) {
+                    this.showClickToLoad();
+                } else {
+                    this.showWaitingMessage();
+                }
+                
+                // 初始化强度滑块值显示
+                const strengthSlider = document.getElementById('volatileStrengthSlider');
+                const strengthValue = document.getElementById('volatileStrengthValue');
+                if (strengthSlider && strengthValue) {
+                    strengthSlider.value = this.filters.minStrength;
+                    strengthValue.textContent = this.filters.minStrength;
+                }
+            }
+            
+            // 连接WebSocket（手动触发）
+            connectVolatile() {
+                if (this.connectionState.connecting || this.connectionState.connected) {
+                    console.log('异动监控：正在连接或已连接');
+                    return;
+                }
+                
+                this.connectionState.connecting = true;
+                this.connectionState.lastConnectAttempt = Date.now();
+                this.connectionState.manualExpand = true;
+                
+                // 显示连接状态
+                this.showConnectingState();
+                
+                try {
+                    console.log('开始连接异动WebSocket...');
+                    this.ws = new WebSocket('ws://115.190.156.240:8080/ws/volatile');
+                    
+                    this.ws.onopen = () => {
+                        console.log('✅ 异动WebSocket连接成功');
+                        this.connectionState.connected = true;
+                        this.connectionState.connecting = false;
+                        this.reconnectDelay = 1000;
+                        this.showConnectedState();
+                        this.updateConnectionStatus(true);
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        this.messageCount++;
+                        
+                        try {
+                            const data = JSON.parse(event.data);
+                            
+                            if (data.type === 'volatile_alert') {
+                                // 如果正在筛选，将警报放入待处理队列
+                                if (this.isFiltering) {
+                                    this.pendingAlerts.push(data);
+                                } else {
+                                    this.handleAlert(data);
+                                }
+                            } else if (data.type === 'system') {
+                                console.log(`系统消息: ${data.message}`);
+                            }
+                        } catch (e) {
+                            console.error('异动消息解析错误:', e);
+                        }
+                    };
+                    
+                    this.ws.onclose = (event) => {
+                        console.log('❌ 异动WebSocket连接关闭:', event.code, event.reason);
+                        this.connectionState.connected = false;
+                        this.connectionState.connecting = false;
+                        this.showDisconnectedState();
+                        this.updateConnectionStatus(false);
+                        
+                        // 如果用户仍需要连接，则尝试重连
+                        if (this.connectionState.manualExpand) {
+                            setTimeout(() => this.connectVolatile(), this.reconnectDelay);
+                            this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+                        }
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('异动WebSocket错误:', error);
+                        this.connectionState.connecting = false;
+                        this.showConnectionError();
+                        this.updateConnectionStatus(false);
+                    };
+                    
+                } catch (error) {
+                    console.error('异动连接失败:', error);
+                    this.connectionState.connecting = false;
+                    this.showConnectionError();
+                    this.updateConnectionStatus(false);
+                    
+                    // 如果用户仍需要连接，则尝试重连
+                    if (this.connectionState.manualExpand) {
+                        setTimeout(() => this.connectVolatile(), this.reconnectDelay);
+                    }
+                }
+            }
+            
+            // 断开WebSocket连接
+            disconnectVolatile() {
+                if (this.ws) {
+                    this.ws.close();
+                    this.ws = null;
+                }
+                this.connectionState.connected = false;
+                this.connectionState.connecting = false;
+                this.connectionState.manualExpand = false;
+                this.showDisconnectedState();
+                this.updateConnectionStatus(false);
+            }
+            
+            // 处理接收到的警报
+            handleAlert(alertData) {
+                // 检查是否已处理过此警报（基于时间戳）
+                const alertKey = `${alertData.symbol}_${alertData.timestamp}`;
+                if (this.lastProcessedTimestamps.has(alertKey)) {
+                    return;
+                }
+                
+                // 添加到已处理集合
+                this.lastProcessedTimestamps.add(alertKey);
+                
+                // 添加到所有警报（存储限制）
+                this.allAlerts.unshift(alertData);
+                
+                // 限制存储数据量（避免内存泄漏）
+                if (this.allAlerts.length > this.maxStorageAlerts) {
+                    const removedAlert = this.allAlerts.pop();
+                    const removedKey = `${removedAlert.symbol}_${removedAlert.timestamp}`;
+                    this.lastProcessedTimestamps.delete(removedKey);
+                }
+                
+                // 更新统计（包括累计统计）
+                this.updateStats(alertData);
+                
+                // 应用筛选
+                this.applyFilters();
+                
+                // 保存到本地存储（如果启用持久化）
+                if (this.dataPersistence) {
+                    this.saveToStorage();
+                }
+            }
+            
+            // 更新统计信息
+            updateStats(alertData = null) {
+                // 重置当前统计（基于存储的数据）
+                this.alertCounts = { high: 0, medium: 0, low: 0, total: this.allAlerts.length };
+                
+                // 计算当前存储数据的各级别数量
+                this.allAlerts.forEach(alert => {
+                    if (alert.alert_level && this.alertCounts[alert.alert_level] !== undefined) {
+                        this.alertCounts[alert.alert_level]++;
+                    }
+                });
+                
+                // 更新累计统计（不受存储限制）
+                if (alertData) {
+                    this.cumulativeCounts.total++;
+                    if (alertData.alert_level && this.cumulativeCounts[alertData.alert_level] !== undefined) {
+                        this.cumulativeCounts[alertData.alert_level]++;
+                    }
+                }
+                
+                this.updateStatsDisplay();
+            }
+            
+            // 更新统计显示
+            updateStatsDisplay() {
+                // 显示累计统计，不受存储限制
+                document.getElementById('volatileHighCount').textContent = this.cumulativeCounts.high;
+                document.getElementById('volatileMediumCount').textContent = this.cumulativeCounts.medium;
+                document.getElementById('volatileLowCount').textContent = this.cumulativeCounts.low;
+                document.getElementById('volatileTotalCount').textContent = this.cumulativeCounts.total;
+            }
+            
+            // 应用筛选条件
+            applyFilters() {
+                // 标记开始筛选
+                this.isFiltering = true;
+                
+                // 获取当前筛选条件
+                const levelCheckboxes = document.querySelectorAll('input[name="level"]:checked');
+                this.filters.levels = Array.from(levelCheckboxes).map(cb => cb.value);
+                
+                const typeCheckboxes = document.querySelectorAll('input[name="type"]:checked');
+                this.filters.types = Array.from(typeCheckboxes).map(cb => cb.value);
+                
+                this.filters.minStrength = parseInt(document.getElementById('volatileStrengthSlider').value);
+                
+                // 保存筛选条件到UI状态
+                this.saveFiltersToUIState();
+                
+                // 应用筛选逻辑
+                this.applyFiltersInternal();
+                
+                // 标记筛选结束
+                this.isFiltering = false;
+                
+                // 处理筛选期间积累的警报
+                this.processPendingAlerts();
+                
+                // 保存筛选条件
+                this.saveToStorage();
+            }
+            
+            // 内部筛选逻辑
+            applyFiltersInternal() {
+                // 先筛选所有存储的数据
+                let filtered = this.allAlerts.filter(alert => {
+                    // 检查级别筛选
+                    if (!this.filters.levels.includes(alert.alert_level)) {
+                        return false;
+                    }
+                    
+                    // 检查类型筛选
+                    if (!this.filters.types.includes(alert.action_text)) {
+                        return false;
+                    }
+                    
+                    // 检查强度筛选
+                    if (alert.strength < this.filters.minStrength) {
+                        return false;
+                    }
+                    
+                    return true;
+                });
+                
+                // 限制显示数量（提高性能）
+                this.filteredAlerts = filtered.slice(0, this.maxDisplayAlerts);
+                
+                this.renderAlerts();
+            }
+            
+            // 重置筛选条件
+            resetFilters() {
+                // 重置级别筛选
+                const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+                levelCheckboxes.forEach(cb => cb.checked = true);
+                
+                // 重置类型筛选
+                const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+                typeCheckboxes.forEach(cb => cb.checked = true);
+                
+                // 重置强度筛选
+                document.getElementById('volatileStrengthSlider').value = 0;
+                document.getElementById('volatileStrengthValue').textContent = '0';
+                
+                // 应用重置后的筛选
+                this.applyFilters();
+            }
+            
+            // 渲染警报列表
+            renderAlerts() {
+                const container = document.getElementById('volatileAlertsContainer');
+                
+                if (this.filteredAlerts.length === 0) {
+                    container.innerHTML = '<div class="volatile-no-alerts">暂无符合条件的异动数据</div>';
+                    return;
+                }
+                
+                // 清除等待消息
+                if (container.innerHTML.includes('等待连接') || container.innerHTML.includes('等待异动数据')) {
+                    container.innerHTML = '';
+                }
+                
+                // 添加平滑过渡类
+                container.classList.add('smooth-transition');
+                
+                // 清空容器
+                container.innerHTML = '';
+                
+                // 添加所有警报项
+                this.filteredAlerts.forEach((alert, index) => {
+                    const alertElement = this.createAlertElement(alert);
+                    
+                    // 如果是第一个元素（最新），添加入场动画
+                    if (index === 0) {
+                        setTimeout(() => {
+                            alertElement.classList.add('animate-in');
+                        }, 10);
+                    }
+                    
+                    container.appendChild(alertElement);
+                });
+                
+                // 移除平滑过渡类（只在渲染完成后）
+                setTimeout(() => {
+                    container.classList.remove('smooth-transition');
+                }, 300);
+                
+                // 自动滚动到底部
+                if (this.autoScroll && container.scrollHeight > container.clientHeight) {
+                    container.scrollTop = 0;
+                }
+            }
+            
+            // 创建警报元素
+            createAlertElement(alert) {
+                const alertElement = document.createElement('div');
+                alertElement.className = `volatile-alert-item ${alert.alert_level}`;
+                
+                const changeClass = alert.change_5min >= 0 ? 'change-positive' : 'change-negative';
+                const changeSign = alert.change_5min >= 0 ? '+' : '';
+                
+                // 格式化大数字为万/亿单位
+                const formatLargeNumber = (num) => {
+                    if (num === undefined || num === null) {
+                        return '0';
+                    }
+                    
+                    const numberValue = Number(num);
+                    if (isNaN(numberValue)) {
+                        return '0';
+                    }
+                    
+                    const absNum = Math.abs(numberValue);
+                    if (absNum >= 100000000) {
+                        return (numberValue / 100000000).toFixed(2) + '亿';
+                    } else if (absNum >= 10000) {
+                        return (numberValue / 10000).toFixed(0) + '万';
+                    }
+                    return numberValue.toFixed(0);
+                };
+                
+                alertElement.innerHTML = `
+                    <div class="volatile-alert-header">
+                        <div class="volatile-stock-info">
+                            <span class="volatile-stock-symbol">${alert.name && alert.name.trim() ? alert.name : alert.symbol}</span>
+                            <span class="volatile-alert-reason">${alert.reason || alert.action_text || '异动'}</span>
+                        </div>
+                        <div class="volatile-alert-meta">
+                            <span class="volatile-alert-level ${alert.alert_level}">${alert.level_text || alert.alert_level}</span>
+                            <span class="volatile-alert-time">${alert.display_time || new Date().toLocaleTimeString()}</span>
+                        </div>
+                    </div>
+                    
+                    <div class="volatile-alert-content">
+                        <div class="volatile-price-section">
+                            <span class="volatile-price-label">现价</span>
+                            <span class="volatile-price-value">${alert.price || '--'}</span>
+                            <span class="volatile-change-5min ${changeClass}">
+                                ${alert.change || '--'}% ${changeSign}${alert.change_5min || 0}%
+                            </span>
+                        </div>
+                        
+                        <div class="volatile-data-grid">
+                            <div class="volatile-data-item">
+                                <span class="volatile-data-label">瞬时成交额</span>
+                                <span class="volatile-data-value">${formatLargeNumber(alert.amount)}</span>
+                            </div>
+                            <div class="volatile-data-item">
+                                <span class="volatile-data-label">5分大单</span>
+                                <span class="volatile-data-value">${formatLargeNumber(alert.large_net_5min)}</span>
+                            </div>
+                            <div class="volatile-data-item">
+                                <span class="volatile-data-label">5分成交额</span>
+                                <span class="volatile-data-value">${formatLargeNumber(alert.amount_5min)}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                // 添加点击事件，显示个股详情
+                alertElement.addEventListener('click', () => {
+                    // 尝试从板块监控中查找该股票
+                    const stock = this.findStockInPlateMonitor(alert.symbol);
+                    if (stock) {
+                        plateMonitor.showStockDetail(stock);
+                    } else {
+                        // 如果没有找到，创建一个简单的股票对象
+                        const mockStock = {
+                            code: alert.symbol,
+                            name: alert.name || alert.symbol,
+                            price: parseFloat(alert.price) || 0,
+                            change_pct: parseFloat(alert.change) / 100 || 0,
+                            volume: alert.amount || 0,
+                            market_cap: 0
+                        };
+                        plateMonitor.showStockDetail(mockStock);
+                    }
+                });
+                
+                return alertElement;
+            }
+            
+            // 尝试从板块监控中查找股票
+            findStockInPlateMonitor(symbol) {
+                if (!plateMonitor || !plateMonitor.currentStocks || plateMonitor.currentStocks.length === 0) {
+                    return null;
+                }
+                
+                // 在当前显示的股票中查找
+                return plateMonitor.currentStocks.find(stock => 
+                    stock.code === symbol || stock.code.endsWith(symbol)
+                );
+            }
+            
+            // 显示点击加载提示
+            showClickToLoad() {
+                const container = document.getElementById('volatileAlertsContainer');
+                if (!container) return;
+                
+                const count = this.allAlerts.length;
+                container.innerHTML = `
+                    <div class="volatile-click-to-load">
+                        <div class="click-to-load-icon">📊</div>
+                        <div class="click-to-load-title">历史数据可用</div>
+                        <div class="click-to-load-subtitle">${count} 条历史异动记录</div>
+                        <div class="click-to-load-hint">点击下方连接按钮开始实时监控</div>
+                        <button class="click-to-load-btn" onclick="volatileMonitor.connectVolatile()">🚀 开始实时监控</button>
+                    </div>
+                `;
+            }
+            
+            // 显示等待消息
+            showWaitingMessage() {
+                const container = document.getElementById('volatileAlertsContainer');
+                if (!container) return;
+                
+                container.innerHTML = `
+                    <div class="volatile-no-alerts">
+                        <div style="font-size: 16px; margin-bottom: 10px;">🚀</div>
+                        <div>点击下方连接按钮开始异动监控</div>
+                        <div style="font-size: 12px; color: #666; margin-top: 5px;">实时接收股票异动警报</div>
+                    </div>
+                `;
+            }
+            
+            // 显示连接中状态
+            showConnectingState() {
+                const container = document.getElementById('volatileAlertsContainer');
+                if (!container) return;
+                
+                container.innerHTML = `
+                    <div class="volatile-loading">
+                        <div class="volatile-loading-spinner"></div>
+                        <div>正在连接异动服务器...</div>
+                    </div>
+                `;
+            }
+            
+            // 显示已连接状态
+            showConnectedState() {
+                // 如果有数据，显示数据；否则显示连接成功消息
+                if (this.allAlerts.length > 0) {
+                    this.applyFilters();
+                } else {
+                    const container = document.getElementById('volatileAlertsContainer');
+                    if (container) {
+                        container.innerHTML = `
+                            <div class="volatile-no-alerts">
+                                <div style="font-size: 16px; margin-bottom: 10px; color: #00c853;">✅</div>
+                                <div>连接成功</div>
+                                <div style="font-size: 12px; color: #666; margin-top: 5px;">等待异动数据...</div>
+                            </div>
+                        `;
+                    }
+                }
+                
+                this.updateConnectionStatus(true);
+            }
+            
+            // 显示断开连接状态
+            showDisconnectedState() {
+                const container = document.getElementById('volatileAlertsContainer');
+                if (!container) return;
+                
+                // 如果有历史数据，显示历史数据；否则显示断开连接消息
+                if (this.allAlerts.length > 0) {
+                    this.showClickToLoad();
+                } else {
+                    container.innerHTML = `
+                        <div class="volatile-no-alerts">
+                            <div style="font-size: 16px; margin-bottom: 10px; color: #ff4444;">❌</div>
+                            <div>连接已断开</div>
+                            <button class="click-to-load-btn" onclick="volatileMonitor.connectVolatile()" style="margin-top: 15px;">重新连接</button>
+                        </div>
+                    `;
+                }
+                
+                this.updateConnectionStatus(false);
+            }
+            
+            // 显示连接错误
+            showConnectionError() {
+                const container = document.getElementById('volatileAlertsContainer');
+                if (!container) return;
+                
+                container.innerHTML = `
+                    <div class="volatile-no-alerts">
+                        <div style="font-size: 16px; margin-bottom: 10px; color: #ff4444;">⚠️</div>
+                        <div>连接失败</div>
+                        <div style="font-size: 12px; color: #666; margin-top: 5px;">请检查网络后重试</div>
+                        <button class="click-to-load-btn" onclick="volatileMonitor.connectVolatile()" style="margin-top: 15px;">重试连接</button>
+                    </div>
+                `;
+            }
+            
+            // 更新连接状态显示
+            updateConnectionStatus(connected) {
+                const statusElement = document.getElementById('volatileConnectionStatus');
+                if (statusElement) {
+                    if (connected) {
+                        statusElement.innerHTML = '<span style="color: #00c853;">●</span> 已连接';
+                        statusElement.classList.add('connected');
+                    } else {
+                        statusElement.innerHTML = '<span style="color: #ff4444;">●</span> 离线';
+                        statusElement.classList.remove('connected');
+                    }
+                }
+            }
+            
+            // 清除所有数据
+            clearAllData() {
+                if (confirm('确定要清空所有股票异动数据吗？此操作将重置累计统计，不可撤销。')) {
+                    // 清空所有数据
+                    this.allAlerts = [];
+                    this.filteredAlerts = [];
+                    this.lastProcessedTimestamps.clear();
+                    
+                    // 重置所有统计（包括累计统计）
+                    this.alertCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                    this.cumulativeCounts = { high: 0, medium: 0, low: 0, total: 0 };
+                    
+                    this.updateStatsDisplay();
+                    
+                    // 显示等待消息
+                    this.showWaitingMessage();
+                    
+                    if (this.dataPersistence) {
+                        this.saveToStorage();
+                    }
+                }
+            }
+            
+            // 切换自动滚动
+            toggleAutoScroll() {
+                this.autoScroll = !this.autoScroll;
+                this.uiState.autoScroll = this.autoScroll;
+                this.updateUIButtons();
+                this.saveToStorage();
+            }
+            
+            // 切换数据持久化
+            toggleDataPersistence() {
+                this.dataPersistence = !this.dataPersistence;
+                this.uiState.dataPersistence = this.dataPersistence;
+                this.updateUIButtons();
+                
+                if (this.dataPersistence) {
+                    // 开启持久化时保存当前数据
+                    this.saveToStorage();
+                } else {
+                    // 关闭持久化时清除存储的数据
+                    localStorage.removeItem('shortTermAlerts');
+                    localStorage.removeItem('shortTermStats');
+                    localStorage.removeItem('shortTermCumulativeStats');
+                }
+                
+                this.saveToStorage(); // 保存持久化设置
+            }
+            
+            // 处理筛选期间的待处理警报
+            processPendingAlerts() {
+                if (this.pendingAlerts.length > 0) {
+                    console.log(`处理 ${this.pendingAlerts.length} 条待处理警报`);
+                    
+                    // 处理所有待处理警报
+                    this.pendingAlerts.forEach(alert => {
+                        this.handleAlert(alert);
+                    });
+                    
+                    // 清空待处理队列
+                    this.pendingAlerts = [];
+                }
+            }
+            
+            // 保存筛选条件到UI状态
+            saveFiltersToUIState() {
+                this.uiState.filters = {
+                    levels: [...this.filters.levels],
+                    types: [...this.filters.types],
+                    minStrength: this.filters.minStrength
+                };
+            }
+            
+            // 更新UI按钮状态
+            updateUIButtons() {
+                // 更新自动滚动按钮
+                const autoScrollBtn = document.getElementById('volatileAutoScrollBtn');
+                if (autoScrollBtn) {
+                    autoScrollBtn.textContent = this.autoScroll ? '🔒 暂停滚动' : '🔓 开启滚动';
+                }
+                
+                // 更新持久化按钮
+                const persistenceBtn = document.getElementById('volatilePersistenceBtn');
+                if (persistenceBtn) {
+                    persistenceBtn.textContent = this.dataPersistence ? '💾 持久化:开' : '💾 持久化:关';
+                }
+            }
+            
+            // 应用UI筛选器
+            applyUIFilters() {
+                // 更新级别筛选
+                const levelCheckboxes = document.querySelectorAll('input[name="level"]');
+                levelCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.levels.includes(checkbox.value);
+                });
+                
+                // 更新类型筛选
+                const typeCheckboxes = document.querySelectorAll('input[name="type"]');
+                typeCheckboxes.forEach(checkbox => {
+                    checkbox.checked = this.filters.types.includes(checkbox.value);
+                });
+                
+                // 更新强度筛选
+                document.getElementById('volatileStrengthSlider').value = this.filters.minStrength;
+                document.getElementById('volatileStrengthValue').textContent = this.filters.minStrength;
+                
+                this.updateUIButtons();
+            }
+            
+            // 生成会话ID
+            generateSessionId() {
+                return 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            }
+            
+            // 本地存储方法
+            saveToStorage() {
+                try {
+                    // 保存所有数据
+                    localStorage.setItem('shortTermAlerts', JSON.stringify(this.allAlerts));
+                    localStorage.setItem('shortTermFilters', JSON.stringify(this.filters));
+                    localStorage.setItem('shortTermStats', JSON.stringify(this.alertCounts));
+                    localStorage.setItem('shortTermCumulativeStats', JSON.stringify(this.cumulativeCounts));
+                    localStorage.setItem('shortTermPersistence', JSON.stringify(this.dataPersistence));
+                    localStorage.setItem('shortTermUIState', JSON.stringify(this.uiState));
+                    localStorage.setItem('shortTermSession', this.sessionId);
+                    
+                    // 保存限制设置
+                    localStorage.setItem('shortTermLimits', JSON.stringify({
+                        storage: this.maxStorageAlerts,
+                        display: this.maxDisplayAlerts
+                    }));
+                } catch (e) {
+                    console.error('保存到本地存储失败:', e);
+                }
+            }
+            
+            // 从本地存储加载
+            loadFromStorage() {
+                try {
+                    // 加载UI状态和筛选条件
+                    const savedUIState = localStorage.getItem('shortTermUIState');
+                    if (savedUIState) {
+                        this.uiState = JSON.parse(savedUIState);
+                        this.autoScroll = this.uiState.autoScroll;
+                        this.dataPersistence = this.uiState.dataPersistence;
+                        
+                        if (this.uiState.filters) {
+                            this.filters = this.uiState.filters;
+                        }
+                    }
+                    
+                    // 加载限制设置
+                    const savedLimits = localStorage.getItem('shortTermLimits');
+                    if (savedLimits) {
+                        const limits = JSON.parse(savedLimits);
+                        this.maxStorageAlerts = limits.storage || 200;
+                        this.maxDisplayAlerts = limits.display || 100;
+                    }
+                    
+                    // 检查是否是同一会话
+                    const lastSession = localStorage.getItem('shortTermSession');
+                    
+                    // 如果禁用持久化或者是新会话，不清除数据
+                    if (!this.dataPersistence || !lastSession) {
+                        console.log('跳过加载历史数据: 持久化关闭或新会话');
+                        return;
+                    }
+                    
+                    // 加载警报数据
+                    const savedAlerts = localStorage.getItem('shortTermAlerts');
+                    if (savedAlerts) {
+                        this.allAlerts = JSON.parse(savedAlerts);
+                        console.log(`从存储加载了 ${this.allAlerts.length} 条警报`);
+                        
+                        // 重建已处理时间戳集合
+                        this.lastProcessedTimestamps.clear();
+                        this.allAlerts.forEach(alert => {
+                            const alertKey = `${alert.symbol}_${alert.timestamp}`;
+                            this.lastProcessedTimestamps.add(alertKey);
+                        });
+                        
+                        // 加载数据后更新统计
+                        this.updateStats();
+                    }
+                    
+                    // 加载当前统计信息
+                    const savedStats = localStorage.getItem('shortTermStats');
+                    if (savedStats) {
+                        this.alertCounts = JSON.parse(savedStats);
+                    }
+                    
+                    // 加载累计统计信息
+                    const savedCumulativeStats = localStorage.getItem('shortTermCumulativeStats');
+                    if (savedCumulativeStats) {
+                        this.cumulativeCounts = JSON.parse(savedCumulativeStats);
+                    } else {
+                        // 如果没有累计统计，从当前统计初始化（兼容旧版本）
+                        this.cumulativeCounts = { ...this.alertCounts };
+                    }
+                } catch (e) {
+                    console.error('从本地存储加载失败:', e);
+                }
+            }
+            
+            // 设置相关函数
+            showSettings() {
+                document.getElementById('volatileSettingsDialog').style.display = 'block';
+                document.getElementById('volatileDialogOverlay').style.display = 'block';
+                
+                // 设置当前值
+                document.getElementById('volatileStorageLimit').value = this.maxStorageAlerts;
+                document.getElementById('volatileDisplayLimit').value = this.maxDisplayAlerts;
+            }
+            
+            hideSettings() {
+                document.getElementById('volatileSettingsDialog').style.display = 'none';
+                document.getElementById('volatileDialogOverlay').style.display = 'none';
+            }
+            
+            applySettings() {
+                const storageLimit = parseInt(document.getElementById('volatileStorageLimit').value);
+                const displayLimit = parseInt(document.getElementById('volatileDisplayLimit').value);
+                
+                if (storageLimit >= 50 && displayLimit >= 20 && displayLimit <= storageLimit) {
+                    this.maxStorageAlerts = storageLimit;
+                    this.maxDisplayAlerts = displayLimit;
+                    this.hideSettings();
+                    console.log(`设置已更新: 存储${storageLimit}条, 显示${displayLimit}条`);
+                    
+                    // 如果当前存储的数据超过新限制，需要截断
+                    if (this.allAlerts.length > this.maxStorageAlerts) {
+                        const removeCount = this.allAlerts.length - this.maxStorageAlerts;
+                        const removedAlerts = this.allAlerts.splice(-removeCount);
+                        
+                        // 从已处理集合中移除
+                        removedAlerts.forEach(alert => {
+                            const alertKey = `${alert.symbol}_${alert.timestamp}`;
+                            this.lastProcessedTimestamps.delete(alertKey);
+                        });
+                        
+                        this.updateStats();
+                        if (this.dataPersistence) {
+                            this.saveToStorage();
+                        }
+                    }
+                    
+                    // 重新应用筛选
+                    this.applyFilters();
+                    
+                    // 保存限制设置
+                    this.saveToStorage();
+                } else {
+                    alert('请输入有效的数值：存储≥50，显示≥20，且显示数量≤存储数量');
+                }
+            }
+        }
+
+
+        // 创建两个监控类的实例
+        // const plateMonitor = new PlateMonitor();
+        const volatileMonitor = new VolatileMonitor();
         
-        document.addEventListener('DOMContentLoaded', function() {
-            plateMonitor.init();
+        // 全局函数 - 展开异动区域
+function expandVolatileSection() {
+    const volatileSection = document.getElementById('volatileSection');
+    const floatBtn = document.getElementById('volatileFloatBtn');
+    const volatileToggleBtn = document.getElementById('volatileToggleBtn');
+    
+    // 显示异动区域
+    volatileSection.classList.add('expanded');
+    
+    // 隐藏悬浮按钮
+    floatBtn.style.display = 'none';
+    
+    // 更新顶部按钮状态
+    if (volatileToggleBtn) {
+        volatileToggleBtn.innerHTML = '<span>🚀</span> 关闭异动';
+        volatileToggleBtn.classList.add('active');
+    }
+    
+    // 开始连接WebSocket
+    volatileMonitor.connectVolatile();
+}
+
+// 全局函数 - 关闭异动区域
+function collapseVolatileSection() {
+    const volatileSection = document.getElementById('volatileSection');
+    const floatBtn = document.getElementById('volatileFloatBtn');
+    const volatileToggleBtn = document.getElementById('volatileToggleBtn');
+    
+    // 隐藏异动区域
+    volatileSection.classList.remove('expanded');
+    
+    // 显示悬浮按钮
+    floatBtn.style.display = 'flex';
+    
+    // 更新顶部按钮状态
+    if (volatileToggleBtn) {
+        volatileToggleBtn.innerHTML = '<span>🚀</span> 异动监控';
+        volatileToggleBtn.classList.remove('active');
+    }
+    
+    // 断开WebSocket连接
+    volatileMonitor.disconnectVolatile();
+}
+
+// 全局函数 - 切换异动区域
+function toggleVolatileSection() {
+    const volatileSection = document.getElementById('volatileSection');
+    
+    if (volatileSection.classList.contains('expanded')) {
+        collapseVolatileSection();
+    } else {
+        expandVolatileSection();
+    }
+}
+
+// 全局函数 - 应用筛选
+function applyVolatileFilters() {
+    volatileMonitor.applyFilters();
+}
+
+// 全局函数 - 重置筛选
+function resetVolatileFilters() {
+    volatileMonitor.resetFilters();
+}
+
+// 全局函数 - 清除数据
+function clearVolatileData() {
+    volatileMonitor.clearAllData();
+}
+
+// 全局函数 - 切换自动滚动
+function toggleVolatileAutoScroll() {
+    volatileMonitor.toggleAutoScroll();
+}
+
+// 全局函数 - 切换数据持久化
+function toggleVolatileDataPersistence() {
+    volatileMonitor.toggleDataPersistence();
+}
+
+// 全局函数 - 显示设置
+function showVolatileSettings() {
+    volatileMonitor.showSettings();
+}
+
+// 页面初始化
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('页面初始化开始...');
+    
+    // 初始化板块监控
+    plateMonitor.init();
+    
+    // 设置异动强度滑块监听器
+    const strengthSlider = document.getElementById('volatileStrengthSlider');
+    const strengthValue = document.getElementById('volatileStrengthValue');
+    
+    if (strengthSlider && strengthValue) {
+        strengthSlider.addEventListener('input', function() {
+            strengthValue.textContent = this.value;
         });
-    </script>
-</body>
-</html>
+        
+        // 初始化值
+        strengthSlider.value = volatileMonitor.filters.minStrength;
+        strengthValue.textContent = volatileMonitor.filters.minStrength;
+    }
+    
+    // 设置对话框遮罩点击事件
+    const dialogOverlay = document.getElementById('volatileDialogOverlay');
+    if (dialogOverlay) {
+        dialogOverlay.addEventListener('click', () => {
+            volatileMonitor.hideSettings();
+        });
+    }
+    
+    // 响应窗口大小变化
+    window.addEventListener('resize', () => {
+        if (plateMonitor.currentChart) {
+            plateMonitor.currentChart.resize();
+        }
+    });
+    
+    // 检查板块监控连接状态
+    setInterval(() => {
+        const plateStatus = plateMonitor.ws && plateMonitor.ws.readyState === WebSocket.OPEN;
+        updateGlobalConnectionStatus(plateStatus);
+        
+        if (!plateStatus) {
+            console.log('板块监控连接断开，尝试重连...');
+            plateMonitor.connect();
+        }
+    }, 5000);
+    
+    console.log('页面初始化完成');
+});
+
+// 更新全局连接状态
+function updateGlobalConnectionStatus(connected) {
+    const statusElement = document.getElementById('connectionStatus');
+    const realTimeBadge = document.getElementById('realTimeBadge');
+    
+    if (connected) {
+        statusElement.innerHTML = '<span class="status-icon">✅</span> 已连接';
+        statusElement.className = 'connection-status status-connected';
+        realTimeBadge.style.display = 'inline';
+    } else {
+        statusElement.innerHTML = '<span class="status-icon">❌</span> 断开连接';
+        statusElement.className = 'connection-status status-disconnected';
+        realTimeBadge.style.display = 'none';
+    }
+}
+
+// 将函数绑定到window对象
+window.expandVolatileSection = expandVolatileSection;
+window.collapseVolatileSection = collapseVolatileSection;
+window.toggleVolatileSection = toggleVolatileSection;
+window.applyVolatileFilters = applyVolatileFilters;
+window.resetVolatileFilters = resetVolatileFilters;
+window.clearVolatileData = clearVolatileData;
+window.toggleVolatileAutoScroll = toggleVolatileAutoScroll;
+window.toggleVolatileDataPersistence = toggleVolatileDataPersistence;
+window.showVolatileSettings = showVolatileSettings;
+window.volatileMonitor = volatileMonitor;
+        
+        // 筛选面板显示/隐藏控制函数
+        function toggleVolatileFilterPanel() {
+            const volatileFilterPanel = document.getElementById('volatileFilterPanel');
+            volatileFilterPanel.classList.toggle('show');
+        }
+        
+        // 添加键盘快捷键支持
+        document.addEventListener('keydown', function(e) {
+            // 只在没有焦点在输入框时生效
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+                return;
+            }
+            
+            // Ctrl + F: 切换异动筛选面板
+            if (e.ctrlKey && e.key === 'f') {
+                e.preventDefault();
+                const filterPanel = document.getElementById('volatileFilterPanel');
+                if (filterPanel) {
+                    filterPanel.classList.toggle('show');
+                }
+            }
+            
+            // Ctrl + H: 切换异动区域显示/隐藏
+            if (e.ctrlKey && e.key === 'h') {
+                e.preventDefault();
+                toggleVolatileSection();
+            }
+            
+            // Ctrl + R: 刷新数据
+            if (e.ctrlKey && e.key === 'r') {
+                e.preventDefault();
+                refreshData();
+            }
+            
+            // Esc: 关闭个股详情
+            if (e.key === 'Escape') {
+                if (plateMonitor.domCache.stockDetailPanel.classList.contains('open')) {
+                    closeStockDetail();
+                }
+            }
+            
+            // 数字键1-5: 快速切换图表类型
+            if (plateMonitor.domCache.stockDetailPanel.classList.contains('open')) {
+                switch(e.key) {
+                    case '1':
+                        switchChart('minute');
+                        break;
+                    case '2':
+                        switchChart('daily');
+                        break;
+                    case '3':
+                        switchChart('weekly');
+                        break;
+                    case '4':
+                        switchChart('1min');
+                        break;
+                    case '5':
+                        switchChart('60min');
+                        break;
+                }
+            }
+        });
+        
+        // 添加右键菜单支持
+        document.addEventListener('contextmenu', function(e) {
+            // 如果在异动区域，显示自定义右键菜单
+            if (e.target.closest('.volatile-section')) {
+                e.preventDefault();
+                showVolatileContextMenu(e);
+            }
+        });
+        
+        // 异动区域右键菜单
+        function showVolatileContextMenu(e) {
+            // 清除现有右键菜单
+            const existingMenu = document.getElementById('volatileContextMenu');
+            if (existingMenu) {
+                existingMenu.remove();
+            }
+            
+            // 创建菜单
+            const menu = document.createElement('div');
+            menu.id = 'volatileContextMenu';
+            menu.style.cssText = `
+                position: fixed;
+                top: ${e.clientY}px;
+                left: ${e.clientX}px;
+                background: rgba(42, 42, 42, 0.95);
+                border: 1px solid #444;
+                border-radius: 6px;
+                padding: 8px 0;
+                min-width: 150px;
+                z-index: 10000;
+                backdrop-filter: blur(10px);
+            `;
+            
+            const menuItems = [
+                { text: '📊 应用筛选', action: () => applyVolatileFilters() },
+                { text: '🔄 重置筛选', action: () => resetVolatileFilters() },
+                { separator: true },
+                { text: '🗑️ 清空数据', action: () => clearVolatileData() },
+                { text: '🔒 暂停滚动', action: () => toggleVolatileAutoScroll() },
+                { separator: true },
+                { text: '⚙️ 设置', action: () => showVolatileSettings() },
+                { text: '📌 显示/隐藏', action: () => toggleVolatileSection() }
+            ];
+            
+            menuItems.forEach(item => {
+                if (item.separator) {
+                    const separator = document.createElement('div');
+                    separator.style.cssText = 'height: 1px; background: #555; margin: 4px 0;';
+                    menu.appendChild(separator);
+                } else {
+                    const menuItem = document.createElement('div');
+                    menuItem.textContent = item.text;
+                    menuItem.style.cssText = `
+                        padding: 6px 12px;
+                        cursor: pointer;
+                        font-size: 12px;
+                        color: #e0e0e0;
+                        transition: all 0.2s;
+                    `;
+                    menuItem.addEventListener('mouseenter', () => {
+                        menuItem.style.background = 'rgba(212, 175, 55, 0.2)';
+                    });
+                    menuItem.addEventListener('mouseleave', () => {
+                        menuItem.style.background = 'transparent';
+                    });
+                    menuItem.addEventListener('click', () => {
+                        item.action();
+                        menu.remove();
+                    });
+                    menu.appendChild(menuItem);
+                }
+            });
+            
+            document.body.appendChild(menu);
+            
+            // 点击其他地方关闭菜单
+            const closeMenu = (event) => {
+                if (!menu.contains(event.target)) {
+                    menu.remove();
+                    document.removeEventListener('click', closeMenu);
+                }
+            };
+            
+            setTimeout(() => {
+                document.addEventListener('click', closeMenu);
+            }, 100);
+        }
+        
+        // 添加性能监控
+        if (typeof PerformanceObserver !== 'undefined') {
+            const perfObserver = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    if (entry.entryType === 'longtask') {
+                        console.warn(`长任务耗时: ${entry.duration}ms`, entry);
+                    }
+                }
+            });
+            
+            perfObserver.observe({ entryTypes: ['longtask'] });
+        }
+        
+        // 添加错误处理
+        window.addEventListener('error', function(e) {
+            console.error('全局错误:', e.error);
+            // 可以在这里添加错误上报
+        });
+        
+        // 添加页面可见性变化处理
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                // 页面隐藏时，可以暂停一些更新
+                console.log('页面隐藏，暂停部分更新');
+            } else {
+                // 页面显示时，恢复更新
+                console.log('页面显示，恢复更新');
+                // 如果需要，可以刷新数据
+                if (plateMonitor.autoUpdate) {
+                    plateMonitor.refreshData();
+                }
+            }
+        });
+        
+        // 添加数据导出功能（调试用）
+        function exportData() {
+            const data = {
+                plates: plateMonitor.currentPlates,
+                selectedPlate: plateMonitor.selectedPlate,
+                selectedSubPlate: plateMonitor.selectedSubPlate,
+                currentStocks: plateMonitor.currentStocks,
+                volatileAlerts: volatileMonitor.allAlerts,
+                volatileFilteredAlerts: volatileMonitor.filteredAlerts,
+                timestamp: new Date().toISOString()
+            };
+            
+            const dataStr = JSON.stringify(data, null, 2);
+            const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+            
+            const exportFileDefaultName = `stock_monitor_data_${Date.now()}.json`;
+            
+            const linkElement = document.createElement('a');
+            linkElement.setAttribute('href', dataUri);
+            linkElement.setAttribute('download', exportFileDefaultName);
+            linkElement.click();
+        }
+        
+        // 添加数据导入功能（调试用）
+        function importData(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    console.log('导入的数据:', data);
+                    // 这里可以根据需要处理导入的数据
+                    alert('数据导入成功（控制台查看）');
+                } catch (error) {
+                    console.error('数据导入失败:', error);
+                    alert('数据导入失败：格式错误');
+                }
+            };
+            reader.readAsText(file);
+        }
+        
+        // 将调试函数绑定到window
+        window.exportData = exportData;
+        window.importData = importData;
+        
+        // 添加控制台帮助
+        console.log(`
+%c📊 股票监控系统已加载 %c
+可用调试命令:
+- plateMonitor: 板块监控实例
+- volatileMonitor: 异动监控实例
+- exportData(): 导出当前数据
+- window.importData(fileInput): 导入数据
+        `, 'color: #d4af37; font-weight: bold;', 'color: #666;');
+        
+
+</script>

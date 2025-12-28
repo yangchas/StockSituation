@@ -48,7 +48,7 @@ typedef int16_t VarDataLenT;
 // ==================== 配置管理 ====================
 struct Config {
     // 数据源配置
-    std::string data_source = "rabbitmq"; // "rabbitmq" 或 "tdengine_replay"
+    std::string data_source = "rabbitmq"; // 默认实盘模式："rabbitmq" 或 "tdengine_replay"
     
     // RabbitMQ配置
     std::string rabbitmq_host = "localhost";
@@ -87,8 +87,8 @@ struct Config {
     std::string tdengine_database = "market_data1";
     
     // 回测配置（新增）
-    std::string replay_start_time = "2025-12-19 09:30:00"; // 回测开始时间
-    std::string replay_end_time = "2025-12-19 15:00:00";   // 回测结束时间
+    std::string replay_start_time = "2025-12-26 09:30:00"; // 回测开始时间
+    std::string replay_end_time = "2025-12-26 15:00:00";   // 回测结束时间
     int replay_speed = 1;           // 回放速度倍数，1=实时
     bool replay_loop = false;       // 是否循环回放
     int replay_tick_interval_ms = 3000; // 回放时每3秒一个tick切片
@@ -415,7 +415,7 @@ class StockNameMapper {
 private:
     std::unordered_map<std::string, std::string> code_to_name_;
     std::unordered_map<std::string, std::string> code_to_sector_; // 新: 板块，预留
-    std::string csv_file_path_ = "stock.csv";
+    std::string csv_file_path_ = "/root/work/C/stock.csv";
     std::mutex mutex_;
     bool loaded_ = false;
     StockNameMapper(){
@@ -4196,20 +4196,76 @@ private:
 };
 std::atomic<bool> EnhancedSingleThreadedConsumerApplication::signal_received_{false};
 
+// ==================== 命令行参数解析 ====================
+void parseCommandLineArgs(int argc, char* argv[], Config& config) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--replay" || arg == "-r") {
+            // 回放模式
+            config.data_source = "tdengine_replay";
+            std::cout << "启用回放模式" << std::endl;
+        }
+        else if (arg == "--live" || arg == "-l") {
+            // 实盘模式
+            config.data_source = "rabbitmq";
+            std::cout << "启用实盘模式" << std::endl;
+        }
+        else if (arg == "--start" || arg == "-s") {
+            // 设置回放开始时间
+            if (i + 1 < argc) {
+                config.replay_start_time = argv[++i];
+                std::cout << "设置回放开始时间: " << config.replay_start_time << std::endl;
+            }
+        }
+        else if (arg == "--end" || arg == "-e") {
+            // 设置回放结束时间
+            if (i + 1 < argc) {
+                config.replay_end_time = argv[++i];
+                std::cout << "设置回放结束时间: " << config.replay_end_time << std::endl;
+            }
+        }
+        else if (arg == "--speed" || arg == "-sp") {
+            // 设置回放速度
+            if (i + 1 < argc) {
+                config.replay_speed = std::atoi(argv[++i]);
+                std::cout << "设置回放速度: " << config.replay_speed << "x" << std::endl;
+            }
+        }
+        else if (arg == "--help" || arg == "-h") {
+            // 显示帮助信息
+            std::cout << "用法: t1 [选项]" << std::endl;
+            std::cout << "选项:" << std::endl;
+            std::cout << "  -r, --replay           启用回放模式 (默认: 实盘模式)" << std::endl;
+            std::cout << "  -l, --live             启用实盘模式" << std::endl;
+            std::cout << "  -s, --start <时间>     回放开始时间 (格式: YYYY-MM-DD HH:MM:SS)" << std::endl;
+            std::cout << "  -e, --end <时间>       回放结束时间 (格式: YYYY-MM-DD HH:MM:SS)" << std::endl;
+            std::cout << "  -sp, --speed <倍数>    回放速度倍数 (默认: 1)" << std::endl;
+            std::cout << "  -h, --help             显示此帮助信息" << std::endl;
+            std::cout << "" << std::endl;
+            std::cout << "示例:" << std::endl;
+            std::cout << "  t1                        # 实盘模式" << std::endl;
+            std::cout << "  t1 --replay               # 回放模式，使用默认时间" << std::endl;
+            std::cout << "  t1 -r -s \"2025-12-26 09:30:00\" -e \"2025-12-26 15:00:00\" -sp 2" << std::endl;
+            exit(0);
+        }
+    }
+}
+
 // ==================== 主函数 ====================
-int main() {
+int main(int argc, char* argv[]) {
     try {
         auto& configManager = ConfigManager::getInstance();
         Config config = configManager.getConfig();
         
+        // 解析命令行参数
+        parseCommandLineArgs(argc, argv, config);
+        
         // 根据环境变量或命令行参数设置数据源
-        // 可以从命令行读取参数
-        int argc = 0;
-        char** argv = nullptr;
-        // 实际使用时，应该解析命令行参数
-        // 这里简化为检查环境变量
+        // 命令行参数优先级高于环境变量
         char* env_data_source = std::getenv("DATA_SOURCE");
-        if (env_data_source) {
+        if (env_data_source && config.data_source == "rabbitmq") {
+            // 只有在没有通过命令行设置回放模式时，才使用环境变量
             std::string data_source_str = env_data_source;
             if (data_source_str == "tdengine_replay" || data_source_str == "rabbitmq") {
                 config.data_source = data_source_str;
@@ -4218,12 +4274,12 @@ int main() {
         
         // 检查是否传递了回放参数
         char* env_replay_start = std::getenv("REPLAY_START_TIME");
-        if (env_replay_start) {
+        if (env_replay_start && config.replay_start_time == "2025-12-26 09:30:00") {
             config.replay_start_time = env_replay_start;
         }
         
         char* env_replay_end = std::getenv("REPLAY_END_TIME");
-        if (env_replay_end) {
+        if (env_replay_end && config.replay_end_time == "2025-12-26 15:00:00") {
             config.replay_end_time = env_replay_end;
         }
         
