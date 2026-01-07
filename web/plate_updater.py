@@ -171,6 +171,9 @@ class LazyPlateUpdater:
         # 重置脏板块标记
         self.dirty_plates.clear()
         
+        # 检查是否是第一次运行，需要初始化板块数据
+        is_first_run = len(self.last_stock_data) == 0
+        
         for stock_id in self.stock_to_plates.keys():
             try:
                 current_data = self.redis_storage.get_stock_data(stock_id)
@@ -179,7 +182,7 @@ class LazyPlateUpdater:
                     
                 # 检查数据是否变化
                 last_data = self.last_stock_data.get(stock_id, {})
-                if self._has_stock_changed(last_data, current_data):
+                if self._has_stock_changed(last_data, current_data) or is_first_run:
                     changed_stocks += 1
                     # 标记相关板块为脏
                     for plate_id in self.stock_to_plates[stock_id]:
@@ -193,6 +196,12 @@ class LazyPlateUpdater:
             except Exception as e:
                 logger.warning(f"⚠️ 处理股票数据失败 {stock_id}: {e}")
         
+        # 如果是第一次运行，强制更新所有板块
+        if is_first_run and self.dirty_plates:
+            # 初始化板块指标数组
+            self._initialize_plate_metrics_from_redis()
+            logger.info(f"🎯 首次运行: 初始化 {len(self.dirty_plates)} 个板块数据")
+        
         # 只有有变化时才更新Redis
         if self.dirty_plates:
             self._update_dirty_plates_to_redis()
@@ -203,7 +212,64 @@ class LazyPlateUpdater:
         
         self.last_refresh_time = time.time()
         return changed_stocks
-    
+
+    def _initialize_plate_metrics_from_redis(self):
+        """从Redis中初始化板块指标数据"""
+        logger.info("🔄 从Redis初始化板块指标数据...")
+        
+        # 重置所有板块指标
+        n_main_plates = len(self.main_plate_ids)
+        self.main_section_sum_change = np.zeros(n_main_plates, dtype=np.float32)
+        self.main_section_total_volume = np.zeros(n_main_plates, dtype=np.int32)
+        self.main_section_total_large_net = np.zeros(n_main_plates, dtype=np.int32)
+        self.main_section_rise_count = np.zeros(n_main_plates, dtype=np.int16)
+        self.main_section_fall_count = np.zeros(n_main_plates, dtype=np.int16)
+        self.main_plate_stock_count = np.zeros(n_main_plates, dtype=np.int16)  # 重置股票计数
+        
+        # 遍历所有股票，从Redis获取当前数据并初始化板块指标
+        for stock_id, plate_list in self.stock_to_plates.items():
+            try:
+                current_data = self.redis_storage.get_stock_data(stock_id)
+                if not current_data:
+                    continue
+                    
+                # 只更新主流板块
+                main_plate_indices = []
+                for plate_id in plate_list:
+                    if plate_id in self.main_plate_to_idx:
+                        main_plate_indices.append(self.main_plate_to_idx[plate_id])
+                
+                if not main_plate_indices:
+                    continue
+                    
+                main_plate_indices = np.array(main_plate_indices, dtype=np.int32)
+                
+                # 获取当前值
+                change = current_data.get('change_pct', 0.0)
+                volume = current_data.get('volume', 0)
+                large_net = current_data.get('large_net', 0)
+                
+                # 初始化板块指标
+                self.main_section_sum_change[main_plate_indices] += change
+                self.main_section_total_volume[main_plate_indices] += volume
+                self.main_section_total_large_net[main_plate_indices] += large_net
+                
+                # 初始化股票计数
+                for idx in main_plate_indices:
+                    self.main_plate_stock_count[idx] += 1
+                
+                # 初始化涨跌计数
+                for idx in main_plate_indices:
+                    if change > 0:
+                        self.main_section_rise_count[idx] += 1
+                    elif change < 0:
+                        self.main_section_fall_count[idx] += 1
+                        
+            except Exception as e:
+                logger.warning(f"⚠️ 初始化股票数据失败 {stock_id}: {e}")
+        
+        logger.info("✅ 板块指标数据初始化完成")
+
     def _has_stock_changed(self, old_data: Dict, new_data: Dict) -> bool:
         """检查股票数据是否发生有意义的变化"""
         if not old_data:
@@ -582,6 +648,9 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
         if (current_time - self.last_all_stocks_update) < self.cache_ttl and self.all_stocks_cache:
             return self.all_stocks_cache
         
+        # 检查是否是第一次运行，需要初始化板块数据
+        is_first_run = len(self.last_stock_data) == 0
+        
         # 获取所有股票代码
         all_stock_ids = list(self.stock_to_plates.keys())
         
@@ -599,13 +668,43 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
             for stock_id in batch_ids:
                 stock_data = self.redis_storage.get_stock_data(stock_id)
                 if stock_data:
-                    all_stocks_data[stock_id] = {
-                        'basic': stock_data,
-                        'advanced': self.redis_storage.get_stock_advanced_indicators(stock_id)
+                    # 格式化数据为basic和advanced结构，并转换数据类型
+                    formatted_data = {
+                        'basic': {
+                            'name': stock_data.get('name', f'股票{stock_id}'),
+                            'price': float(stock_data.get('price', 0.0)),
+                            'change_pct': float(stock_data.get('change_pct', 0.0)),
+                            'volume': int(stock_data.get('volume', 0)),
+                            'market_cap': int(stock_data.get('market_cap', 0)),
+                            'large_net': int(stock_data.get('large_net', 0)),
+                            'timestamp': int(stock_data.get('timestamp', int(time.time())))
+                        },
+                        'advanced': {
+                            'change_rate_1min': float(stock_data.get('change_rate_1min', 0.0)),
+                            'amount_2min': int(stock_data.get('amount_2min', 0))
+                        }
                     }
+                    all_stocks_data[stock_id] = formatted_data
+                    
+                    # 如果是第一次运行，标记相关板块为脏
+                    if is_first_run:
+                        for plate_id in self.stock_to_plates[stock_id]:
+                            self.dirty_plates.add(plate_id)
+                    
+                    # 更新股票当前数据
+                    self.last_stock_data[stock_id] = formatted_data
         
         self.all_stocks_cache = all_stocks_data
         self.last_all_stocks_update = current_time
+        
+        # 如果是第一次运行，强制更新所有板块
+        if is_first_run and self.dirty_plates:
+            # 初始化板块指标数组
+            self._initialize_plate_metrics_from_redis()
+            logger.info(f"🎯 首次运行: 初始化 {len(self.dirty_plates)} 个板块数据")
+            
+            # 更新Redis中的板块数据
+            self._update_dirty_plates_to_redis()
         
         logger.debug(f"🔄 批量刷新 {len(all_stocks_data)} 只股票数据")
         return all_stocks_data
@@ -886,17 +985,15 @@ class OptimizedEnhancedPlateUpdater(OptimizedPlateUpdater):
             for metrics in plate_metrics:
                 # 存储完整指标（包含高级指标）
                 key = f"plate:metrics:{metrics['id']}"
-                pipeline.hset(key, mapping={
-                    'change_pct': str(metrics['change_pct']),
-                    'total_volume': str(metrics['total_volume']),
-                    'total_large_net': str(metrics['total_large_net']),
-                    'rise_count': str(metrics['rise_count']),
-                    'fall_count': str(metrics['fall_count']),
-                    'stock_count': str(metrics['stock_count']),
-                    'change_rate_1min': str(metrics.get('change_rate_1min', 0)),
-                    'total_amount_2min': str(metrics.get('total_amount_2min', 0)),
-                    'timestamp': str(metrics['timestamp'])
-                })
+                pipeline.hset(key, 'change_pct', str(metrics['change_pct']))
+                pipeline.hset(key, 'total_volume', str(metrics['total_volume']))
+                pipeline.hset(key, 'total_large_net', str(metrics['total_large_net']))
+                pipeline.hset(key, 'rise_count', str(metrics['rise_count']))
+                pipeline.hset(key, 'fall_count', str(metrics['fall_count']))
+                pipeline.hset(key, 'stock_count', str(metrics['stock_count']))
+                pipeline.hset(key, 'change_rate_1min', str(metrics.get('change_rate_1min', 0)))
+                pipeline.hset(key, 'total_amount_2min', str(metrics.get('total_amount_2min', 0)))
+                pipeline.hset(key, 'timestamp', str(metrics['timestamp']))
                 pipeline.expire(key, 30)  # 30秒过期
             
             pipeline.execute()

@@ -6251,6 +6251,12 @@
             // 初始化
             init() {
                 this.loadFromStorage();
+                
+                // 强制重置筛选条件到默认值
+                this.filters.minStrength = 0;
+                this.filters.levels = ['high', 'medium', 'low'];
+                this.filters.types = ['封单异动', '成交额异动', '其他'];
+                
                 this.applyUIFilters();
                 this.updateStatsDisplay();
                 
@@ -6367,6 +6373,10 @@
             
             // 处理接收到的警报
             handleAlert(alertData) {
+                // 调试：输出接收到的原始数据格式
+                console.log('接收到的异动数据:', alertData);
+                console.log('数据字段:', Object.keys(alertData));
+                
                 // 检查是否已处理过此警报（基于时间戳）
                 const alertKey = `${alertData.symbol}_${alertData.timestamp}`;
                 if (this.lastProcessedTimestamps.has(alertKey)) {
@@ -6464,18 +6474,46 @@
             applyFiltersInternal() {
                 // 先筛选所有存储的数据
                 let filtered = this.allAlerts.filter(alert => {
-                    // 检查级别筛选
-                    if (!this.filters.levels.includes(alert.alert_level)) {
+                    // 检查级别筛选 - 修复：支持多种级别表示方式
+                    const alertLevel = alert.alert_level || alert.level || 'low';
+                    
+                    // 映射级别值到标准格式
+                    let mappedLevel = alertLevel;
+                    if (alertLevel === '强烈' || alertLevel === '强烈异动' || alertLevel === '3') {
+                        mappedLevel = 'high';
+                    } else if (alertLevel === '中度' || alertLevel === '中度异动' || alertLevel === '2') {
+                        mappedLevel = 'medium';
+                    } else if (alertLevel === '轻微' || alertLevel === '轻微异动' || alertLevel === '1') {
+                        mappedLevel = 'low';
+                    }
+                    
+                    if (!this.filters.levels.includes(mappedLevel)) {
+                        // console.log('级别筛选不匹配:', alertLevel, '映射为', mappedLevel, '不在', this.filters.levels);
                         return false;
                     }
                     
-                    // 检查类型筛选
-                    if (!this.filters.types.includes(alert.action_text)) {
+                    // 检查类型筛选 - 修复：支持多种字段名和容错处理
+                    const alertType = alert.action_text || alert.reason || alert.type || '其他';
+                    
+                    // 映射类型值到标准格式
+                    let mappedType = alertType;
+                    if (alertType.includes('封单') || alertType.includes('封板')) {
+                        mappedType = '封单异动';
+                    } else if (alertType.includes('成交额') || alertType.includes('金额')) {
+                        mappedType = '成交额异动';
+                    } else if (alertType === '其他' || alertType === 'unknown' || alertType === 'volatile_alert') {
+                        mappedType = '其他';
+                    }
+                    
+                    if (!this.filters.types.includes(mappedType)) {
+                        // console.log('类型筛选不匹配:', alertType, '映射为', mappedType, '不在', this.filters.types);
                         return false;
                     }
                     
-                    // 检查强度筛选
-                    if (alert.strength < this.filters.minStrength) {
+                    // 检查强度筛选 - 修复：容错处理
+                    const strength = Number(alert.strength) || Number(alert.intensity) || 0;
+                    if (strength < this.filters.minStrength) {
+                        // console.log('强度筛选不匹配:', strength, '<', this.filters.minStrength);
                         return false;
                     }
                     
@@ -6501,6 +6539,13 @@
                 // 重置强度筛选
                 document.getElementById('volatileStrengthSlider').value = 0;
                 document.getElementById('volatileStrengthValue').textContent = '0';
+                
+                // 强制更新筛选条件
+                this.filters.levels = ['high', 'medium', 'low'];
+                this.filters.minStrength = 0;
+                
+                // 强制更新UI状态
+                this.uiState.filters.minStrength = 0;
                 
                 // 应用重置后的筛选
                 this.applyFilters();
@@ -6553,6 +6598,7 @@
             
             // 创建警报元素
             createAlertElement(alert) {
+                console.log(alert.name)
                 const alertElement = document.createElement('div');
                 alertElement.className = `volatile-alert-item ${alert.alert_level}`;
                 
@@ -6582,7 +6628,7 @@
                 alertElement.innerHTML = `
                     <div class="volatile-alert-header">
                         <div class="volatile-stock-info">
-                            <span class="volatile-stock-symbol">${alert.name && alert.name.trim() ? alert.name : alert.symbol}</span>
+                            <span class="volatile-stock-symbol">${alert.name}</span>
                             <span class="volatile-alert-reason">${alert.reason || alert.action_text || '异动'}</span>
                         </div>
                         <div class="volatile-alert-meta">

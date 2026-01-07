@@ -10,7 +10,7 @@ import os
 from typing import Dict, Set, List, Optional
 import logging
 import tablib
-
+import base64
 # 初始化日志记录器
 logger = logging.getLogger(__name__)
 from aiohttp import web
@@ -1856,6 +1856,55 @@ class OptimizedIntegratedWebService:
                 'timestamp': int(time.time() * 1000)
             }
         
+        # 新增：获取全部个股数据（支持差异更新）
+        elif msg_type == 'get_all_stocks':
+            client_timestamp = data.get('last_update', 0)  # 客户端上次更新时间
+            force_full = data.get('force_full', False)    # 是否强制全量更新
+            
+            logger.info(f"📊 请求全部个股数据, 客户端时间戳: {client_timestamp}, 强制全量: {force_full}")
+            
+            # 获取服务器端最新数据
+            all_stocks_data = self.plate_updater.refresh_all_stocks_data()
+            
+            if force_full or client_timestamp == 0:
+                # 全量更新模式
+                response = {
+                    'type': 'all_stocks',
+                    'data': all_stocks_data,
+                    'update_type': 'full',
+                    'timestamp': int(time.time() * 1000),
+                    'count': len(all_stocks_data)
+                }
+                logger.info(f"📤 全量推送全部个股数据: {len(all_stocks_data)} 只股票")
+            else:
+                # 差异更新模式 - 只返回有变化的股票
+                changed_stocks = {}
+                
+                for stock_id, stock_data in all_stocks_data.items():
+                    # 检查股票数据是否有变化（基于时间戳或关键字段变化）
+                    if self._has_stock_changed(stock_id, stock_data, client_timestamp):
+                        changed_stocks[stock_id] = stock_data
+                
+                if changed_stocks:
+                    response = {
+                        'type': 'all_stocks',
+                        'data': changed_stocks,
+                        'update_type': 'delta',
+                        'timestamp': int(time.time() * 1000),
+                        'count': len(changed_stocks),
+                        'total_count': len(all_stocks_data)
+                    }
+                    logger.info(f"📤 差异推送个股数据: {len(changed_stocks)} 只有变化的股票")
+                else:
+                    # 没有变化，只返回时间戳确认
+                    response = {
+                        'type': 'all_stocks',
+                        'update_type': 'no_change',
+                        'timestamp': int(time.time() * 1000),
+                        'message': '没有数据变化'
+                    }
+                    logger.info("📤 个股数据无变化，返回确认")
+        
         # 新增：个股订阅消息处理
         elif msg_type == 'subscribe_stocks':
             plate_id = data.get('plate_id')
@@ -1899,6 +1948,56 @@ class OptimizedIntegratedWebService:
         
         # 发送响应
         await websocket.send_str(json.dumps(response, ensure_ascii=False))
+    
+    def _has_stock_changed(self, stock_id: str, stock_data: Dict, client_timestamp: int) -> bool:
+        """检查股票数据是否有变化（支持差异更新）"""
+        try:
+            # 检查时间戳变化
+            stock_timestamp = stock_data.get('basic', {}).get('timestamp', 0)
+            if stock_timestamp > client_timestamp:
+                return True
+            
+            # 检查关键字段变化（涨跌幅、价格、成交量等）
+            # 从Redis获取上次的数据进行比较
+            cache_key = f"stock:last_sent:{stock_id}"
+            last_sent_data = self.redis_storage.get_data(cache_key)
+            
+            if not last_sent_data:
+                # 没有历史数据，视为有变化
+                self.redis_storage.store_data(cache_key, stock_data, expire_seconds=300)  # 缓存5分钟
+                return True
+            
+            # 比较关键字段
+            key_fields = ['change_pct', 'price', 'volume', 'large_net']
+            
+            for field in key_fields:
+                current_value = stock_data.get('basic', {}).get(field, 0)
+                last_value = last_sent_data.get('basic', {}).get(field, 0)
+                
+                # 对于数值字段，检查是否有显著变化
+                if isinstance(current_value, (int, float)) and isinstance(last_value, (int, float)):
+                    if abs(current_value - last_value) > 0.001:  # 微小变化阈值
+                        self.redis_storage.store_data(cache_key, stock_data, expire_seconds=300)
+                        return True
+            
+            # 检查高级指标变化
+            current_advanced = stock_data.get('advanced', {})
+            last_advanced = last_sent_data.get('advanced', {})
+            
+            advanced_fields = ['change_rate_1min', 'amount_2min']
+            for field in advanced_fields:
+                current_val = current_advanced.get(field, 0)
+                last_val = last_advanced.get(field, 0)
+                
+                if abs(current_val - last_val) > 0.01:  # 高级指标变化阈值
+                    self.redis_storage.store_data(cache_key, stock_data, expire_seconds=300)
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 检查股票变化失败 {stock_id}: {e}")
+            return True  # 出错时保守地返回有变化
     
     async def handle_stock_kline_api(self, request):
         """处理个股K线数据API请求"""
@@ -2299,7 +2398,10 @@ class StockVolatileMonitor:
     def format_volatile_alert(self, data: Dict) -> Dict:
         """格式化异动警报消息"""
         symbol = data.get('symbol', '')
-        name = data.get('name', '')
+        name_b64 = data.get('name_b64', '')
+        if isinstance(name_b64, str):
+            name_b64 = name_b64.encode('utf-8')
+        name = base64.b64decode(name_b64).decode('utf-8', errors='ignore')
         change = data.get('change', '')
         amount = data.get('amount', '')
         reason = data.get('reason', '')

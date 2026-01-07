@@ -820,7 +820,10 @@ class RedisStorageManager:
         }
         
         metrics_key = f"{self.PLATE_METRICS_PREFIX}{plate_id}"
-        redis_client.hset(metrics_key, mapping=plate_metrics)
+        
+        # 使用传统的hset方式，避免mapping参数问题
+        for field, value in plate_metrics.items():
+            redis_client.hset(metrics_key, field, value)
         redis_client.expire(metrics_key, self.PLATE_METRICS_TTL)
     
     def update_plate_info(self, plate_id: str, plate_info: Dict, pipeline: Optional[Any] = None) -> None:
@@ -838,24 +841,31 @@ class RedisStorageManager:
             info_data["p"] = plate_info["parent"]
         
         info_key = f"{self.PLATE_INFO_PREFIX}{plate_id}"
-        redis_client.hset(info_key, mapping=info_data)
+        
+        # 使用传统的hset方式，避免mapping参数问题
+        for field, value in info_data.items():
+            redis_client.hset(info_key, field, value)
         redis_client.expire(info_key, self.BASE_INFO_TTL)
     
     def batch_update_plates(self, plate_metrics: Dict[str, Dict], plate_infos: Dict[str, Dict] = None) -> None:
         """批量更新板块数据"""
         pipeline = self.start_pipeline()
         
+        total_updates = 0
+        
         # 更新板块指标
         for plate_id, metrics in plate_metrics.items():
             self.update_plate_metrics(plate_id, metrics, pipeline)
+            total_updates += 1
         
         # 更新板块基础信息
         if plate_infos:
             for plate_id, info in plate_infos.items():
                 self.update_plate_info(plate_id, info, pipeline)
+                total_updates += 1
         
         self.execute_pipeline(pipeline)
-        logger.info(f"✅ 批量更新 {len(plate_metrics)} 个板块数据到Redis")
+        logger.info(f"✅ 批量更新 {total_updates} 个板块数据到Redis")
     
     def get_plate_data(self, plate_id: str) -> Optional[Dict]:
         """获取板块完整数据"""
