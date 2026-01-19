@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-增强版通用突破形态识别系统 - 修正版V2
-修复压力位检测问题，确保能正确识别集群压力位
+增强版通用突破形态识别系统 - 修正版V5
+修复压力位检测问题，确保能正确识别集群压力位，并改进筹码区计算，捕捉放量高点，替换MA为BOLL支撑，添加长阳收盘支撑，添加横盘区检测
 """
 
 import pandas as pd
@@ -23,11 +23,9 @@ plt.rcParams['axes.unicode_minus'] = False
 plt.rcParams['figure.figsize'] = [12, 8]
 plt.rcParams['figure.dpi'] = 100
 plt.rcParams['font.size'] = 10
-
-
 class StockBreakoutAnalyzer:
     """
-    修正版突破形态检测器 V2 - 修复压力位检测问题
+    修正版突破形态检测器 V5 - 改进压力检测捕捉放量高点，替换MA为BOLL支撑，添加长阳收盘支撑，添加横盘区检测
     """
     
     def __init__(self, data: pd.DataFrame):
@@ -61,7 +59,10 @@ class StockBreakoutAnalyzer:
             try:
                 data.index = pd.to_datetime(data.index)
             except:
-                data.index = pd.date_range(end=pd.Timestamp.now(), periods=len(data), freq='D')
+                # 修复时间戳运算兼容性问题
+                end_date = pd.Timestamp.now()
+                start_date = end_date - pd.Timedelta(days=len(data)-1)
+                data.index = pd.date_range(start=start_date, end=end_date, freq='D')
         
         data = data.sort_index()
         
@@ -81,27 +82,67 @@ class StockBreakoutAnalyzer:
         
         return data
     
-    def detect_pressure_levels_v2(self, 
+    def detect_pressure_levels_v5(self, 
                                 current_price: float = None,
-                                lookback_days: int = 60) -> List[Dict]:
+                                lookback_days: int = 60,
+                                decay_rate: float = 0.01) -> List[Dict]:
         """
-        修正版压力位检测 V2 - 确保能检测到集群压力位
+        修正版压力位检测 V5 - 只检测上方压力位，改进筹码区为动态衰减加权分布，捕捉放量高点，强制捕捉全局最高点
         """
-        print("🔍 修正版压力位检测V2...")
+        print("🔍 修正版压力位检测V5...")
         
         if current_price is None:
             current_price = self.data['close'].iloc[-1]
         
         data_len = len(self.data)
         
-        # 方法1：使用滚动窗口检测所有高点（包括低于当前价的）
+        # 方法1：使用滚动窗口检测上方高点，优先放量
         all_highs = []
         
+        # 全局最高点
+        max_high_idx = self.data['high'].tail(lookback_days).idxmax()
+        max_high_price = self.data['high'].loc[max_high_idx]
+        if max_high_price > current_price:
+            # 修复时间戳运算兼容性问题
+            idxmax_position = self.data.tail(lookback_days)['high'].idxmax()
+            i = data_len - lookback_days + self.data.index.get_loc(idxmax_position)  # 绝对索引
+            # 修复索引越界问题
+            if i < 0 or i >= data_len:
+                # 跳过无效索引，使用默认值
+                volume_ratio = 1
+            else:
+                start_idx = max(0, i-10)
+                if start_idx >= i:  # 确保切片有效
+                    avg_volume = self.data['turnover'].iloc[i]  # 如果无法计算平均值，使用当前值
+                else:
+                    avg_volume = self.data['turnover'].iloc[start_idx:i].mean()
+                volume_ratio = self.data['turnover'].iloc[i] / avg_volume if avg_volume > 0 else 1
+            test_count = sum(1 for j in range(max(0, i-30), min(data_len, i+30)) if abs(self.data['high'].iloc[j] - max_high_price) / max_high_price < 0.02)
+            if volume_ratio > 1.5:
+                test_count += 2  # 放量加分
+            else:
+                test_count += 1
+            distance_pct = (max_high_price - current_price) / current_price * 100
+            category = 'near' if distance_pct < 10 else 'far'
+            all_highs.append({
+                'date': max_high_idx,
+                'price': max_high_price,
+                'close': self.data['close'].loc[max_high_idx],
+                'volume_ratio': volume_ratio,
+                'test_count': test_count,
+                'days_ago': data_len - 1 - i,
+                'distance_to_current_pct': distance_pct,
+                'window': 'global_max',
+                'category': category
+            })
         
         # 使用更宽的窗口来捕捉所有潜在阻力位
         for window in [5, 10, 15, 20]:
             for i in range(window, min(data_len, lookback_days) - window):
                 current_high_price = self.data['high'].iloc[i]
+                if current_high_price <= current_price:  # 只检测上方
+                    continue
+                
                 current_date = self.data.index[i]
                 
                 # 检查是否是窗口内高点
@@ -112,7 +153,14 @@ class StockBreakoutAnalyzer:
                 is_local_high = (current_high_price >= left_max * 0.98 and 
                                 current_high_price >= right_max * 0.98)
                 
-                if is_local_high:
+                # 计算成交量情况
+                if i >= 10:
+                    avg_volume = self.data['turnover'].iloc[max(0, i-10):i].mean()
+                    volume_ratio = self.data['turnover'].iloc[i] / avg_volume if avg_volume > 0 else 1
+                else:
+                    volume_ratio = 1
+                
+                if is_local_high or volume_ratio > 1.2:  # 放宽放量阈值
                     # 计算该价格被测试的次数
                     test_count = 0
                     for j in range(max(0, i-30), min(data_len, i+30)):
@@ -120,17 +168,15 @@ class StockBreakoutAnalyzer:
                             self.data['high'].iloc[j] <= current_high_price * 1.02):
                             test_count += 1
                     
-                    # 计算成交量情况
-                    if i >= 10:
-                        avg_volume = self.data['turnover'].iloc[max(0, i-10):i].mean()
-                        volume_ratio = self.data['turnover'].iloc[i] / avg_volume if avg_volume > 0 else 1
-                    else:
-                        volume_ratio = 1
+                    if volume_ratio > 1.2:  # 放量加分
+                        test_count += 1
                     
                     # 计算距离当前价的百分比
                     distance_pct = (current_high_price - current_price) / current_price * 100
                     
-                    # 添加到列表（包括所有高点，不仅仅是高于当前价的）
+                    # 分类近远期
+                    category = 'near' if distance_pct < 10 else 'far'
+                    
                     all_highs.append({
                         'date': current_date,
                         'price': current_high_price,
@@ -139,13 +185,15 @@ class StockBreakoutAnalyzer:
                         'test_count': test_count,
                         'days_ago': data_len - 1 - i,
                         'distance_to_current_pct': distance_pct,
-                        'window': window
+                        'window': window,
+                        'category': category
                     })
         
-        # 方法2：检测重要的历史阻力位（基于价格显著回调）
-        # 找出价格从高点回落超过10%的位置作为潜在阻力
+        # 方法2：检测重要的历史阻力位（基于价格显著回调，只上方）
         for i in range(20, min(data_len, lookback_days)):
             high_price = self.data['high'].iloc[i]
+            if high_price <= current_price:
+                continue
             
             # 检查后续是否有显著回落
             future_days = min(20, data_len - i - 1)
@@ -154,6 +202,13 @@ class StockBreakoutAnalyzer:
                 decline_pct = (high_price - future_min) / high_price * 100
                 
                 if decline_pct > 10:  # 回落超过10%
+                    # 计算成交量情况
+                    if i >= 10:
+                        avg_volume = self.data['turnover'].iloc[max(0, i-10):i].mean()
+                        volume_ratio = self.data['turnover'].iloc[i] / avg_volume if avg_volume > 0 else 1
+                    else:
+                        volume_ratio = 1
+                    
                     # 检查这个高点是否被多次测试
                     test_count = 0
                     for j in range(max(0, i-30), min(data_len, i+30)):
@@ -161,69 +216,111 @@ class StockBreakoutAnalyzer:
                             self.data['high'].iloc[j] <= high_price * 1.02):
                             test_count += 1
                     
-                    if test_count >= 2:
+                    if volume_ratio > 1.2:
+                        test_count += 1
+                    
+                    if test_count >= 1:  # 放宽条件
+                        distance_pct = (high_price - current_price) / current_price * 100
+                        category = 'near' if distance_pct < 10 else 'far'
                         all_highs.append({
                             'date': self.data.index[i],
                             'price': high_price,
                             'close': self.data['close'].iloc[i],
-                            'volume_ratio': 1.5,
+                            'volume_ratio': volume_ratio,
                             'test_count': test_count,
                             'days_ago': data_len - 1 - i,
-                            'distance_to_current_pct': (high_price - current_price) / current_price * 100,
-                            'window': 'history_resistance'
+                            'distance_to_current_pct': distance_pct,
+                            'window': 'history_resistance',
+                            'category': category
                         })
         
-        # 方法3：检测成交密集区形成的压力位
-        # 分析最近lookback_days的价格分布
+        # 方法3：检测成交密集区形成的压力位（动态衰减加权筹码分布）
         recent_data = self.data.tail(min(lookback_days, data_len))
         
-        # 使用KDE估计价格分布
         price_samples = []
+        weights = []
+        
         for idx in range(len(recent_data)):
-            # 为每个交易日生成多个价格样本（基于高低区间）
             low_price = recent_data['low'].iloc[idx]
             high_price = recent_data['high'].iloc[idx]
-            samples = np.linspace(low_price, high_price, 5)
-            price_samples.extend(samples)
+            turnover = recent_data['turnover'].iloc[idx]
+            days_ago = len(recent_data) - 1 - idx
+            weight = turnover * np.exp(-decay_rate * days_ago)
+            
+            if turnover > 0:
+                num_samples = int(turnover / recent_data['turnover'].mean() * 5)
+                num_samples = max(1, min(100, num_samples))
+                samples = np.linspace(low_price, high_price, num_samples)
+                price_samples.extend(samples)
+                weights.extend([weight / num_samples] * num_samples)
         
         if price_samples:
             price_samples = np.array(price_samples)
-            kde = stats.gaussian_kde(price_samples)
-            
-            # 在价格范围内评估密度
-            price_range = np.linspace(price_samples.min(), price_samples.max(), 100)
-            density = kde(price_range)
-            
-            # 找出密度峰值（成交密集区）
-            peaks = []
-            for i in range(1, len(density)-1):
-                if density[i] > density[i-1] and density[i] > density[i+1]:
-                    peaks.append({
-                        'price': price_range[i],
-                        'density': density[i]
-                    })
-            
-            # 取密度最高的前5个作为潜在压力位
-            peaks.sort(key=lambda x: x['density'], reverse=True)
-            for i, peak in enumerate(peaks[:5]):
-                if peak['price'] < current_price * 1.5:  # 不要太高
-                    all_highs.append({
-                        'date': recent_data.index[-1],  # 最近日期
-                        'price': peak['price'],
-                        'close': peak['price'],
-                        'volume_ratio': 1.0,
-                        'test_count': 3,  # 假设被多次测试
-                        'days_ago': 0,
-                        'distance_to_current_pct': (peak['price'] - current_price) / current_price * 100,
-                        'window': 'volume_density'
-                    })
+            if len(price_samples) > 0:
+                kde = stats.gaussian_kde(price_samples, weights=weights)
+                price_range = np.linspace(price_samples.min(), price_samples.max(), 200)
+                density = kde(price_range)
+                
+                peaks = []
+                for i in range(1, len(density)-1):
+                    if density[i] > density[i-1] and density[i] > density[i+1]:
+                        peaks.append({
+                            'price': price_range[i],
+                            'density': density[i]
+                        })
+                
+                peaks.sort(key=lambda x: x['density'], reverse=True)
+                for i, peak in enumerate(peaks[:5]):
+                    if peak['price'] > current_price:
+                        distance_pct = (peak['price'] - current_price) / current_price * 100
+                        if abs(distance_pct) > 30:
+                            continue
+                        category = 'near' if distance_pct < 10 else 'far'
+                        all_highs.append({
+                            'date': recent_data.index[-1],
+                            'price': peak['price'],
+                            'close': peak['price'],
+                            'volume_ratio': 1.0,
+                            'test_count': 2,
+                            'days_ago': 0,
+                            'distance_to_current_pct': distance_pct,
+                            'window': 'volume_density',
+                            'category': category
+                        })
+        
+        # 方法4：横盘放量试盘压力位
+        std_20 = self.data['close'].rolling(20).std()
+        mean_std = std_20.mean()
+        high_vol_mask = self.data['turnover'] > self.data['turnover'].rolling(20).mean() * 1.5
+        low_vol_mask = std_20 < mean_std * 0.5
+        horizontal_high_vol = self.data[low_vol_mask & high_vol_mask].tail(lookback_days)
+        
+        for idx in horizontal_high_vol.index:
+            i = self.data.index.get_loc(idx)
+            high_price = self.data['high'].loc[idx]
+            if high_price <= current_price:
+                continue
+            test_count = sum(1 for j in range(max(0, i-30), min(data_len, i+30)) if abs(self.data['high'].iloc[j] - high_price) / high_price < 0.02)
+            volume_ratio = self.data['turnover'].loc[idx] / self.data['turnover'].iloc[max(0, i-10):i].mean()
+            if volume_ratio > 1.2:
+                test_count += 1
+            distance_pct = (high_price - current_price) / current_price * 100
+            category = 'near' if distance_pct < 10 else 'far'
+            all_highs.append({
+                'date': idx,
+                'price': high_price,
+                'close': self.data['close'].loc[idx],
+                'volume_ratio': volume_ratio,
+                'test_count': test_count,
+                'days_ago': data_len - 1 - i,
+                'distance_to_current_pct': distance_pct,
+                'window': 'horizontal_high_vol',
+                'category': category
+            })
         
         # 去重和合并
         if all_highs:
-            # 按价格排序
             all_highs.sort(key=lambda x: x['price'])
-            
-            # 合并相近的高点（2%以内）
             filtered_highs = []
             for high in all_highs:
                 if not filtered_highs:
@@ -233,28 +330,13 @@ class StockBreakoutAnalyzer:
                     price_diff = abs(high['price'] - last_high['price']) / last_high['price'] * 100
                     
                     if price_diff <= 2.0:
-                        # 合并，取测试次数多的
                         if high['test_count'] > last_high['test_count']:
                             filtered_highs[-1] = high
                     else:
                         filtered_highs.append(high)
         
-        # 过滤：只保留测试次数>=2的压力位，并且距离不要太远（±30%以内）
-        final_highs = []
-        for high in filtered_highs:
-            if (high['test_count'] >= 2 and 
-                abs(high['distance_to_current_pct']) <= 30):
-                final_highs.append(high)
+        final_highs = [high for high in filtered_highs if high['test_count'] >= 1]
         
-        # 如果没有找到足够的压力位，放宽条件
-        if len(final_highs) < 3:
-            print(f"   警告: 只找到{len(final_highs)}个压力位，放宽条件...")
-            for high in filtered_highs:
-                if high['test_count'] >= 1 and abs(high['distance_to_current_pct']) <= 40:
-                    if high not in final_highs:
-                        final_highs.append(high)
-        
-        # 按价格降序排序
         final_highs.sort(key=lambda x: x['price'], reverse=True)
         
         self.pressure_levels = final_highs
@@ -265,26 +347,25 @@ class StockBreakoutAnalyzer:
             print("   主要压力位:")
             for i, high in enumerate(final_highs[:10], 1):
                 strength = "强" if high['test_count'] >= 3 else "中" if high['test_count'] >= 2 else "弱"
-                position = "上方" if high['distance_to_current_pct'] > 0 else "下方"
                 print(f"     {i}. {high['price']:.2f} "
                       f"(测试:{high['test_count']}次, 强度:{strength}, "
-                      f"位置:当前价{position}{abs(high['distance_to_current_pct']):.1f}%)")
+                      f"位置:上方{high['distance_to_current_pct']:.1f}%, {high['category']})")
         
         return final_highs
     
-    def cluster_pressure_levels_v2(self, 
+    def cluster_pressure_levels_v5(self, 
                                   max_gap_pct: float = None,
-                                  min_cluster_size: int = 2) -> List[Dict]:
+                                  min_cluster_size: int = 1) -> List[Dict]:
         """
-        修正版压力位聚类 V2 - 确保能形成集群
+        修正版压力位聚类 V5 - 允许单点集群
         """
-        print("📊 修正版压力位聚类V2...")
+        print("📊 修正版压力位聚类V5...")
         
         if not self.pressure_levels:
-            self.pressure_levels = self.detect_pressure_levels_v2()
+            self.pressure_levels = self.detect_pressure_levels_v5()
         
-        if len(self.pressure_levels) < min_cluster_size:
-            print(f"   压力位数量不足: {len(self.pressure_levels)} < {min_cluster_size}")
+        if len(self.pressure_levels) < 1:
+            print(f"   压力位数量不足: {len(self.pressure_levels)}")
             self.pressure_clusters = []
             return []
         
@@ -294,9 +375,8 @@ class StockBreakoutAnalyzer:
         price_median = np.median(prices)
         
         if max_gap_pct is None:
-            # 根据价格分布自动确定聚类参数
             if price_range / price_median > 0.3:
-                max_gap_pct = 6.0  # 价格波动大，聚类宽松些
+                max_gap_pct = 6.0
             elif price_range / price_median > 0.15:
                 max_gap_pct = 4.0
             else:
@@ -314,58 +394,42 @@ class StockBreakoutAnalyzer:
             if not current_cluster:
                 current_cluster.append(level)
             else:
-                # 计算当前集群的平均价格
                 cluster_prices = [l['price'] for l in current_cluster]
                 cluster_avg = np.mean(cluster_prices)
-                
-                # 计算价格差距百分比
                 price_gap = abs(level['price'] - cluster_avg) / cluster_avg * 100
                 
                 if price_gap <= max_gap_pct:
                     current_cluster.append(level)
                 else:
-                    # 保存当前集群
                     if len(current_cluster) >= min_cluster_size:
                         clusters.append(current_cluster.copy())
                     current_cluster = [level]
         
-        # 处理最后一个集群
         if len(current_cluster) >= min_cluster_size:
             clusters.append(current_cluster)
         
-        # 对于没有形成集群的单个压力位，如果它们很重要（测试次数多），也单独考虑
-        all_clustered_indices = []
-        for cluster in clusters:
-            for level in cluster:
-                all_clustered_indices.append(sorted_levels.index(level))
-        
-        # 处理未聚类的单个重要压力位
+        # 处理单个重要压力位
+        all_clustered_indices = [sorted_levels.index(level) for cluster in clusters for level in cluster]
         for i, level in enumerate(sorted_levels):
-            if i not in all_clustered_indices and level['test_count'] >= 3:
-                # 作为一个单独的"集群"处理
+            if i not in all_clustered_indices and level['test_count'] >= 1:  # 进一步放宽
                 clusters.append([level])
         
-        # 计算集群统计信息
+        # 计算集群统计
         clustered_results = []
         for i, cluster in enumerate(clusters):
             prices = [l['price'] for l in cluster]
             test_counts = [l['test_count'] for l in cluster]
             dates = [l['date'] for l in cluster]
+            categories = [l['category'] for l in cluster]
             
-            # 计算集群强度（基于平均测试次数）
             avg_test_count = np.mean(test_counts)
-            if avg_test_count >= 3:
-                strength = '强'
-                strength_score = 3
-            elif avg_test_count >= 2:
-                strength = '中'
-                strength_score = 2
-            else:
-                strength = '弱'
-                strength_score = 1
+            strength = '强' if avg_test_count >= 3 else '中' if avg_test_count >= 2 else '弱'
+            strength_score = 3 if strength == '强' else 2 if strength == '中' else 1
             
-            # 计算集群密度（价格范围百分比）
-            price_range_pct = (max(prices) - min(prices)) / np.mean(prices) * 100
+            price_range_pct = (max(prices) - min(prices)) / np.mean(prices) * 100 if len(prices)>1 else 0
+            density = '密集' if price_range_pct <= 5 else '中等' if price_range_pct <= 10 else '分散'
+            
+            category = max(set(categories), key=categories.count)
             
             cluster_info = {
                 'cluster_id': i + 1,
@@ -375,25 +439,25 @@ class StockBreakoutAnalyzer:
                 'avg_price': np.mean(prices),
                 'median_price': np.median(prices),
                 'price_range_pct': price_range_pct,
-                'density': '密集' if price_range_pct <= 5 else '中等' if price_range_pct <= 10 else '分散',
+                'density': density,
                 'earliest_date': min(dates),
                 'latest_date': max(dates),
                 'level_count': len(cluster),
                 'avg_test_count': avg_test_count,
                 'resistance_strength': strength,
                 'strength_score': strength_score,
-                'is_single': len(cluster) == 1
+                'is_single': len(cluster) == 1,
+                'category': category
             }
             
-            # 对于单个重要压力位，调整描述
             if len(cluster) == 1:
-                cluster_info['description'] = f"重要独立压力位 (测试{test_counts[0]}次)"
+                cluster_info['description'] = f"重要独立压力位 (测试{test_counts[0]}次, {category})"
             else:
-                cluster_info['description'] = f"压力集群 (密度:{cluster_info['density']})"
+                cluster_info['description'] = f"压力集群 (密度:{density}, {category})"
             
             clustered_results.append(cluster_info)
         
-        # 按强度排序（强度高的在前）
+        # 按强度排序
         clustered_results.sort(key=lambda x: (-x['strength_score'], -x['level_count']))
         
         self.pressure_clusters = clustered_results
@@ -401,33 +465,83 @@ class StockBreakoutAnalyzer:
         print(f"✅ 识别到{len(clustered_results)}个压力集群/位")
         
         for cluster in clustered_results:
+            strength_icon = "🟥" if cluster['resistance_strength'] == '强' else "🟧" if cluster['resistance_strength'] == '中' else "🟨"
             if cluster['is_single']:
                 level = cluster['levels'][0]
-                strength_icon = "🟥" if cluster['resistance_strength'] == '强' else "🟧" if cluster['resistance_strength'] == '中' else "🟨"
                 print(f"   {strength_icon} 独立压力位{cluster['cluster_id']}: {level['price']:.2f} "
-                      f"(测试:{level['test_count']}次, 强度:{cluster['resistance_strength']})")
+                      f"(测试:{level['test_count']}次, 强度:{cluster['resistance_strength']}, {cluster['category']})")
             else:
-                strength_icon = "🟥" if cluster['resistance_strength'] == '强' else "🟧" if cluster['resistance_strength'] == '中' else "🟨"
                 print(f"   {strength_icon} 集群{cluster['cluster_id']}: "
                       f"{cluster['min_price']:.2f}-{cluster['max_price']:.2f} "
-                      f"(密度:{cluster['density']}, {cluster['level_count']}个点, 强度:{cluster['resistance_strength']})")
+                      f"(密度:{cluster['density']}, {cluster['level_count']}个点, 强度:{cluster['resistance_strength']}, {cluster['category']})")
         
         return clustered_results
     
-    def calculate_support_levels_v2(self) -> List[Dict]:
+    def detect_horizontal_zones(self, lookback_days=60, std_threshold=0.5, vol_threshold=1.5):
         """
-        计算支撑位 V2
+        检测横盘放量区，作为支撑/压力
         """
-        print("📉 计算支撑位V2...")
+        recent_data = self.data.tail(lookback_days)
+        std_20 = recent_data['close'].rolling(20).std()
+        mean_std = std_20.mean()
+        high_vol_mask = recent_data['turnover'] > recent_data['turnover'].rolling(20).mean() * vol_threshold
+        low_vol_mask = std_20 < mean_std * std_threshold
+        horizontal_periods = recent_data[low_vol_mask]
+        
+        zones = []
+        if not horizontal_periods.empty:
+            # 聚类横盘期
+            current_zone_start = horizontal_periods.index[0]
+            current_zone_high = horizontal_periods['high'].iloc[0]
+            current_zone_low = horizontal_periods['low'].iloc[0]
+            current_vol = 0
+            
+            for idx in horizontal_periods.index[1:]:
+                if (idx - current_zone_start).days <= 5:  # 连续期
+                    current_zone_high = max(current_zone_high, horizontal_periods['high'].loc[idx])
+                    current_zone_low = min(current_zone_low, horizontal_periods['low'].loc[idx])
+                    if high_vol_mask.loc[idx]:
+                        current_vol += 1
+                else:
+                    if current_vol > 0:  # 有放量
+                        zones.append({
+                            'start': current_zone_start,
+                            'end': previous_idx,
+                            'high': current_zone_high,
+                            'low': current_zone_low,
+                            'vol_count': current_vol,
+                            'type': 'horizontal_zone'
+                        })
+                    current_zone_start = idx
+                    current_zone_high = horizontal_periods['high'].loc[idx]
+                    current_zone_low = horizontal_periods['low'].loc[idx]
+                    current_vol = 1 if high_vol_mask.loc[idx] else 0
+                previous_idx = idx
+            
+            if current_vol > 0:
+                zones.append({
+                    'start': current_zone_start,
+                    'end': previous_idx,
+                    'high': current_zone_high,
+                    'low': current_zone_low,
+                    'vol_count': current_vol,
+                    'type': 'horizontal_zone'
+                })
+        
+        return zones
+    
+    def calculate_support_levels_v5(self, decay_rate: float = 0.01) -> List[Dict]:
+        """
+        计算支撑位 V5 - 替换MA为BOLL下轨和中轨（距离过滤），添加长阳收盘支撑，添加横盘区下轨支撑
+        """
+        print("📉 计算支撑位V5...")
         
         current_price = self.data['close'].iloc[-1]
-        current_low = self.data['low'].iloc[-1]
         
         supports = []
         
         # 1. 斐波那契回调支撑（基于近期波段）
         if len(self.data) >= 20:
-            # 找到近期波段（最近30天）
             recent_high = self.data['high'].iloc[-30:].max()
             recent_low = self.data['low'].iloc[-30:].min()
             
@@ -444,27 +558,50 @@ class StockBreakoutAnalyzer:
                 if price < current_price:
                     distance_pct = (current_price - price) / current_price * 100
                     strength = '强' if level in ['38.2%', '50.0%'] else '中等'
+                    category = 'near' if distance_pct < 10 else 'far'
                     supports.append({
                         'price': price,
                         'type': f'斐波那契{level}',
                         'strength': strength,
                         'distance_pct': distance_pct,
-                        'priority': 1 if strength == '强' else 2
+                        'priority': 1 if strength == '强' else 2,
+                        'category': category
                     })
         
-        # 2. 移动平均线支撑
-        for period in [5, 10, 20, 30, 60]:
-            if len(self.data) >= period:
-                ma = self.data['close'].rolling(period).mean().iloc[-1]
-                if ma < current_price:
-                    distance_pct = (current_price - ma) / current_price * 100
-                    strength = '强' if period >= 20 else '中等'
+        # 2. BOLL支撑（中轨强，下轨若近加）
+        boll_period = 20
+        boll_std = 2
+        if len(self.data) >= boll_period:
+            rolling_mean = self.data['close'].rolling(boll_period).mean()
+            rolling_std = self.data['close'].rolling(boll_period).std()
+            boll_mid = rolling_mean.iloc[-1]
+            boll_lower = rolling_mean.iloc[-1] - (rolling_std.iloc[-1] * boll_std)
+            
+            # 中轨
+            if boll_mid < current_price:
+                distance_pct = (current_price - boll_mid) / current_price * 100
+                category = 'near' if distance_pct < 10 else 'far'
+                supports.append({
+                    'price': boll_mid,
+                    'type': f'BOLL中轨({boll_period})',
+                    'strength': '强',
+                    'distance_pct': distance_pct,
+                    'priority': 1,
+                    'category': category
+                })
+            
+            # 下轨若距离<15%加
+            if boll_lower < current_price:
+                distance_pct = (current_price - boll_lower) / current_price * 100
+                if distance_pct < 15:
+                    category = 'near' if distance_pct < 10 else 'far'
                     supports.append({
-                        'price': ma,
-                        'type': f'MA{period}',
-                        'strength': strength,
+                        'price': boll_lower,
+                        'type': f'BOLL下轨({boll_period})',
+                        'strength': '中等',
                         'distance_pct': distance_pct,
-                        'priority': 1 if strength == '强' else 2
+                        'priority': 2,
+                        'category': category
                     })
         
         # 3. 近期低点支撑
@@ -473,6 +610,8 @@ class StockBreakoutAnalyzer:
         
         for i in range(len(self.data)-lookback, len(self.data)-5):
             low_price = self.data['low'].iloc[i]
+            if low_price >= current_price:  # 只下方
+                continue
             date = self.data.index[i]
             
             # 检查是否是局部低点
@@ -481,7 +620,7 @@ class StockBreakoutAnalyzer:
                 right_min = self.data['low'].iloc[i+1:min(len(self.data), i+6)].min()
                 
                 if low_price <= left_min and low_price <= right_min:
-                    # 检查这个低点是否被测试过（价格回到附近）
+                    # 检查这个低点是否被测试过
                     test_count = 0
                     for j in range(max(0, i-10), min(len(self.data), i+11)):
                         if (self.data['low'].iloc[j] <= low_price * 1.02 and 
@@ -490,6 +629,7 @@ class StockBreakoutAnalyzer:
                     
                     if test_count >= 2:
                         distance_pct = (current_price - low_price) / current_price * 100
+                        category = 'near' if distance_pct < 10 else 'far'
                         recent_lows.append({
                             'price': low_price,
                             'date': date,
@@ -497,7 +637,8 @@ class StockBreakoutAnalyzer:
                             'strength': '中等',
                             'test_count': test_count,
                             'distance_pct': distance_pct,
-                            'priority': 2
+                            'priority': 2,
+                            'category': category
                         })
         
         supports.extend(recent_lows)
@@ -507,28 +648,130 @@ class StockBreakoutAnalyzer:
         price_min = self.data['low'].min()
         price_max = self.data['high'].max()
         
-        # 找出在价格范围内的整数位
         min_int = int(np.floor(price_min))
         max_int = int(np.ceil(price_max))
         
         for int_level in range(min_int, max_int + 1):
             if int_level < current_price:
-                # 检查这个整数位是否被多次测试
                 mask = (self.data['low'] <= int_level * 1.02) & (self.data['high'] >= int_level * 0.98)
                 test_count = mask.sum()
                 
                 if test_count >= 3:
                     distance_pct = (current_price - int_level) / current_price * 100
+                    category = 'near' if distance_pct < 10 else 'far'
                     integer_levels.append({
                         'price': int_level,
                         'type': '整数位支撑',
                         'strength': '中等',
                         'test_count': test_count,
                         'distance_pct': distance_pct,
-                        'priority': 3
+                        'priority': 3,
+                        'category': category
                     })
         
         supports.extend(integer_levels)
+        
+        # 5. 加权筹码密集区作为支撑（下方峰值）
+        lookback_days = 60
+        recent_data = self.data.tail(min(lookback_days, len(self.data)))
+        
+        price_samples = []
+        weights = []
+        
+        for idx in range(len(recent_data)):
+            low_price = recent_data['low'].iloc[idx]
+            high_price = recent_data['high'].iloc[idx]
+            turnover = recent_data['turnover'].iloc[idx]
+            days_ago = len(recent_data) - 1 - idx
+            weight = turnover * np.exp(-decay_rate * days_ago)
+            
+            if turnover > 0:
+                num_samples = int(turnover / recent_data['turnover'].mean() * 5)
+                num_samples = max(1, min(100, num_samples))
+                samples = np.linspace(low_price, high_price, num_samples)
+                price_samples.extend(samples)
+                weights.extend([weight / num_samples] * num_samples)
+        
+        if price_samples:
+            price_samples = np.array(price_samples)
+            if len(price_samples) > 0:
+                kde = stats.gaussian_kde(price_samples, weights=weights)
+                price_range = np.linspace(price_samples.min(), price_samples.max(), 200)
+                density = kde(price_range)
+                
+                peaks = []
+                for i in range(1, len(density)-1):
+                    if density[i] > density[i-1] and density[i] > density[i+1]:
+                        peaks.append({
+                            'price': price_range[i],
+                            'density': density[i]
+                        })
+                
+                peaks.sort(key=lambda x: x['density'], reverse=True)
+                for i, peak in enumerate(peaks[:5]):
+                    if peak['price'] < current_price:  # 只下方作为支撑
+                        distance_pct = (current_price - peak['price']) / current_price * 100
+                        if distance_pct > 30:
+                            continue
+                        category = 'near' if distance_pct < 10 else 'far'
+                        supports.append({
+                            'price': peak['price'],
+                            'type': '筹码密集区',
+                            'strength': '强' if peak['density'] > np.mean(density) * 2 else '中等',
+                            'distance_pct': distance_pct,
+                            'priority': 1,
+                            'category': category
+                        })
+        
+        # 6. 长阳收盘支撑 (放宽阈值)
+        long_yang_supports = []
+        recent_data = self.data.tail(60)
+        for i in range(1, len(recent_data)):
+            close = recent_data['close'].iloc[i]
+            prev_close = recent_data['close'].iloc[i-1]
+            open_p = recent_data['open'].iloc[i]
+            volume = recent_data['turnover'].iloc[i]
+            date = recent_data.index[i]
+            
+            change_pct = (close - prev_close) / prev_close * 100
+            if change_pct > 3 and close > open_p:  # 放宽到>3%
+                if i >= 10:
+                    avg_volume = recent_data['turnover'].iloc[max(0, i-10):i].mean()
+                    volume_ratio = volume / avg_volume if avg_volume > 0 else 1
+                else:
+                    volume_ratio = 1
+                
+                if volume_ratio > 1.0 and close < current_price:  # 放宽vol
+                    distance_pct = (current_price - close) / current_price * 100
+                    category = 'near' if distance_pct < 10 else 'far'
+                    long_yang_supports.append({
+                        'price': close,
+                        'date': date,
+                        'type': '长阳收盘',
+                        'strength': '中等',
+                        'distance_pct': distance_pct,
+                        'priority': 2,
+                        'category': category
+                    })
+        
+        supports.extend(long_yang_supports)
+        
+        # 7. 横盘放量下轨支撑
+        horizontal_zones = self.detect_horizontal_zones()
+        for zone in horizontal_zones:
+            low_price = zone['low']
+            if low_price < current_price:
+                distance_pct = (current_price - low_price) / current_price * 100
+                strength = '强' if zone['vol_count'] >= 3 else '中等'
+                category = 'near' if distance_pct < 10 else 'far'
+                supports.append({
+                    'price': low_price,
+                    'type': '横盘下轨',
+                    'strength': strength,
+                    'distance_pct': distance_pct,
+                    'priority': 1 if strength == '强' else 2,
+                    'category': category
+                })
         
         # 合并相近的支撑位（1.5%以内）
         merged_supports = []
@@ -540,11 +783,9 @@ class StockBreakoutAnalyzer:
                 price_diff = abs(support['price'] - last_support['price']) / last_support['price'] * 100
                 
                 if price_diff <= 1.5:
-                    # 合并，取优先级高的（数字小的优先级高）
                     if support['priority'] < last_support['priority']:
                         merged_supports[-1] = support
                     elif support['priority'] == last_support['priority']:
-                        # 优先级相同，取距离更近的
                         if support['distance_pct'] < last_support['distance_pct']:
                             merged_supports[-1] = support
                 else:
@@ -553,7 +794,7 @@ class StockBreakoutAnalyzer:
         # 按优先级和距离排序
         merged_supports.sort(key=lambda x: (x['priority'], x['distance_pct']))
         
-        # 只保留在当前价格下方且距离合理的支撑位（50%以内）
+        # 只保留距离合理的支撑位（50%以内）
         filtered_supports = [s for s in merged_supports if s['distance_pct'] <= 50]
         
         self.support_levels = filtered_supports
@@ -565,30 +806,28 @@ class StockBreakoutAnalyzer:
             for i, support in enumerate(filtered_supports[:8], 1):
                 strength_icon = "🟩" if support['strength'] == '强' else "🟨" if support['strength'] == '中等' else "⬜"
                 print(f"     {strength_icon} {i}. {support['price']:.2f} - {support['type']} "
-                      f"(距离:{support['distance_pct']:.1f}%, 强度:{support['strength']})")
+                      f"(距离:{support['distance_pct']:.1f}%, 强度:{support['strength']}, {support['category']})")
         
         return filtered_supports
     
-    def analyze_breakouts_v2(self, 
+    def analyze_breakouts_v5(self, 
                            days_to_analyze: int = 30,
                            min_breakout_pct: float = 3.0) -> Dict:
         """
-        分析突破 V2
+        分析突破 V5
         """
-        print(f"🔍 分析最近{days_to_analyze}天的突破V2...")
+        print(f"🔍 分析最近{days_to_analyze}天的突破V5...")
         
         if not self.pressure_clusters:
-            self.pressure_clusters = self.cluster_pressure_levels_v2()
+            self.pressure_clusters = self.cluster_pressure_levels_v5()
         
         current_date = self.data.index[-1]
         current_price = self.data['close'].iloc[-1]
         current_high = self.data['high'].iloc[-1]
         
-        # 获取近期数据
         recent_start = current_date - timedelta(days=days_to_analyze)
         recent_data = self.data[self.data.index >= recent_start]
         
-        # 分析大涨交易日
         big_up_days = []
         valid_breakout_days = []
         
@@ -600,28 +839,21 @@ class StockBreakoutAnalyzer:
             low = recent_data['low'].iloc[i]
             volume = recent_data['turnover'].iloc[i]
             
-            # 计算涨幅
             daily_change = (close - prev_close) / prev_close * 100
-            
-            # 检查是否是大涨日（涨幅>3%）
             is_big_up = daily_change > 3.0
             
             if is_big_up:
-                # 计算成交量放大
                 if i >= 10:
                     avg_volume = recent_data['turnover'].iloc[max(0, i-10):i].mean()
                     volume_ratio = volume / avg_volume if avg_volume > 0 else 1
                 else:
                     volume_ratio = 1
                 
-                # 检查突破哪些压力集群
                 broken_clusters = []
                 for cluster in self.pressure_clusters:
-                    # 突破判断：收盘价高于压力位且突破幅度足够
                     if close > cluster['avg_price'] and high > cluster['avg_price'] * (1 + min_breakout_pct/100):
                         broken_clusters.append(cluster['cluster_id'])
                 
-                # 计算振幅
                 amplitude = (high - low) / prev_close * 100
                 
                 day_info = {
@@ -640,29 +872,24 @@ class StockBreakoutAnalyzer:
                 
                 big_up_days.append(day_info)
                 
-                # 如果是突破日，验证突破有效性
                 if day_info['is_breakout']:
-                    # 检查突破后是否站稳（至少2天不跌回）
                     break_date = date
-                    break_price = cluster['avg_price']
+                    break_idx = self.data.index.get_loc(break_date)
+                    future_days = min(3, len(self.data) - break_idx - 1)
                     
-                    # 找到突破后的数据
-                    try:
-                        break_idx = self.data.index.get_loc(break_date)
-                        future_days = min(3, len(self.data) - break_idx - 1)
-                        
-                        if future_days > 0:
-                            # 检查后续几天的收盘价是否都在突破位之上
-                            future_closes = [self.data['close'].iloc[break_idx + j] for j in range(1, future_days+1)]
-                            all_above = all([fc > break_price * 0.99 for fc in future_closes])
-                            
-                            if all_above:
-                                day_info['is_valid_breakout'] = True
-                                valid_breakout_days.append(day_info)
-                    except:
-                        pass
+                    if future_days >= 2:
+                        future_closes = [self.data['close'].iloc[break_idx + j] for j in range(1, future_days+1)]
+                        all_above = all([fc > cluster['avg_price'] * 0.99 for fc in future_closes])
+                        if all_above:
+                            day_info['is_valid_breakout'] = True
+                    else:
+                        if volume_ratio > 1.2 and amplitude > 4:  # 放宽
+                            day_info['is_valid_breakout'] = True
+                    
+                    if day_info['is_valid_breakout']:
+                        valid_breakout_days.append(day_info)
         
-        # 找出连续上涨序列
+        # 连续上涨序列
         consecutive_up = []
         temp_sequence = []
         
@@ -673,12 +900,8 @@ class StockBreakoutAnalyzer:
             if close > prev_close:
                 if not temp_sequence:
                     temp_sequence = [i-1, i]
-                elif i == temp_sequence[-1] + 1:
-                    temp_sequence.append(i)
                 else:
-                    if len(temp_sequence) >= 3:
-                        consecutive_up.append(temp_sequence.copy())
-                    temp_sequence = [i-1, i]
+                    temp_sequence.append(i)
             else:
                 if len(temp_sequence) >= 3:
                     consecutive_up.append(temp_sequence.copy())
@@ -713,14 +936,14 @@ class StockBreakoutAnalyzer:
         
         return result
     
-    def evaluate_pattern_v2(self, analysis_result: Dict = None) -> Dict:
+    def evaluate_pattern_v5(self, analysis_result: Dict = None) -> Dict:
         """
-        形态评估 V2
+        形态评估 V5
         """
-        print("📈 形态评估V2...")
+        print("📈 形态评估V5...")
         
         if analysis_result is None:
-            analysis_result = self.analyze_breakouts_v2()
+            analysis_result = self.analyze_breakouts_v5()
         
         pattern_score = 0
         pattern_indicators = []
@@ -728,7 +951,7 @@ class StockBreakoutAnalyzer:
         current_price = self.data['close'].iloc[-1]
         current_high = self.data['high'].iloc[-1]
         
-        # 1. 压力集群分析 (0-25分)
+        # 1. 压力集群分析 (0-25分，只上方)
         pressure_clusters = analysis_result.get('pressure_clusters', [])
         if pressure_clusters:
             strong_clusters = [c for c in pressure_clusters if c['resistance_strength'] == '强']
@@ -736,13 +959,12 @@ class StockBreakoutAnalyzer:
             
             if strong_clusters:
                 pattern_score += min(len(strong_clusters) * 6, 15)
-                pattern_indicators.append(f"🎯 发现{len(strong_clusters)}个强压力集群")
+                pattern_indicators.append(f"🎯 发现{len(strong_clusters)}个强压力集群 ({len([c for c in strong_clusters if c['category']=='near'])} near)")
             
             if medium_clusters:
                 pattern_score += min(len(medium_clusters) * 3, 10)
-                pattern_indicators.append(f"📊 发现{len(medium_clusters)}个中等压力集群")
+                pattern_indicators.append(f"📊 发现{len(medium_clusters)}个中等压力集群 ({len([c for c in medium_clusters if c['category']=='near'])} near)")
             
-            # 检查是否有密集集群
             dense_clusters = [c for c in pressure_clusters if c['density'] == '密集']
             if dense_clusters:
                 pattern_score += 5
@@ -756,13 +978,11 @@ class StockBreakoutAnalyzer:
             pattern_score += min(len(valid_breakout_days) * 10, 25)
             pattern_indicators.append(f"✅ {len(valid_breakout_days)}次有效突破")
             
-            # 检查突破强度
             strong_breakouts = [d for d in valid_breakout_days if d['daily_change_pct'] > 7]
             if strong_breakouts:
                 pattern_score += 5
                 pattern_indicators.append(f"⚡ {len(strong_breakouts)}次强势突破(>7%)")
         else:
-            # 检查是否有大涨日（虽然没有有效突破）
             big_up_days = analysis_result.get('big_up_days', [])
             if big_up_days:
                 pattern_score += min(len(big_up_days) * 2, 10)
@@ -772,21 +992,7 @@ class StockBreakoutAnalyzer:
         
         # 3. 当前位置分析 (0-20分)
         if pressure_clusters:
-            clusters_above = 0
-            clusters_near = 0
-            
-            for cluster in pressure_clusters:
-                distance_pct = (current_price - cluster['avg_price']) / cluster['avg_price'] * 100
-                
-                if current_price > cluster['avg_price'] * 1.03:  # 高于3%
-                    clusters_above += 1
-                elif abs(distance_pct) <= 3:  # 3%以内
-                    clusters_near += 1
-            
-            if clusters_above > 0:
-                pattern_score += min(clusters_above * 5, 15)
-                pattern_indicators.append(f"🏆 已突破{clusters_above}个压力区")
-            
+            clusters_near = sum(1 for c in pressure_clusters if abs((current_price - c['avg_price']) / c['avg_price'] * 100) <= 3)
             if clusters_near > 0:
                 pattern_score += 5
                 pattern_indicators.append(f"📍 接近{clusters_near}个压力区")
@@ -798,9 +1004,8 @@ class StockBreakoutAnalyzer:
             
             if strong_supports:
                 pattern_score += min(len(strong_supports) * 3, 9)
-                pattern_indicators.append(f"🛡️  {len(strong_supports)}个强支撑位")
+                pattern_indicators.append(f"🛡️  {len(strong_supports)}个强支撑位 ({len([s for s in strong_supports if s['category']=='near'])} near)")
             
-            # 检查是否有近支撑
             near_supports = [s for s in support_levels if s['distance_pct'] <= 10]
             if near_supports:
                 pattern_score += 6
@@ -813,7 +1018,6 @@ class StockBreakoutAnalyzer:
             ma10 = self.data['close'].rolling(10).mean().iloc[-1]
             ma5 = self.data['close'].rolling(5).mean().iloc[-1]
             
-            # 均线多头排列
             if ma5 > ma10 > ma20 and current_price > ma5:
                 pattern_score += 8
                 pattern_indicators.append(f"📊 均线多头排列(5>10>20)")
@@ -821,10 +1025,8 @@ class StockBreakoutAnalyzer:
                 pattern_score += 4
                 pattern_indicators.append(f"📈 站上20日均线")
         
-        # 限制分数
         pattern_score = min(100, max(0, pattern_score))
         
-        # 评级系统
         if pattern_score >= 75:
             pattern_rating = "强势突破"
             pattern_detected = True
@@ -860,12 +1062,12 @@ class StockBreakoutAnalyzer:
         
         return evaluation
     
-    def detect_complete_pattern_v2(self) -> Dict:
+    def detect_complete_pattern_v5(self) -> Dict:
         """
-        完整版突破形态检测 V2
+        完整版突破形态检测 V5
         """
         print("=" * 70)
-        print("🚀 完整版突破形态检测开始 V2")
+        print("🚀 完整版突破形态检测开始 V5")
         print("=" * 70)
         
         current_date = self.data.index[-1]
@@ -879,19 +1081,19 @@ class StockBreakoutAnalyzer:
         print(f"   数据周期: {len(self.data)}天")
         
         # 1. 检测压力位
-        self.detect_pressure_levels_v2(current_price, lookback_days=60)
+        self.detect_pressure_levels_v5(current_price, lookback_days=60)
         
         # 2. 聚类压力位
-        self.cluster_pressure_levels_v2()
+        self.cluster_pressure_levels_v5()
         
         # 3. 计算支撑位
-        self.calculate_support_levels_v2()
+        self.calculate_support_levels_v5()
         
         # 4. 分析突破
-        analysis_result = self.analyze_breakouts_v2(days_to_analyze=30)
+        analysis_result = self.analyze_breakouts_v5(days_to_analyze=30)
         
         # 5. 评估形态
-        evaluation = self.evaluate_pattern_v2(analysis_result)
+        evaluation = self.evaluate_pattern_v5(analysis_result)
         
         # 6. 构建结果
         final_result = {
@@ -906,7 +1108,7 @@ class StockBreakoutAnalyzer:
         }
         
         print("\n" + "=" * 70)
-        print("📊 完整版分析总结 V2")
+        print("📊 完整版分析总结 V5")
         print("=" * 70)
         print(f"压力集群: {len(self.pressure_clusters)}个")
         print(f"支撑位: {len(self.support_levels)}个")
@@ -914,7 +1116,6 @@ class StockBreakoutAnalyzer:
         print(f"形态评级: {evaluation['pattern_rating']}")
         print(f"形态检测: {'✅ 符合突破形态' if evaluation['pattern_detected'] else '⚠️  观察中' if evaluation['pattern_score'] >= 30 else '❌ 不符合'}")
         
-        # 显示关键特征
         if evaluation['pattern_score'] >= 30:
             print(f"\n🎯 关键特征:")
             for indicator in evaluation['indicators'][:6]:
@@ -924,22 +1125,20 @@ class StockBreakoutAnalyzer:
         
         return final_result
     
-    def plot_analysis_v2(self, analysis_result: Dict = None, save_path: str = None) -> plt.Figure:
+    def plot_analysis_v5(self, analysis_result: Dict = None, save_path: str = None) -> plt.Figure:
         """
-        绘制分析图 V2
+        绘制分析图 V5
         """
-        print("🎨 绘制分析图V2...")
+        print("🎨 绘制分析图V5...")
         
         if analysis_result is None:
-            analysis_result = self.detect_complete_pattern_v2()
+            analysis_result = self.detect_complete_pattern_v5()
         
         fig = plt.figure(figsize=(18, 14))
         gs = fig.add_gridspec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.1)
         
-        # 1. 主图：价格走势与压力支撑
         ax1 = fig.add_subplot(gs[0])
         
-        # 绘制最近60天的K线
         plot_days = min(60, len(self.data))
         plot_data = self.data.tail(plot_days)
         x_indices = np.arange(len(plot_data))
@@ -947,31 +1146,26 @@ class StockBreakoutAnalyzer:
         
         # 绘制K线
         for i in range(len(plot_data)):
-            if plot_data['close'].iloc[i] >= plot_data['open'].iloc[i]:
-                color = 'red'
-                fill_color = 'red'
-            else:
-                color = 'green'
-                fill_color = 'green'
+            open_p = plot_data['open'].iloc[i]
+            close = plot_data['close'].iloc[i]
+            color = 'red' if close >= open_p else 'green'
             
-            # 影线
             ax1.plot([x_indices[i], x_indices[i]], 
                     [plot_data['low'].iloc[i], plot_data['high'].iloc[i]], 
                     color=color, linewidth=1.5, alpha=0.8)
             
-            # 实体
             width = 0.6
             rect = Rectangle(
-                (x_indices[i] - width/2, min(plot_data['open'].iloc[i], plot_data['close'].iloc[i])),
+                (x_indices[i] - width/2, min(open_p, close)),
                 width,
-                abs(plot_data['close'].iloc[i] - plot_data['open'].iloc[i]),
-                facecolor=fill_color,
+                abs(close - open_p),
+                facecolor=color,
                 edgecolor=color,
                 alpha=0.7
             )
             ax1.add_patch(rect)
         
-        # 绘制移动平均线
+        # 移动平均线
         if len(plot_data) >= 5:
             ma5 = plot_data['close'].rolling(5).mean()
             ma10 = plot_data['close'].rolling(10).mean()
@@ -981,79 +1175,46 @@ class StockBreakoutAnalyzer:
             ax1.plot(x_indices, ma10.values, 'blue', linewidth=1.5, alpha=0.7, label='MA10')
             ax1.plot(x_indices, ma20.values, 'purple', linewidth=1.5, alpha=0.7, label='MA20')
         
-        # 标记压力集群
+        # 标记压力集群 (上方)
         pressure_clusters = analysis_result.get('pressure_clusters', [])
         for cluster in pressure_clusters:
+            color = 'darkred' if cluster['category'] == 'near' else 'red'
+            alpha = 0.3 if cluster['resistance_strength'] == '强' else 0.2
+            label = f"{cluster['description']}"
+            
             if cluster['is_single']:
-                # 独立压力位
-                price = cluster['avg_price']
-                color = 'darkred' if cluster['resistance_strength'] == '强' else 'orange' if cluster['resistance_strength'] == '中' else 'yellow'
-                ax1.axhline(y=price, color=color, linestyle='--', linewidth=2, alpha=0.7)
-                ax1.text(x_indices[-1], price, 
-                        f" 压力{cluster['cluster_id']}: {price:.2f}", 
-                        color=color, fontsize=10, verticalalignment='center',
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
+                ax1.axhline(y=cluster['avg_price'], color=color, linestyle='--', linewidth=2, alpha=0.7)
+                ax1.text(x_indices[-1], cluster['avg_price'], label, color=color, fontsize=10)
             else:
-                # 压力集群
-                cluster_min = cluster['min_price']
-                cluster_max = cluster['max_price']
-                cluster_avg = cluster['avg_price']
-                
-                color = 'darkred' if cluster['resistance_strength'] == '强' else 'orange' if cluster['resistance_strength'] == '中' else 'yellow'
-                alpha = 0.3 if cluster['resistance_strength'] == '强' else 0.2 if cluster['resistance_strength'] == '中' else 0.1
-                
-                # 绘制压力区间
-                ax1.axhspan(cluster_min, cluster_max, alpha=alpha, color=color)
-                ax1.axhline(y=cluster_avg, color=color, linestyle='--', linewidth=1.5, alpha=0.6)
-                
-                # 标注
-                ax1.text(x_indices[-1], cluster_avg, 
-                        f" 压力集群{cluster['cluster_id']}: {cluster_avg:.2f}", 
-                        color=color, fontsize=10, verticalalignment='center',
-                        bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
+                ax1.axhspan(cluster['min_price'], cluster['max_price'], alpha=alpha, color=color)
+                ax1.axhline(y=cluster['avg_price'], color=color, linestyle='--', linewidth=1.5, alpha=0.6)
+                ax1.text(x_indices[-1], cluster['avg_price'], label, color=color, fontsize=10)
         
-        # 标记支撑位
+        # 标记支撑位 (下方)
         support_levels = analysis_result.get('support_levels', [])
-        for i, support in enumerate(support_levels[:5]):  # 只显示前5个
-            if support['strength'] == '强':
-                linestyle = '-'
-                linewidth = 2
-                color = 'darkgreen'
-                alpha = 0.7
-            elif support['strength'] == '中等':
-                linestyle = '--'
-                linewidth = 1.5
-                color = 'green'
-                alpha = 0.5
-            else:
-                linestyle = ':'
-                linewidth = 1
-                color = 'lightgreen'
-                alpha = 0.3
+        for i, support in enumerate(support_levels[:5]):
+            color = 'darkgreen' if support['category'] == 'near' else 'green'
+            linestyle = '-' if support['strength'] == '强' else '--'
+            linewidth = 2 if support['strength'] == '强' else 1.5
+            alpha = 0.7 if support['strength'] == '强' else 0.5
             
             ax1.axhline(y=support['price'], color=color, linestyle=linestyle, 
                        linewidth=linewidth, alpha=alpha)
-            
-            # 标注
             ax1.text(x_indices[0], support['price'], 
-                    f" 支撑{i+1}: {support['price']:.2f}", 
-                    color=color, fontsize=9, verticalalignment='center',
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
+                    f"支撑{i+1}: {support['price']:.2f} ({support['category']})", 
+                    color=color, fontsize=9)
         
-        # 标记当前价格
+        # 当前价格
         current_price = self.data['close'].iloc[-1]
         ax1.axhline(y=current_price, color='blue', linestyle='-', linewidth=2, alpha=0.5)
-        ax1.text(x_indices[-1], current_price, 
-                f" 当前价: {current_price:.2f}", 
-                color='blue', fontsize=12, verticalalignment='center',
-                fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.7))
+        ax1.text(x_indices[-1], current_price, f" 当前价: {current_price:.2f}", color='blue', fontsize=12)
         
-        ax1.set_title('价格走势与压力支撑分析', fontsize=16, fontweight='bold', pad=20)
+        ax1.set_title('价格走势与压力支撑分析 V5', fontsize=16, fontweight='bold', pad=20)
         ax1.set_ylabel('价格', fontsize=12)
         ax1.legend(loc='upper left', fontsize=9)
         ax1.grid(True, alpha=0.2)
         
-        # 设置x轴刻度
+        # x轴
         if len(dates) > 10:
             step = max(1, len(dates) // 10)
             tick_indices = np.arange(0, len(dates), step)
@@ -1064,79 +1225,53 @@ class StockBreakoutAnalyzer:
             ax1.set_xticks(x_indices)
             ax1.set_xticklabels([d.strftime('%m-%d') for d in dates], rotation=45)
         
-        # 2. 成交量
+        # 成交量
         ax2 = fig.add_subplot(gs[1], sharex=ax1)
-        
-        colors = ['red' if close >= open_price else 'green' 
-                 for close, open_price in zip(plot_data['close'], plot_data['open'])]
-        
-        ax2.bar(x_indices, plot_data['turnover'].values/1e8, width=0.6, 
-                color=colors, alpha=0.7)
-        
-        ax2.set_title('成交量分析', fontsize=14, fontweight='bold')
+        colors = ['red' if c >= o else 'green' for c, o in zip(plot_data['close'], plot_data['open'])]
+        ax2.bar(x_indices, plot_data['turnover'].values/1e8, width=0.6, color=colors, alpha=0.7)
+        ax2.set_title('成交量分析', fontsize=14)
         ax2.set_ylabel('成交量 (亿)', fontsize=12)
         ax2.grid(True, alpha=0.2)
         
-        # 3. 涨幅
+        # 涨幅
         ax3 = fig.add_subplot(gs[2], sharex=ax1)
-        
         daily_changes = plot_data['close'].pct_change() * 100
         colors_change = ['red' if change >= 0 else 'green' for change in daily_changes]
-        
-        ax3.bar(x_indices[1:], daily_changes.values[1:], width=0.6, 
-                color=colors_change[1:], alpha=0.7)
-        
+        ax3.bar(x_indices[1:], daily_changes.values[1:], width=0.6, color=colors_change[1:], alpha=0.7)
         ax3.axhline(y=0, color='black', linewidth=0.5)
         ax3.axhline(y=5, color='orange', linestyle='--', alpha=0.6, label='大涨线(5%)')
         ax3.axhline(y=10, color='red', linestyle='--', alpha=0.6, label='暴涨线(10%)')
-        
-        ax3.set_title('每日涨幅分析', fontsize=14, fontweight='bold')
+        ax3.set_title('每日涨幅分析', fontsize=14)
         ax3.set_ylabel('涨幅 (%)', fontsize=12)
         ax3.legend(loc='upper left', fontsize=9)
         ax3.grid(True, alpha=0.2)
         
-        # 4. RSI
+        # RSI
         ax4 = fig.add_subplot(gs[3], sharex=ax1)
-        
         if len(plot_data) >= 14:
             delta = plot_data['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             rsi = 100 - (100 / (1 + rs))
-            
             ax4.plot(x_indices[14:], rsi.values[14:], 'purple', linewidth=2, label='RSI(14)')
             ax4.axhline(y=70, color='red', linestyle='--', alpha=0.5, label='超买(70)')
             ax4.axhline(y=30, color='green', linestyle='--', alpha=0.5, label='超卖(30)')
             ax4.axhline(y=50, color='gray', linestyle='-', alpha=0.3)
-        
-        ax4.set_title('技术指标 (RSI)', fontsize=14, fontweight='bold')
+        ax4.set_title('技术指标 (RSI)', fontsize=14)
         ax4.set_xlabel('日期', fontsize=12)
         ax4.set_ylabel('RSI', fontsize=12)
         ax4.set_ylim(0, 100)
         ax4.legend(loc='upper left', fontsize=9)
         ax4.grid(True, alpha=0.2)
         
-        # 添加形态评分
+        # 形态评分
         pattern_score = analysis_result.get('pattern_score', 0)
         pattern_rating = analysis_result.get('pattern_rating', '未知')
         pattern_detected = analysis_result.get('pattern_detected', False)
         
-        if pattern_score >= 75:
-            color = 'darkgreen'
-            facecolor = 'lightgreen'
-        elif pattern_score >= 60:
-            color = 'green'
-            facecolor = 'lightyellow'
-        elif pattern_score >= 45:
-            color = 'orange'
-            facecolor = 'wheat'
-        elif pattern_score >= 30:
-            color = 'goldenrod'
-            facecolor = 'linen'
-        else:
-            color = 'red'
-            facecolor = 'mistyrose'
+        color = 'darkgreen' if pattern_score >= 75 else 'green' if pattern_score >= 60 else 'orange' if pattern_score >= 45 else 'goldenrod' if pattern_score >= 30 else 'red'
+        facecolor = 'lightgreen' if pattern_score >= 75 else 'lightyellow' if pattern_score >= 60 else 'wheat' if pattern_score >= 45 else 'linen' if pattern_score >= 30 else 'mistyrose'
         
         fig.text(0.02, 0.98, 
                 f"形态评分: {pattern_score}/100\n评级: {pattern_rating}\n状态: {'✅突破' if pattern_detected else '⚠️观察' if pattern_score >= 30 else '❌无突破'}", 
@@ -1146,7 +1281,6 @@ class StockBreakoutAnalyzer:
         
         plt.tight_layout()
        
-        # 保存图片
         if save_path:
             import os
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1155,7 +1289,7 @@ class StockBreakoutAnalyzer:
         else:
             import os
             os.makedirs('output', exist_ok=True)
-            save_path = f'output/stock_analysis_v2_{self.data.index[-1].date()}.png'
+            save_path = f'output/stock_analysis_v5_{self.data.index[-1].date()}.png'
             fig.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"✅ 分析图已保存到: {save_path}")
         
@@ -1163,14 +1297,14 @@ class StockBreakoutAnalyzer:
         plt.show()
         return fig
     
-    def generate_report_v2(self, analysis_result: Dict = None, stock_code: str = "股票") -> str:
+    def generate_report_v5(self, analysis_result: Dict = None, stock_code: str = "股票") -> str:
         """
-        生成报告 V2
+        生成报告 V5 - 添加买卖建议基于近点位
         """
-        print("📋 生成详细报告V2...")
+        print("📋 生成详细报告V5...")
         
         if analysis_result is None:
-            analysis_result = self.detect_complete_pattern_v2()
+            analysis_result = self.detect_complete_pattern_v5()
         
         current_date = self.data.index[-1]
         current_price = self.data['close'].iloc[-1]
@@ -1180,7 +1314,7 @@ class StockBreakoutAnalyzer:
         pattern_detected = analysis_result.get('pattern_detected', False)
         
         report = "=" * 80 + "\n"
-        report += f"突破形态分析报告 V2 - {stock_code}\n"
+        report += f"突破形态分析报告 V5 - {stock_code}\n"
         report += "=" * 80 + "\n\n"
         
         report += f"📅 分析时间: {current_date}\n"
@@ -1196,21 +1330,24 @@ class StockBreakoutAnalyzer:
         
         if pressure_clusters:
             report += f"识别到{len(pressure_clusters)}个压力集群/位:\n\n"
+            near_pressures = [c for c in pressure_clusters if c['category'] == 'near']
+            far_pressures = [c for c in pressure_clusters if c['category'] == 'far']
             
-            for cluster in pressure_clusters:
+            report += "近期压力:\n"
+            for cluster in near_pressures:
                 if cluster['is_single']:
                     level = cluster['levels'][0]
-                    report += f"独立压力位{cluster['cluster_id']}:\n"
-                    report += f"  价格: {level['price']:.2f}\n"
-                    report += f"  强度: {cluster['resistance_strength']} (测试{level['test_count']}次)\n"
-                    report += f"  日期: {level['date'].date()}\n\n"
+                    report += f"独立压力位{cluster['cluster_id']}: {level['price']:.2f} ({cluster['category']})\n"
                 else:
-                    report += f"压力集群{cluster['cluster_id']}:\n"
-                    report += f"  价格范围: {cluster['min_price']:.2f} - {cluster['max_price']:.2f}\n"
-                    report += f"  平均压力: {cluster['avg_price']:.2f}\n"
-                    report += f"  密度: {cluster['density']} ({cluster['price_range_pct']:.1f}%)\n"
-                    report += f"  强度: {cluster['resistance_strength']} (平均测试{cluster['avg_test_count']:.1f}次)\n"
-                    report += f"  包含点数: {cluster['level_count']}个\n\n"
+                    report += f"压力集群{cluster['cluster_id']}: {cluster['min_price']:.2f} - {cluster['max_price']:.2f} ({cluster['category']})\n"
+            
+            report += "\n远期压力:\n"
+            for cluster in far_pressures:
+                if cluster['is_single']:
+                    level = cluster['levels'][0]
+                    report += f"独立压力位{cluster['cluster_id']}: {level['price']:.2f} ({cluster['category']})\n"
+                else:
+                    report += f"压力集群{cluster['cluster_id']}: {cluster['min_price']:.2f} - {cluster['max_price']:.2f} ({cluster['category']})\n"
         else:
             report += "未识别到明显的压力集群\n\n"
         
@@ -1221,9 +1358,19 @@ class StockBreakoutAnalyzer:
         
         if support_levels:
             report += f"识别到{len(support_levels)}个支撑位:\n\n"
+            near_supports = [s for s in support_levels if s['category'] == 'near']
+            far_supports = [s for s in support_levels if s['category'] == 'far']
             
-            for i, support in enumerate(support_levels[:5], 1):
-                report += f"支撑{i}: {support['price']:.2f}\n"
+            report += "近期支撑:\n"
+            for i, support in enumerate(near_supports[:5], 1):
+                report += f"支撑{i}: {support['price']:.2f} ({support['category']})\n"
+                report += f"  类型: {support['type']}\n"
+                report += f"  强度: {support['strength']}\n"
+                report += f"  距离当前价: {support['distance_pct']:.1f}%\n\n"
+            
+            report += "远期支撑:\n"
+            for i, support in enumerate(far_supports[:5], 1):
+                report += f"支撑{i}: {support['price']:.2f} ({support['category']})\n"
                 report += f"  类型: {support['type']}\n"
                 report += f"  强度: {support['strength']}\n"
                 report += f"  距离当前价: {support['distance_pct']:.1f}%\n\n"
@@ -1243,9 +1390,12 @@ class StockBreakoutAnalyzer:
         
         report += "\n"
         
-        # 操作建议
+        # 操作建议 - 添加买卖预案
         report += "【🎯 操作建议】\n"
         report += "-" * 60 + "\n"
+        
+        near_pressure = min([c['avg_price'] for c in near_pressures] + [float('inf')]) if near_pressures else float('inf')
+        near_support = max([s['price'] for s in near_supports] + [0]) if near_supports else 0
         
         if pattern_detected:
             if pattern_score >= 75:
@@ -1274,42 +1424,46 @@ class StockBreakoutAnalyzer:
             report += "2. 📊 关注基本面\n"
             report += "3. ⚠️  谨慎操作\n"
         
+        report += "\n买卖预案（基于近点位）:\n"
+        if near_pressure < float('inf'):
+            report += f" - 若强势突破{near_pressure:.2f}，可买入，目标远压力\n"
+        if near_support > 0:
+            report += f" - 若跌破{near_support:.2f}，变盘卖出，止损\n"
+        else:
+            report += " - 无近点位，观察趋势\n"
+        
         report += "\n📌 风险提示:\n"
         report += "  1. 技术分析仅供参考\n"
         report += "  2. 结合其他指标综合分析\n"
         report += "  3. 投资有风险，入市需谨慎\n"
         
         report += "\n" + "=" * 80 + "\n"
-        report += "报告生成完毕 - 突破形态分析系统 V2\n"
+        report += "报告生成完毕 - 突破形态分析系统 V5\n"
         report += "=" * 80
         
         print("✅ 详细报告生成完成")
         
         return report
-
-
 # 测试函数
-def test_v2_with_real_data(data):
+def test_v5_with_real_data(data):
     """
-    使用真实数据测试V2版本
+    使用真实数据测试V5版本
     """
-    print("🧪 测试V2版本分析器...")
+    print("🧪 测试V5版本分析器...")
     
     analyzer = StockBreakoutAnalyzer(data)
     
     # 运行完整分析
-    result = analyzer.detect_complete_pattern_v2()
+    result = analyzer.detect_complete_pattern_v5()
     
     # 生成报告
-    report = analyzer.generate_report_v2(result, "300433")
+    report = analyzer.generate_report_v5(result, "300433")
     print(report)
     
     # 绘制图表
-    fig = analyzer.plot_analysis_v2(result, save_path='output/300433_v2_analysis.png')
+    fig = analyzer.plot_analysis_v5(result, save_path='output/300433_v5_analysis.png')
     fig.show()
     return analyzer, result, fig
-
-
 # 实时行情数据获取函数
 def get_real_stock_data(stock_code='300433', days=100, realtime=False):
     """
@@ -1418,7 +1572,7 @@ def update_stock_data(analyzer, stock_code='300433', realtime=False):
     
     try:
         # 获取最新数据（默认获取最近30天）
-        new_data = get_real_stock_data(stock_code, days=30, realtime=realtime)
+        new_data = get_real_stock_data(stock_code, days=100, realtime=realtime)
         
         # 更新分析器数据
         analyzer.data = new_data
@@ -1511,24 +1665,22 @@ def run_complete_analysis(stock_code='300433', days=100, save_chart=True, realti
     analyzer = StockBreakoutAnalyzer(data)
     
     # 3. 运行完整分析
-    result = analyzer.detect_complete_pattern_v2()
+    result = analyzer.detect_complete_pattern_v5()
     
     # 4. 生成报告
-    report = analyzer.generate_report_v2(result, stock_code)
+    report = analyzer.generate_report_v5(result, stock_code)
     print(report)
     
     # 5. 绘制图表
     if save_chart:
-        chart_path = f'output/{stock_code}_breakout_analysis.png'
-        fig = analyzer.plot_analysis_v2(result, save_path=chart_path)
+        chart_path = f'output/{stock_code}_breakout_analysis_v5.png'
+        fig = analyzer.plot_analysis_v5(result, save_path=chart_path)
     else:
-        fig = analyzer.plot_analysis_v2(result)
+        fig = analyzer.plot_analysis_v5(result)
     
     print("✅ 完整分析流程完成！")
     
     return analyzer, result, fig
-
-
 # 批量分析函数
 def batch_analysis(stock_codes, days=100, save_chart=True, realtime=False):
     """
@@ -1606,8 +1758,6 @@ def batch_analysis(stock_codes, days=100, save_chart=True, realtime=False):
     print("\n✅ 批量分析完成！")
     
     return results
-
-
 # 命令行参数解析
 def parse_arguments():
     """
@@ -1619,7 +1769,7 @@ def parse_arguments():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='修正版突破形态识别系统 V2 - 真实行情数据集成版',
+        description='修正版突破形态识别系统 V5 - 真实行情数据集成版',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 使用示例:
@@ -1675,7 +1825,7 @@ def main():
     """主函数 - 支持命令行参数"""
     args = parse_arguments()
     
-    print("修正版突破形态识别系统 V2 - 真实行情数据集成版")
+    print("修正版突破形态识别系统 V5 - 真实行情数据集成版")
     print("=" * 80)
     print("主要功能:")
     print("1. ✅ 集成新浪财经真实行情数据")
@@ -1752,7 +1902,5 @@ def main():
     print("4. 不保存图表: python StockBreakoutAnalyzer.py -n")
     print("5. 详细模式: python StockBreakoutAnalyzer.py -v")
     print("6. 实时数据: python StockBreakoutAnalyzer.py -r")
-
-
 if __name__ == "__main__":
     main()
