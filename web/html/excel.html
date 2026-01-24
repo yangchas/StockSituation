@@ -2903,7 +2903,7 @@
                             name: stock.name,
                             code: stock.code,
                             amount: stock.trade_amount || stock.amount || 0,
-                            gain: stock.change_pct*100 || 0,  // 统一乘以100转换为百分比
+                            gain: stock.change_pct || 0,  // 统一乘以100转换为百分比
                             speed: stock.change_rate_1min*100 || 0,  // 统一乘以100转换为百分比
                             capitalType: 0,
                             theme: stock.plate || '其他',
