@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 import pandas as pd
 import json
 import asyncio
+import time
 import schedule
 import time
 from pykaipan import pykaipan
@@ -497,6 +498,11 @@ class LimitUpDailyUpdater:
         
         # 初始化TDEngine表
         self.td_storage.init_table()
+        
+        # 问财低频兜底缓存（不改变原有连板数据key体系）
+        self.wencai_limitup_lb_cache_prefix = "cache:wencai:limitup_lb:"  # + YYYY-MM-DD
+        self.wencai_first_limit_cache_prefix = "cache:wencai:first_limit:"  # + YYYY-MM-DD
+        self.wencai_meta_cache_prefix = "cache:wencai:meta:"  # + YYYY-MM-DD
     
     def has_previous_trade_day_data(self):
         """
@@ -542,6 +548,90 @@ class LimitUpDailyUpdater:
             logger.error(f"❌ 检查上一个交易日数据失败: {e}")
             return False
     
+    async def update_wencai_baseline_today(self, timeout_sec: int = 25, expire_seconds: int = 86400) -> bool:
+        """低频：用问财兜底获取“今日涨停+连板天数(去ST)”与“今日首板(去ST)”，并写入Redis缓存。
+
+        设计目标：
+        - 不改变原有连板数据key体系（limit_up_{date} / cache:comprehensive:*）
+        - 只新增 cache:wencai:* 缓存供盘中校验/补漏使用
+        - 超时/失败/空结果：不覆盖旧缓存，写meta标记stale=true
+
+        Returns:
+            bool: True表示本次成功刷新并写入Redis
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        key_limitup_lb = f"{self.wencai_limitup_lb_cache_prefix}{today}"
+        key_first_limit = f"{self.wencai_first_limit_cache_prefix}{today}"
+        key_meta = f"{self.wencai_meta_cache_prefix}{today}"
+
+        meta = {
+            'date': today,
+            'timestamp': int(time.time() * 1000),
+            'stale': True,
+            'error': ''
+        }
+
+        try:
+            from ai.API.api import UnifiedMarketDataFetcher
+
+            fetcher = UnifiedMarketDataFetcher()  # 使用默认cookie
+
+            async def _fetch():
+                df_lb = await fetcher.get_wencai_limitup_with_lb_days(loop=True)
+                df_first = await fetcher.get_wencai_first_limit(loop=True)
+                return df_lb, df_first
+
+            df_lb, df_first = await asyncio.wait_for(_fetch(), timeout=timeout_sec)
+
+            # 处理涨停+连板天数字典
+            limitup_lb_map: Dict[str, int] = {}
+            if df_lb is not None and not df_lb.empty:
+                for _, row in df_lb.iterrows():
+                    code6 = str(row.get('code6', '')).strip()
+                    if not code6 or len(code6) != 6:
+                        continue
+                    lb_days = row.get('lb_days')
+                    try:
+                        if pd.isna(lb_days):
+                            continue
+                        limitup_lb_map[code6] = int(lb_days)
+                    except Exception:
+                        continue
+
+            # 处理首板集合
+            first_limit_set = set()
+            if df_first is not None and not df_first.empty:
+                for _, row in df_first.iterrows():
+                    code6 = str(row.get('code6', '')).strip()
+                    if code6 and len(code6) == 6:
+                        first_limit_set.add(code6)
+
+            # 空结果也算失败（避免覆盖有效缓存）
+            if not limitup_lb_map and not first_limit_set:
+                meta['error'] = 'wencai empty result'
+                self.redis_storage.store_data(key_meta, meta, expire_seconds=expire_seconds)
+                return False
+
+            # 写入缓存
+            self.redis_storage.store_data(key_limitup_lb, limitup_lb_map, expire_seconds=expire_seconds)
+            self.redis_storage.store_data(key_first_limit, list(first_limit_set), expire_seconds=expire_seconds)
+
+            meta['stale'] = False
+            self.redis_storage.store_data(key_meta, meta, expire_seconds=expire_seconds)
+            logger.info(f"✅ 问财baseline已刷新: {today}, limitup_lb={len(limitup_lb_map)}, first_limit={len(first_limit_set)}")
+            return True
+
+        except asyncio.TimeoutError:
+            meta['error'] = f'wencai timeout {timeout_sec}s'
+            self.redis_storage.store_data(key_meta, meta, expire_seconds=expire_seconds)
+            logger.warning(f"⚠️ 问财baseline刷新超时: {today}")
+            return False
+        except Exception as e:
+            meta['error'] = str(e)
+            self.redis_storage.store_data(key_meta, meta, expire_seconds=expire_seconds)
+            logger.warning(f"⚠️ 问财baseline刷新失败: {today}, {e}")
+            return False
+
     def update_previous_trade_day(self):
         """更新上一个交易日的连板数据"""
         try:
@@ -1751,7 +1841,7 @@ class IntegratedStockService:
             from datetime import datetime
             
             # 获取连板票
-            limit_up_stocks = []#self.redis_storage.get_first_limit_up_stocks()
+            limit_up_stocks = self.redis_storage.get_first_limit_up_stocks()
             
             # 获取热门票（作为核心票）
             hot_stocks = await self._get_hot_stocks()

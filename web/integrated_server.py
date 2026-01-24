@@ -2043,11 +2043,15 @@ class OptimizedIntegratedWebService:
 class StockVolatileMonitor:
     def __init__(self):
         self.redis = None
+        self.redis_storage = RedisStorageManager()  # 复用现有Redis缓存工具，读取昨日涨停集合等
         self.connections: Set = set()  # 移除类型注解以兼容两种WebSocket类型
         self.volatile_pool_key = "stock:volatile_pool"  # 修正键名，从真正的异动池获取数据
-        self.first_limit_key = "stock:first_limit_up"  # 涨停票存储键名
+        self.first_limit_key = "stock:first_limit_up"  # 严格首板票存储键名
         self.last_check_timestamp = 0
         self.monitoring_active = False
+        self.calendar = TradeCalendar()  # 避免在监控循环中重复创建
+        self.prev_day_cache = None
+        self.yesterday_limit_set_cache = set()
         
     async def connect_redis(self):
         """连接Redis"""
@@ -2207,29 +2211,61 @@ class StockVolatileMonitor:
                             symbol = data.get('symbol', '')
                             limit_up_threshold = 9.8 if symbol.startswith(('6', '0')) else 19.8
                             
-                            # 如果是涨停票，标记为first_limit类型并广播，同时写入Redis
+                            # 如果是涨停票，按“严格首板”规则写入 Redis：涨停且不在昨日涨停集合
                             if change >= limit_up_threshold:
+                                symbol = str(symbol).strip()
+
+                                # 计算昨日交易日（复用初始化的交易日历，避免循环内重复创建）
+                                today_str = datetime.now().strftime('%Y-%m-%d')
+                                prev_day = self.calendar.get_previous_trade_day(today_str)
+
+                                # 昨日涨停集合：优先读取 limit_up_{prev_day}（连板数据日更缓存），并fallback到综合视图缓存
+                                # 这里做一层缓存，避免每条异动都去读Redis
+                                if self.prev_day_cache != prev_day:
+                                    self.prev_day_cache = prev_day
+                                    self.yesterday_limit_set_cache = set()
+                                    try:
+                                        # 1) 主优先：limit_up_{prev_day}
+                                        key_limit_up = f"limit_up_{prev_day}"
+                                        prev_limit_up_result = self.redis_storage.get_data(key_limit_up)
+
+                                        # 2) fallback：cache:comprehensive:prev_limit_up:{prev_day}
+                                        if not prev_limit_up_result:
+                                            key_prev_limit_up = f"cache:comprehensive:prev_limit_up:{prev_day}"
+                                            prev_limit_up_result = self.redis_storage.get_data(key_prev_limit_up)
+
+                                        if prev_limit_up_result:
+                                            for item in prev_limit_up_result:
+                                                if isinstance(item, dict):
+                                                    code = str(item.get('code', '') or item.get('股票代码', '')).strip()
+                                                    if code:
+                                                        self.yesterday_limit_set_cache.add(code)
+                                    except Exception:
+                                        # 如果读取失败，保守为空集合
+                                        self.yesterday_limit_set_cache = set()
+
+                                yesterday_limit_set = self.yesterday_limit_set_cache
+
+                                # 严格首板：不在昨日涨停集合
+                                if symbol in yesterday_limit_set:
+                                    continue
+
                                 first_limit_data = data.copy()
                                 first_limit_data['type'] = 'first_limit'
                                 first_limit_data['change_pct'] = change  # 确保change_pct字段存在
-                                
-                                # 广播涨停警报
+
+                                # 广播首板警报
                                 await self.broadcast_first_limit_alert(first_limit_data)
-                                
-                                # 将涨停票写入Redis的stock:first_limit_up键中
+
+                                # 写入 Redis 的 stock:first_limit_up（严格首板池）
                                 try:
-                                    # 将股票代码作为member，时间戳作为score写入zset
                                     await self.redis.zadd(self.first_limit_key, {
                                         json.dumps(first_limit_data): int(time.time())
                                     })
-                                    
-                                    # 设置过期时间为24小时
                                     await self.redis.expire(self.first_limit_key, 24 * 60 * 60)
-                                    
-                                    logger.info(f"✅ 成功写入Redis涨停票数据: {first_limit_data.get('symbol')} ({change}%)")
-                                    
+                                    logger.info(f"✅ 成功写入Redis首板数据: {first_limit_data.get('symbol')} ({change}%)")
                                 except Exception as e:
-                                    logger.error(f"❌ 写入Redis涨停票数据失败: {e}")
+                                    logger.error(f"❌ 写入Redis首板数据失败: {e}")
                             
                             # 更新最后检查时间戳
                             if int(score) > self.last_check_timestamp:
