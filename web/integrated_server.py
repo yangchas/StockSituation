@@ -29,15 +29,57 @@ except Exception as e:
 from plate_updater import LazyPlateUpdater,  OptimizedPlateUpdater, OptimizedEnhancedPlateUpdater
 from redis_storage import RedisStorageManager
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-import json
-import requests
-from datetime import datetime, timedelta
 import logging
-from typing import List, Set, Dict
+import asyncio
+import os
+import sys
+import json
+from aiohttp import web
+import aioredis
+from datetime import datetime
+import traceback
+
+# Ensure project root is in path to allow importing from ai.API
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 import holidays
-from redis_storage import RedisStorageManager
-from limit_up_storage import ZTBService
-from trade_calendar import TradeCalendar
+from market_edge_engine import MarketEdgeEngine
+try:
+    from ai.API.StockAnalyzer import StockAnalyzer
+except ImportError:
+    try:
+        from web.ai.API.StockAnalyzer import StockAnalyzer
+    except ImportError:
+        StockAnalyzer = None
+
+try:
+    from web.market_edge_theme_ranker import ThemeRanker
+except ImportError:
+    try:
+        from market_edge_theme_ranker import ThemeRanker
+    except ImportError:
+        ThemeRanker = None
+try:
+    from ai.API.StockAnalyzer import StockAnalyzer
+except ImportError:
+    # If package structure requires different path
+    try:
+        from web.ai.API.StockAnalyzer import StockAnalyzer
+    except ImportError:
+        logger.error("Could not import StockAnalyzer")
+        StockAnalyzer = None
+
+try:
+    from web.market_edge_theme_ranker import ThemeRanker
+except ImportError:
+    try:
+        from market_edge_theme_ranker import ThemeRanker
+    except ImportError:
+        logger.error("Could not import ThemeRanker")
+        ThemeRanker = None
 
 logger = logging.getLogger(__name__)
 # 涨停板数据服务 - ztb_service.py
@@ -572,6 +614,20 @@ class TradingCalendarService:
         except Exception as e:
             logger.error(f"❌ 判断交易日失败 {date_str}: {e}")
             return False
+
+    def get_previous_trade_day(self, date_str: str) -> str:
+        """获取上一个交易日"""
+        try:
+            current_date = datetime.strptime(date_str, '%Y-%m-%d')
+            for _ in range(30): # Safety limit
+                current_date -= timedelta(days=1)
+                date_s = current_date.strftime('%Y-%m-%d')
+                if self.is_trading_day(date_s):
+                    return date_s
+            return date_str # Fallback
+        except Exception as e:
+            logger.error(f"❌ 获取上个交易日失败 {date_str}: {e}")
+            return date_str
     
     def get_previous_trading_day(self, date_str: str = None) -> str:
         """获取前一个交易日"""
@@ -2049,7 +2105,7 @@ class StockVolatileMonitor:
         self.first_limit_key = "stock:first_limit_up"  # 严格首板票存储键名
         self.last_check_timestamp = 0
         self.monitoring_active = False
-        self.calendar = TradeCalendar()  # 避免在监控循环中重复创建
+        self.calendar = TradingCalendarService()  # 避免在监控循环中重复创建
         self.prev_day_cache = None
         self.yesterday_limit_set_cache = set()
         
@@ -2206,10 +2262,21 @@ class StockVolatileMonitor:
                                     change = 0
                             except ValueError:
                                 change = 0
+
+                            # 统一为百分比口径：0.2 -> 20.0，11.07 -> 11.07
+                            if isinstance(change, (int, float)) and abs(change) <= 1:
+                                change = float(change) * 100.0
                             
                             # 根据股票前缀判断涨停阈值
                             symbol = data.get('symbol', '')
-                            limit_up_threshold = 9.8 if symbol.startswith(('6', '0')) else 19.8
+                            # 10%板：60/00；20%板：30/68
+                            if symbol.startswith(('60', '00')):
+                                limit_up_threshold = 9.8
+                            elif symbol.startswith(('30', '68')):
+                                limit_up_threshold = 19.8
+                            else:
+                                # 兜底按10%处理，避免误将未知代码误判为20%
+                                limit_up_threshold = 9.8
                             
                             # 如果是涨停票，按“严格首板”规则写入 Redis：涨停且不在昨日涨停集合
                             if change >= limit_up_threshold:
@@ -2411,8 +2478,11 @@ class StockVolatileMonitor:
             # 如果是字符串，去掉百分号并转换为数字
             change_pct = float(change.replace('%', ''))
         else:
-            # 如果已经是数字，转换为百分比（乘以100）
-            change_pct = float(change) * 100 if isinstance(change, (int, float)) else 0
+            # 数字口径兼容：0.2 -> 20.0；11.07 -> 11.07
+            if isinstance(change, (int, float)):
+                change_pct = float(change) * 100 if abs(float(change)) <= 1 else float(change)
+            else:
+                change_pct = 0
         
         return {
             'code': code,  # 前端使用code字段
@@ -3181,6 +3251,47 @@ async def main():
         await monitor.connect_redis()
     except Exception as e:
         logger.error(f"❌ 短线精灵Redis连接失败: {e}")
+
+    # Initialize MarketEdgeEngine (live by default, replay only when env is set)
+    stock_analyzer_instance = None
+    if StockAnalyzer:
+        try:
+             stock_analyzer_instance = StockAnalyzer()
+        except Exception as e:
+             logger.error(f"Failed to init StockAnalyzer: {e}")
+
+    theme_ranker = None
+    if ThemeRanker:
+        try:
+            theme_ranker = ThemeRanker(service.plate_updater, stock_analyzer_instance)
+        except Exception as e:
+            logger.error(f"Failed to init ThemeRanker: {e}")
+
+    if theme_ranker:
+        try:
+            # Create a dedicated calendar instance or reuse one if available
+            calendar_service = TradingCalendarService()
+            
+            market_edge = MarketEdgeEngine(
+                redis=monitor.redis,  # Use monitor's redis connection as service.redis might be internal
+                redis_storage=service.redis_storage,
+                plate_updater=service.plate_updater,
+                calendar=calendar_service,
+                advanced_indicators=service.advanced_indicators,
+                theme_ranker=theme_ranker,
+                stock_analyzer=stock_analyzer_instance,
+            )
+            # 可选回放模式：仅在设置 MARKET_EDGE_REPLAY_DATE 时启用
+            replay_date = os.environ.get("MARKET_EDGE_REPLAY_DATE", "").strip()
+            if replay_date:
+                market_edge.manual_date = replay_date
+                logger.info(f"✅ MarketEdgeEngine initialized (Mode: replay, Date: {replay_date})")
+            else:
+                logger.info("✅ MarketEdgeEngine initialized (Mode: live)")
+            asyncio.create_task(market_edge.run())
+        except Exception as e:
+            logger.error(f"Failed to start MarketEdgeEngine: {e}")
+            traceback.print_exc()
         
     # 启动优化后的服务
     await service.start_optimized_services()
