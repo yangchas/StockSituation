@@ -42,6 +42,8 @@ class AuctionStock:
     momentum_delta: float = 0.0 # 盘中对冲 (Current - Open)
     volume_intensity: float = 1.0 # 量能强度 (相对倍率)
     speed_1m: float = 0.0 # 1分钟涨速
+    amount_2m: float = 0.0 # 2分钟成交额 (新增)
+    resonance_factor: float = 1.0 # 板块共振因子 (新增)
 
 @dataclass
 class AuctionReport:
@@ -58,10 +60,11 @@ class AuctionReport:
     amount_king: Optional[AuctionStock] = None
     premium_king: Optional[AuctionStock] = None
     promo_stats: Dict[int, Tuple[int, int, List[AuctionStock], List[AuctionStock]]] = field(default_factory=dict)
-    yest_hot_sectors: List[Tuple[str, int, float, str]] = field(default_factory=list) # Name, Cnt, Delta, Status
+    yest_hot_sectors: List[Tuple[str, int, float, str, float, float]] = field(default_factory=list) # Name, Cnt, Delta, Status, Str, Flow
     strategic_signals: List[StrategicSignal] = field(default_factory=list)
     rotation_msg: str = ""
     yest_summary: str = "板块出现分级，资金内斗剧烈，龙头虽在但后排掉队。"
+    battle_kpis: Dict = field(default_factory=dict) # 战役 KPI (新增)
     
     # 5级情绪系统
     emotion: Optional[EmotionPhaseResult] = None
@@ -74,6 +77,13 @@ def build_summary(report: AuctionReport) -> str:
         f"--------------------------------------------------",
         f"💡 [情绪周期] 阶段: {report.cycle_phase} (得分: {report.money_making_effect}/10)",
     ]
+    
+    # Commander-Prime 指挥系统输出
+    if report.battle_kpis:
+        bk = report.battle_kpis
+        lines.append(f"🛡️ [战前指挥] {bk.get('battle_status', 'N/A')}")
+        lines.append(f"📈 [标兵体检] 晋级率:{bk['promotion_rate']:.1%} | 爆头率:{bk['headshot_rate']:.1%} | 红开率:{bk['red_open_rate']:.1%}")
+        lines.append(f"💰 [封单能级] 昨日均封单: {bk['avg_bid_amt']/1e8:.2f}亿 (能级探测)")
     
     if report.emotion:
         lines.append(f"🧬 [进化状态] {report.emotion.transition_reason} | 置信度: {report.emotion.confidence*100:.0f}%")
@@ -129,12 +139,14 @@ def build_summary(report: AuctionReport) -> str:
             lines.append(f"    ↳ 📉 [深水]: {w_detail}")
         if level > 1: lines.append("") # 梯队间隔
 
-    # 热门板块反馈
+    # 热门板块反馈 (Commander-Prime 增强)
     if report.yest_hot_sectors:
-        lines.append(f"\n📂 [昨日热门板块反馈]")
-        for name, count, delta, st in report.yest_hot_sectors:
-            feedback = "✅  承接强" if "正常" in st or "走强" in st else "⚠️ 走弱"
-            lines.append(f"   {name:<12} 涨停:{count:<3} | 今日溢价: {delta*100:>+5.1f}% | 反馈:{feedback}")
+        lines.append(f"\n📂 [资金基因反馈 - 板块热力图]")
+        lines.append(f"   板块          涨停  强度(Str)  主力净流(亿)  反馈")
+        lines.append(f"   ------------------------------------------------------------")
+        for name, count, delta, st, strength, flow in report.yest_hot_sectors:
+            feedback = "🔥 极强" if strength > 3000 else ("✅ 走强" if "正常" in st or "走强" in st else "⚠️ 走弱")
+            lines.append(f"   {name:<12} {count:<3}  {strength:<8.0f}  {flow/1e8:<10.2f}  {feedback}")
 
     # 轮动信号
     if report.rotation_msg:
@@ -174,10 +186,10 @@ class AuctionAnalyzer:
     async def analyze(
         self, current_raw: List[Dict], auction_snapshot: Optional[Dict[str, float]] = None,
         yest_limit_map: Optional[Dict[str, AuctionStock]] = None, yest_hot_plates = None,
-        date_str: str = ""
+        date_str: str = "", battle_kpis: Dict = None
     ) -> AuctionReport:
         mode = "INTRA_DAY" if auction_snapshot else "AUCTION"
-        report = AuctionReport(date_str=date_str, mode=mode)
+        report = AuctionReport(date_str=date_str, mode=mode, battle_kpis=battle_kpis or {})
         yest_limit_map = yest_limit_map or {}
         auction_snapshot = auction_snapshot or {}
         
@@ -201,9 +213,11 @@ class AuctionAnalyzer:
                 s.expected_pct = 0.005 if s.lb_days == 1 else (0.02 + (s.lb_days - 2) * 0.02)
                 s.is_super_expected = (s.open_pct >= s.expected_pct)
             
-            # 注入实时指标
+            # 注入实时指标 (Resonance Prime)
             s.speed_1m = float(item.get("speed_1m", 0.0))
             s.volume_intensity = float(item.get("vol_intensity", 1.0))
+            s.amount_2m = float(item.get("amount_2m", 0.0))
+            s.resonance_factor = float(item.get("resonance_factor", 1.0))
             
             stocks.append(s)
 
@@ -247,13 +261,28 @@ class AuctionAnalyzer:
         # [官榜对撞与印证]
         sector_results = {}
         if yest_hot_plates:
-            for p_name, count in yest_hot_plates:
+            # yest_hot_plates 如果是 Dict，格式为 {name: {strength, net_amount, rank}}
+            # 如果是 List，则为原有的 [(name, count), ...]
+            is_prime_data = isinstance(yest_hot_plates, dict)
+            
+            for p_name, count in (yest_hot_plates.items() if is_prime_data else yest_hot_plates):
+                # 统计数据
+                target_count = count.get('count', 1) if isinstance(count, dict) else count
                 p_today = [s for s in stocks if s.is_yest_limit and (p_name in s.plate)]
+                
                 if p_today:
                     avg_delta = sum(s.current_pct - s.expected_pct for s in p_today) / len(p_today)
-                    # 板块强弱判定基于溢价差（而非 momentum_delta，避免同源数据归零）
                     st = "✅ 印证走强" if avg_delta > 0.01 else ("⚠️ 分歧转弱" if avg_delta < -0.02 else "⚖️ 正常承接")
-                    report.yest_hot_sectors.append((p_name, count, avg_delta, st))
+                    
+                    # 提取 Prime 指标
+                    strength = 0.0
+                    flow = 0.0
+                    if is_prime_data:
+                        p_meta = yest_hot_plates.get(p_name, {})
+                        strength = p_meta.get('strength', 0.0)
+                        flow = p_meta.get('net_amount', 0.0)
+                    
+                    report.yest_hot_sectors.append((p_name, target_count, avg_delta, st, strength, flow))
                     sector_results[p_name] = avg_delta
 
         # [作战指令生成 - 核心策略引擎 (含预期差)]

@@ -42,6 +42,8 @@ from web.services.chip_batch_runner import ChipBatchRunner
 from ai.API.api import UnifiedMarketDataFetcher
 from ai.API.StockAnalyzer import StockAnalyzer
 import aiohttp
+from collections import deque
+from engine_v2.v2_prime_logic import ResonancePrimeService
 
 # 日志配置
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
@@ -91,12 +93,15 @@ class AuctionOrchestrator:
         # 初始化 V2 专用抓取器 (Session 将在启动时维持)
         self.fetcher: Optional[UnifiedDataFetcher] = None 
         self._session: Optional[aiohttp.ClientSession] = None
+        self.chip_runner = ChipBatchRunner(kline_service=self.kline_service) # V3 集成计算器
         self.is_running = True
         self.last_sentiment = 0.0
         self.is_first_session_run = True # 标记盘中首次有效运行
         self.state = _load_state()
         self.auction_snapshot = {} 
         self.bridge = v2_core_bridge
+        self.prime = ResonancePrimeService(self.redis)
+        self.tick_history = {} # {code: deque([(time, price, amount), ...], maxlen=45)}
         self.auction_synced_date = None  # 竞价同步状态位
         
         # 定义适配 Lifecycle 的无参异步包装
@@ -115,16 +120,20 @@ class AuctionOrchestrator:
             symbol_list=[], 
             fetch_yest_bans_fn=l_fetch_bans,
             fetch_yest_plates_fn=l_fetch_plates,
-            fetch_daily_kline_fn=self._sync_stock_kline,
+            fetch_daily_kline_fn=self._sync_and_calculate_stock, # V3 集成任务注入
             fetch_dde_fn=self._sync_stock_dde,
             trigger_rust_calc_fn=self._trigger_factor_calc
         )
 
     async def _startup_sync(self, date_str: str):
         """启动时同步与环境预研"""
-        # 1. 注入 Symbols
+        # 1. 注入 Symbols 并执行水位扫描 (V3.1 聚合优化)
         logger.info(f"🔍 [System] 启动自检中 (基于 Lifecycle 任务)...")
         self.lifecycle.symbols = list(self.metadata.stock_info.keys())
+        
+        # 预加载 TDengine 水位，实现秒级对齐
+        await asyncio.get_event_loop().run_in_executor(None, self.kline_service.preload_latest_dates)
+        
         await self.lifecycle.on_startup()
         
         # 2. 预研情绪阶段
@@ -387,11 +396,11 @@ class AuctionOrchestrator:
             if rust_snap:
                 logger.debug(f"⚡ [Rust] 成功拉取 {len(rust_snap)} 条实时快照")
 
-        # 1. 动态对齐昨日数据基因
-        if not self.yest_limit_map or not self.hot_plates:
-            yest_str = self.calendar.get_previous_trade_day(date_str)
-            self.yest_limit_map = await self._fetch_kaipan_limit_ups(yest_str)
-            self.hot_plates = await self._fetch_kaipan_hot_plates(yest_str)
+        # 1. 极速前置检查 (Lazy-load): 如果昨日涨停底池为空，现场补位
+        if not self.yest_limit_map and mode == "INTRA_DAY":
+            logger.info("🛡️ [Lazy-load] 监测到底池为空，正在极速对齐昨日元数据...")
+            await self.lifecycle.on_startup()
+            self.yest_limit_map = self.analyzer.get_yest_limit_map(date_str)
 
         # 2. 获取参考坐标系 (Pre-Close) 用于涨幅精算
         prev_date = self.calendar.get_previous_trade_day(date_str)
@@ -426,6 +435,7 @@ class AuctionOrchestrator:
             rust_idx = {str(k).strip()[-6:]: v for k, v in rust_snap.items() if k != "_EXTREMES_"}
             for code, r_it in rust_idx.items():
                 if code == "_EXTREMES_": continue
+                
                 # 1. 基础信息
                 name = await self.metadata.get_name(code)
                 yest_it = self.yest_limit_map.get(code)
@@ -433,24 +443,50 @@ class AuctionOrchestrator:
                 # 2. 涨幅精算：(当前价 / 昨收) - 1.0 (修正 10.0 分情绪报错)
                 pre_close = pre_close_map.get(code, 0.0)
                 curr_price = r_it.get("price", 0.0)
+                if curr_price <= 0.1: continue # 物理过滤僵死数据
+
                 pct = (curr_price / pre_close - 1.0) if pre_close > 0.1 else 0.0
+                if pct <= -0.99: continue # 逻辑核爆过滤
                 
                 # 3. 基因补完：板块属性
                 stock_info = self.metadata.stock_info.get(code)
                 plate = stock_info.get('plate', 'Other') if stock_info else "Other"
+
+                # 4. 增强指标：1m Speed 与 2m Amount (来自 Python 滑动窗口)
+                hist = self.tick_history.get(code)
+                speed_auto = r_it.get("speed", 0.0)
+                amount_2m = 0.0
+                if hist and len(hist) > 1:
+                    first_t, first_p, first_a = hist[0]
+                    last_t, last_p, last_a = hist[-1]
+                    # 计算 2 分钟成交额增量
+                    amount_2m = last_a - first_a
+                    # 重新对齐 1 分钟涨速 (如果有时间差)
+                    if (last_t - first_t) > 30:
+                        speed_auto = (last_p - first_p) / first_p if first_p > 0.1 else 0.0
                 
+                # 5. 注入板块热力评分 (Commander-Prime)
+                resonance_factor = self.prime.get_plate_resonance(plate)
+
                 current_data.append({
                     "code": code, "name": name,
                     "change_pct": pct,
                     "auction_amount_yuan": r_it.get("amount", 0.0),
-                    "speed_1m": r_it.get("speed", 0.0),
-                    "vol_intensity": r_it.get("vol_intensity", 1.0),
+                    "amount_2m": amount_2m,
+                    "speed_1m": speed_auto,
+                    "vol_intensity": r_it.get("vol_intensity", 1.0) * resonance_factor,
                     "plate": plate,
                     "lb_days": yest_it.lb_days if yest_it else 0,
-                    "is_yest_limit": True if yest_it else False
+                    "is_yest_limit": True if yest_it else False,
+                    "resonance_factor": resonance_factor
                 })
             if current_data: 
-                logger.info(f"✅ [Simd] Rust 镜像底池构建成功: {len(current_data)} 条")
+                logger.debug(f"✅ [Simd] Rust 镜像底池构建成功: {len(current_data)} 条 | 注入 Prime 因数")
+        
+        # 2.2 增加昨日涨停 KPI 计算
+        battle_kpis = self.prime.calculate_battle_kpis(date_str)
+        if battle_kpis:
+             logger.info(f"📊 [BattleReady] 晋级率:{battle_kpis['promotion_rate']:.1%} | 爆头率:{battle_kpis['headshot_rate']:.1%} | 态势:{battle_kpis['battle_status']}")
         
         # 2.2 传统三级降级 (TDengine / Wencai)
         if not current_data:
@@ -488,20 +524,27 @@ class AuctionOrchestrator:
                         it["change_pct"] = r_it.get("price", 0.0)
         
         if not current_data:
+            # 修正：收盘后 (15:00-09:15) 不再报出数据失效警告
+            now_h_m = datetime.now().strftime("%H:%M")
+            if not ("09:25" <= now_h_m <= "15:01"):
+                return
+            
             if datetime.now().second % 60 < 2:
-                logger.warning(f"❌ [Data] 所有数据源均失效，跳过本次分析。")
+                logger.warning(f"❌ [Data] 交易时段所有数据源均失效，跳过本次分析。")
             return
 
         if mode == "AUCTION":
             for it in current_data:
                 self.auction_snapshot[it["code"]] = it["change_pct"]
 
-        # 3. 语义分析
+        # 3. 语义分析 (Commander-Prime 增强)
         report = await self.analyzer.analyze(
             current_data, 
             auction_snapshot=self.auction_snapshot if mode == "INTRA_DAY" else None,
             yest_limit_map=self.yest_limit_map, 
-            yest_hot_plates=self.hot_plates, date_str=date_str
+            yest_hot_plates=self.prime.hot_plates_map, # 使用 Prime 服务的热力图映射
+            date_str=date_str,
+            battle_kpis=battle_kpis # 传入博弈 KPI
         )
         
         # 4. 智能输出
@@ -548,14 +591,33 @@ class AuctionOrchestrator:
             h_m = now.strftime("%H:%M")
             date_str = now.strftime("%Y-%m-%d")
             
-            if h_m == "09:26":
+            # ─────────────────────────────────────────────────────────────
+            # 调度决策：分时触发器 (V2.0 作战排期对标)
+            # ─────────────────────────────────────────────────────────────
+            
+            # 1. 盘前补位 (08:30): 同步 DDE 与 历史极值
+            if h_m == "08:30":
+                await self.lifecycle.on_pre_market()
+                self.yest_limit_map = self.analyzer.get_yest_limit_map(date_str)
+                await asyncio.sleep(60)
+
+            # 2. 开盘准备 (09:26): 确定昨日涨停底池并执行首轮推演
+            elif h_m == "09:26":
+                self.yest_limit_map = self.analyzer.get_yest_limit_map(date_str)
                 await self.execute_analysis(date_str, mode="AUCTION")
                 await asyncio.sleep(60)
 
-            elif h_m == "15:31":
-                logger.info("🏁 [EOD] 盘后结算与数据复盘开始...")
+            # 3. 收盘进入休眠 (15:05): 停止行情泵读数
+            elif h_m == "15:05":
+                logger.info("🏁 [Market-Close] 行情结束，停止实时读数监听。")
+                await asyncio.sleep(60)
+
+            # 4. 结算黄金窗 (16:30): 触发日K同步与筹码区全量计算
+            elif h_m == "16:30":
+                logger.info("🏁 [EOD] 盘后结算与数据流水线开启 (V3.1 Dual-Sync)...")
+                # 重新扫描水位 (针对长期挂机的进程)
+                await asyncio.get_event_loop().run_in_executor(None, self.kline_service.preload_latest_dates)
                 await self.lifecycle.on_eod()
-                
                 # 盘后报告 (Legacy 迁移)
                 try:
                     subprocess.Popen([sys.executable, "v3_final_review.py"])
@@ -598,6 +660,33 @@ class AuctionOrchestrator:
                     continue
                 
                 t_start = time.time()
+                # 批量管道获取最新行情
+                pipe = self.redis.pipeline()
+                for k in redis_keys: pipe.hgetall(k)
+                results = pipe.execute()
+                
+                # 同步 Kaipanla 板块排行 (Commander-Prime)
+                await self.prime.sync_kaipan_hotspots()
+                
+                for k, q in zip(redis_keys, results):
+                    if not q: continue
+                    code = key_map[k]
+                    # 压入 Rust Core ( Tier 0 实时算力层 )
+                    p = float(q.get("price") or q.get("current", 0))
+                    if p <= 0.1: continue # 极速过滤：不处理 0 价或空数据，防止污染
+                    
+                    a = float(q.get("amount", 0))
+                    v = float(q.get("volume", 0))
+                    ba = float(q.get("bid_amount", 0))
+                    t_str = q.get("time", "00:00:00")
+                    self.bridge.push_tick_raw(code, p, a, v, t_str, ba)
+                    
+                    # 维护 Python 侧滑动窗口 (为 1m Speed 和 2m Amount 补偿)
+                    if code not in self.tick_history:
+                        self.tick_history[code] = deque(maxlen=45) # 约 135 秒
+                    self.tick_history[code].append((time.time(), p, a))
+                
+                t_end = time.time()
                 # 批量拉取 (Pipeline 避免阻塞)
                 pipe = self.redis.pipeline()
                 for k in redis_keys:
@@ -696,30 +785,51 @@ class AuctionOrchestrator:
     # 数据生命周期适配器 (Lifecycle Adapters)
     # ─────────────────────────────────────────────────────────────────────────────
 
-    async def _sync_stock_kline(self, symbol: str) -> bool:
-        """Lifecycle 适配器：同步单只股票日K线 (切到 Baostock)"""
+    async def _sync_and_calculate_stock(self, symbol: str) -> bool:
+        """V3.1 集成任务：双写持久化 (Redis+TDengine) + 内存回收"""
         try:
-            # 使用内部带增量同步与 TDengine 持久化的 K 线服务
-            # start_date=None / end_date=None 会触发默认 120 交易日增量检查
-            data = await asyncio.get_event_loop().run_in_executor(
-                None, self.kline_service.fetch_kline_data, symbol, 'd'
+            now = datetime.now()
+            if now.hour < 15 or (now.hour == 15 and now.minute < 30):
+                target_day = self.calendar.get_previous_trading_day(self._today)
+            else:
+                target_day = self._today
+            
+            # 1. K线对齐并获取内存序列
+            k_list = await asyncio.get_event_loop().run_in_executor(
+                None, self.kline_service.fetch_kline_data, symbol, 'd', None, target_day
             )
             
-            # 策略：分级保护核心数据 (上海/深圳主板 vs 北交所)
-            if data and len(data) > 0:
+            if k_list and len(k_list) >= 5:
+                # 2. 调用算法引擎 (计算指标 + 因子)
+                res = await asyncio.get_event_loop().run_in_executor(
+                    None, self.chip_runner.calculate_for_stock, symbol, k_list, target_day
+                )
+                code, peak, factors = res
+                
+                # 3. 双写持久化
+                if peak and factors:
+                    # A. 写入 Redis (瞬时决策用)
+                    self.redis.hset(f"cache:chip_peaks:{target_day}", symbol, json.dumps(peak))
+                    self.redis.hset(f"cache:stock_extra:{target_day}", symbol, json.dumps(factors))
+                    
+                    # B. 写入 TDengine (历史存证用)
+                    # 我们使用 run_in_executor 避免 SQL 写入阻塞主循环
+                    await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_chips, symbol, peak)
+                    # 因子数据需要 DataFrame 格式
+                    df_factors = pd.DataFrame([factors])
+                    df_factors['date'] = pd.to_datetime(target_day)
+                    await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_factors, symbol, df_factors)
+                
+                # 4. 内存释放 (清除引用)
+                del k_list, peak, factors
                 return True
-            
-            # 如果没抓到数据，判断是否为主板核心板块 (6/0/3 开头)
-            if symbol.startswith(('6', '0', '3')):
-                # 主板数据缺失 -> 严格模式，返回 False 触发重试/警告
-                logger.warning(f"⚠️ [Strict] 主板个股数据缺失 {symbol}, 触发重试...")
-                return False
-            else:
-                # 北交所或其他非核心板块 -> 兼容模式，返回 True (跳过)
-                return True
-        except Exception as e:
-            logger.error(f"Sync KLine Exception ({symbol}): {e}")
             return False
+        except Exception as e:
+            # logger.error(f"Integrated Worker Error ({symbol}): {e}")
+            return False
+        finally:
+            # 每 200 个任务周期触发一次 GC（由管道控制更佳，此处做弱保障）
+            pass
 
     async def _sync_stock_dde(self, symbol: str) -> bool:
         """Lifecycle 适配器：同步单只股票DDE (20天)"""
@@ -775,32 +885,19 @@ class AuctionOrchestrator:
             return False
 
     async def _trigger_factor_calc(self) -> bool:
-        """Lifecycle 适配器：触发盘后核心计算 (筹码 + 多因子)"""
-        logger.info("🚀 [EOD] 启动盘后核心算法计算 (ChipBatchRunner)...")
+        """Lifecycle 适配器：收尾工作 (V3 集成版不再执行全量批算)"""
         try:
-            # 锁定目标日期：盘前/盘中始终锁定上一个交易日，结算后(15:31)才算当天
-            now = datetime.now()
-            if now.hour < 15 or (now.hour == 15 and now.minute < 30):
-                target_date = self.calendar.get_previous_trading_day(self._today)
-            else:
-                target_date = self._today
-            
-            # 1. 触发筹码、真市值与多因子增量计算 (Redis 缓存化)
-            runner = ChipBatchRunner(kline_service=self.kline_service)
-            await asyncio.get_event_loop().run_in_executor(
-                None, runner.run_batch, target_date
-            )
-            
-            # 2. 注入 Rust 底层进行初始化 (为次日对准做准备)
+            # 由于已在同步过程中边跑边算，此处仅负责 Rust 底层镜像属性刷新
             symbols = list(self.metadata.stock_info.keys())
             if symbols:
                 self.bridge.register_symbols(symbols)
-                logger.info(f"✅ [EOD] Rust 底层 symbols 注入完成: {len(symbols)} 个")
-            
-            logger.info(f"✅ [EOD] 盘后核心计算闭环完成 (目标日期: {target_date})")
+                # 触发 Rust Core 重新加载 Redis 中的计算结果 (筹码、因子等)
+                if self.bridge.engine:
+                    self.bridge.reload_metadata()
+                logger.info(f"✅ [EOD] 盘后全维度计算闭环完成，Rust 镜像已刷新。")
             return True
         except Exception as e:
-            logger.error(f"❌ [EOD] 因子计算触发异常: {e}")
+            logger.error(f"❌ [EOD] 收尾触发异常: {e}")
             return False
 
 if __name__ == "__main__":

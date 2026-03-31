@@ -49,5 +49,13 @@ class RustMarketEngineAdapter:
             return {}
         return self.engine.get_snapshot()
 
+    def reload_metadata(self):
+        """[V3.1] 通知 Rust Core 重新加载 Redis 镜像 (筹码、因子等)"""
+        if self.engine and hasattr(self.engine, 'reload_metadata'):
+            self.engine.reload_metadata()
+            logger.info("📡 已指令 Rust Core 重新加载全量元数据镜像")
+        elif self.engine:
+            logger.warning("⚠️ Rust Core 当前版本尚不支持 reload_metadata 接口")
+
 # 独立单例供其他模块安全导入
 v2_core_bridge = RustMarketEngineAdapter()

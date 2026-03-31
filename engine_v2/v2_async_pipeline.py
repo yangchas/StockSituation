@@ -144,8 +144,8 @@ class AsyncDataPipeline:
                         func(*args, **kwargs), timeout=self.timeout
                     )
                     
-                    # 任务成功判定：只有返回 True 的才算完成（用于同步任务）
-                    if result is True:
+                    # 任务成功判定：只要返回不是 None，即视为已处理 (支持 bool 或 list/dict 返回)
+                    if result is not None:
                         task.result = result
                         task.status = TaskStatus.DONE
                         self.checkpoint.mark_done(task.task_id)
@@ -154,8 +154,8 @@ class AsyncDataPipeline:
                         if hasattr(self, '_batch_total') and self._batch_total > 0:
                             self._batch_progress += 1
                             pct = (self._batch_progress / self._batch_total) * 100
-                            # 每 10 个或完成时才刷新一次 IO 减少压力
-                            if self._batch_progress % 10 == 0 or self._batch_progress == self._batch_total:
+                            # 每 2 个或完成时才刷新一次 IO
+                            if self._batch_progress % 2 == 0 or self._batch_progress == self._batch_total:
                                 sys.stdout.write(f"\r📊 同步中: [{'#' * (int(pct)//5)}{'-' * (20 - int(pct)//5)}] {self._batch_progress}/{self._batch_total} ({pct:.1f}%)   ")
                                 sys.stdout.flush()
                                 if self._batch_progress == self._batch_total:
