@@ -21,6 +21,7 @@ import subprocess
 import re
 from types import SimpleNamespace
 from datetime import datetime, timedelta, time as dt_time
+import time
 from typing import List, Dict, Optional, Tuple, Any
 import pandas as pd
 
@@ -95,8 +96,8 @@ class AuctionOrchestrator:
         self.is_first_session_run = True # 标记盘中首次有效运行
         self.state = _load_state()
         self.auction_snapshot = {} 
-        self.yest_limit_map = {}
         self.bridge = v2_core_bridge
+        self.auction_synced_date = None  # 竞价同步状态位
         
         # 定义适配 Lifecycle 的无参异步包装
         async def l_fetch_bans():
@@ -141,10 +142,14 @@ class AuctionOrchestrator:
                 p_stocks = [s for s, plate in self.metadata.plate_map.items() if p_name in plate]
                 self.bridge.register_plate_mapping(p_name, p_stocks)
 
-        # 2. 补全 09:25 竞价锚点 (若当前已过 09:25)
+        # 2. 补全 09:25 竞价锚点 (需满足：交易日、时间已过 09:25、今日尚未加载)
+        if not self.calendar.is_trade_day(date_str):
+            logger.info("🌑 [System] 今日非交易日，跳过竞价数据补全")
+            return
+
         now = datetime.now()
         h_m = now.strftime("%H:%M")
-        if h_m >= "09:25":
+        if h_m >= "09:25" and self.auction_synced_date != date_str:
             logger.info("⏳ [Anchor] 检测到已过竞价时间，正在补全开盘锚点...")
             date_sh = date_str.replace("-", "")
             auc_key = f"market:auction:{date_sh}:0925"
@@ -163,9 +168,13 @@ class AuctionOrchestrator:
                 if items:
                     for it in items:
                         self.auction_snapshot[it["code"]] = it["change_pct"]
+                    self.auction_synced_date = date_str
                     logger.info(f"✅ [Anchor] 降级补全成功 ({len(self.auction_snapshot)} 条)")
                 else:
                     logger.error("❌ [Anchor] 补全失败，盘中推演逻辑将受限。")
+            
+            if self.auction_synced_date == date_str:
+                logger.info("✅ [Anchor] 今日竞价锚点已就绪")
 
     async def _fetch_kaipan_limit_ups(self, date_str: str) -> Dict[str, AuctionStock]:
         kpl_date = date_str.replace("-", "")
@@ -369,12 +378,7 @@ class AuctionOrchestrator:
 
     async def execute_analysis(self, date_str: str, mode: str = "AUCTION"):
         date_sh = date_str.replace("-", "")
-        
-        # 1. 动态对齐昨日数据
-        if not self.yest_limit_map or not self.hot_plates:
-            yest_str = self.calendar.get_previous_trading_day(date_str)
-            self.yest_limit_map = await self._fetch_kaipan_limit_ups(yest_str)
-            self.hot_plates = await self._fetch_kaipan_hot_plates(yest_str)
+        current_data = []
         
         # 1. 尝试从 Rust Core 获取实时快照 (Tier 0)
         rust_snap = {}
@@ -383,20 +387,22 @@ class AuctionOrchestrator:
             if rust_snap:
                 logger.debug(f"⚡ [Rust] 成功拉取 {len(rust_snap)} 条实时快照")
 
-        # 2. 传统数据源 (Redis -> TDengine -> Wencai)
-        current_data = []
-        # 1. 尝试从 Redis 获取截面 (支持模糊匹配解决不可见字符问题)
+        # 1. 动态对齐昨日数据基因
+        if not self.yest_limit_map or not self.hot_plates:
+            yest_str = self.calendar.get_previous_trade_day(date_str)
+            self.yest_limit_map = await self._fetch_kaipan_limit_ups(yest_str)
+            self.hot_plates = await self._fetch_kaipan_hot_plates(yest_str)
+
+        # 2. 获取参考坐标系 (Pre-Close) 用于涨幅精算
+        prev_date = self.calendar.get_previous_trade_day(date_str)
+        pre_close_map = await self._get_pre_close_map(prev_date)
+
+        # 2.1 关键逻辑：如果 Redis 实时源失效，尝试从 Rust 内存镜像直接构建底池 (Resonance V5 穿透逻辑)
         data_sh = date_str.replace("-", "")
         base_key = f"market:auction:{data_sh}:0925" if mode == "AUCTION" else f"market:auction:{data_sh}:latest"
-        logger.debug(f"🔍 [Data] 尝试定位 Redis 竞价 Key: {base_key}*")
-        
-        # 针对潜在的不可见字符 (如 \r 或空格)，使用 keys() 进行模糊搜索
         matched_keys = self.redis.keys(f"{base_key}*")
         data_key = matched_keys[0] if matched_keys else base_key
-        if len(matched_keys) > 1:
-            logger.debug(f"ℹ️ [Data] 匹配到多个竞价 Key: {matched_keys}，取第 1 个。")
         
-        # 获取真实数据
         try:
             r_type = self.redis.type(data_key)
             raw_data = None
@@ -412,27 +418,65 @@ class AuctionOrchestrator:
                     if item: current_data.append(item)
                 logger.info(f"✅ [Data] Redis 源读取成功: {data_key} ({len(current_data)} 条)")
         except Exception as re_err:
-            logger.warning(f"⚠️ [Data] Redis 读取解析异常: {re_err}")
+            logger.debug(f"ℹ️ [Data] Redis 探测跳过 (Key: {data_key}): {re_err}")
             
+        # 2.1 关键逻辑：如果 Redis 实时源失效，尝试从 Rust 内存镜像直接构建底池 (Resonance V5 穿透逻辑)
+        if not current_data and mode == "INTRA_DAY" and rust_snap:
+            logger.debug(f"⚡ [Simd] Redis 实时源缺失，正在从 Rust 内存镜像直接穿透采样 ({len(rust_snap)} 条)...")
+            rust_idx = {str(k).strip()[-6:]: v for k, v in rust_snap.items() if k != "_EXTREMES_"}
+            for code, r_it in rust_idx.items():
+                if code == "_EXTREMES_": continue
+                # 1. 基础信息
+                name = await self.metadata.get_name(code)
+                yest_it = self.yest_limit_map.get(code)
+                
+                # 2. 涨幅精算：(当前价 / 昨收) - 1.0 (修正 10.0 分情绪报错)
+                pre_close = pre_close_map.get(code, 0.0)
+                curr_price = r_it.get("price", 0.0)
+                pct = (curr_price / pre_close - 1.0) if pre_close > 0.1 else 0.0
+                
+                # 3. 基因补完：板块属性
+                stock_info = self.metadata.stock_info.get(code)
+                plate = stock_info.get('plate', 'Other') if stock_info else "Other"
+                
+                current_data.append({
+                    "code": code, "name": name,
+                    "change_pct": pct,
+                    "auction_amount_yuan": r_it.get("amount", 0.0),
+                    "speed_1m": r_it.get("speed", 0.0),
+                    "vol_intensity": r_it.get("vol_intensity", 1.0),
+                    "plate": plate,
+                    "lb_days": yest_it.lb_days if yest_it else 0,
+                    "is_yest_limit": True if yest_it else False
+                })
+            if current_data: 
+                logger.info(f"✅ [Simd] Rust 镜像底池构建成功: {len(current_data)} 条")
+        
+        # 2.2 传统三级降级 (TDengine / Wencai)
         if not current_data:
-            # 只有在 09:25 之后才允许通过 TDengine 或 Wencai 降级，防止凌晨无效调用
             h_m_now = datetime.now().strftime("%H:%M")
-            if h_m_now >= "09:25":
-                logger.warning(f"⚠️ [Data] Redis 源缺失或为空 ({data_key})，尝试降级恢复...")
-                # 方案 1: TDengine
+            if h_m_now >= "09:25" and self.auction_synced_date != date_str:
+                logger.warning(f"⚠️ [Data] 实时源全线缺失，尝试从 TDengine 恢复竞价基础...")
                 td_items = await self._fetch_tdengine_auction(date_str)
-                if td_items: current_data.extend(td_items)
+                if td_items: 
+                    current_data.extend(td_items)
+                    self.auction_synced_date = date_str # 成功回溯一次也算完成
                 
                 # 方案 2: Wencai (如果 TDengine 依然不足)
                 if len(current_data) < 50:
                     wc_items = await self._fetch_wencai_auction(date_str)
-                    if wc_items: current_data.extend(wc_items)
+                    if wc_items: 
+                        current_data.extend(wc_items)
+                        self.auction_synced_date = date_str
             else:
-                logger.debug(f"⏳ [Data] 当前时刻 {h_m_now} 尚早，跳过降级查询。")
-        
-        # 2.1 合并 Rust 实时指标到 current_data (若有)
-        if rust_snap:
-            # 建立索引
+                if self.auction_synced_date == date_str and mode == "INTRA_DAY":
+                    logger.debug(f"ℹ️ [Data] Redis 实时源缺失，但今日竞价已锚定，分析挂载中。")
+                else:
+                    logger.debug(f"⏳ [Data] 当前时刻 {h_m_now} 尚早，跳过降级查询。")
+
+        # 2.3 合并 Rust 实时指标到 current_data (若 current_data 非空)
+        if rust_snap and current_data and not any(it.get("speed_1m") for it in current_data[:10]):
+            # 仅当 current_data 中还没有指标时才执行合并逻辑 (防止重复合并导致性能浪费)
             rust_idx = {str(k).strip()[-6:]: v for k, v in rust_snap.items() if k != "_EXTREMES_"}
             for it in current_data:
                 code = it["code"]
@@ -440,9 +484,8 @@ class AuctionOrchestrator:
                     r_it = rust_idx[code]
                     it["speed_1m"] = r_it.get("speed", 0.0)
                     it["vol_intensity"] = r_it.get("vol_intensity", 1.0)
-                    # 如果 Redis/TD 无效，甚至可以降级用 Rust 的价格
                     if it.get("change_pct") is None or it.get("change_pct") == 0:
-                        it["change_pct"] = r_it.get("price", 0.0) # 假设 Rust 处理了涨幅
+                        it["change_pct"] = r_it.get("price", 0.0)
         
         if not current_data:
             if datetime.now().second % 60 < 2:
@@ -480,6 +523,11 @@ class AuctionOrchestrator:
 
         # 0. 启动即同步 (根据 Lifecycle 内部逻辑决策全量或轻量)
         await self._startup_sync(date_str)
+        
+        # [NEW] 启动异步行情提取泵并预热
+        pump_task = asyncio.create_task(self._v2_tick_pump())
+        logger.info("⏳ [System] 正在等待行情泵首轮预热 (2s)...")
+        await asyncio.sleep(2)
         
         # 1. 尝试初始推演 (仅在 09:15 - 15:31 活跃时段执行)
         now_hm = datetime.now().strftime("%H:%M")
@@ -530,6 +578,55 @@ class AuctionOrchestrator:
                 if now.second % 60 == 0:
                     logger.info(f"🌑 [NightMode] 引擎基盘在线 | 时刻: {h_m} | 等待下一交易日")
                 await asyncio.sleep(1)
+
+    async def _v2_tick_pump(self):
+        """[Resonance V5] 极速行情提取泵：将 stock:quote:* 直接按需压入本进程 Rust Core"""
+        logger.info("🚀 [Pump] 智库行情提取泵已就位 (Shared-Memory Mode)")
+        
+        # 预生成 Redis Key 列表以优化性能 (根据 metadata 中的 5000+ 代码)
+        all_symbols = list(self.metadata.stock_info.keys())
+        key_map = {f"stock:quote:{s}": s for s in all_symbols}
+        redis_keys = list(key_map.keys())
+        
+        while self.is_running:
+            try:
+                now = datetime.now()
+                # 仅在交易活跃时段运行 (09:15 - 11:35, 12:55 - 15:10)
+                h_m = now.strftime("%H:%M")
+                if not ("09:15" <= h_m <= "11:35" or "12:55" <= h_m <= "15:10"):
+                    await asyncio.sleep(60)
+                    continue
+                
+                t_start = time.time()
+                # 批量拉取 (Pipeline 避免阻塞)
+                pipe = self.redis.pipeline()
+                for k in redis_keys:
+                    pipe.hgetall(k)
+                all_quotes = pipe.execute()
+                
+                # 压入 Rust 
+                push_count = 0
+                for k, data in zip(redis_keys, all_quotes):
+                    if not data: continue
+                    symbol = key_map[k]
+                    # 提取核心指标
+                    try:
+                        price = float(data.get('price', data.get('current', 0)))
+                        amount = float(data.get('amount', data.get('turnover', 0)))
+                        volume = float(data.get('volume', 0))
+                        self.bridge.push_tick_raw(symbol, price, amount, volume)
+                        push_count += 1
+                    except: continue
+                
+                t_end = time.time()
+                if push_count > 0:
+                    logger.debug(f"⚡ [Pump] 成功压入 {push_count} 只 Tick | 耗时: {(t_end-t_start)*1000:.2f}ms")
+                
+                # 呼吸周期 (3秒抓一次，平衡性能与实时性)
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"❌ [Pump] 运行异常: {e}")
+                await asyncio.sleep(5)
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Kaipanla 接口适配
