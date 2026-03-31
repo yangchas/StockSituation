@@ -1,0 +1,13 @@
+[package]
+name = "market_edge_v2_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "market_edge_v2_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module"] }
+rayon = "1.8"
+dashmap = "5.5"
