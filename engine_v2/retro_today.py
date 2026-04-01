@@ -43,40 +43,11 @@ def amt_fmt(v_yuan): return f"{float(v_yuan)/1e8:.2f}亿"
 # ── 数据获取 ──────────────────────────────────────────────────
 
 def fetch_limit_ups(date_str: str) -> list:
-    """拉取全量涨停 (板 1~5), 返回已解析的 dict 列表"""
-    from pykaipan.pykaipan import getHisBans
-    all_bans = []
-    for ban_lvl in ['1', '2', '3', '4', '5']:
-        try:
-            res = getHisBans(date=date_str, ban=ban_lvl, size=200)
-            pages = res.get('info', [])
-            if not pages: continue
-            for page in pages:
-                for rec in page:
-                    if len(rec) < 16: continue
-                    code    = str(rec[0])[-6:].zfill(6)
-                    name    = str(rec[1])
-                    lb_days = int(rec[15]) if rec[15] else 1
-                    plate   = str(rec[12]) if len(rec) > 12 else "其他"
-                    # rec[3]: 封板时间; rec[6]: 封单量; rec[9]: 换手率
-                    seal_time    = str(rec[3])  if len(rec) > 3  else "?"
-                    turnover     = float(rec[9]) if len(rec) > 9 and rec[9] else 0.0
-                    close_pct    = float(rec[2]) if len(rec) > 2 and rec[2] else 10.0
-                    all_bans.append({
-                        "code": code, "name": name, "lb_days": lb_days,
-                        "plate": plate, "seal_time": seal_time,
-                        "turnover": turnover, "close_pct": close_pct,
-                    })
-        except Exception as e:
-            pass
-    # 去重 by code
-    seen = set()
-    result = []
-    for b in all_bans:
-        if b['code'] not in seen:
-            seen.add(b['code'])
-            result.append(b)
-    return result
+    """[V3.5 统一网关] 拉取全量涨停，采用 StockAnalyzer 统一逻辑"""
+    from ai.API.StockAnalyzer import StockAnalyzer
+    analyzer = StockAnalyzer()
+    # 直接调用网关的黄金解析逻辑 (内部已处理 1-5 板、Index [15]/[12]、去重)
+    return analyzer.get_history_bans_pool(date_str, max_ban=5)
 
 
 def fetch_hot_plates(date_str: str) -> list:

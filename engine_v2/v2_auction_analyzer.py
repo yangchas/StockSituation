@@ -344,7 +344,8 @@ class AuctionAnalyzer:
         # [轮动信号生成]
         if report.highest_board and report.highest_board.open_pct < report.highest_board.expected_pct:
             # 总龙不及预期，寻找切入板块
-            strong_sectors = [name for name, _, _, st in report.yest_hot_sectors if "走强" in st]
+            # yest_hot_sectors 现为 6 元组: (name, count, delta, st, strength, flow)
+            strong_sectors = [name for name, _, _, st, *_ in report.yest_hot_sectors if "走强" in st]
             incoming = "、".join(strong_sectors[:2]) if strong_sectors else "暂未发现"
             report.rotation_msg = f"【衰退】: {report.highest_board.plate} | 【切入】: {incoming}\n   💡 [对撞]: 核心总龙 [{report.highest_board.name}] 开盘不及预期，检测到资金可能正通过‘高低切’逻辑切入至 [{incoming}] 板块。"
 

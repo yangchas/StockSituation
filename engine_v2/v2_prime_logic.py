@@ -3,7 +3,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 import redis
-
+import time
 # 尝试导入通用服务
 try:
     from web.services.kaipan_plate_service import fetch_kaipan_plate_rank
@@ -30,19 +30,24 @@ class ResonancePrimeService:
         if now - self.last_sync_time < 60: return 
         
         try:
-            raw_plates = await fetch_kaipan_plate_rank()
-            if raw_plates:
+            # fetch_kaipan_plate_rank 是同步函数，且返回字典 {"ok": True, "plates": [...]}
+            res = fetch_kaipan_plate_rank()
+            if res and res.get('ok'):
+                raw_plates = res.get('plates', [])
                 self.hot_plates_map = {
                     p['name']: {
                         'strength': float(p.get('strength', 0)),
-                        'net_amount': float(p.get('main_net_amount', 0)),
+                        'net_amount': float(p.get('main_net', 0)), # 注意：新接口字段名为 main_net
                         'rank': i + 1
                     } for i, p in enumerate(raw_plates)
                 }
                 self.last_sync_time = now
                 logger.info(f"✅ [Commander] 已同步 Kaipanla 板块能级 (Count: {len(self.hot_plates_map)})")
+            else:
+                err = res.get('error', 'Unknown error')
+                logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {err}")
         except Exception as e:
-            logger.warning(f"⚠️ [Commander] Kaipanla 排行同步失败: {e}")
+            logger.warning(f"⚠️ [Commander] Kaipanla 排行同步致命失败: {e}")
 
     def calculate_battle_kpis(self, date_str: str) -> dict:
         """
