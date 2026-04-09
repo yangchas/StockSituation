@@ -47,7 +47,10 @@ class ResonancePrimeService:
                 err = res.get('error', 'Unknown error')
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {err}")
         except Exception as e:
-            logger.warning(f"⚠️ [Commander] Kaipanla 排行同步致命失败: {e}")
+            if "SSL" in str(e) or "Max retries" in str(e):
+                logger.debug(f"🤫 [Commander] 网络波动，跳过本次排行同步: {e}")
+            else:
+                logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {e}")
 
     def calculate_battle_kpis(self, date_str: str) -> dict:
         """

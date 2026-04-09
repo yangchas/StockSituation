@@ -7,11 +7,13 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Callable, Coroutine, List, Optional
 
 from v2_async_pipeline import AsyncDataPipeline, Checkpoint, FetchTask, build_stock_tasks, TaskStatus
 from web.services.trading_calendar_service import TradingCalendarService
+from web.services.stock_kline_service import StockKLineService
 
 logger = logging.getLogger("V2Lifecycle")
 STATE_FILE = os.path.join(os.path.dirname(__file__), "data_state.json")
@@ -63,15 +65,23 @@ class DataLifecycleManager:
         if dt_time(0, 0) <= now <= dt_time(15, 0):
             await self._sync_metadata()
 
-        # 2. 核心调度：00:01 - 09:15 或 16:31 - 24:00 进入数据补齐窗口
-        if dt_time(0, 1) <= now < dt_time(9, 15):
-            logger.info("[Lifecycle] 🕒 [A.黎明补齐] 启动全量对撞任务...")
+        # 2. 核心调度：17:40 - 24:00 或 00:00 - 09:15 进入数据对撞窗口
+        # 将触发时间对准至 17:40，确保 Baostock 日线数据结清
+        if dt_time(17, 40) <= now <= dt_time(23, 59) or dt_time(0, 0) <= now < dt_time(9, 15):
+            # [A.全量对撞] 数据补齐
+            logger.info(f"[Lifecycle] 🕒 [A.全量对撞] 窗口开启 (当前: {now.strftime('%H:%M')})...")
             await self._sync_daily_kline()
             await self._trigger_factors()
-        elif dt_time(16, 31) <= now <= dt_time(23, 59):
-            logger.info("[Lifecycle] 📊 [D.结算窗口] 启动今日全量增量对撞...")
-            await self._sync_daily_kline()
-            await self._trigger_factors()
+            
+            # [B.物理审计] 跨日对账逻辑 (建议在 01:00 - 08:30 之间执行)
+            if dt_time(1, 0) <= now < dt_time(8, 30):
+                target_day = self.calendar.get_previous_trade_day(date.today().strftime("%Y-%m-%d"))
+                logger.info(f"[Lifecycle] 📊 [B.物理审计] 启动对昨日 ({target_day}) 的全网对账...")
+                try:
+                    import subprocess
+                    subprocess.Popen([sys.executable, "v2_recap_engine_final.py", "--date", target_day])
+                except Exception as e:
+                    logger.error(f"启动复盘引擎失败: {e}")
         else:
             logger.info("[Lifecycle] 🛡️ 战时稳定优先，仅加载本地数据种子。")
 
@@ -102,8 +112,17 @@ class DataLifecycleManager:
         date_tag = target_date.replace("-", "")
         logger.info(f"[Lifecycle] 🚀 执行 V3.1 集成流水线 (Tag: {date_tag})")
 
+        # [V7.5] 物理对撞校验函数：确保 Checkpoint 的 'done' 与数据库物理水位一致
+        k_service = StockKLineService()
+        def physical_validator(sym: str, tag: str) -> bool:
+            # tag 格式为 '20260407'，转换为 '2026-04-07'
+            target_iso = f"{tag[:4]}-{tag[4:6]}-{tag[6:]}"
+            latest = k_service.latest_dates_map.get(sym)
+            if not latest: return False
+            return latest >= target_iso
+
         # 核心：使用 integrated_sync 任务名，触发 Orchestrator 的边拉边算逻辑
-        tasks = build_stock_tasks(self.symbols, "integrated_sync", self._cp, date_tag=date_tag)
+        tasks = build_stock_tasks(self.symbols, "integrated_sync", self._cp, date_tag=date_tag, validate_fn=physical_validator)
         pending = [t for t in tasks if t.status != TaskStatus.DONE]
         
         if not pending or not self._fn_kline:

@@ -82,6 +82,12 @@ class Checkpoint:
         self._data[task_id] = TaskStatus.DONE
         self._save()
 
+    def remove(self, task_id: str):
+        """物理移除记录，用于纠偏"""
+        if task_id in self._data:
+            del self._data[task_id]
+            self._save()
+
     def clear(self):
         self._data = {}
         self._save()
@@ -225,22 +231,46 @@ def build_stock_tasks(
     task_type: str,
     checkpoint: Checkpoint,
     date_tag: str = "",
+    validate_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> List[FetchTask]:
     """
     为每只股票生成一个 FetchTask。
     task_id = f"{task_type}:{symbol}:{date_tag}"，支持按日期刷新。
+    
+    validate_fn: 可选回调 (symbol, date_tag) -> bool
+                如果返回 False，说明物理校验不通过，即使 Checkpoint 为 DONE 也要重做。
     """
     tasks = []
     skipped = 0
+    phys_re_exec = 0
     for sym in symbols:
         tid = f"{task_type}:{sym}:{date_tag}"
         task = FetchTask(task_id=tid, symbol=sym, task_type=task_type)
-        if checkpoint.is_done(tid):
+        
+        # 1. 检查 Checkpoint 状态
+        is_recorded_done = checkpoint.is_done(tid)
+        
+        # 2. 物理校验 (如果提供)
+        is_phys_done = True
+        if validate_fn:
+            is_phys_done = validate_fn(sym, date_tag)
+            
+        if is_recorded_done and is_phys_done:
             task.status = TaskStatus.DONE
             skipped += 1
+        else:
+            if is_recorded_done and not is_phys_done:
+                phys_re_exec += 1
+                logger.warning(f"[Physical-Fix] {tid} 记录虽为DONE但物理缺失，正在强制清理断点...")
+                checkpoint.remove(tid) # 物理清理，让内层 run_task 能够通行
+            task.status = TaskStatus.PENDING
+
         tasks.append(task)
+    
     if skipped:
         logger.info(f"[续传] {task_type} 跳过已完成 {skipped}/{len(symbols)} 只")
+    if phys_re_exec:
+        logger.warning(f"[纠偏] {task_type} 检测到 {phys_re_exec} 只股票物理缺失，强制拉回 PENDING 状态")
     return tasks
 
 
