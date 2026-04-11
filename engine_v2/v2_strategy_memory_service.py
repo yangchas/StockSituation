@@ -68,17 +68,27 @@ class StrategyMemoryService:
             score += 0.4 * (1.0 - abs(current_dna.sentiment_score - target['sentiment_score']) / 10.0)
             # 2. 最高标相似度 (权重 0.3)
             score += 0.3 * (1.0 - min(1.0, abs(current_dna.max_lb - target['max_lb']) / 5.0))
-            # 3. 龙头反馈对齐 (权重 0.2)
-            if current_dna.leader_feedback == target['leader_feedback']:
+            # 3. 龙头反馈对齐 - 模糊分类匹配 (权重 0.2)
+            def _feedback_class(fb: str) -> str:
+                fb = fb.lower()
+                if "lock" in fb or "稳板" in fb: return "LOCKED"
+                if "diverge" in fb or "分歧" in fb or "nuclear" in fb: return "DIVERGENT"
+                if "weak" in fb or "弱" in fb: return "WEAK"
+                return "OTHER"
+            if _feedback_class(current_dna.leader_feedback) == _feedback_class(target['leader_feedback']):
                 score += 0.2
+            else:
+                score += 0.05 # 部分相似，不完全归零
             
             # 4. 动能斜率相似度 (权重 0.1)
             score += 0.1 * (1.0 - min(1.0, abs(current_dna.momentum_slope - target.get('momentum_slope', 1.0)) / 5.0))
-            if score >= threshold:
+            if score >= 0.68:  # V9.0: 放宽至 0.68，容纳近似市场环境
                 case['similarity'] = round(score * 100, 1)
                 results.append(case)
         
         return sorted(results, key=lambda x: x['similarity'], reverse=True)
+
+V2StrategyMemoryService = StrategyMemoryService
 
 # 种子数据：2026-04-07 的化工日
 if __name__ == "__main__":

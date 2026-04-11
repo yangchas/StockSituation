@@ -8,7 +8,7 @@ import os
 import json
 import logging
 import numpy as np
-import redis
+import redis.asyncio as redis
 import aiohttp
 import asyncio
 import subprocess
@@ -75,10 +75,11 @@ class AuctionOrchestrator:
     def __init__(self):
         self.is_running = True
         # Redis 连接 (优先尝试远程 IP 确保跨设备对齐)
-        self.redis = redis.Redis(host='127.0.0.1', port=6379, db=0, decode_responses=True)
+        self.redis = redis.from_url("redis://127.0.0.1:6379/0", decode_responses=True)
         try:
-            self.redis.ping()
-            logger.info("✅ 成功连接至物理服务器 Redis (115.190.156.240)")
+            # ping 在 aioredis 中现在是 coroutine
+            # asyncio.create_task(self.redis.ping())
+            logger.info("✅ 异步 Redis 驱动初始化完成 (115.190.156.240)")
         except:
             # self.redis = redis.Redis(host='127.0.0.1', port=6379, db=0, decode_responses=True)
             logger.warning("⚠️ 物理 IP 连接失败，降级使用 127.0.0.1")
@@ -86,12 +87,10 @@ class AuctionOrchestrator:
         self.calendar = TradingCalendarService()
         self.analyzer = AuctionAnalyzer(redis_client=self.redis)
         
-        self.calendar = TradingCalendarService()
-        self.analyzer = AuctionAnalyzer(redis_client=self.redis)
-        
         # 🛠️ 暴力路径探测：从当前目录递归向上查找 3 级，直到找到 web/data/f10.csv
         data_dir = ""
         search_root = BASE_DIR
+        # 1. 整理特征向量...
         for _ in range(3):
             candidate = os.path.join(search_root, 'web', 'data')
             if os.path.exists(os.path.join(candidate, 'f10.csv')):
@@ -117,16 +116,22 @@ class AuctionOrchestrator:
         self.wencai = UnifiedMarketDataFetcher()
         self.chip_runner = ChipBatchRunner(kline_service=self.kline_service) 
 
-        
+        self.bridge = v2_core_bridge
+        self.lifecycle = DataLifecycleManager(self.bridge, self.redis)
+        self.prime = ResonancePrimeService(self.redis)
+
+        # 战时状态管理
         self.last_sentiment = 0.0
         self.highest_board = None # V5.5 实时龙头监控位
         self.is_first_session_run = True 
         self.state = _load_state()
-        self.auction_snapshot = {} 
-        self.bridge = v2_core_bridge
-        self.prime = ResonancePrimeService(self.redis)
         self.tick_history = {} 
-        self.auction_synced_date = None  
+        self.risk_stats = {} # [V9.5] 记录各票盘中历史最高价/2min前价格
+        self.pre_close_map = {} # [P0 Fix] 缓存昨收价用于风控精算
+
+        # [V15.0] 生命周期状态管理：支持实战不重启捕获与 Redis 归档对位
+        self.auction_snapshot = {}
+        self.auction_synced_date = ""
         
         # 定义适配 Lifecycle 的异步包装
         async def l_fetch_bans():
@@ -157,10 +162,17 @@ class AuctionOrchestrator:
         return self._tdengine
 
     async def _startup_sync(self, date_str: str):
-        """启动时同步与环境预研 (内存加固版)"""
+        """启动时同步与环境预研 (内存加固版)平衡"""
         logger.info(f"🔍 [System] 启动自绘自检中 (基于并行加速)...")
-        # 🛠️ 优化 1: 仅生成一次全市场代码列表，避免后续多次 list() 拷贝产生的分配
-        all_symbols = list(self.metadata.stock_info.keys())
+        # 补全：获取昨收基准映射
+        yest_str = self.calendar.get_previous_trading_day(date_str)
+        self.pre_close_map = await self._get_pre_close_map(yest_str)
+        logger.info(f"📈 [P0] 已加载 {len(self.pre_close_map)} 只证券的基准价 (Anchor Date: {yest_str})")
+        # 🛠️ 优化 1: 仅生成一次全市场代码列表，并跳过北交所 (根据用户指令)
+        all_symbols = [
+            s for s in self.metadata.stock_info.keys() 
+            if not s.startswith(('83', '87', '88', '43', '920'))
+        ]
         self.lifecycle.symbols = all_symbols
         
         await asyncio.get_event_loop().run_in_executor(None, self.kline_service.preload_latest_dates)
@@ -172,7 +184,7 @@ class AuctionOrchestrator:
         
         # 🛠️ 优化 3: 异步加载“Alpha种子池”(盘后预计算结果)
         self.alpha_candidates = {}
-        raw_candidates = self.redis.get("market:alpha:candidates")
+        raw_candidates = await self.redis.get("market:alpha:candidates")
         if raw_candidates:
             try:
                 c_list = json.loads(raw_candidates)
@@ -190,38 +202,83 @@ class AuctionOrchestrator:
                 if p_stocks:
                     self.bridge.register_plate_mapping(p_name, p_stocks)
 
+        # [V13.5] 移除硬拦截，允许非交易日加载历史锚点用于复盘/模拟
         if not self.calendar.is_trade_day(date_str):
-            logger.info("🌑 [System] 今日非交易日，跳过竞价数据补全")
-            return
+            logger.info("🌑 [System] 检测到非交易日启动 (模拟模式)...")
 
         now = datetime.now()
         h_m = now.strftime("%H:%M")
         if h_m >= "09:25" and self.auction_synced_date != date_str:
-            logger.info("⏳ [Anchor] 检测到已过竞价时间，正在补全开盘锚点...")
+            # [V13.0] 增强型冷启动回赎链路
             date_sh = date_str.replace("-", "")
+            # 优先级 1: 专用高性能锚点归档 (New)
+            new_auc_key = f"market:auction:anchor:{date_sh}"
+            raw_new = await self.redis.get(new_auc_key)
+            if raw_new:
+                try:
+                    self.auction_snapshot = json.loads(raw_new)
+                    logger.info(f"✅ [Anchor Recovery] 成功从归档回赎 {len(self.auction_snapshot)} 条竞价锚点 (High Fidelity)")
+                    return
+                except Exception as e:
+                    logger.warning(f"⚠️ [Anchor Recovery] 归档解析失败: {e}")
+
+            # 优先级 2: 原始行情快照数据 (Legacy)
             auc_key = f"market:auction:{date_sh}:0925"
-            auc_raw = self.redis.hget(auc_key, "top_amount")
+            auc_raw = await self.redis.hget(auc_key, "top_amount")
             
+            items_found = False
             if auc_raw:
-                items = json.loads(auc_raw)
-                self.auction_snapshot = {str(i.get("symbol","")).strip()[-6:]: float(i.get("change_pct",0)) for i in items}
-                logger.info(f"✅ [Anchor] Redis 锚点补全成功 ({len(self.auction_snapshot)} 条)")
-            else:
-                logger.warning(f"⚠️ [Anchor] Redis 缺失 09:25 数据，启动多级韧性补全...")
-                items = await self._fetch_tdengine_auction(date_str)
-                print(type(items),items)
-                if len(items)<10:
-                    items = []
-                if not items: 
-                    logger.info("启用问财")
-                    items = await self._fetch_wencai_auction(date_str)
-                if not items: 
-                    logger.info("启用本地数据")
-                    items = await self._reconstruct_from_bars(date_str)
-                
-                if items:
-                    logger.info(f"✅ [Anchor] 锚点韧性补全成功: {len(items)} 条 | 来源: {items[0].get('source', 'Unknown')}")
-                else: logger.error("❌ [Anchor] 所有补全路径(TD/WC/Bars)均已失效。")
+                try:
+                    items = json.loads(auc_raw)
+                    self.auction_snapshot = {}
+                    for i in items:
+                        if not isinstance(i, dict): continue
+                        raw_sym = str(i.get("symbol", i.get("code", ""))).strip()
+                        if not raw_sym: continue
+                        code = raw_sym.split('.')[0][-6:] if '.' in raw_sym else raw_sym[-6:]
+                        pct = float(i.get("change_pct", 0))
+                        price = float(i.get("price", 0))
+                        if abs(pct) < 1e-6 and price > 0:
+                            val = self.pre_close_map.get(code, 0)
+                            pc = val[0] if isinstance(val, (tuple, list)) else float(val)
+                            if pc > 0: pct = price / pc - 1.0
+                        if code: self.auction_snapshot[code] = pct
+                    
+                    if len(self.auction_snapshot) > 100:
+                        self.auction_synced_date = date_str
+                        logger.info(f"✅ [Anchor Recovery] 成功从 Redis 归档对位 ({len(self.auction_snapshot)} 条)")
+                        items_found = True
+                except: pass
+
+            if items_found: return
+
+            # [V16.0] 优先级 3: TDengine 数据库回补 (次级兜底)
+            logger.info("⏳ [Resilience] Redis 本地归档缺失，正在切入 TDengine 数据库兜底链路...")
+            td_items = await self._fetch_tdengine_auction(date_str)
+            if td_items:
+                self.auction_snapshot = {
+                    str(s.get('code', '')).split('.')[0][-6:]: s.get('change_pct', 0) 
+                    for s in td_items if s.get('code')
+                }
+                if len(self.auction_snapshot) > 100:
+                    self.auction_synced_date = date_str
+                    logger.info(f"✅ [Anchor Recovery] 成功从 TDengine 补全数据 ({len(self.auction_snapshot)} 条)")
+                    return
+
+            # [V16.0] 优先级 4: 问财 API 强制回补 (终极生命线)
+            logger.info("📡 [Resilience] 内部数据源全线失守，正在发起问财 API 终极空投指令...")
+            wc_items = await self._fetch_wencai_auction(date_str)
+            if wc_items:
+                self.auction_snapshot = {
+                    str(s.get('code', '')).split('.')[0][-6:]: s.get('change_pct', 0) 
+                    for s in wc_items if s.get('code')
+                }
+                if len(self.auction_snapshot) > 50: # 问财源通常较小，50条即可支撑核心池
+                    self.auction_synced_date = date_str
+                    logger.info(f"✅ [Anchor Recovery] 问财 API 终极补全成功 ({len(self.auction_snapshot)} 条)")
+                    return
+            
+            logger.error("❌ [Anchor Recovery] 灾难性故障：四级回赎链路全部落空，请人工介入检查数据源。")
 
         # 🛠️ 终极自检后垃圾回收：清理启动阶段产生的所有临时 Symbols 列表和中转对象
         import gc
@@ -314,9 +371,10 @@ class AuctionOrchestrator:
         return res_map
 
     async def _fetch_tdengine_auction(self, date_str: str) -> List[Dict]:
-        prev_date = self.calendar.get_previous_trade_day(date_str)
+        # 确保 prev_date 是相对于传入日期 (可能是历史日期) 的前一交易日
+        prev_date = self.calendar.get_previous_trading_day(date_str)
         pc_map = await self._get_pre_close_map(prev_date)
-        sql = f"SELECT LAST(lp), LAST(v), LAST(a), symbol FROM stock_data WHERE ts >= '{date_str} 09:25:00' AND ts <= '{date_str} 09:30:00' GROUP BY symbol"
+        sql = f"SELECT LAST(lp), LAST(v), LAST(a), symbol FROM stock_data WHERE ts >= '{date_str} 09:25:00' AND ts <= '{date_str} 09:25:01' GROUP BY symbol"
         try:
             cursor = await asyncio.get_event_loop().run_in_executor(None, self.tdengine.execute_query, sql)
             if not cursor: return []
@@ -392,37 +450,51 @@ class AuctionOrchestrator:
 
         data_sh = date_str.replace("-", "")
         # V5.5 预加载筹码压制分布 (从 Redis)
-        chip_map = self.redis.hgetall(f"cache:chip_peaks:{data_sh}") or {}
+        chip_map = await self.redis.hgetall(f"cache:chip_peaks:{data_sh}") or {}
         
-        base_key = f"market:auction:{data_sh}:0925" if mode == "AUCTION" else f"market:auction:{data_sh}:latest"
-        matched = self.redis.keys(f"{base_key}*")
-        data_key = matched[0] if matched else base_key
-        
-        try:
-            r_t = self.redis.type(data_key)
-            raw = self.redis.hget(data_key, "top_amount") if r_t == 'hash' else self.redis.get(data_key)
-            if raw:
-                for raw_it in json.loads(raw):
-                    item = await self._standardize_item(raw_it, 'REDIS')
-                    if item: current_data.append(item)
-        except: pass
+        # [V10.0] 彻底解耦：竞价数据仅作为参考锚点 (self.auction_snapshot)，盘中严禁作为行情源
+        if mode == "AUCTION" or (not self.auction_snapshot and mode == "INTRA_DAY"):
+            base_key = f"market:auction:{data_sh}:0925"
+            matched = await self.redis.keys(f"{base_key}*")
+            data_key = matched[0] if matched else base_key
+            try:
+                r_t = await self.redis.type(data_key)
+                raw = await self.redis.hget(data_key, "top_amount") if r_t == 'hash' else await self.redis.get(data_key)
+                if raw:
+                    items = json.loads(raw)
+                    if mode == "AUCTION":
+                        for raw_it in items:
+                            item = await self._standardize_item(raw_it, 'REDIS')
+                            if item: current_data.append(item)
+                    # 无论什么模式，如果 snapshot 为空，则填充它作为后续分析的参考系
+                    if not self.auction_snapshot:
+                        self.auction_snapshot = {str(i.get("symbol","")).strip(): float(i.get("change_pct",0)) for i in items}
+                        logger.info(f"✅ [Anchor] 竞价锚点异步补全成功 ({len(self.auction_snapshot)} 条)")
+            except Exception as e:
+                logger.warning(f"⚠️ [Anchor] 竞价键读取跳过或失败: {e}")
             
-        if not current_data and mode == "INTRA_DAY" and rust_snap:
-            rust_idx = {str(k).strip()[-6:]: v for k, v in rust_snap.items() if k != "_EXTREMES_"}
-            for code, r_it in rust_idx.items():
-                p_c, y_amt = pc_data.get(code, (0.0, 0.0))
+        if mode == "INTRA_DAY" and rust_snap:
+            for k, r_it in rust_snap.items():
+                if k == "_EXTREMES_": continue
+                code = str(k).strip()
+                # [V11.1] 鲁棒性对位：6位数字(Rust) -> 带后缀的 Key (Metadata/PC_Data)
+                p_c = pc_data.get(code) or pc_data.get(f"{code}.SZ") or pc_data.get(f"{code}.SH") or 0.0
                 c_p = r_it.get("price", 0.0)
+                
                 if c_p <= 0.1 or p_c <= 0.1: continue
                 pct = c_p / p_c - 1.0
+                y_amt = 0.0 # 保持变量链完整性
                 
                 # 2. 基因补完：板块属性与聚合指标 (V5.5 游资版)
-                yest_it = self.yest_limit_map.get(code)
-                stock_info = self.metadata.stock_info.get(code, {})
+                # 对标 Key 补全
+                full_code = code if code in self.metadata.stock_info else (f"{code}.SZ" if f"{code}.SZ" in self.metadata.stock_info else f"{code}.SH")
+                stock_info = self.metadata.stock_info.get(full_code, {})
                 plate = stock_info.get('plate', 'Other')
                 res_factor = self.prime.get_plate_resonance(plate)
+                yest_it = self.yest_limit_map.get(code) or self.yest_limit_map.get(full_code)
                 
                 # 筹码压制解析
-                chips = json.loads(chip_map.get(code, "[]"))
+                chips = json.loads(chip_map.get(full_code, "[]")) if isinstance(chip_map.get(full_code), str) else []
                 top_peak = max([c['price'] for c in chips]) if chips else 0.0
                 resistance_gap = (top_peak - c_p) / c_p if top_peak > c_p else -0.1 # -0.1 代表已突破
                 
@@ -438,24 +510,35 @@ class AuctionOrchestrator:
                     if m1: speed_auto = (m0[0] - m1[0]) / m1[0] if m1[0] > 0.1 else 0.0 # [0] 为 Price
 
                 current_data.append({
-                    "code": code, "name": await self.metadata.get_name(code), "change_pct": pct,
+                    "code": full_code, 
+                    "name": stock_info.get('name', 'Unknown'), 
+                    "change_pct": pct,
                     "auction_amount_yuan": r_it.get("amount", 0.0), "plate": plate,
                     "price": float(r_it.get("price", 0.0)),
-                    "lb_days": yest_it.lb_days if yest_it else 0, "is_yest_limit": True if yest_it else False,
-                    "resonance_factor": res_factor, "vol_intensity": r_it.get("vol_intensity", 1.0) * res_factor,
+                    "lb_days": yest_it.lb_days if yest_it else 0, 
+                    "is_yest_limit": True if yest_it else False,
+                    "resonance_factor": res_factor, 
+                    "vol_intensity": r_it.get("vol_intensity", 1.0) * res_factor,
                     "speed_1m": speed_auto, "amount_2m": amount_2m,
-                    "yest_amount": y_amt, "resistance_gap": resistance_gap
+                    "yest_amount": y_amt, "resistance_gap": resistance_gap,
+                    "source": "RUST"
                 })
         
-        battle_kpis = self.prime.calculate_battle_kpis(date_str)
+        battle_kpis = await self.prime.calculate_battle_kpis(date_str)
         if not current_data and mode == "AUCTION":
             current_data.extend(await self._fetch_tdengine_auction(date_str))
             if len(current_data) < 50: current_data.extend(await self._fetch_wencai_auction(date_str))
 
-        if not current_data: return
+        # [V12.2] 拦截器后移：先执行补丁回捞，再判定是否退出
 
         if mode == "AUCTION":
             for it in current_data: self.auction_snapshot[it["code"]] = it["change_pct"]
+            # [V13.0] 实时固化竞价成果到 Redis，防止盘中重启丢失锚点
+            if self.auction_snapshot:
+                date_sh = date_str.replace("-", "")
+                auc_archive_key = f"market:auction:anchor:{date_sh}"
+                await self.redis.set(auc_archive_key, json.dumps(self.auction_snapshot), ex=86400 * 3) # 保留3天
+                logger.info(f"💾 [Persistence] 竞价锚点已固化至 Redis ({len(self.auction_snapshot)} 只标的)")
 
         # [V5.7 阵型强行合拢] 自动查漏补齐昨日涨停 56 只核心标的
         if self.yest_limit_map:
@@ -465,23 +548,85 @@ class AuctionOrchestrator:
                 logger.info(f"🛡️ [Resilience] 阵型合拢补丁开启：正在回捞 {len(missing_ban_codes)} 只掉队的昨日涨停标点...")
                 for code in missing_ban_codes:
                     # 单点从 Redis 协议栈抓取实时行情 (stock:quote:xxxx)
-                    q = self.redis.hgetall(f"stock:quote:{code}")
+                    q = await self.redis.hgetall(f"stock:quote:{code}")
                     if q:
-                        p_c, y_amt = pc_data.get(code, (0.0, 0.0))
+                        p_c = pc_data.get(code, 0.0)
                         c_p = float(q.get("price", 0.0))
                         if p_c > 0 and c_p > 0:
                             current_data.append({
                                 "code": code, "name": q.get("name", "unknown"),
-                                "price": float(q.get("price", 0.0)),
+                                "price": c_p,
                                 "change_pct": (c_p / p_c - 1.0), "auction_amount_yuan": float(q.get("amount", 0)),
                                 "plate": self.metadata.stock_info.get(code, {}).get('plate', 'Other'),
-                                "yest_amount": y_amt, "resistance_gap": 0.0 # 实时补齐模式暂略筹码计算
+                                "yest_amount": 0.0, "resistance_gap": 0.0, "source": "REDIS"
                             })
+
+        if not current_data: 
+            logger.warning("⚠️ [Execution] 分析终端无数据输入 (请检查行情泵状态)")
+            return
+
+        # [V12.0] 实时感知当前情绪周期 (基于分析器产出的真实截面指标)
+        current_allowed_setups = []
 
         report = await self.analyzer.analyze(current_data, auction_snapshot=self.auction_snapshot if mode == "INTRA_DAY" else None,
                                            yest_limit_map=self.yest_limit_map, yest_hot_plates=self.prime.hot_plates_map,
-                                           date_str=date_str, battle_kpis=battle_kpis, alpha_candidates=self.alpha_candidates)
+                                           date_str=date_str, battle_kpis=battle_kpis, alpha_candidates=self.alpha_candidates,
+                                           allowed_setups=current_allowed_setups)
+
+        # [V12.0/V12.3] 执行情绪周期同步判定 (必须在产生 report 之后)
+        try:
+            from engine_v2.v2_business_logic import V2BusinessLogicService
+            _logic = V2BusinessLogicService()
+            
+            # 获取当前场上最高标
+            max_lb_val = 0
+            if report.highest_board:
+                # highest_board 可能是 AuctionStock 对象，尝试获取其 lb_days
+                if hasattr(report.highest_board, 'lb_days'):
+                    max_lb_val = report.highest_board.lb_days
+                else:
+                    max_lb_val = getattr(report.highest_board, 'lb_days', 0)
+
+            _phase = _logic.predict_market_phase(
+                st_score=max(report.money_making_effect, battle_kpis.get('sentiment_score', 0.0)),
+                red_green_ratio=max(report.red_green_ratio, battle_kpis.get('red_green_ratio', 0.0)),
+                max_lb=max(max_lb_val, battle_kpis.get('max_lb', 0)),
+                consensus_score=battle_kpis.get('consensus_score', 20.0),
+            )
+            current_allowed_setups = _phase.allowed_setups
+            report.emotion = _phase # 将对准后的情绪对象回写报告
+            logger.info(f"🧠 [V12.3] 情绪感知对准: 阶段={_phase.phase} | 实时得分={report.money_making_effect:.1f}")
+        except Exception as e:
+            logger.error(f"⚠️ [V12.3] 情绪感知同步失败: {e}")
+        
+        # [V9.5] 竞价入场资格二次审查 (风险阻断)
+        if mode == "AUCTION" and report.strategic_signals:
+            from engine_v2.v2_risk_controller import AuctionEntryChecker, RiskAction
+            # 获取板块预期与龙头状态 (模拟简化版，实战建议走 prime.get_plate_stats)
+            locked_plates = {s.plate for s in report.all_stocks if s.is_locked}
+            
+            for signal in report.strategic_signals:
+                check = AuctionEntryChecker.evaluate(
+                    plate_resonance=signal.confidence / 60.0, # 模拟共振映射
+                    sector_volume_vs_expect=battle_kpis.get('vol_ratio', 1.0),
+                    plate_locked=(signal.plate in locked_plates),
+                    sentiment_score=report.money_making_effect,
+                    allowed_setups=current_allowed_setups
+                )
+                
+                if check.action == RiskAction.CANCEL_ENTRY:
+                    signal.action = "风险取消"
+                    signal.reason = f"🛑 风险控制器拦截: {check.reason}"
+                    signal.confidence = 0
+                elif check.action == RiskAction.HALF_ENTRY:
+                    signal.action = f"试探|{signal.action}"
+                    signal.reason += f" (⚠️ 风控建议半仓: {check.reason})"
+                    signal.confidence -= 10
+
         self.highest_board = report.highest_board # 同步更新龙头状态
+        
+        # [V9.7] 样本完整性监控
+        logger.info(f"📊 [Execution] 全量分析完成 | 样本规模: {len(report.all_stocks)} | 实时评分: {report.money_making_effect}")
         
         # 4. 智能输出 (V5.5 呼吸式优化)
         now = datetime.now()
@@ -497,10 +642,20 @@ class AuctionOrchestrator:
         is_period_hit = (now.minute % 9 == 0 and now.second < 10)
         
         if mode == "AUCTION" or self.is_first_session_run or is_urgent or is_period_hit:
+            # [V15.0] 实时捕获模式：在 09:25 分析后，将实时内存数据固化至归档字典并同步 Redis
+            if mode == "AUCTION" and not self.auction_synced_date:
+                logger.info("💾 [Anchor Persistence] 正在将实时竞价捕获结果固化至内存与 Redis...")
+                self.auction_snapshot = {s.code: s.open_pct for s in report.all_stocks if s.code}
+                self.auction_synced_date = datetime.now().strftime("%Y-%m-%d")
+                # 异步推送到 Redis 供其它系统/重启回赎使用
+                date_sh = self.auction_synced_date.replace("-", "")
+                await self.redis.set(f"market:auction:anchor:{date_sh}", json.dumps(self.auction_snapshot), ex=172800)
+
             # 标记战役 KPI 用于看板显示
             report.battle_kpis['current_time'] = now.strftime("%H:%M")
-            up_cnt = sum(1 for s in report.all_stocks if s.current_pct > 0.0)
-            down_cnt = sum(1 for s in report.all_stocks if s.current_pct < 0.0)
+            # [V12.1] 增加空值过滤防御 (针对非交易日或数据空洞)
+            up_cnt = sum(1 for s in report.all_stocks if s and s.current_pct > 0.0)
+            down_cnt = sum(1 for s in report.all_stocks if s and s.current_pct < 0.0)
             report.battle_kpis['up_down_ratio'] = f"{up_cnt}/{down_cnt}"
             
             # 先换行，避免覆盖交互线
@@ -521,7 +676,7 @@ class AuctionOrchestrator:
                         for sig in report.strategic_signals
                     ]
                 }
-                self.redis.set(snap_key, json.dumps(signals_data, ensure_ascii=False), ex=604800)
+                await self.redis.set(snap_key, json.dumps(signals_data, ensure_ascii=False), ex=604800)
                 logger.info(f"💾 [Snapshot] 宏观镜像与实战指令已固化 ({snap_key})")
 
             self.last_sentiment, self.is_first_session_run = report.money_making_effect, False
@@ -529,12 +684,22 @@ class AuctionOrchestrator:
     async def run_guardian(self):
         logger.info("🛡️ MarketEdge V7.2.1 Strategic Guardian (对准增强版) 物理上线")
         date_str = datetime.now().strftime("%Y-%m-%d")
-        yes_str = self.calendar.get_previous_trading_day(date_str)
+        now = datetime.now()
+        
+        # [V15.0] 智能仿真对焦：仅在周末且未明确指定测试日期时开启
+        if now.weekday() >= 5 and self.calendar.is_trade_day(date_str) == False:
+             logger.info("🎮 [Simulation] 侦测到非交易日启动，自动切入周末仿真对合 (2026-04-10)...")
+             date_str = "2026-04-10"
+             yes_str = "2026-04-09"
+        else:
+             yes_str = self.calendar.get_previous_trading_day(date_str)
+
         self._today = date_str
         self._session = aiohttp.ClientSession()
         await self._startup_sync(date_str)
         
         asyncio.create_task(self._v2_tick_pump())
+        asyncio.create_task(self._risk_monitoring_loop()) # [V9.5] 激活风控哨兵
         await asyncio.sleep(2)
         
         # 初始推演 (盘前重播模式) - 仅在 09:25 以后启动才立即输出，防止盘前刷屏噪音
@@ -544,11 +709,15 @@ class AuctionOrchestrator:
 
         while self.is_running:
             now = datetime.now()
-            if now.weekday() >= 5:
-                await asyncio.sleep(300); continue
+            # if now.weekday() >= 5:
+            #     await asyncio.sleep(300); continue
             h_m = now.strftime("%H:%M")
             
-            if h_m == "08:30":
+            if h_m == "08:30" or h_m == "09:00":
+                # [V15.0] 全周期状态重置：清理昨日记忆，准备迎接新一轮竞价捕获
+                logger.info("♻️ [Lifecycle] 清除历史竞价记忆，准备进入当日实时分析阶段...")
+                self.auction_synced_date = ""
+                self.auction_snapshot = {}
                 await self.lifecycle.on_startup()
                 self.yest_limit_map = await self._fetch_kaipan_limit_ups(yes_str)
                 await asyncio.sleep(60)
@@ -558,20 +727,24 @@ class AuctionOrchestrator:
                 await asyncio.sleep(60)
             elif h_m == "15:05":
                 logger.info("🏁 [Market-Close] 停止监听"); await asyncio.sleep(60)
-            elif h_m == "16:30":
+            elif h_m == "17:40":
                 await asyncio.get_event_loop().run_in_executor(None, self.kline_service.preload_latest_dates)
                 await self.lifecycle.on_eod()
                 try: subprocess.Popen([sys.executable, "v2_final_retro.py"])
                 except: pass
                 await asyncio.sleep(60)
-            elif "09:30" <= h_m <= "15:00":
-                # 每 3 分钟执行一次深度推演 (保持指标更新)
-                if now.minute % 3 == 0 and now.second < 5: 
+            elif 1:#"09:30" <= h_m <= "15:00":
+                # [V12.2] 强制首跑点亮：如果是刚启动，且处于交易时间段，立即执行一次全量分析
+                is_time_to_analyze = (now.minute % 3 == 0 and now.second < 5)
+                if self.is_first_session_run or is_time_to_analyze:
                     await self.execute_analysis(date_str, mode="INTRA_DAY")
+                    self.is_first_session_run = False
                 
                 # 每 10 秒单行状态栏刷新 (不增行)
                 if now.second % 10 == 0:
-                    hb_text = f"[{h_m}] 🛡️ 战役对准 | 情绪:{self.last_sentiment:.1f} | 龙头: {self.highest_board.name if self.highest_board else 'N/A'} ({self.highest_board.current_pct*100:+.1f}%)   "
+                    hb_name = self.highest_board.name if self.highest_board else 'N/A'
+                    hb_pct = self.highest_board.current_pct * 100 if self.highest_board else 0.0
+                    hb_text = f"[{h_m}] 🛡️ 战役对准 | 情绪:{self.last_sentiment:.1f} | 龙头: {hb_name} ({hb_pct:+.1f}%)   "
                     sys.stdout.write(f"\r{hb_text}")
                     sys.stdout.flush()
                 await asyncio.sleep(1)
@@ -591,11 +764,13 @@ class AuctionOrchestrator:
                 if not ("09:15" <= h_m <= "11:50" or "12:55" <= h_m <= "15:10"):
                     await asyncio.sleep(60); continue
                 t_start = time.time()
-                # 🛠️ 优化 1: 仅拉取所需字段，避免 HGETALL 产生 5000+ 重叠字典
+                # 🛠️ 优化 1: 仅拉取所需字段
                 fields = ["price", "current", "amount", "volume", "time", "bid_amount"]
-                pipe = self.redis.pipeline()
-                for k in redis_keys: pipe.hmget(k, fields)
-                results = pipe.execute()
+                async with self.redis.pipeline(transaction=False) as pipe:
+                    for k in redis_keys: 
+                        await pipe.hmget(k, fields)
+                    results = await pipe.execute()
+                
                 await self.prime.sync_kaipan_hotspots()
                 m_idx = int(time.time() // 60)
                 
@@ -633,6 +808,116 @@ class AuctionOrchestrator:
                 await asyncio.sleep(3)
             except Exception as e: logger.error(f"❌ [Pump] Error: {e}"); await asyncio.sleep(5)
 
+    async def _risk_monitoring_loop(self):
+        """[V9.5] 实时风控哨兵任务"""
+        logger.info("🛡️ [RiskSentinel] 持仓风险监控哨兵已上线")
+        from engine_v2.v2_risk_controller import OpeningStopLoss, IntradayTracker, MainlineValidator, RiskAction
+        
+        while self.is_running:
+            try:
+                now = datetime.now()
+                h_m = now.strftime("%H:%M")
+                if not ("09:30" <= h_m <= "15:00"):
+                    await asyncio.sleep(30); continue
+                
+                # 1. 拉取实时持仓 (从 Redis)
+                holdings_raw = await self.redis.get("market:account:holdings")
+                if not holdings_raw:
+                    await asyncio.sleep(15); continue
+                holdings = json.loads(holdings_raw) # 预期格式: {"000889": {"cost": 3.85, "is_mainline": True, "entry_time": "09:25"}}
+                
+                # 2. 获取快照
+                snapshot = self.bridge.get_snapshot()
+                if not snapshot:
+                    await asyncio.sleep(5); continue
+                
+                # 3. 逐一巡检
+                for code, info in holdings.items():
+                    curr_p = snapshot.get(code, {}).get("price", 0.0)
+                    if curr_p <= 0.01: continue
+                    
+                    cost = info.get("cost", 0.0)
+                    is_mainline = info.get("is_mainline", False)
+                    
+                    decision = None
+                    # A. 开盘止损 (09:30 - 09:35)
+                    if "09:30" <= h_m <= "09:35":
+                        decision = OpeningStopLoss.evaluate(curr_p, cost, is_mainline)
+                    
+                    # B. 盘中追踪 (09:35 - 15:00)
+                    else:
+                        # 记录/获取历史最高价
+                        if code not in self.risk_stats:
+                            self.risk_stats[code] = {"high": curr_p, "p_2m": curr_p, "last_t": time.time()}
+                        
+                        stats = self.risk_stats[code]
+                        stats["high"] = max(stats["high"], curr_p)
+                        
+                        # 每 2 分钟滚动一次价格锚点
+                        if time.time() - stats["last_t"] > 120:
+                            stats["p_2m"] = curr_p
+                            stats["last_t"] = time.time()
+                        
+                        # 执行盘中评估器
+                        # [P1] 动态验证主线有效性
+                        # 获取板块排名与龙头状态 (适配 V3.5 字典结构)
+                        plate_stats = self.prime.hot_plates_map.get(info.get("plate", ""), {}) 
+                        is_valid, v_reason = MainlineValidator.is_mainline_valid(
+                            sector_strength_rank=plate_stats.get('rank', 99),
+                            leader_is_locked=info.get("is_leader_locked", True), # 默认主线龙头为锁定，除非手动干预
+                            sector_volume_vs_peak=1.0, # 简版暂定
+                            current_sentiment=self.last_sentiment,
+                            auction_sentiment=7.0 # 模拟基准
+                        )
+                        
+                        mainline_ready = is_mainline and is_valid
+                        
+                        decision = IntradayTracker.evaluate_hard_stop(curr_p, cost, is_mainline, mainline_ready)
+                        if not decision:
+                            # [P0 Fix] 使用真实的昨收价映射
+                            prev_close = self.pre_close_map.get(code, cost)
+                            high_pct = (stats["high"] / prev_close) - 1.0
+                            curr_pct = (curr_p / prev_close) - 1.0
+                            decision = IntradayTracker.evaluate_spike_reversal(high_pct, curr_pct, is_mainline, mainline_ready)
+                        if not decision:
+                            decision = IntradayTracker.evaluate_plunge_speed(stats["p_2m"], curr_p, is_mainline, mainline_ready)
+                        
+                        # [P1] 炸板监控
+                        if not decision:
+                            p_close_val = self.pre_close_map.get(code, 0)
+                            is_limit = curr_p >= (p_close_val * 1.098) if p_close_val > 0 else False
+                            if not is_limit and stats.get("was_limit", False):
+                                # 刚刚炸板
+                                if "limit_break_t" not in stats:
+                                    stats["limit_break_t"] = time.time()
+                                    logger.warning(f"🌀 [Risk] {code} 发生炸板，开始 30min 倒计时回封监控")
+                                
+                                # 评估炸板时长
+                                diff_min = (time.time() - stats["limit_break_t"]) / 60
+                                decision = IntradayTracker.evaluate_limit_open(int(diff_min), is_limit, is_mainline)
+                            elif is_limit:
+                                stats["was_limit"] = True
+                                stats.pop("limit_break_t", None) # 回封则清除计时
+                    
+                    # 4. 指令输出
+                    if decision and decision.action != RiskAction.HOLD:
+                        color = "\033[91m" if "清仓" in decision.reason or "止损" in decision.reason else "\033[93m"
+                        reset = "\033[0m"
+                        msg = f"{color}🔥 [RISK ALERT] {code} | {decision.action.value} | 原因: {decision.reason}{reset}"
+                        sys.stdout.write(f"\n{msg}\n")
+                        # 写入报警通道
+                        await self.redis.lpush("market:risk:alerts", json.dumps({
+                            "time": now.strftime("%H:%M:%S"),
+                            "code": code,
+                            "action": decision.action.value,
+                            "reason": decision.reason
+                        }, ensure_ascii=False))
+
+                await asyncio.sleep(15) # 15 秒轮询一次
+            except Exception as e:
+                logger.error(f"⚠️ [RiskSentinel] Error: {e}")
+                await asyncio.sleep(10)
+
     async def _sync_and_calculate_stock(self, symbol: str) -> bool:
         try:
             target_day = self._today
@@ -640,14 +925,52 @@ class AuctionOrchestrator:
             k_list = await asyncio.get_event_loop().run_in_executor(None, self.kline_service.fetch_kline_data, symbol, 'd', None, target_day)
             if k_list and len(k_list) >= 5:
                 res = await asyncio.get_event_loop().run_in_executor(None, self.chip_runner.calculate_for_stock, symbol, k_list, target_day)
-                code, peak, factors = res
-                if peak:
-                    self.redis.hset(f"cache:chip_peaks:{target_day}", symbol, json.dumps(peak))
-                    self.redis.hset(f"cache:stock_extra:{target_day}", symbol, json.dumps(factors))
-                    await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_chips, symbol, peak)
+                if res and isinstance(res, (list, tuple)) and len(res) == 3:
+                    code, peak, factors = res
+                    if peak:
+                        await self.redis.hset(f"cache:chip_peaks:{target_day}", symbol, json.dumps(peak))
+                        await self.redis.hset(f"cache:stock_extra:{target_day}", symbol, json.dumps(factors))
+                        await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_chips, symbol, peak)
                 return True
-            return False
         except: return False
+    
+    async def _get_pre_close_map(self, target_date: str = None) -> Dict[str, float]:
+        """[P0 Fix] 获取昨收价映射，使用 Pipeline 优化确保 5000+ 样本秒级对齐"""
+        try:
+            # 1. 获取所有实时 Key
+            keys = await self.redis.keys("stock:quote:*")
+            if not keys:
+                 if target_date:
+                    hist_key = f"market:snapshot:{target_date.replace('-','')}:pre_close"
+                    hist_data = await self.redis.get(hist_key)
+                    if hist_data: return json.loads(hist_data)
+                 # 最后的降级：从元数据预加载
+                 return {code: float(info.get('pre_close', 0)) for code, info in self.metadata.stock_info.items()}
+
+            # 2. Pipeline 批量拉取 (O(1) 替代 O(N))
+            price_map = {}
+            async with self.redis.pipeline(transaction=False) as pipe:
+                for k in keys:
+                    pipe.hget(k, "pre_close")
+                results = await pipe.execute()
+            
+            for k, p_str in zip(keys, results):
+                if p_str:
+                    code = k.split(":")[-1]
+                    price_map[code] = float(p_str)
+            
+            # 3. 完整性补充：如果 Redis 缺失，用 Metadata 里的昨收补齐
+            if len(price_map) < 4000:
+                logger.info(f"🛡️ [P0 Refresh] Redis 样本不足 ({len(price_map)}), 正在注入 Metadata 基准...")
+                for code, info in self.metadata.stock_info.items():
+                    if code not in price_map:
+                        p_c = float(info.get('pre_close', 0))
+                        if p_c > 0.01: price_map[code] = p_c
+            
+            return price_map
+        except Exception as e:
+            logger.error(f"❌ 昨收基准拉取失败: {e}")
+            return {code: float(info.get('pre_close', 0)) for code, info in self.metadata.stock_info.items() if 'pre_close' in info}
 
     async def _sync_stock_dde(self, symbol: str) -> bool:
         try:

@@ -52,12 +52,12 @@ class ResonancePrimeService:
             else:
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {e}")
 
-    def calculate_battle_kpis(self, date_str: str) -> dict:
+    async def calculate_battle_kpis(self, date_str: str) -> dict:
         """
         计算昨日涨停标兵的晋级率、爆头率、红开率。
         """
         zt_key = f"limit_up_{date_str}"
-        zt_raw = self.r.get(zt_key)
+        zt_raw = await self.r.get(zt_key)
         if not zt_raw: return {}
 
         zt_items = json.loads(zt_raw)
@@ -71,7 +71,7 @@ class ResonancePrimeService:
 
         for it in zt_items:
             code = it.get("code") or it.get("股票代码")
-            q = self.r.hgetall(f"stock:quote:{code}")
+            q = await self.r.hgetall(f"stock:quote:{code}")
             if not q: continue
 
             cp = float(q.get("change_pct", 0))
@@ -86,13 +86,28 @@ class ResonancePrimeService:
             # 假设存储在 quote 的 bid_amount 字段
             total_bid_amt += float(q.get("bid_amount", 0))
 
+        # [Sentiment Recalibration]
+        promotion_rate = promotion_cnt / total
+        headshot_rate = headshot_cnt / total
+        # 赚钱效应评分 (0-10): 晋级率(50%) + 红开率(30%) + (1-爆头率)(20%)
+        sentiment_score = round((promotion_rate * 0.5 + (red_open_cnt / total) * 0.3 + (1 - headshot_rate) * 0.2) * 10, 1)
+
+        max_lb = 0
+        for it in zt_items:
+            lb = int(it.get('lb_days', 1))
+            if lb > max_lb: max_lb = lb
+
         return {
             "total_count": total,
             "red_open_rate": red_open_cnt / total,
-            "promotion_rate": promotion_cnt / total,
-            "headshot_rate": headshot_cnt / total,
+            "promotion_rate": promotion_rate,
+            "headshot_rate": headshot_rate,
+            "sentiment_score": sentiment_score,
+            "max_lb": max_lb,
+            "consensus_score": promotion_cnt * 5,
+            "red_green_ratio": red_open_cnt / max(1, total - red_open_cnt),
             "avg_bid_amt": total_bid_amt / total if total > 0 else 0,
-            "battle_status": self._judge_status(headshot_cnt / total, promotion_cnt / total)
+            "battle_status": self._judge_status(headshot_rate, promotion_rate)
         }
 
     def _judge_status(self, headshot_rate: float, promotion_rate: float) -> str:

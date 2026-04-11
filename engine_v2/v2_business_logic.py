@@ -61,12 +61,11 @@ class V2BusinessLogicService:
         st_score: float,
         red_green_ratio: float,
         max_lb: int,
-        consensus_score: float,
+        consensus_score: float = 20.0,
         effectiveness: float = 0.5,
         fade_count: int = 0,
         one_word_break_rate: float = 0.0,
-        seal_ratio_front20: float = 1.0,
-        last_phase: str = "UNKNOWN"
+        seal_ratio_front20: float = 1.0
     ) -> EmotionPhaseResult:
         """
         核心情绪状态机逻辑。
@@ -98,7 +97,9 @@ class V2BusinessLogicService:
             confidence = 0.9
 
         # CLIMAX (高潮)
-        elif (consensus_score > 35 or seal_ratio_front20 > 1.25) and max_lb >= 5 and red_green_ratio > 0.85:
+        # 条件: 高赚钱效应 + 红绿比积极 + 至少4连板龙头
+        # consensus_score/seal 是加分项，不再是强依赖
+        elif (st_score >= 6.5 and red_green_ratio >= 1.15 and max_lb >= 4):
             phase = "climax"
             pos_cap = 0.6
             allowed = ["low_level_relay", "high_board_chase", "new_theme_first_board"]

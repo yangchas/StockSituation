@@ -65,9 +65,9 @@ class DataLifecycleManager:
         if dt_time(0, 0) <= now <= dt_time(15, 0):
             await self._sync_metadata()
 
-        # 2. 核心调度：17:40 - 24:00 或 00:00 - 09:15 进入数据对撞窗口
+        # 2. 核心调度：17:40 - 24:00 或 00:00 - 09:00 进入数据对撞窗口
         # 将触发时间对准至 17:40，确保 Baostock 日线数据结清
-        if dt_time(17, 40) <= now <= dt_time(23, 59) or dt_time(0, 0) <= now < dt_time(9, 15):
+        if dt_time(17, 40) <= now <= dt_time(23, 59) or dt_time(0, 0) <= now < dt_time(9, 0):
             # [A.全量对撞] 数据补齐
             logger.info(f"[Lifecycle] 🕒 [A.全量对撞] 窗口开启 (当前: {now.strftime('%H:%M')})...")
             await self._sync_daily_kline()

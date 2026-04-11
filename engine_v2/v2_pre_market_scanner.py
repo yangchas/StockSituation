@@ -40,9 +40,17 @@ class PreMarketScanner:
         symbols = list(self.meta.stock_info.keys())
         candidates = []
         
-        # 批量获取全场水位因素 (模拟环境暂用 SQL, 实战建议走超级表)
-        # 获取 20 日均线乖离率 (bias_20) 和 获利盘比例 (profit_ratio)
-        sql = f"SELECT symbol, LAST(bias_20), LAST(profit_ratio), LAST(vol_ratio) FROM daily_factors WHERE ts <= '{target_date} 23:59:59' GROUP BY symbol"
+        from engine_v2.v2_quantitative_factors import calc_daily_score
+        
+        # 批量获取全场水位因素 (基于 market_data1 因子库超级表)
+        sql = f"""
+        SELECT 
+            symbol, LAST(bias_20), LAST(profit_ratio), LAST(vol_ratio), 
+            LAST(rsi_6), LAST(concentration) 
+        FROM market_data1.daily_factors 
+        WHERE ts <= '{target_date} 23:59:59' 
+        GROUP BY symbol
+        """
         
         try:
             loop = asyncio.get_event_loop()
@@ -54,22 +62,22 @@ class PreMarketScanner:
             rows = cursor.fetchall()
             factors_map = {row[0]: (row[1], row[2], row[3]) for row in rows}
             
-            for code in symbols:
-                f = factors_map.get(code)
-                if not f: continue
+            for row in rows:
+                code, bias_20, profit, vol_ratio, rsi_6, concentration = row
                 
-                bias_20, profit, vol_ratio = f
+                # 调用量化评分引擎 (V9.0)
+                score = calc_daily_score(bias_20, profit, vol_ratio, rsi_6, concentration)
                 
-                # 漏斗 1: 位阶判定
-                # 逻辑：价格偏离 20 日线不超过 5% (甚至水下) 且 获利盘比例在 30%-70% 之间 (非极度抛压也非过热)
-                if bias_20 is not None and bias_20 < 0.05:
-                    if profit is not None and 30 < profit < 85:
-                        candidates.append({
-                            "code": code,
-                            "bias_20": bias_20,
-                            "profit": profit,
-                            "vol_ratio": vol_ratio
-                        })
+                # 漏斗: 仅保留 60 分以上的高质量种子
+                if score >= 60:
+                    candidates.append({
+                        "code": code,
+                        "score": score,
+                        "bias_20": bias_20,
+                        "profit_ratio": profit,
+                        "vol_ratio": vol_ratio,
+                        "date": target_date
+                    })
             
             # 存入 Redis
             if candidates:

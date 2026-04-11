@@ -15,8 +15,6 @@ from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 from v2_business_logic import V2BusinessLogicService, EmotionPhaseResult, YesterdayStateProfile
 from v2_strategy_memory_service import StrategyMemoryService, EnvironmentDNA
-
-# 日志配置
 logger = logging.getLogger("V5Analyzer")
 
 @dataclass
@@ -83,6 +81,7 @@ class AuctionReport:
     rotation_msg: str = ""
     summary_text: str = ""
     battle_kpis: Dict = field(default_factory=dict) 
+    red_green_ratio: float = 0.0
     emotion: Optional[Any] = None
 
 def build_summary(report: AuctionReport) -> str:
@@ -199,16 +198,19 @@ class AuctionAnalyzer:
     async def analyze(
         self, current_raw: List[Dict], auction_snapshot: Optional[Dict[str, float]] = None,
         yest_limit_map: Optional[Dict[str, AuctionStock]] = None, yest_hot_plates = None,
-        date_str: str = "", battle_kpis: Dict = None, alpha_candidates: Optional[Dict] = None
+        date_str: str = "", battle_kpis: Dict = None, alpha_candidates: Optional[Dict] = None,
+        allowed_setups: Optional[List[str]] = None
     ) -> AuctionReport:
         mode = "INTRA_DAY" if auction_snapshot else "AUCTION"
         report = AuctionReport(date_str=date_str, mode=mode, battle_kpis=battle_kpis or {})
+        _allowed = allowed_setups or [] # [V9.0] 激活允许战法名单
+        # [作战预检] 初始化环境指标，供决策链使用
         yest_limit_map = yest_limit_map or {}
         auction_snapshot = auction_snapshot or {}
         
-        # 🛠️ 优化 1: 批量拉去板块信息，严禁循环内 HGET
+        # 🛠️ 优化 1: 批量拉去板块信息
         if not self.plate_cache or len(self.plate_cache) < 100:
-            self.plate_cache = self.redis.hgetall("market:stock_plate") or {}
+            self.plate_cache = await self.redis.hgetall("market:stock_plate") or {}
 
         stocks: List[AuctionStock] = []
         for item in current_raw:
@@ -260,6 +262,7 @@ class AuctionAnalyzer:
         total_red = sum(1 for s in stocks if s.current_pct > 0.0)
         total_green = sum(1 for s in stocks if s.current_pct < -0.0)
         red_green_ratio = total_red / max(1, total_green)
+        report.red_green_ratio = red_green_ratio
         report.emotion = self.logic.predict_market_phase(
             st_score=report.money_making_effect,
             red_green_ratio=red_green_ratio,
@@ -338,6 +341,31 @@ class AuctionAnalyzer:
                 elif s.resistance_gap < 0.03:
                     action, reason = "补涨抢筹", f"💎 身位套利: 同板块标杆封死 | 筹码极优"
                     conf += 20
+                
+            # [V9.0] PatternFactory 战法工厂：覆盖 allowed_setups 触发的高置信模式
+            if _allowed and action not in ("高危避雷", "观望"):
+                from engine_v2.v2_quantitative_factors import PatternFactory, calc_kelly_position
+                pattern = PatternFactory.match(
+                    code=s.code, price=s.price,
+                    open_pct=s.open_pct, vol_ratio=s.vol_ratio,
+                    lb_days=s.lb_days, plate=s.plate,
+                    plate_resonance=s.resonance_factor,
+                    resistance_gap=s.resistance_gap,
+                    is_alpha_seed=("ALPHA种子" in s.tags),
+                    allowed_setups=_allowed,
+                    sentiment_score=report.money_making_effect,
+                )
+                if pattern:
+                    action = pattern["action"]
+                    reason = pattern["reason"]
+                    conf += pattern["conf_bonus"]
+                    # 凯利仓位建议 (基于 V9.6 历史 DNA 真实胜率对准)
+                    history = self.memory.match_dna(code=s.code, setups=[pattern["action"]])
+                    real_win_rate = history.get(pattern["action"], {}).get("win_rate", 0.48)
+                    if "ALPHA种子" in s.tags: real_win_rate = max(real_win_rate, 0.55)
+                    
+                    kelly_pos = calc_kelly_position(win_rate=real_win_rate)
+                    reason += f" | 建议仓位: {kelly_pos*100:.1f}% (胜率:{real_win_rate:.0%})"
 
             # C. 强转弱回避 (不及预期 + 动能背离)
             elif s.lb_days >= 3 and s.open_pct < s.expected_pct and s.momentum_delta < -0.01:
