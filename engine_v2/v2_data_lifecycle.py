@@ -56,7 +56,7 @@ class DataLifecycleManager:
         self.calendar    = TradingCalendarService()
         self._state      = _load_state()
 
-    async def on_startup(self):
+    async def on_startup(self, override_date: str = None):
         """启动自检：全时窗排期检测 (V3.1 集成版)"""
         now = datetime.now().time()
         logger.info(f"[Lifecycle] 🚀 智库自检中 (Time: {now.strftime('%H:%M:%S')})")
@@ -70,7 +70,7 @@ class DataLifecycleManager:
         if dt_time(17, 40) <= now <= dt_time(23, 59) or dt_time(0, 0) <= now < dt_time(9, 0):
             # [A.全量对撞] 数据补齐
             logger.info(f"[Lifecycle] 🕒 [A.全量对撞] 窗口开启 (当前: {now.strftime('%H:%M')})...")
-            await self._sync_daily_kline()
+            await self._sync_daily_kline(override_date)
             await self._trigger_factors()
             
             # [B.物理审计] 跨日对账逻辑 (建议在 01:00 - 08:30 之间执行)
@@ -98,13 +98,16 @@ class DataLifecycleManager:
             if self._fn_plates: await self._fn_plates()
         except Exception as e: logger.error(f"[Lifecycle] Metadata Error: {e}")
 
-    async def _sync_daily_kline(self):
+    async def _sync_daily_kline(self, override_date: str = None):
         """V3.1 集成对撞逻辑：K线与因子并行处理"""
-        today = date.today().strftime("%Y-%m-%d")
+        today = override_date or date.today().strftime("%Y-%m-%d")
         now = datetime.now().time()
         
         # 确定目标日期：15:30前算上一交易日，15:30后算今日
-        if now < dt_time(15, 30):
+        # [V19.6] 如果 override_date 存在，则跳过逻辑判断直接对齐
+        if override_date:
+            target_date = override_date
+        elif not self.calendar.is_trade_day(today) or now < dt_time(15, 30):
             target_date = self.calendar.get_previous_trade_day(today)
         else:
             target_date = today
@@ -135,6 +138,17 @@ class DataLifecycleManager:
             func_map={"integrated_sync": self._fn_kline},
             arg_builder=lambda t: (t.symbol,),
         )
+        
+        # 🚀 [V34.3] 自动黑名单构建：将最终失败的僵尸股加入黑名单
+        fails = [r for r in results if r.status == TaskStatus.FAILED]
+        if fails:
+            from v2_infra_provider import get_global_redis
+            r_client = await get_global_redis()
+            for f_task in fails:
+                # 判据：如果是由于函数返回 False (数据源缺失) 导致的最终失败
+                if f_task.error == "Function returned False" and f_task.symbol:
+                    await r_client.sadd("market_edge:blacklist", f_task.symbol)
+                    logger.warning(f"🗄️ [Blacklist-Auto] {f_task.symbol} 物理同步失败已达上限，已永久列入黑名单过滤池")
         
         done = sum(1 for r in results if r.status == TaskStatus.DONE)
         if done == len(pending):

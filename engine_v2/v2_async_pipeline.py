@@ -133,11 +133,21 @@ class AsyncDataPipeline:
         *args,
         **kwargs,
     ) -> FetchTask:
-        """执行单个任务，含重试 + 超时 + 检查点跳过"""
+        """执行单个任务，含重试 + 超时 + 检查点跳过 + [V34.2] 黑名单避障"""
         if self.checkpoint.is_done(task.task_id):
             task.status = TaskStatus.DONE
             logger.debug(f"[skip] {task.task_id} 已完成（续传）")
             return task
+
+        # 🚀 [V34.2] 物理黑名单检查：如果是已知退市、ST或无数据标的，静默跳过
+        if task.symbol:
+            from v2_infra_provider import get_global_redis
+            r = await get_global_redis()
+            if await r.sismember("market_edge:blacklist", task.symbol):
+                task.status = TaskStatus.DONE
+                self.checkpoint.mark_done(task.task_id)
+                logger.info(f"🚫 [SKIP] {task.symbol} 为已知黑名单标的，物理跳过")
+                return task
 
         for attempt in range(self.max_retry + 1):
             try:

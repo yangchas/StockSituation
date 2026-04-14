@@ -24,6 +24,8 @@ class StrategicSignal:
     action: str # 买入/持有/减仓/止损/观望
     confidence: float # 0-100
     reason: str
+    current_pct: float = 0.0
+    plate: str = ""  # 🚀 [V29.0] 补齐板块属性用于风控映射
     is_fake_signal: bool = False
 
 class AuctionStock:
@@ -32,7 +34,8 @@ class AuctionStock:
         'code', 'name', 'change_pct', 'auction_amount', 'lb_days', 'is_yest_limit', 
         'plate', 'expected_pct', 'is_super_expected', 'open_pct', 'current_pct', 
         'momentum_delta', 'volume_intensity', 'speed_1m', 'amount_2m', 
-        'resonance_factor', 'yest_amount', 'resistance_gap', 'vol_ratio', 'tags', 'seal_amount', 'price'
+        'resonance_factor', 'yest_amount', 'resistance_gap', 'vol_ratio', 'tags', 'seal_amount', 'price',
+        'is_locked'  # 🚀 [V25.2] 补齐插槽声明
     )
     def __init__(self, code, name="unknown", **kwargs):
         self.code = code
@@ -57,6 +60,7 @@ class AuctionStock:
         self.tags = kwargs.get('tags', [])
         self.seal_amount = float(kwargs.get('seal_amount', 0.0))
         self.price = float(kwargs.get('price', 0.0))
+        self.is_locked = bool(kwargs.get('is_locked', False)) # 🚀 显式初始化
 
 @dataclass
 class AuctionReport:
@@ -85,8 +89,9 @@ class AuctionReport:
     emotion: Optional[Any] = None
 
 def build_summary(report: AuctionReport) -> str:
-    """V5.5 短线作战大屏 - 极致紧凑看板"""
-    now_hm = report.battle_kpis.get('current_time', '09:25')
+    """V19.2 Sentinel-Edition 大屏 - 极简锚点版"""
+    from datetime import datetime
+    now_hm = report.battle_kpis.get('current_time', datetime.now().strftime('%H:%M'))
     data_src = report.battle_kpis.get('data_source', 'Redis')
     health_icon = "🟢" if data_src == "Redis" else ("🟡" if data_src == "WENCAI" else "🟠")
     
@@ -95,7 +100,7 @@ def build_summary(report: AuctionReport) -> str:
     audit_warn = f" | ⚠️ 竞价缺失:{missing_cnt}" if missing_cnt > 0 else ""
 
     lines = [
-        f"================ [{now_hm}] 短线作战分析 (V5.5) ================",
+        f"================ [{now_hm}] V38.2 [Titan-Edition] ================",
         f"🌡️ [战温] 评分: {report.money_making_effect}/10 | 阶段: {report.cycle_phase} | 数据: {health_icon}{data_src}{audit_warn}",
         f"💰 [量能] {report.total_amount/1e8:.2f}亿 | 核心风向: {report.amount_king.name if report.amount_king else 'N/A'}({report.amount_king.auction_amount/1e8 if report.amount_king else 0:.2f}亿)",
     ]
@@ -162,9 +167,37 @@ def build_summary(report: AuctionReport) -> str:
         for sig in report.strategic_signals[:8]:
             tag = "【建议买入】" if "买入" in sig.action else ("【封死观察】" if "观察" in sig.action else ("【炸板接力】" if "接力" in sig.action else "【补涨关注】"))
             icon = "🚀" if "买入" in sig.action else ("💎" if "关注" in sig.action or "观察" in sig.action else "🌀")
-            lines.append(f"   {tag} {sig.name} ({sig.confidence}%): {icon} {sig.reason}")
+            # 展示标的的实时涨跌幅 (current_pct)
+            lines.append(f"   {tag} {sig.name} ({sig.current_pct*100:+.1f}%): {icon} {sig.reason}")
 
+    # 8. 战役实时情报行 (Sentinel Heartbeat - V21.0 Ground-Truth 版)
+    # A. 动态板块回捞：即便 yest_hot_sectors 为空，也从 top_stocks 中提取最集中的板块
+    top_sector = "扫描中..."
+    if report.yest_hot_sectors:
+        top_sector = report.yest_hot_sectors[0][0]
+    else:
+        # 暴力回捞：从成交额或涨幅前20中找出现频率最高的板块
+        p_counts = defaultdict(int)
+        for s in report.all_stocks[:50]:
+            if s.plate and s.plate != "Other": p_counts[s.plate] += 1
+        if p_counts:
+            top_sector = sorted(p_counts.items(), key=lambda x: x[1], reverse=True)[0][0]
+        
+    # B. 风险对撞强化
+    risk_label = "🟢 稳"
+    if report.money_making_effect < 4.5:
+        risk_label = "🔴 杀跌"
+    elif report.battle_kpis.get('missing_auction_cnt', 0) > 30:
+        risk_label = "🟡 盲区" # 数据缺失导致的分析盲区
+    elif report.negative_stocks:
+        risk_label = "⚠️ 分歧"
+    
+    leader_name = report.highest_board.name if report.highest_board else "N/A"
+    leader_pct = (report.highest_board.current_pct * 100) if report.highest_board else 0.0
+    heartbeat = f"\r[{now_hm}] {risk_label} | 🔥 {top_sector[:4]} | 👑 {leader_name}({leader_pct:+.1f}%)"
+    
     lines.append(f"============================================================")
+    report.rotation_msg = heartbeat 
     return "\n".join(lines)
 
 class AuctionAnalyzer:
@@ -172,9 +205,10 @@ class AuctionAnalyzer:
         self.redis = redis_client or redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
         self.logic = V2BusinessLogicService()
         self.memory = StrategyMemoryService()
-        self.plate_cache = {} # 🛠️ 外部注入或批量拉取的板块映射
-        self.last_plates_strength = {}    
+        self.plate_cache = {} 
         self.auction_plates_strength = {} 
+        self.last_plates_strength = {}
+        self.last_summary_hash = "" # 🚀 V19.2: 用于输出去重
 
     def _calc_confidence(self, s: AuctionStock, sector_delta: float, sentiment: float) -> float:
         score = 40.0
@@ -373,7 +407,11 @@ class AuctionAnalyzer:
                 conf -= 20
             
             if action != "观望":
-                report.strategic_signals.append(StrategicSignal(code=s.code, name=s.name, action=action, confidence=conf, reason=reason))
+                report.strategic_signals.append(StrategicSignal(
+                    code=s.code, name=s.name, action=action, 
+                    confidence=conf, reason=reason, current_pct=s.current_pct,
+                    plate=s.plate # 🚀 [V29.1] 显式回传板块属性
+                ))
 
         # [V7.3 动态强度迁移探测]
         if yest_hot_plates:
@@ -419,7 +457,7 @@ class AuctionAnalyzer:
                         conf = self._calc_confidence(s, sector_slope, report.money_making_effect)
                         report.strategic_signals.append(StrategicSignal(
                             code=s.code, name=s.name, action="【主线切换】", 
-                            confidence=conf, 
+                            confidence=conf, current_pct=s.current_pct,
                             reason=f"⚡ 能量换挡: [{s.plate}] 动能斜率 {sector_slope:.1f}x | 标兵 {s.name} 平开放量"
                         ))
         # [系统对焦] 过滤掉当日涨停后的样本，重点分析盘中博弈标的
@@ -510,11 +548,15 @@ class AuctionAnalyzer:
 
         report.total_amount = sum(s.auction_amount for s in stocks)
         report.avg_market_pct = sum(s.open_pct for s in stocks) / len(stocks) if stocks else 0.0
-        report.limit_up_cnt = sum(1 for s in stocks if s.current_pct >= 0.095)
-        report.limit_down_cnt = sum(1 for s in stocks if s.current_pct <= -0.095)
-        report.battle_kpis = {
-            'current_time': time.strftime("%H:%M"),
-            'up_down_ratio': f"{total_red}/{total_green}"
-        }
-        report.summary_text = build_summary(report)
+        
+        # 🚀 V19.2: 基于内容的去重打印 + 智能情报行提取
+        summary = build_summary(report)
+        current_hash = str(hash(summary))
+        if current_hash == self.last_summary_hash:
+            # 去重期间，只输出精简的战役情报行，不重画大屏
+            report.summary_text = report.rotation_msg 
+        else:
+            self.last_summary_hash = current_hash
+            report.summary_text = summary
+            
         return report

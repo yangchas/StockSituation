@@ -28,7 +28,7 @@ class NetworkAuditLib:
         
         # B. 晋级失败池 (昨日涨停今日未涨停)
         yest_date = date_str # 问财自然语义会将'昨日'解析为date_str的前一天
-        q_fail = f"{date_str}昨日涨停;{date_str}未涨停;{date_str}收盘价;{date_str}成交额;{date_str}最高价;{date_str}开盘价"
+        q_fail = f"前日涨停;{date_str}未涨停;{date_str}收盘价;{date_str}成交额;{date_str}最高价;{date_str}开盘价"
         df_fail = await wencai.get_wencai_data(q_fail)
         
         return df_success, df_fail

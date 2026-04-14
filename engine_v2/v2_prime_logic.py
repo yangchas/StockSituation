@@ -33,11 +33,11 @@ class ResonancePrimeService:
             # fetch_kaipan_plate_rank 是同步函数，且返回字典 {"ok": True, "plates": [...]}
             res = fetch_kaipan_plate_rank()
             if res and res.get('ok'):
-                raw_plates = res.get('plates', [])
+                raw_plates = [p for p in res.get('plates', []) if p and p.get('name')]
                 self.hot_plates_map = {
-                    p['name']: {
-                        'strength': float(p.get('strength', 0)),
-                        'net_amount': float(p.get('main_net', 0)), # 注意：新接口字段名为 main_net
+                    str(p['name']): {
+                        'strength': float(p.get('strength', 0) or 0),
+                        'net_amount': float(p.get('main_net', 0) or 0),
                         'rank': i + 1
                     } for i, p in enumerate(raw_plates)
                 }
@@ -121,11 +121,12 @@ class ResonancePrimeService:
         全量能量对撞因子 (0.0 - 2.0)
         计算逻辑：基础权重 (Rank) + 强度溢价 + 净额系数
         """
-        if not self.hot_plates_map or not plate_name: return 1.0
+        if not self.hot_plates_map or not plate_name or not isinstance(plate_name, str): return 1.0
         
         # 匹配板块数据 (支持模糊匹配，防止 V1 与 Kaipan 名称微差)
         p_data = None
-        for name, data in self.hot_plates_map.items():
+        for name, data in (self.hot_plates_map or {}).items():
+            if not name or not data: continue
             if name in plate_name or plate_name in name:
                 p_data = data
                 break

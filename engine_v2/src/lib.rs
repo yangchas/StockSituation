@@ -110,6 +110,22 @@ impl MarketEngine {
         self.plate_to_stocks.insert(plate_id, indices);
     }
 
+    fn reload_metadata(&mut self) {
+        self.symbol_to_index.clear();
+        self.index_to_symbol.clear();
+        self.current_prices.clear();
+        self.current_amounts.clear();
+        self.open_prices.clear();
+        self.extremes.clear();
+        self.auction_snaps.clear();
+        self.price_history.clear();
+        self.daily_k_close.clear();
+        self.daily_k_vol.clear();
+        self.daily_k_high.clear();
+        self.daily_k_low.clear();
+        self.plate_to_stocks.clear();
+    }
+
     // --- Advanced Logic: Chip & Indicators ---
 
     fn update_daily_k(&mut self, symbol: &str, close: f64, high: f64, low: f64, vol: f64) {

@@ -92,6 +92,10 @@ class MetadataProvider:
             assets = df[col_mkt_cap].values
             roes = df[col_roe].values
             
+            # 🛠️ [V34.1] 物理排毒：根据名称特征自动过滤 ST、退市、停牌僵尸股
+            import re
+            blacklist_pattern = re.compile(r"(ST|\*ST|退)")
+            
             for code_val, name_val, asset_val, roe_val in zip(codes, names, assets, roes):
                 # 对齐处理：剥离后缀
                 code = str(code_val).split('.')[0].strip().zfill(6)
@@ -101,6 +105,10 @@ class MetadataProvider:
                 name = str(name_val).strip()
                 if len(name) > 8 or (name.isdigit() and len(name) > 4):
                     name = "unknown"
+                
+                # 🚀 物理过滤核心：直接剔除 ST/退市股
+                if blacklist_pattern.search(name):
+                    continue
                 
                 # 压缩存储：只保留核心数值，不再存储冗长的 main_products
                 self.stock_info[code] = {

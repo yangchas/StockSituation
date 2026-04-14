@@ -50,12 +50,21 @@ class RustMarketEngineAdapter:
         return self.engine.get_snapshot()
 
     def reload_metadata(self):
-        """[V3.1] 通知 Rust Core 重新加载 Redis 镜像 (筹码、因子等)"""
-        if self.engine and hasattr(self.engine, 'reload_metadata'):
-            self.engine.reload_metadata()
-            logger.info("📡 已指令 Rust Core 重新加载全量元数据镜像")
-        elif self.engine:
-            logger.warning("⚠️ Rust Core 当前版本尚不支持 reload_metadata 接口")
+        """[V33.0] 支持物理重载或逻辑重载（作为兜底）"""
+        if not self.engine: return
+        
+        if hasattr(self.engine, 'reload_metadata'):
+            try:
+                self.engine.reload_metadata()
+                logger.info("📡 已指令 Rust Core 执行物理内存归零 (V33.0 Physical)")
+                return
+            except Exception as e:
+                logger.warning(f"⚠️ Rust 物理重载失败: {e}，尝试逻辑重置...")
+        
+        # 🚀 [V33.0 Fallback] 逻辑重置方案：重新载入驱动模块
+        # 注意：这需要调用者稍后重新执行 register_symbols
+        logger.warning("🔄 Rust Core 不支持热重载，执行逻辑重置 (Re-Instantiating)...")
+        self._load_binary()
 
 # 独立单例供其他模块安全导入
 v2_core_bridge = RustMarketEngineAdapter()
