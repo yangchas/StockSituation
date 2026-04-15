@@ -123,6 +123,7 @@ class AuctionOrchestrator:
         # [V15.0] 生命周期状态管理：支持实战不重启捕获与 Redis 归档对位
         self.auction_snapshot = {}
         self.auction_synced_date = ""
+        self.last_report = None # 🚀 [V39.1] 持久化最后一份分析报告，防止 NightMode 冲刷
         # 定义适配 Lifecycle 的异步包装
         async def l_fetch_bans():
             yest = self.calendar.get_previous_trading_day(datetime.now().strftime("%Y-%m-%d"))
@@ -138,8 +139,10 @@ class AuctionOrchestrator:
             fetch_yest_plates_fn=l_fetch_plates,
             fetch_daily_kline_fn=self._sync_and_calculate_stock,
             fetch_dde_fn=self._sync_stock_dde,
-            trigger_rust_calc_fn=self._trigger_factor_calc
+            trigger_rust_calc_fn=self._trigger_factor_calc,
+            check_status_fn=self._physical_check_all_dimensions # 🚀 [V39.2] 统一物理校验逻辑
         )
+        self.watermarks: Dict[str, Dict[str, str]] = {} # 🚀 [V39.2] 水位内存映射：kline, dde, factor
         self._session = None # 🚀 [V26.2] 初始化预定义，防止清理时报错
     @property
     def tdengine(self):
@@ -268,7 +271,10 @@ class AuctionOrchestrator:
                 None, self.api_analyzer.get_history_bans_pool, date, 5
             )
             for item in raw_pool:
-                symbol = item['code']
+                raw_sym = item['code']
+                # 🚀 [V39.5] 物理对位：统一强制 6 位数字代码，消除 sh/sz 前缀干扰
+                symbol = raw_sym[-6:] if raw_sym else ""
+                if not symbol: continue
                 full_pool[symbol] = SimpleNamespace(
                     lb_days=item['lb_days'], plate=item['plate'],
                     is_yest_limit=True, close_pct=item['close_pct'],
@@ -410,6 +416,10 @@ class AuctionOrchestrator:
         data_sh = date_str.replace("-", "")
         # V5.5 预加载筹码压制分布 (从 Redis)
         chip_map = await self.redis.hgetall(f"cache:chip_peaks:{data_sh}") or {}
+        # 🚀 [V39.3] 预加载全量技术因子映射 (MACD, KDJ, MA, etc.)
+        factor_map_raw = await self.redis.hgetall(f"cache:stock_extra:{data_sh}") or {}
+        factor_map = {k: json.loads(v) for k, v in factor_map_raw.items()}
+        
         # [V10.0] 彻底解耦：竞价数据仅作为参考锚点 (self.auction_snapshot)，盘中严禁作为行情源
         if mode == "AUCTION" or (not self.auction_snapshot and mode == "INTRA_DAY"):
             base_key = f"market:auction:{data_sh}:0925"
@@ -460,6 +470,8 @@ class AuctionOrchestrator:
                     ref_bar = m2 or m1
                     if ref_bar: amount_2m = m0[1] - ref_bar[1] # [1] 为 Amount
                     if m1: speed_auto = (m0[0] - m1[0]) / m1[0] if m1[0] > 0.1 else 0.0 # [0] 为 Price
+                # 🚀 [V39.3] 注入增强型因子
+                f_data = factor_map.get(full_code, {})
                 current_data.append({
                     "code": full_code, 
                     "name": stock_info.get('name', 'Unknown'), 
@@ -472,6 +484,17 @@ class AuctionOrchestrator:
                     "vol_intensity": r_it.get("vol_intensity", 1.0) * res_factor,
                     "speed_1m": speed_auto, "amount_2m": amount_2m,
                     "yest_amount": y_amt, "resistance_gap": resistance_gap,
+                    # 🚀 多因子载入
+                    "macd_hist": f_data.get("macd_hist", 0.0),
+                    "kdj_j": f_data.get("kdj_j", 50.0),
+                    "ma5": f_data.get("ma5", 0.0),
+                    "ma10": f_data.get("ma10", 0.0),
+                    "ma20": f_data.get("ma20", 0.0),
+                    "dde_3d_sum": f_data.get("dde_3d_sum", 0.0) or f_data.get("ddje_3d_sum", 0.0),
+                    "concentration": f_data.get("concentration", 0.0),
+                    # 🚀 [V39.5] 反包状态注入
+                    "t2_lb_days": f_data.get("t2_lb_days", 0),
+                    "t2_pct": f_data.get("t2_pct", 0.0),
                     "source": "RUST"
                 })
         # 🚀 [V36.0] 这里是最隐蔽的覆盖点，必须强制 or {}
@@ -513,6 +536,7 @@ class AuctionOrchestrator:
             return
         # [V12.0] 实时感知当前情绪周期 (基于分析器产出的真实截面指标)
         current_allowed_setups = []
+        battle_kpis["current_time"] = datetime.now().strftime("%H:%M") # [V38.2] 修正时间锁死
         report = await self.analyzer.analyze(current_data, auction_snapshot=self.auction_snapshot if mode == "INTRA_DAY" else None,
                                            yest_limit_map=self.yest_limit_map, yest_hot_plates=getattr(self.prime, "hot_plates_map", {}) or {},
                                            date_str=date_str, battle_kpis=battle_kpis, alpha_candidates=self.alpha_candidates,
@@ -577,10 +601,7 @@ class AuctionOrchestrator:
                 await self.redis.set(f"market:auction:anchor:{date_sh}", json.dumps(self.auction_snapshot), ex=172800)
             # 标记战役 KPI 用于看板显示
             report.battle_kpis['current_time'] = now.strftime("%H:%M")
-            # [V12.1] 增加空值过滤防御 (针对非交易日或数据空洞)
-            up_cnt = sum(1 for s in report.all_stocks if s and s.current_pct > 0.0)
-            down_cnt = sum(1 for s in report.all_stocks if s and s.current_pct < 0.0)
-            report.battle_kpis['up_down_ratio'] = f"{up_cnt}/{down_cnt}"
+            self.last_report = report # 🚀 [V39.1] 固化以便非交易时间展示
             # 先换行，避免覆盖交互线
             sys.stdout.write("\n")
             if report.summary_text:
@@ -630,8 +651,6 @@ class AuctionOrchestrator:
         date_str = datetime.now().strftime("%Y-%m-%d")
         now = datetime.now()
         
-        
-
         # [V15.0] 智能仿真对焦：仅在周末且未明确指定测试日期时开启
         if now.weekday() >= 5 and self.calendar.is_trade_day(date_str) == False:
              logger.info("🎮 [Simulation] 侦测到非交易日启动，自动切入周末仿真对合 (2026-04-10)...")
@@ -641,13 +660,22 @@ class AuctionOrchestrator:
              yes_str = self.calendar.get_previous_trading_day(date_str)
         self._today = date_str
         self._session = aiohttp.ClientSession()
+
+        # 🚀 [V39.2] 一次性预审计：加载全场 5000 只标的水位，消除同步中的大量数据库 IO
+        await self._preload_all_watermarks(date_str)
         await self._startup_sync(date_str)
 
         # [V35.3 Official] 物理快照自愈：确保复盘引擎有粮草
         snap_key = f"market:snapshot:{date_str}"
         # 延迟一下，等 Redis 彻底稳固
         await asyncio.sleep(0.5)
-        if not await self.redis.exists(snap_key):
+
+        # 🚀 [V39.4 Fix] 预检：如果是当日启动且早于 09:25，严禁执行物理补全，防止数据空洞引发 Crash
+        now_str = datetime.now().strftime("%Y-%m-%d")
+        now_hm = datetime.now().strftime("%H:%M")
+        is_too_early = (date_str == now_str and now_hm < "09:25")
+
+        if not await self.redis.exists(snap_key) and not is_too_early:
              logger.warning(f"🗄️ [Repair] 未发现 {date_str} 的定音快照，正在强制执行物理补全...")
              try:
                  # 🚀 [V35.5] 对位对齐：调用真正的核心分析入口，触发快照固化
@@ -657,6 +685,7 @@ class AuctionOrchestrator:
 
         asyncio.create_task(self._v2_tick_pump())
         asyncio.create_task(self._risk_monitoring_loop()) # [V9.5] 激活风控哨兵
+        
         await asyncio.sleep(2)
         # 初始推演 (盘前重播模式) - 仅在 09:25 以后启动才立即输出，防止盘前刷屏噪音
         now_hm = datetime.now().strftime("%H:%M")
@@ -702,7 +731,13 @@ class AuctionOrchestrator:
                     sys.stdout.flush()
                 await asyncio.sleep(1)
             else:
-                if now.second % 60 == 0: logger.info(f"🌑 [NightMode] 引擎基盘在线 | 时刻: {h_m}")
+                if now.second % 60 == 0:
+                    if self.last_report and self.last_report.rotation_msg:
+                        # 🚀 [V39.1] 优雅心跳：在非交易时段，使用最后一份报告的心跳行刷新，不增行，不刷屏
+                        sys.stdout.write(f"{self.last_report.rotation_msg}")
+                        sys.stdout.flush()
+                    else:
+                        logger.info(f"🌑 [NightMode] 引擎基盘在线 | 时刻: {h_m}")
                 await asyncio.sleep(1)
     async def _v2_tick_pump(self):
         logger.info("🚀 [Pump] 智库行情提取泵已就位")
@@ -846,21 +881,91 @@ class AuctionOrchestrator:
             except Exception as e:
                 logger.error(f"⚠️ [RiskSentinel] Error: {e}")
                 await asyncio.sleep(10)
-    async def _sync_and_calculate_stock(self, symbol: str) -> bool:
+    async def _preload_all_watermarks(self, target_date: str = None):
+        """🚀 [V39.2] 性能加速器：一次性聚合全市场水位，消除 5000+ 次循环 IO"""
         try:
+            start_t = time.time()
+            # 1. 并发拉取 3 大核心维度的全量水位 (K线 / DDE / 因子)
+            tasks = [
+                asyncio.get_event_loop().run_in_executor(None, self.tdengine.get_all_latest_dates, "daily_kline"),
+                asyncio.get_event_loop().run_in_executor(None, self.tdengine.get_all_latest_dates, "daily_dde"),
+                asyncio.get_event_loop().run_in_executor(None, self.tdengine.get_all_latest_dates, "daily_factors")
+            ]
+            k_map, dde_map, factor_map = await asyncio.gather(*tasks)
+            
+            self.watermarks = {
+                'kline': k_map or {},
+                'dde': dde_map or {},
+                'factor': factor_map or {}
+            }
+            cost = time.time() - start_t
+            logger.info(f"📊 [Bulk-Audit] 水位审计完成! 覆盖: K={len(k_map)}, DDE={len(dde_map)}, Fac={len(factor_map)} | 耗时: {cost:.2f}s")
+        except Exception as e:
+            logger.error(f"❌ [Bulk-Audit] 水位预载严重异常: {e}")
+            self.watermarks = {'kline': {}, 'dde': {}, 'factor': {}}
+
+    async def _sync_and_calculate_stock(self, symbol: str) -> bool:
+        """🚀 [V39.2] 智能补全中枢 (Smart-Filler Hub - Memory Cached)
+        逻辑：基于预载的内存水位，执行缺谁补谁。
+        """
+        try:
+            # 1. 确定基准日期
             target_day = self._today
-            if datetime.now().hour < 15: target_day = self.calendar.get_previous_trading_day(self._today)
-            k_list = await asyncio.get_event_loop().run_in_executor(None, self.kline_service.fetch_kline_data, symbol, 'd', None, target_day)
-            if k_list and len(k_list) >= 5:
-                res = await asyncio.get_event_loop().run_in_executor(None, self.chip_runner.calculate_for_stock, symbol, k_list, target_day)
-                if res and isinstance(res, (list, tuple)) and len(res) == 3:
-                    code, peak, factors = res
-                    if peak:
-                        await self.redis.hset(f"cache:chip_peaks:{target_day}", symbol, json.dumps(peak))
-                        await self.redis.hset(f"cache:stock_extra:{target_day}", symbol, json.dumps(factors))
-                        await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_chips, symbol, peak)
-                return True
-        except: return False
+            now_t = datetime.now().time()
+            if now_t < dt_time(15, 30):
+                target_day = self.calendar.get_previous_trade_day(self._today)
+            
+            # 2. 状态原子审计 (内存级别，无 IO)
+            # A. K线 (🚀 [V39.2.2] 安全取值防止 KeyError)
+            latest_k = self.watermarks.get('kline', {}).get(symbol)
+            k_exists = latest_k >= target_day if latest_k else False
+            
+            # B. DDE 
+            latest_dde = self.watermarks.get('dde', {}).get(symbol)
+            dde_exists = latest_dde >= target_day if latest_dde else False
+            
+            # C. 筹码与因子
+            # 因子特别检查：如果内存水位存在但不满足目标，或 Redis 缺失
+            latest_fac = self.watermarks.get('factor', {}).get(symbol)
+            chip_exists = await self.redis.hexists(f"cache:chip_peaks:{target_day}", symbol)
+            # 对于因子，除了 check 进度，还需确保新列（如 ma5）不为 0
+            factor_exists = await self.redis.hexists(f"cache:stock_extra:{target_day}", symbol)
+            
+            # 3. 执行补全
+            if not dde_exists:
+                await self._sync_stock_dde(symbol, target_day)
+            
+            current_k_list = None
+            if not k_exists:
+                current_k_list = await asyncio.get_event_loop().run_in_executor(
+                    None, self.kline_service.fetch_kline_data, symbol, 'd', None, target_day
+                )
+            
+            # 算力补全 (筹码/多因子)
+            if not chip_exists or not factor_exists or (latest_fac and latest_fac < target_day):
+                if not current_k_list:
+                    current_k_list = await asyncio.get_event_loop().run_in_executor(
+                        None, self.tdengine.get_daily_kline, symbol, 
+                        (datetime.strptime(target_day, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d"), 
+                        target_day
+                    )
+                
+                if current_k_list and len(current_k_list) >= 35: # V39.2 稳定性门槛
+                    res = await asyncio.get_event_loop().run_in_executor(
+                        None, self.chip_runner.calculate_for_stock, symbol, current_k_list, target_day
+                    )
+                    if res and isinstance(res, (list, tuple)) and len(res) == 3:
+                        _, peak, factors = res
+                        if peak:
+                            await self.redis.hset(f"cache:chip_peaks:{target_day}", symbol, json.dumps(peak))
+                            await self.redis.hset(f"cache:stock_extra:{target_day}", symbol, json.dumps(factors))
+                            await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_chips, symbol, peak)
+                            await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_factors, symbol, pd.DataFrame([factors]))
+            
+            return k_exists or (current_k_list is not None)
+        except Exception as e:
+            logger.error(f"❌ [Hub Error] {symbol} process failed: {e}")
+            return False
     async def _get_pre_close_map(self, target_date: str = None) -> Dict[str, float]:
         """[P0 Fix] 获取昨收价映射，使用 Pipeline 优化确保 5000+ 样本秒级对齐"""
         try:
@@ -895,18 +1000,56 @@ class AuctionOrchestrator:
         except Exception as e:
             logger.error(f"❌ 昨收基准拉取失败: {e}")
             return {code: float(info.get('pre_close', 0)) for code, info in self.metadata.stock_info.items() if 'pre_close' in info}
-    async def _sync_stock_dde(self, symbol: str) -> bool:
+    async def _sync_stock_dde(self, symbol: str, override_date: str = None) -> bool:
+        """[V39.2 Fix] 修复 DDE 字段不匹配与过时停滞问题"""
         try:
-            target_date = self._today.replace("-", "")
-            if datetime.now().hour < 16: target_date = self.calendar.get_previous_trading_day(self._today).replace("-", "")
-            res = await asyncio.get_event_loop().run_in_executor(None, self.api_analyzer.get_his_stock_dde, symbol.split(".")[0], target_date)
+            target_date = (override_date or self._today).replace("-", "")
+            # 时间纠偏：如果是盘中且没传 override，则取上一交易日数据
+            if not override_date and datetime.now().hour < 16:
+                target_date = self.calendar.get_previous_trading_day(self._today).replace("-", "")
+            
+            res = await asyncio.get_event_loop().run_in_executor(
+                None, self.api_analyzer.get_his_stock_dde, symbol.split(".")[0], target_date
+            )
+            
             if not res or res.get('errcode') != '0': return False
-            data = {k: v for k, v in res.items() if isinstance(v, list)}
-            if not data: return True
+            
+            # 1. 动态对齐 API 原始字段 (兼容大写与缺失)
+            data = {}
+            mapping = {'DDJE': 'ddje', 'Date': 'date', 'DDX': 'ddx', 'DDY': 'ddy', 'DDZ': 'ddz'}
+            for api_key, db_key in mapping.items():
+                if api_key in res: data[db_key] = res[api_key]
+            
+            if not data or 'date' not in data: 
+                return True # 虽然没拿到当天的，但也算接口通了
+                
             df = pd.DataFrame(data).head(20)
-            df.rename(columns={'DDJE': 'ddje', 'Date': 'date', 'DDX': 'ddx', 'DDY': 'ddy', 'DDZ': 'ddz'}, inplace=True)
-            return self.tdengine.save_daily_dde(symbol, df)
-        except: return False
+            # 补齐缺失字段为 0，防止 TDengine 驱动报错
+            for col in ['ddx', 'ddy', 'ddz', 'ddje']:
+                if col not in df.columns: df[col] = 0.0
+            
+            return await asyncio.get_event_loop().run_in_executor(None, self.tdengine.save_daily_dde, symbol, df)
+        except Exception as e:
+            logger.debug(f"⚠️ [DDE Error] {symbol}: {e}")
+            return False
+    def _physical_check_all_dimensions(self, symbol: str, tag: str) -> bool:
+        """🚀 [V39.2.3] 物理对冲校验优化：优先使用内存审计（Watermarks）"""
+        try:
+            target_iso = f"{tag[:4]}-{tag[4:6]}-{tag[6:]}"
+            
+            # 使用内存水位索引，避免 5000+ 次 DB 爆炸查询
+            # 1. K线校验
+            latest_k = self.watermarks.get('kline', {}).get(symbol)
+            if not latest_k or latest_k < target_iso: return False
+            
+            # 2. DDE 校验
+            latest_dde = self.watermarks.get('dde', {}).get(symbol)
+            if not latest_dde or latest_dde < target_iso: return False
+            
+            return True
+        except Exception as e:
+            return False
+
     async def _trigger_factor_calc(self) -> bool:
         try:
             if self.bridge.engine: self.bridge.reload_metadata()
@@ -931,3 +1074,4 @@ if __name__ == "__main__":
                 else: loop.run_until_complete(_s.close())
             except: pass
         logger.info("正在释放网络资源...")
+

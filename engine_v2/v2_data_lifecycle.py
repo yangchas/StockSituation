@@ -41,6 +41,7 @@ class DataLifecycleManager:
         fetch_yest_bans_fn: Optional[Callable] = None,
         fetch_yest_plates_fn: Optional[Callable] = None,
         trigger_rust_calc_fn: Optional[Callable] = None,
+        check_status_fn: Optional[Callable] = None, # 🚀 [V39.2] 新增全维度状态自检函数
         pipeline: Optional[AsyncDataPipeline] = None,
         checkpoint: Optional[Checkpoint] = None,
     ):
@@ -50,6 +51,7 @@ class DataLifecycleManager:
         self._fn_bans    = fetch_yest_bans_fn
         self._fn_plates  = fetch_yest_plates_fn
         self._fn_rust    = trigger_rust_calc_fn
+        self._fn_check   = check_status_fn
         self._cp         = checkpoint or Checkpoint()
         # V3.3 稳定性验证：在 TLS 线程局部连接模式下，恢复 4 个并发
         self._pipeline   = AsyncDataPipeline(max_retry=3, concurrency=4, delay_jitter=0.05, checkpoint=self._cp)
@@ -118,7 +120,11 @@ class DataLifecycleManager:
         # [V7.5] 物理对撞校验函数：确保 Checkpoint 的 'done' 与数据库物理水位一致
         k_service = StockKLineService()
         def physical_validator(sym: str, tag: str) -> bool:
-            # tag 格式为 '20260407'，转换为 '2026-04-07'
+            # 🚀 [V39.2] 优先使用外部注入的全维度校验逻辑
+            if self._fn_check:
+                return self._fn_check(sym, tag)
+                
+            # 降级：仅校验 K线
             target_iso = f"{tag[:4]}-{tag[4:6]}-{tag[6:]}"
             latest = k_service.latest_dates_map.get(sym)
             if not latest: return False

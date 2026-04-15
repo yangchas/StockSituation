@@ -88,76 +88,94 @@ class PatternFactory:
         vol_ratio: float,
         lb_days: int,
         plate: str,
-        plate_resonance: float,        # 来自 v2_prime_logic.get_plate_resonance()
+        plate_resonance: float,
         resistance_gap: float,
-        is_alpha_seed: bool,           # 是否在 Redis alpha:candidates 中
+        is_alpha_seed: bool,
         allowed_setups: List[str],
         sentiment_score: float,
         red_green_ratio: float = 1.0,
+        # 🚀 [V39.5] 动态与历史因子
+        speed_1m: float = 0.0,
+        amount_2m: float = 0.0,
+        is_intra_day: bool = False,
+        history_meta: dict = None
     ) -> Optional[dict]:
         """
         返回格式: {"setup_id": str, "action": str, "reason": str, "conf_bonus": int}
         或 None
         """
         candidates = []
+        history = history_meta or {}
+        t2_lb = history.get('t2_lb_days', 0)
+        t2_pct = history.get('t2_pct', 0.0)
 
-        # ── A. 补涨先锋 (follower_chase / low_level_relay) ──────────────
-        # 触发条件：龙头锁死的板块内，低价低开的同板块标的
+        # ── A. 补涨先锋 (follower_chase) ──────────────────────────────────
         if any(s in allowed_setups for s in ["follower_chase", "low_level_relay"]):
-            if (plate_resonance > 1.3
-                    and price < 6.5
-                    and -0.01 < open_pct < 0.05
-                    and vol_ratio > 2.0
-                    and lb_days <= 1):
-                score = 25 + (10 if is_alpha_seed else 0) + (5 if price < 4 else 0)
+            if (plate_resonance > 1.3 and price < 6.5 and -0.01 < open_pct < 0.05 
+                and vol_ratio > 2.0 and lb_days <= 1):
+                score = 25 + (10 if is_alpha_seed else 0)
                 candidates.append({
                     "setup_id": "SETUP_FOLLOW_CHASE",
                     "action": "补涨先锋",
-                    "reason": f"💎 龙头锁死({plate_resonance:.1f}x)·低价({price:.2f})·量能认同(x{vol_ratio:.1f})",
+                    "reason": f"💎 龙头锁死·低价协同·量能认同",
                     "conf_bonus": score,
                 })
 
-        # ── B. 弱转强接力 (low_level_relay / new_theme_first_board) ─────
+        # ── B. 弱转强接力 (low_level_relay) ───────────────────────────────
         if any(s in allowed_setups for s in ["low_level_relay", "new_theme_first_board"]):
-            if (lb_days > 0
-                    and open_pct > 0.04
-                    and vol_ratio > 0.08
-                    and resistance_gap < 0.05):
+            if (lb_days > 0 and open_pct > 0.04 and vol_ratio > 0.10 and resistance_gap < 0.05):
                 score = 20 + (15 if is_alpha_seed else 0)
                 candidates.append({
                     "setup_id": "SETUP_WEAK_STRONG",
                     "action": "弱转强买入",
-                    "reason": f"🚀 超预期强修复·量比{vol_ratio*100:.0f}%·筹码净区",
+                    "reason": f"🚀 超预期强修复(Weak2Strong)·筹码净区",
                     "conf_bonus": score,
                 })
 
-        # ── C. 核心低吸 (core_dip_buying) ───────────────────────────────
+        # ── C. 反包先锋 (Counter-Attack / Rebound) 🚀 [V39.5] ──────────────
+        # 逻辑：T-2 涨停/新高 + T-1 回调 + T-0 确认
+        was_strong_t2 = (t2_lb >= 1 or t2_pct > 0.08)
+        is_correction_t1 = (lb_days == 0) # 昨日未涨停
+        
+        if was_strong_t2 and is_correction_t1:
+            # 基础因子：如果已身处盘中模式，优先看脉冲
+            if is_intra_day:
+                # 动态确认：1分速 > 1.5% 或 2分额大
+                is_pulsing = (speed_1m > 0.015)
+                if is_pulsing:
+                    bonus = 35 if t2_lb >= 3 else 25 # 龙头反包加分更高
+                    candidates.append({
+                        "setup_id": "SETUP_COUNTER_ATTACK_DYNAMIC",
+                        "action": "反包瞬发" if t2_lb < 3 else "妖股反包",
+                        "reason": f"⚡ 动能确认: 1分速{speed_1m*100:.1f}% | {'龙头身位' if t2_lb >=3 else '强势反攻'}",
+                        "conf_bonus": bonus
+                    })
+            else:
+                # 竞价预判：需要高开或放量
+                is_expected = (open_pct > -0.01 and vol_ratio > 2.5)
+                if is_expected:
+                    candidates.append({
+                        "setup_id": "SETUP_COUNTER_ATTACK_PRE",
+                        "action": "反包潜伏",
+                        "reason": f"📈 基因预唤醒: 前日强势+昨日洗盘 | {'高标回踩' if t2_lb >= 3 else '反包预期'}",
+                        "conf_bonus": 20
+                    })
+
+        # ── D. 核心低吸 (core_dip_buying) ───────────────────────────────
         if "core_dip_buying" in allowed_setups:
-            if (lb_days >= 2
-                    and open_pct < 0.0
-                    and resistance_gap < 0.02
-                    and plate_resonance > 1.0):
-                score = 18
+            if (lb_days >= 2 and open_pct < 0.0 and resistance_gap < 0.02 and plate_resonance > 1.0):
                 candidates.append({
                     "setup_id": "SETUP_CORE_DIP",
                     "action": "核心低吸",
-                    "reason": f"💡 龙头分歧回踩·零压筹码·板块未变盘",
-                    "conf_bonus": score,
+                    "reason": f"💡 龙头分歧回踩·零压筹码",
+                    "conf_bonus": 18,
                 })
 
-        # ── D. 冰点破壳 (ice_rebound_core) ──────────────────────────────
-        if "ice_rebound_core" in allowed_setups:
-            if (sentiment_score < 4.0
-                    and lb_days == 1
-                    and red_green_ratio > 1.2
-                    and vol_ratio > 3.0):
-                score = 22
-                candidates.append({
-                    "setup_id": "SETUP_ICE_BREAK",
-                    "action": "冰点破壳",
-                    "reason": f"❄️→🔥 冰点首板·红绿比{red_green_ratio:.2f}·放量{vol_ratio:.1f}x",
-                    "conf_bonus": score,
-                })
+        if not candidates:
+            return None
+
+        # 冲突仲裁：取置信加分最高的一个
+        return max(candidates, key=lambda x: x["conf_bonus"])
 
         if not candidates:
             return None

@@ -125,6 +125,8 @@ class AsyncDataPipeline:
         self.checkpoint = checkpoint or Checkpoint()
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._batch_progress = 0  # 批次进度计数
+        self._batch_total = 0     # 批次总数记录
+        self._phys_fix_count = 0  # [V38.8] 物理修复计数降噪
 
     async def run_task(
         self,
@@ -138,16 +140,18 @@ class AsyncDataPipeline:
             task.status = TaskStatus.DONE
             logger.debug(f"[skip] {task.task_id} 已完成（续传）")
             return task
+        
+        # [V38.8] 额外的物理存在校验 (可选)，如果 checkpoint 认为完成但实际漏了，这里可以加日志
 
-        # 🚀 [V34.2] 物理黑名单检查：如果是已知退市、ST或无数据标的，静默跳过
-        if task.symbol:
-            from v2_infra_provider import get_global_redis
-            r = await get_global_redis()
-            if await r.sismember("market_edge:blacklist", task.symbol):
-                task.status = TaskStatus.DONE
-                self.checkpoint.mark_done(task.task_id)
-                logger.info(f"🚫 [SKIP] {task.symbol} 为已知黑名单标的，物理跳过")
-                return task
+        # 🚀 [V34.2] 物理黑名单检查：如果是已知退市、ST或无数据标的，改为 DEBUG 记录但不强制跳过
+        # if task.symbol:
+        #     from v2_infra_provider import get_global_redis
+        #     r = await get_global_redis()
+        #     if await r.sismember("market_edge:blacklist", task.symbol):
+        #         # task.status = TaskStatus.DONE
+        #         # self.checkpoint.mark_done(task.task_id)
+        #         logger.debug(f"🚫 [Blacklist-Check] {task.symbol} 命过黑名单，但基于稳定性策略强制放行")
+        #         # return task
 
         for attempt in range(self.max_retry + 1):
             try:
@@ -271,7 +275,7 @@ def build_stock_tasks(
         else:
             if is_recorded_done and not is_phys_done:
                 phys_re_exec += 1
-                logger.warning(f"[Physical-Fix] {tid} 记录虽为DONE但物理缺失，正在强制清理断点...")
+                logger.debug(f"[Physical-Fix] {tid} 记录虽为DONE但物理缺失，正在强制清理断点...")
                 checkpoint.remove(tid) # 物理清理，让内层 run_task 能够通行
             task.status = TaskStatus.PENDING
 

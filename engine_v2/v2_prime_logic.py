@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any # [V38.4] 补充类型定义
 import redis
 import time
 # 尝试导入通用服务
@@ -42,7 +43,7 @@ class ResonancePrimeService:
                     } for i, p in enumerate(raw_plates)
                 }
                 self.last_sync_time = now
-                logger.info(f"✅ [Commander] 已同步 Kaipanla 板块能级 (Count: {len(self.hot_plates_map)})")
+                logger.debug(f"✅ [Commander] 已同步 Kaipanla 板块能级 (Count: {len(self.hot_plates_map)})")
             else:
                 err = res.get('error', 'Unknown error')
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {err}")
@@ -52,10 +53,9 @@ class ResonancePrimeService:
             else:
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {e}")
 
-    async def calculate_battle_kpis(self, date_str: str) -> dict:
-        """
-        计算昨日涨停标兵的晋级率、爆头率、红开率。
-        """
+    async def calculate_battle_kpis(self, date_str: str) -> Dict:
+        """从 Redis 反馈计算盘中战役级别 KPI"""
+        if not self.r: return {} # [V38.2] 物理绝缘：防止在单例注入前被调用
         zt_key = f"limit_up_{date_str}"
         zt_raw = await self.r.get(zt_key)
         if not zt_raw: return {}

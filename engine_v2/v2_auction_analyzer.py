@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple, Set
 from collections import defaultdict
 from v2_business_logic import V2BusinessLogicService, EmotionPhaseResult, YesterdayStateProfile
 from v2_strategy_memory_service import StrategyMemoryService, EnvironmentDNA
+from v2_quantitative_factors import PatternFactory, calc_kelly_position
 logger = logging.getLogger("V5Analyzer")
 
 @dataclass
@@ -35,7 +36,12 @@ class AuctionStock:
         'plate', 'expected_pct', 'is_super_expected', 'open_pct', 'current_pct', 
         'momentum_delta', 'volume_intensity', 'speed_1m', 'amount_2m', 
         'resonance_factor', 'yest_amount', 'resistance_gap', 'vol_ratio', 'tags', 'seal_amount', 'price',
-        'is_locked'  # 🚀 [V25.2] 补齐插槽声明
+        'is_locked',
+        # 🚀 [V39.3 Evolution] 技术与资金面扩展插槽
+        'macd_hist', 'kdj_j', 'rsi_6', 'bias_20', 'ma5', 'ma10', 'ma20',
+        'boll_mid', 'concentration', 'dde_3d_sum',
+        # 🚀 [V39.5] 动力与历史扩展
+        't2_lb_days', 't2_pct'
     )
     def __init__(self, code, name="unknown", **kwargs):
         self.code = code
@@ -60,7 +66,23 @@ class AuctionStock:
         self.tags = kwargs.get('tags', [])
         self.seal_amount = float(kwargs.get('seal_amount', 0.0))
         self.price = float(kwargs.get('price', 0.0))
-        self.is_locked = bool(kwargs.get('is_locked', False)) # 🚀 显式初始化
+        self.is_locked = bool(kwargs.get('is_locked', False))
+        
+        # 🚀 [V39.3 Evolution] 因子初始化
+        self.macd_hist = float(kwargs.get('macd_hist', 0.0))
+        self.kdj_j = float(kwargs.get('kdj_j', 50.0))
+        self.rsi_6 = float(kwargs.get('rsi_6', 50.0))
+        self.bias_20 = float(kwargs.get('bias_20', 0.0))
+        self.ma5 = float(kwargs.get('ma5', 0.0))
+        self.ma10 = float(kwargs.get('ma10', 0.0))
+        self.ma20 = float(kwargs.get('ma20', 0.0))
+        self.boll_mid = float(kwargs.get('boll_mid', 0.0))
+        self.concentration = float(kwargs.get('concentration', 0.0))
+        self.dde_3d_sum = float(kwargs.get('dde_3d_sum', 0.0))
+        
+        # 🚀 [V39.5] 历史身位初始化
+        self.t2_lb_days = int(kwargs.get('t2_lb_days', 0))
+        self.t2_pct = float(kwargs.get('t2_pct', 0.0))
 
 @dataclass
 class AuctionReport:
@@ -89,116 +111,161 @@ class AuctionReport:
     emotion: Optional[Any] = None
 
 def build_summary(report: AuctionReport) -> str:
-    """V19.2 Sentinel-Edition 大屏 - 极简锚点版"""
+    """V39.0 Command-Center Edition - 实战决策指令中心（替代无用情绪循环）"""
     from datetime import datetime
     now_hm = report.battle_kpis.get('current_time', datetime.now().strftime('%H:%M'))
     data_src = report.battle_kpis.get('data_source', 'Redis')
     health_icon = "🟢" if data_src == "Redis" else ("🟡" if data_src == "WENCAI" else "🟠")
+    up_down = report.battle_kpis.get('up_down_ratio', '?/?')
+
+    # ─── 【0】 行情态势总判 ────────────────────────────────────
+    phase = report.cycle_phase or "unknown"
+    emo = report.emotion
+    pos_cap = f"{emo.pos_cap*100:.0f}%" if emo else "N/A"
+    setups_str = "、".join(emo.allowed_setups) if emo and emo.allowed_setups else "⚠️ 暂停操作"
     
-    # 阵型审计告警
-    missing_cnt = report.battle_kpis.get('missing_auction_cnt', 0)
-    audit_warn = f" | ⚠️ 竞价缺失:{missing_cnt}" if missing_cnt > 0 else ""
-
-    lines = [
-        f"================ [{now_hm}] V38.2 [Titan-Edition] ================",
-        f"🌡️ [战温] 评分: {report.money_making_effect}/10 | 阶段: {report.cycle_phase} | 数据: {health_icon}{data_src}{audit_warn}",
-        f"💰 [量能] {report.total_amount/1e8:.2f}亿 | 核心风向: {report.amount_king.name if report.amount_king else 'N/A'}({report.amount_king.auction_amount/1e8 if report.amount_king else 0:.2f}亿)",
-    ]
-    
-    if report.emotion:
-        lines.append(f"🧬 [策略] 仓位上限: {report.emotion.pos_cap*100:.0f}% | 允许战法: {'、'.join(report.emotion.allowed_setups) or '减仓'}")
-    
-    # 1. 高标生死簿 (3B+)
-    lines.append(f"\n👑 [高标生死簿 (3B+)]")
-    lines.append(f"   标的(题材)      梯队   溢价(竞)  现价(实)  状态    封单(亿)  特征")
-    lines.append(f"   --------------------------------------------------------------------------------")
-    leaders = [s for s in report.all_stocks if s.lb_days >= 3]
-    for s in sorted(leaders, key=lambda x: x.lb_days, reverse=True):
-        status = "封板" if s.current_pct > 0.098 else ("炸板" if s.open_pct > 0.09 and s.current_pct < 0.09 else ("走强" if s.momentum_delta > 0.01 else "分歧"))
-        seal_str = f"{s.seal_amount:^9.2f}" if s.current_pct > 0.098 else f"{'-':^11}"
-        tag_str = "".join([f"[{t}]" for t in s.tags[:2]])
-        name_plate = f"{s.name}({s.plate[:4]})"
-        lines.append(f"   {name_plate:<15} {s.lb_days}->{s.lb_days+1}B  {s.open_pct*100:+.1f}%    {s.current_pct*100:+.1f}%    {status:<8} {seal_str} {tag_str}")
-
-    # 2. 板块异动热力
-    if report.yest_hot_sectors:
-        lines.append(f"\n🔥 [板块异动热力]")
-        for name, count, delta, st, strength, flow in report.yest_hot_sectors[:5]:
-            lines.append(f"   {name:<12} (Str:{strength:^6.0f}) -> [状态]: {st}")
-
-    # 3. 阵型图 (梯队体检对照)
-    lines.append(f"\n🧱 [阵型图 - 梯队晋级对照]")
-    for level in sorted(report.promo_stats.keys(), reverse=True):
-        total_yest, red_open, strongs, nuclear = report.promo_stats[level]
-        if total_yest == 0: continue
-        rate = f"{red_open/total_yest*100:.0f}%"
-        s_info = ""
-        st_label = "[极强]" if red_open/total_yest > 0.8 else ("[分歧]" if red_open/total_yest < 0.4 else "[强势]")
-        if strongs:
-            s = strongs[0]
-            s_info = f" | [标兵]: {s.name}({s.plate[:2]}) {s.current_pct*100:+.1f}% {''.join([f'[{t}]' for t in s.tags[:1]])}"
-        lines.append(f"   {level}B->{level+1}B: {red_open} / {total_yest} ({rate}) {st_label}{s_info} | 核:{len(nuclear)}")
-
-    # 4. 物理负反馈 (风险极值)
-    if report.negative_stocks:
-        lines.append(f"\n📉 [物理负反馈 - 风险极值]")
-        lines.append(f"   标的(题材)      开盘     现价     偏离度   风险状态")
-        for s in report.negative_stocks[:5]:
-            risk_state = "核按钮" if s.open_pct < -0.05 else ("弱杀跌" if s.momentum_delta < -0.02 else "不及预期")
-            lines.append(f"   {s.name + '(' + s.plate[:2] + ')':<15} {s.open_pct*100:+.1f}%    {s.current_pct*100:+.1f}%    {(s.open_pct-s.expected_pct)*100:+.1f}%    [{risk_state}]")
-
-    # 5. 记忆匹配 (智库进化)
-    if report.memory_matches:
-        lines.append(f"\n🧠 [记忆匹配 - 历史策略参考]")
-        for match in report.memory_matches[:1]:
-            lines.append(f"   💡 相似度 {match['similarity']}%: [历:{match['dna'].get('date_ref', 'N/A')}] {match['strategy']}")
-            lines.append(f"   🎯 建议: {match['comment']}")
-
-    # 6. 主线切换预警 (动能雷达)
-    if any("切换" in sig.action for sig in report.strategic_signals):
-        lines.append(f"\n🚨 [主线切换预报 - 强度迁移中]")
-        for sig in report.strategic_signals:
-            if "切换" in sig.action:
-                lines.append(f"   【🚨】 {sig.name} ({sig.confidence}%): {sig.reason}")
-
-    # 7. 作战指令 (Alpha 信号)
-    if report.strategic_signals:
-        lines.append(f"\n🎯 [实战指令 - 预期差捕捉]")
-        for sig in report.strategic_signals[:8]:
-            tag = "【建议买入】" if "买入" in sig.action else ("【封死观察】" if "观察" in sig.action else ("【炸板接力】" if "接力" in sig.action else "【补涨关注】"))
-            icon = "🚀" if "买入" in sig.action else ("💎" if "关注" in sig.action or "观察" in sig.action else "🌀")
-            # 展示标的的实时涨跌幅 (current_pct)
-            lines.append(f"   {tag} {sig.name} ({sig.current_pct*100:+.1f}%): {icon} {sig.reason}")
-
-    # 8. 战役实时情报行 (Sentinel Heartbeat - V21.0 Ground-Truth 版)
-    # A. 动态板块回捞：即便 yest_hot_sectors 为空，也从 top_stocks 中提取最集中的板块
-    top_sector = "扫描中..."
+    # 全场主板块
+    top_sector = "扫描中"
     if report.yest_hot_sectors:
         top_sector = report.yest_hot_sectors[0][0]
+
+    missing_cnt = report.battle_kpis.get('missing_auction_cnt', 0)
+    audit_warn = f"⚠️缺失:{missing_cnt} " if missing_cnt > 0 else ""
+    
+    lines = [
+        f"",
+        f"╔══════ [{now_hm}] V39.0 [Command-Center] ═══ {health_icon}{data_src} {audit_warn}══╗",
+        f"║ 🌡️ 情绪:{report.money_making_effect:.1f}/10  阶段:{phase:<12} 涨跌比:{up_down}  总额:{report.total_amount/1e8:.0f}亿",
+        f"║ 🛡️ 仓位上限:{pos_cap}   允许战法: {setups_str}",
+        f"╚═══════════════════════════════════════════════════════════╝",
+    ]
+
+    # ─── 【1】 买入决策排行（核心） ─────────────────────────────
+    buy_signals = [s for s in report.strategic_signals
+                   if any(k in s.action for k in ("买入", "补涨", "接力", "补位", "身位", "弱转强"))
+                   and s.confidence >= 40]
+    buy_signals = sorted(buy_signals, key=lambda x: x.confidence, reverse=True)[:6]
+    
+    if buy_signals:
+        lines.append(f"\n🚀 ━━━ 买入候选（按置信度排序） ━━━")
+        lines.append(f"   {'标的':<8} {'现价%':>6} {'置信':>5}  {'建议仓位':>7}  {'板块':<8} 原因")
+        lines.append(f"   {'─'*72}")
+        for sig in buy_signals:
+            # 从 reason 里提取凯利仓位，若无则按置信度估算
+            kelly_match = ""
+            kelly_pos = 0.0
+            if "建议仓位:" in sig.reason:
+                import re
+                m = re.search(r'建议仓位:\s*([\d.]+)%', sig.reason)
+                if m:
+                    kelly_pos = float(m.group(1))
+                    kelly_match = f"{kelly_pos:.0f}%"
+            if not kelly_match:
+                kelly_pos = min(30.0, sig.confidence * 0.3)
+                kelly_match = f"{kelly_pos:.0f}%"
+            
+            action_icon = "🚀" if "买入" in sig.action else ("💎" if "接力" in sig.action else "⚡")
+            reason_short = sig.reason[:30].rstrip()
+            lines.append(
+                f"   {action_icon}{sig.name:<7} {sig.current_pct*100:>+5.1f}%  {sig.confidence:>4.0f}  {kelly_match:>7}  {sig.plate[:6]:<8} {reason_short}"
+            )
     else:
-        # 暴力回捞：从成交额或涨幅前20中找出现频率最高的板块
-        p_counts = defaultdict(int)
-        for s in report.all_stocks[:50]:
-            if s.plate and s.plate != "Other": p_counts[s.plate] += 1
-        if p_counts:
-            top_sector = sorted(p_counts.items(), key=lambda x: x[1], reverse=True)[0][0]
-        
-    # B. 风险对撞强化
-    risk_label = "🟢 稳"
-    if report.money_making_effect < 4.5:
-        risk_label = "🔴 杀跌"
-    elif report.battle_kpis.get('missing_auction_cnt', 0) > 30:
-        risk_label = "🟡 盲区" # 数据缺失导致的分析盲区
-    elif report.negative_stocks:
-        risk_label = "⚠️ 分歧"
+        lines.append(f"\n🚀 ━━━ 买入候选 ━━━  ⚠️ 当前无高置信买入信号，建议观望")
+
+    # ─── 【2】 持仓风险警报（高危避雷 + 减仓） ────────────────────
+    risk_signals = [s for s in report.strategic_signals
+                    if any(k in s.action for k in ("避雷", "减仓", "回避"))]
+    if risk_signals:
+        import re
+        lines.append(f"\n🔴 ━━━ 持仓风险警报（建议减仓/止损） ━━━")
+        for sig in risk_signals[:5]:
+            # [V39.8 Fix] 强行剔除名称中的 (60xxxx) 干扰，只留纯名称 + 板块
+            clean_name = re.sub(r'\(?\d{6}\)?', '', sig.name)
+            plate_tag = f"[{sig.plate[:4]}]" if sig.plate else ""
+            display_name = f"{clean_name}{plate_tag}"
+            lines.append(f"   ❌ {display_name:<16} {sig.current_pct*100:>+5.1f}%  [{sig.action}]  {sig.reason[:45]}")
+
+    # ─── 【3】 板块方向（核心主线 + 切换预警） ────────────────────
+    lines.append(f"\n🔥 ━━━ 板块实战方向 ━━━")
+    if report.yest_hot_sectors:
+        for name, count, delta, st, strength, flow in report.yest_hot_sectors[:5]:
+            delta_arrow = "▲" if delta > 0.01 else ("▼" if delta < -0.02 else "─")
+            st_icon = "🟢" if st == "走强" else ("🔴" if st == "分歧" else "🟡")
+            flow_str = f"净额:{flow/1e8:.1f}亿" if flow != 0 else ""
+            lines.append(f"   {st_icon} {name:<10} {delta_arrow}{abs(delta)*100:.1f}%  [{st}]  Str:{strength:.0f}  {flow_str}")
     
-    leader_name = report.highest_board.name if report.highest_board else "N/A"
-    leader_pct = (report.highest_board.current_pct * 100) if report.highest_board else 0.0
-    heartbeat = f"\r[{now_hm}] {risk_label} | 🔥 {top_sector[:4]} | 👑 {leader_name}({leader_pct:+.1f}%)"
+    # 板块切换预警
+    switch_signals = [s for s in report.strategic_signals if "切换" in s.action]
+    if switch_signals:
+        lines.append(f"   🚨 主线切换预警: {switch_signals[0].name}  原因: {switch_signals[0].reason[:30]}")
+
+    # ─── 【4】 龙头生死簿（高标实时状态 + 封单变化） ────────────────
+    leaders = sorted([s for s in report.all_stocks if s.lb_days >= 3],
+                     key=lambda x: x.lb_days, reverse=True)[:5]
+    if leaders:
+        lines.append(f"\n👑 ━━━ 龙头生死簿 ━━━")
+        lines.append(f"   {'标的':<12} {'梯队':>5}  {'竞价':>6}  {'现价':>6}  {'状态':<8}  {'封单':>8}  {'动能'}")
+        lines.append(f"   {'─'*72}")
+        for s in leaders:
+            status = "🟢封板" if s.current_pct > 0.098 else ("💥炸板" if s.open_pct > 0.09 and s.current_pct < 0.09 else ("📈走强" if s.momentum_delta > 0.01 else "⚡分歧"))
+            # 🚨 [P0 - Seal Safety Rating] 封单安全评级
+            if s.current_pct > 0.098:
+                if s.seal_amount >= 5.0:   seal_str = f"✅{s.seal_amount:.2f}亿"
+                elif s.seal_amount >= 1.0: seal_str = f"⚠️{s.seal_amount:.2f}亿"
+                else:                      seal_str = f"🚨{s.seal_amount:.2f}亿"
+            else:
+                seal_str = "   -  "
+            momentum_str = f"{s.momentum_delta*100:+.1f}%" if s.momentum_delta != 0 else ""
+            # [V39.8 Fix] 强行剔除名称中的 (60xxxx) 干扰
+            clean_name = re.sub(r'\(?\d{6}\)?', '', s.name)
+            plate_tag = f"[{s.plate[:4]}]" if s.plate else ""
+            display_name = f"{clean_name}{plate_tag}"
+            lines.append(
+                f"   {display_name:<16} {s.lb_days}→{s.lb_days+1}B  {s.open_pct*100:>+5.1f}%  {s.current_pct*100:>+5.1f}%  {status:<8} {seal_str:>9}  {momentum_str}"
+            )
+
+    # ─── 【5】 全场市场脉搏 ─────────────────────────────────────
+    amount_king_name = re.sub(r'\(?\d{6}\)?', '', report.amount_king.name) if report.amount_king else "N/A"
+    amount_king_str = f"{amount_king_name}({report.amount_king.auction_amount/1e8:.1f}亿)" if report.amount_king else "N/A"
+    lines.append(f"\n📊 ━━━ 市场脉搏 ━━━")
     
-    lines.append(f"============================================================")
-    report.rotation_msg = heartbeat 
+    # 梯队晋级率（关键情绪评估）
+    if report.promo_stats:
+        for level in sorted(report.promo_stats.keys(), reverse=True):
+            total_yest, promoted, strongs, nuclear, red_open = report.promo_stats[level]
+            if total_yest == 0: continue
+            rate = promoted / total_yest
+            rate_icon = "🟢" if rate > 0.5 else ("🔴" if rate < 0.2 else "🟡")
+            # [V39.8 Fix] 强行剔除名称中的 (60xxxx) 干扰
+            clean_strong_name = re.sub(r'\(?\d{6}\)?', '', strongs[0].name) if strongs else "N/A"
+            s_info = f" 标兵:{clean_strong_name}({strongs[0].current_pct*100:+.1f}%)" if strongs else ""
+            lines.append(f"   {rate_icon} {level}B→{level+1}B: {promoted}/{total_yest} (晋级:{rate*100:.0f}%){s_info}")
+
+    lines.append(f"   💰 量能冠军: {amount_king_str}")
+
+    # ─── 【6】 历史记忆匹配（经验参考） ──────────────────────────
+    if report.memory_matches:
+        m = report.memory_matches[0]
+        lines.append(f"\n🧠 ━━━ 历史相似度 {m['similarity']}% → {m['strategy']} ━━━")
+        comment_short = m['comment'][:60] if len(m['comment']) > 60 else m['comment']
+        lines.append(f"   {comment_short}")
+        # 🚨 [P2 - 历史记忆主动警报] 若历史复盘包含风险关键词，升级为主动警告
+        risk_keywords = ["严禁追涨", "危险", "回避", "陷阱", "诱多", "炸板", "崩盘"]
+        if any(kw in m.get('comment', '') for kw in risk_keywords):
+            lines.append(f"   ⚠️ [历史警报] 相似行情教训已触发风险拦截，当前极不建议追涨买入")
+
+    # ─── 【7】 单行心跳（状态栏，供 \r 刷新） ────────────────────
+    risk_label = "🟢稳" if report.money_making_effect >= 6 else ("🔴危" if report.money_making_effect < 4.5 else "🟡观")
+    clean_hb_name = re.sub(r'\(?\d{6}\)?', '', report.highest_board.name) if report.highest_board else "N/A"
+    leader_str = f"{clean_hb_name}({report.highest_board.current_pct*100:+.1f}%)" if report.highest_board else "N/A"
+    heartbeat = f"\r[{now_hm}] {risk_label} 情绪:{report.money_making_effect:.1f} | 仓:{pos_cap} | 主线:{top_sector[:4]} | 龙头:{leader_str} | 买入候选:{len(buy_signals)}只   "
+    
+    lines.append(f"════════════════════════════════════════════════════════════")
+    report.rotation_msg = heartbeat
     return "\n".join(lines)
+
+
+
 
 class AuctionAnalyzer:
     def __init__(self, redis_client=None):
@@ -211,23 +278,73 @@ class AuctionAnalyzer:
         self.last_summary_hash = "" # 🚀 V19.2: 用于输出去重
 
     def _calc_confidence(self, s: AuctionStock, sector_delta: float, sentiment: float) -> float:
-        score = 40.0
-        # 🛠️ 优化 A: 低价因子红利 (Price < 6元 且处于热门板块)
+        """🚀 [V39.3] 三层架构置信度引擎 (Layered Intelligence Model)"""
+        # ==========================================
+        # Layer 1: 盘口基础得分 (Base Auction Score, 0-60)
+        # ==========================================
+        base_score = 30.0
+        # 1.1 低价/热门板块加成
         if 0 < s.price < 6.0 and sector_delta > 0.01:
-            score += 10.0
-            s.tags.append("低价优势")
+            base_score += 10.0; s.tags.append("低价先锋")
             
-        if s.is_super_expected: score += 20
-        # 筹码压制惩罚
-        if s.resistance_gap > 0.1: score -= 15
-        elif s.resistance_gap < 0.05: score += 10
-        # 量能增益
-        if s.vol_ratio > 0.15: score += 15
+        # 1.2 超预期得分 (连板股)
+        if s.is_super_expected: base_score += 15.0
         
-        score += max(-10, min(20, (s.open_pct - s.expected_pct) * 100))
-        score += max(-15, min(30, sector_delta * 200))
-        score += max(0, min(10, sentiment)) 
-        return round(min(99.0, max(0.0, score)), 1)
+        # 1.3 竞价活跃度 (量能密度)
+        if s.vol_ratio > 0.15: base_score += 15.0
+        elif s.vol_ratio > 0.08: base_score += 8.0
+        
+        # 1.4 瞬时偏差 (开盘价与预期价)
+        base_score += max(-10, min(15, (s.open_pct - s.expected_pct) * 100))
+        
+        # 1.5 板块与情绪背景
+        base_score += max(-10, min(20, sector_delta * 200))
+        base_score += max(0, min(5, sentiment)) 
+
+        # ==========================================
+        # Layer 2: 技术趋势乘数 (Trend Multiplier, 0.5x - 1.5x)
+        # ==========================================
+        multiplier = 1.0
+        
+        # 2.1 均线对位
+        if s.ma5 > s.ma10 > s.ma20 > 0: # 完美多头
+            multiplier += 0.2
+            s.tags.append("多头排列")
+        elif s.price < s.ma20 < s.ma10 and s.ma20 > 0: # 明显下降通道
+            multiplier -= 0.3
+            
+        # 2.2 技术指标背书
+        if s.macd_hist > 0: multiplier += 0.1 # MACD 多头
+        if s.kdj_j < 20: multiplier += 0.1   # 超跌安全边际
+        elif s.kdj_j > 90: multiplier -= 0.1 # 超买预警
+        
+        # 2.3 筹码结构压制 (物理重压)
+        if s.resistance_gap > 0.1: multiplier -= 0.3
+        elif s.resistance_gap < 0.05: multiplier += 0.1
+        
+        # ==========================================
+        # Layer 3: 资金面修正 (Money-Flow Overlay, +/- 20)
+        # ==========================================
+        overlay = 0.0
+        
+        # 3.1 DDE 持续性检查
+        if s.dde_3d_sum > 0: 
+            overlay += 10.0
+            s.tags.append("机构囤货")
+            
+        # 3.2 逆向纠偏 (V39.3 核心)
+        # 如果昨日大涨但 DDE 净流出 -> 诱多出货
+        if s.change_pct > 0.05 and s.dde_3d_sum < -1e6:
+            overlay -= 20.0
+            s.tags.append("诱多风险")
+        # 如果昨日低迷但 DDE 净流入 -> 潜伏低吸
+        elif s.change_pct < -0.02 and s.dde_3d_sum > 1e6:
+            overlay += 15.0
+            s.tags.append("资金潜伏")
+
+        # 最终得分合成
+        final_score = base_score * multiplier + overlay
+        return round(min(99.0, max(0.0, final_score)), 1)
 
     async def analyze(
         self, current_raw: List[Dict], auction_snapshot: Optional[Dict[str, float]] = None,
@@ -257,7 +374,7 @@ class AuctionAnalyzer:
                 code=code, name=item.get("name", "unknown"),
                 current_pct=current_pct,
                 auction_amount=auction_amount,
-                plate=self.plate_cache.get(code, "Other"), # 🛠️ 这里由 O(N) 远程请求变为 O(1) 本地内存查找
+                plate=self.plate_cache.get(code, self.plate_cache.get(f"sz{code}", self.plate_cache.get(f"sh{code}", "Other"))), 
                 yest_amount=yest_amount,
                 resistance_gap=float(item.get("resistance_gap", 0.0)),
                 price=float(item.get("price", 0.0)),
@@ -286,11 +403,33 @@ class AuctionAnalyzer:
             stocks.append(s)
 
         report.all_stocks = stocks
+        
+        # 🚀 [V39.5 Evolution] 市场脉搏实时审计：上移至分析链内，确保看板 Summary 同步对齐
+        up_cnt = sum(1 for s in stocks if s.current_pct > 0.0)
+        down_cnt = sum(1 for s in stocks if s.current_pct < 0.0)
+        report.battle_kpis['up_down_ratio'] = f"{up_cnt}/{down_cnt}"
+        
         y_stocks = [s for s in stocks if s.is_yest_limit]
         if y_stocks:
             report.highest_board = sorted(y_stocks, key=lambda x: (x.lb_days, x.open_pct), reverse=True)[0]
             red_cnt = sum(1 for s in y_stocks if s.current_pct > 0)
-            report.money_making_effect = round(red_cnt / len(y_stocks) * 10, 1)
+            base_sentiment = round(red_cnt / len(y_stocks) * 10, 1)
+
+            # 🚨 [P1 - Ladder Health Factor] 梯队健康系数修正
+            # 统计低梯队（1B→2B）的晋级率，若过低则压制情绪虚高
+            lb1_stocks = [s for s in y_stocks if s.lb_days == 1]
+            lb1_promoted = sum(1 for s in lb1_stocks if s.current_pct > 0.098)
+            lb1_rate = lb1_promoted / len(lb1_stocks) if lb1_stocks else 1.0
+            # 封单安全系数：最高梯队若封单不足 1亿，说明封板质地很差
+            top_seal = report.highest_board.seal_amount if report.highest_board else 0
+            seal_penalty = 1.0 if top_seal >= 1.0 else max(0.6, top_seal)  # 封单越少，折扣越大
+            # 低梯队晋级率 < 20% 时，情绪分下调 1-1.5
+            ladder_penalty = 0.0
+            if lb1_rate < 0.20: ladder_penalty = 1.5
+            elif lb1_rate < 0.40: ladder_penalty = 0.8
+            report.money_making_effect = round(max(0.0, base_sentiment * seal_penalty - ladder_penalty), 1)
+            report.battle_kpis['ladder_health'] = f"{lb1_rate*100:.0f}%"  # 供看板显示
+            report.battle_kpis['top_seal_amt'] = top_seal
         
         # 情绪分阶段
         total_red = sum(1 for s in stocks if s.current_pct > 0.0)
@@ -376,20 +515,24 @@ class AuctionAnalyzer:
                     action, reason = "补涨抢筹", f"💎 身位套利: 同板块标杆封死 | 筹码极优"
                     conf += 20
                 
-            # [V9.0] PatternFactory 战法工厂：覆盖 allowed_setups 触发的高置信模式
-            if _allowed and action not in ("高危避雷", "观望"):
-                from engine_v2.v2_quantitative_factors import PatternFactory, calc_kelly_position
-                pattern = PatternFactory.match(
-                    code=s.code, price=s.price,
-                    open_pct=s.open_pct, vol_ratio=s.vol_ratio,
-                    lb_days=s.lb_days, plate=s.plate,
-                    plate_resonance=s.resonance_factor,
-                    resistance_gap=s.resistance_gap,
-                    is_alpha_seed=("ALPHA种子" in s.tags),
-                    allowed_setups=_allowed,
-                    sentiment_score=report.money_making_effect,
-                )
-                if pattern:
+            # [V9.0] PatternFactory 战法工厂
+            history_meta = {"t2_lb_days": s.t2_lb_days, "t2_pct": s.t2_pct}
+            pattern = PatternFactory.match(
+                code=s.code, price=s.price,
+                open_pct=s.open_pct, vol_ratio=s.vol_ratio,
+                lb_days=s.lb_days, plate=s.plate,
+                plate_resonance=s.resonance_factor,
+                resistance_gap=s.resistance_gap,
+                is_alpha_seed=("ALPHA种子" in s.tags),
+                allowed_setups=_allowed,
+                sentiment_score=report.money_making_effect,
+                # 🚀 [V39.5] 动态参数对齐
+                speed_1m=s.speed_1m, 
+                amount_2m=s.amount_2m,
+                is_intra_day=(mode == "INTRA_DAY"),
+                history_meta=history_meta
+            )
+            if pattern:
                     action = pattern["action"]
                     reason = pattern["reason"]
                     conf += pattern["conf_bonus"]
@@ -489,12 +632,13 @@ class AuctionAnalyzer:
         # [阵型审计 V6.1 - 上帝视角回归]
         # 1. 统计昨日真实底座 (固定分母)
         yest_counts = defaultdict(int)
-        for _, y_s in yest_limit_map.items():
-            yest_counts[y_s.lb_days] += 1
-            # 记录梯队最高标特征
+        max_level = 0
+        if yest_limit_map:
+            for _, y_s in yest_limit_map.items():
+                yest_counts[y_s.lb_days] += 1
             max_level = max(yest_counts.keys()) if yest_counts else 0
 
-        report.promo_stats = defaultdict(lambda: [0, 0, [], []]) # [total_yest, red_open, strongs, nuclear]
+        report.promo_stats = defaultdict(lambda: [0, 0, [], [], 0]) # [total, promoted, strongs, nuclear, red_open]
         for level, count in yest_counts.items():
             report.promo_stats[level][0] = count
 
@@ -505,7 +649,10 @@ class AuctionAnalyzer:
             
             if s.is_yest_limit:
                 level = s.lb_days
-                if s.open_pct > 0: report.promo_stats[level][1] += 1
+                # [V39.7 Fix] 区分红开率与真实晋级率
+                if s.open_pct > 0: report.promo_stats[level][4] += 1
+                if s.current_pct > 0.098: report.promo_stats[level][1] += 1
+                
                 # 标兵判定 (高溢价 + 高额)
                 if s.open_pct > 0.04 and s.auction_amount > 1e7: report.promo_stats[level][2].append(s)
                 # 负反馈判定 (核按钮 <-5% 或 严重不及预期)
