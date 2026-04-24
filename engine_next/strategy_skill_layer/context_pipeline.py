@@ -31,7 +31,10 @@ def build_context_strategy_bundle_for_symbols(
         snapshot for snapshot in context.stock_snapshots if not symbol_filter or snapshot.symbol in symbol_filter
     )
     profiles = tuple(assess_stock_profile(snapshot) for snapshot in selected_snapshots)
-    decisions = tuple(build_auction_and_ladder_decision(snapshot) for snapshot in selected_snapshots)
+    decisions = tuple(
+        build_auction_and_ladder_decision(snapshot, profile=profile)
+        for snapshot, profile in zip(selected_snapshots, profiles)
+    )
 
     ranked = sorted(
         decisions,

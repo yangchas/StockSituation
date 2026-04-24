@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from engine_next.domain.models import IntradayContext, StockStateSnapshot
 from engine_next.runtime.plate_mapping_registry import is_generic_plate, split_plate_tokens
@@ -41,7 +41,9 @@ def build_auction_plate_bucket_stats(
     if not selected:
         return ()
 
-    hot_plate_map = context.hot_plate_map or context.yesterday_hot_plate_map
+    hot_plate_map = context.session_facts.hot_plate_today_map or context.session_facts.hot_plate_yesterday_map
+    if not hot_plate_map:
+        hot_plate_map = context.hot_plate_map or context.yesterday_hot_plate_map
     bucket_payload: dict[str, dict[str, object]] = {}
 
     for snapshot in selected:
@@ -81,10 +83,10 @@ def build_auction_plate_bucket_stats(
     stats: list[AuctionPlateBucketStat] = []
     for plate_name, payload in bucket_payload.items():
         hot_payload = hot_plate_map.get(plate_name, {})
-        hot_rank = int(hot_payload.get("rank", 999) or 999) if hot_payload else 999
-        hot_change_pct = float(hot_payload.get("change_pct", 0.0) or 0.0) if hot_payload else 0.0
-        hot_strength = float(hot_payload.get("strength", hot_payload.get("hot", 0.0)) or 0.0) if hot_payload else 0.0
-        hot_net_inflow_yi = float(hot_payload.get("net_inflow_yi", 0.0) or 0.0) if hot_payload else 0.0
+        hot_rank = int(_hot_field(hot_payload, "rank", default=999) or 999) if hot_payload else 999
+        hot_change_pct = _hot_field(hot_payload, "change_pct") if hot_payload else 0.0
+        hot_strength = _hot_strength(hot_payload) if hot_payload else 0.0
+        hot_net_inflow_yi = _hot_field(hot_payload, "net_inflow_yi") if hot_payload else 0.0
         hot_capital_behavior = _hot_plate_capital_behavior_score(hot_change_pct, hot_net_inflow_yi)
         auction_amount = float(payload["auction_amount"])
         symbol_count = len(payload["symbols"]) if isinstance(payload["symbols"], set) else 0
@@ -200,11 +202,11 @@ def _resolve_theme_weights(snapshot: StockStateSnapshot) -> tuple[tuple[str, flo
 def _score_snapshot(
     snapshot: StockStateSnapshot,
     weight: float,
-    hot_payload: dict[str, object],
+    hot_payload: Any,
 ) -> float:
-    hot_strength = float(hot_payload.get("strength", hot_payload.get("hot", 0.0)) or 0.0) if hot_payload else 0.0
-    hot_change_pct = float(hot_payload.get("change_pct", 0.0) or 0.0) if hot_payload else 0.0
-    hot_net_inflow_yi = float(hot_payload.get("net_inflow_yi", 0.0) or 0.0) if hot_payload else 0.0
+    hot_strength = _hot_strength(hot_payload) if hot_payload else 0.0
+    hot_change_pct = _hot_field(hot_payload, "change_pct") if hot_payload else 0.0
+    hot_net_inflow_yi = _hot_field(hot_payload, "net_inflow_yi") if hot_payload else 0.0
     hot_bonus = min(hot_strength / 5000.0, 2.0) + _hot_plate_capital_behavior_score(hot_change_pct, hot_net_inflow_yi)
     leader_bonus = 0.8 if snapshot.leader_rank_in_theme <= 3 else 0.0
     yest_limit_bonus = 0.9 if snapshot.is_yest_limit else 0.0
@@ -253,3 +255,21 @@ def _hot_plate_capital_behavior_score(change_pct: float, net_inflow_yi: float) -
     else:
         score = max(change_pct, 0.0) * 0.08
     return round(score, 4)
+
+
+def _hot_field(payload: Any, field: str, *, default: float = 0.0) -> float:
+    if isinstance(payload, dict):
+        value = payload.get(field, default)
+    else:
+        value = getattr(payload, field, default)
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return float(default or 0.0)
+
+
+def _hot_strength(payload: Any) -> float:
+    strength = _hot_field(payload, "strength")
+    if strength > 0.0:
+        return strength
+    return _hot_field(payload, "hot")

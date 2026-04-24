@@ -7,7 +7,7 @@ from engine_next.domain.enums import (
     StockStage,
     TradeWindowState,
 )
-from engine_next.domain.models import AuctionLadderDecision, StockStateSnapshot
+from engine_next.domain.models import AuctionLadderDecision, StockProfileAssessment, StockStateSnapshot
 from engine_next.strategy_skill_layer.stock_profile import assess_stock_profile
 
 
@@ -49,8 +49,12 @@ def _estimate_win_rate(snapshot: StockStateSnapshot, profile: object) -> float:
     return max(0.25, min(0.75, win_rate))
 
 
-def build_auction_and_ladder_decision(snapshot: StockStateSnapshot) -> AuctionLadderDecision:
-    profile = assess_stock_profile(snapshot)
+def build_auction_and_ladder_decision(
+    snapshot: StockStateSnapshot,
+    *,
+    profile: StockProfileAssessment | None = None,
+) -> AuctionLadderDecision:
+    profile = profile or assess_stock_profile(snapshot)
     reasons: list[str] = list(profile.notes)
     confidence = 35
     setup_id = "observe_only"

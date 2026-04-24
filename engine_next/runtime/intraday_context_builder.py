@@ -16,6 +16,11 @@ from engine_next.runtime.plate_mapping_registry import (
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.runtime.rust_runtime_feed import RustRuntimeFeed
 from engine_next.runtime.rust_snapshot_bridge import RustSnapshotBridge
+from engine_next.runtime.session_facts import (
+    build_session_facts,
+    session_facts_from_payload,
+    session_facts_to_payload,
+)
 from engine_next.runtime.tick_window_tracker import TickWindowTracker
 from engine_next.runtime.tick_window_tracker import TickWindowMetrics
 
@@ -378,12 +383,32 @@ class IntradayContextBuilder:
             )
 
         ranked_snapshots = self._attach_theme_ranks(snapshots)
+        session_facts = self._load_cached_session_facts(
+            trade_date=primed.trade_date,
+            phase=primed.phase,
+            latest_quote_timestamp_ms=primed.latest_quote_timestamp_ms,
+            symbol_count=len(ranked_snapshots),
+        )
+        if session_facts is None:
+            session_facts = build_session_facts(
+                trade_date=primed.trade_date,
+                phase_name=primed.phase.value,
+                snapshots=ranked_snapshots,
+                hot_plate_map=primed.effective_hot_plate_map,
+                yesterday_hot_plate_map=primed.yesterday_hot_plate_map,
+            )
+            self._write_cached_session_facts(
+                trade_date=primed.trade_date,
+                phase=primed.phase,
+                latest_quote_timestamp_ms=primed.latest_quote_timestamp_ms,
+                symbol_count=len(ranked_snapshots),
+                facts=session_facts,
+            )
         market_summary = self._build_market_summary(
             snapshots=ranked_snapshots,
             auction_map=auction_map,
             yest_limit_map=primed.yest_limit_map,
-            hot_plate_map=primed.effective_hot_plate_map,
-            yesterday_hot_plate_map=primed.yesterday_hot_plate_map,
+            session_facts=session_facts,
             rust_market_extremes=primed.rust_market_extremes,
             cache_rows=tuple(cache_map.values()),
             market_runtime_state=primed.market_runtime_state,
@@ -394,6 +419,7 @@ class IntradayContextBuilder:
             offline_context_date=primed.offline_context_date,
             stock_snapshots=tuple(ranked_snapshots),
             market_summary=market_summary,
+            session_facts=session_facts,
             hot_plate_map=primed.hot_plate_map,
             yesterday_hot_plate_map=primed.yesterday_hot_plate_map,
             yest_limit_map=primed.yest_limit_map,
@@ -511,6 +537,66 @@ class IntradayContextBuilder:
         self._string_hash_cache = {}
         self._string_key_cache = {}
 
+    def _session_facts_cache_key(self, trade_date: str, phase: RunPhase) -> str:
+        return f"cache:session_facts:{trade_date}:{phase.value}"
+
+    def _session_facts_meta_key(self, trade_date: str, phase: RunPhase) -> str:
+        return f"cache:session_facts_meta:{trade_date}:{phase.value}"
+
+    def _load_cached_session_facts(
+        self,
+        *,
+        trade_date: str,
+        phase: RunPhase,
+        latest_quote_timestamp_ms: int,
+        symbol_count: int,
+    ):
+        meta = self._load_json_string(self._session_facts_meta_key(trade_date, phase))
+        if not isinstance(meta, dict):
+            return None
+        try:
+            meta_quote_ts = int(float(meta.get("latest_quote_timestamp_ms", 0) or 0))
+            meta_symbol_count = int(meta.get("symbol_count", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if meta_quote_ts != latest_quote_timestamp_ms or meta_symbol_count != symbol_count:
+            return None
+        payload = self._load_json_string(self._session_facts_cache_key(trade_date, phase))
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return session_facts_from_payload(payload)
+        except Exception:
+            return None
+
+    def _write_cached_session_facts(
+        self,
+        *,
+        trade_date: str,
+        phase: RunPhase,
+        latest_quote_timestamp_ms: int,
+        symbol_count: int,
+        facts,
+    ) -> None:
+        payload = session_facts_to_payload(facts)
+        meta = {
+            "fact_set_id": facts.fact_set_id,
+            "trade_date": trade_date,
+            "phase": phase.value,
+            "latest_quote_timestamp_ms": latest_quote_timestamp_ms,
+            "symbol_count": symbol_count,
+        }
+        self.hub.redis.set(
+            self._session_facts_cache_key(trade_date, phase),
+            json.dumps(payload, ensure_ascii=False),
+        )
+        self.hub.redis.set(
+            self._session_facts_meta_key(trade_date, phase),
+            json.dumps(meta, ensure_ascii=False),
+        )
+        self._string_key_cache[self._session_facts_cache_key(trade_date, phase)] = payload
+        self._string_key_cache[self._session_facts_meta_key(trade_date, phase)] = meta
+
     def _plate_persistence_score(
         self,
         plate: str,
@@ -591,8 +677,7 @@ class IntradayContextBuilder:
         snapshots: list[StockStateSnapshot],
         auction_map: dict[str, dict],
         yest_limit_map: dict[str, dict],
-        hot_plate_map: dict[str, dict],
-        yesterday_hot_plate_map: dict[str, dict],
+        session_facts,
         rust_market_extremes: dict[str, Any],
         cache_rows: tuple[dict[str, Any], ...],
         market_runtime_state: dict[str, Any],
@@ -609,54 +694,40 @@ class IntradayContextBuilder:
         fading_plate_count = 0
         mainline_switch = False
         previous_top_plate_name = ""
+        hot_plate_map = {fact.plate_name: fact for fact in session_facts.hot_plate_today}
+        yesterday_hot_plate_map = {fact.plate_name: fact for fact in session_facts.hot_plate_yesterday}
         if yesterday_hot_plate_map:
-            previous_ranked = sorted(
-                yesterday_hot_plate_map.items(),
-                key=self._hot_plate_sort_key,
-            )
-            previous_top_plate_name = previous_ranked[0][0] if previous_ranked else ""
+            previous_top_plate_name = session_facts.hot_plate_yesterday[0].plate_name if session_facts.hot_plate_yesterday else ""
         runtime_mainline_sector = self._infer_runtime_mainline_sector(snapshots, hot_plate_map)
-        if hot_plate_map:
-            ranked = sorted(
-                hot_plate_map.items(),
-                key=self._hot_plate_sort_key,
-            )
-            top_plate_name, top_plate_data = ranked[0]
-            top_plate_strength = round(self._hot_plate_strength_value(top_plate_data), 2)
-            mainline_net_inflow_yi = round(float(top_plate_data.get("net_inflow_yi", 0.0) or 0.0), 2)
-            top_sector_pct = round(float(top_plate_data.get("change_pct", 0.0) or 0.0), 3)
-            top_strengths = sorted(
-                [
-                    self._hot_plate_strength_value(payload)
-                    for payload in hot_plate_map.values()
-                    if self._hot_plate_strength_value(payload) > 0.0
-                ],
-                reverse=True,
-            )[:5]
+        if session_facts.hot_plate_today:
+            top_fact = session_facts.hot_plate_today[0]
+            top_plate_name = top_fact.plate_name
+            top_plate_strength = top_fact.strength
+            mainline_net_inflow_yi = top_fact.net_inflow_yi
+            top_sector_pct = top_fact.change_pct
+            top_strengths = [fact.strength for fact in session_facts.hot_plate_today[:5] if fact.strength > 0.0]
             if top_strengths:
                 resonance_score = round(sum(top_strengths) / len(top_strengths), 2)
-            for plate_name, payload in hot_plate_map.items():
-                current_metric = self._hot_plate_metric(payload)
-                current_behavior = self._hot_plate_capital_behavior_score(payload)
-                if plate_name in yesterday_hot_plate_map:
+            for migration in session_facts.plate_migration:
+                if migration.present_today and migration.present_yesterday:
                     yest_hot_plate_match_count += 1
-                    y_payload = yesterday_hot_plate_map[plate_name]
-                    previous_metric = self._hot_plate_metric(y_payload)
-                    if current_metric >= previous_metric:
+                    today_change_pct = migration.today_change_pct
+                    today_net_inflow_yi = migration.today_net_inflow_yi
+                    if migration.strength_delta >= 0:
                         persistent_plate_count += 1
-                        if plate_name == top_plate_name:
+                        if migration.plate_name == top_plate_name:
                             top_plate_migration_type = "PERSIST"
-                    elif current_behavior <= -0.3:
+                    elif today_net_inflow_yi < 0 and today_change_pct > 0:
                         fading_plate_count += 1
-                        if plate_name == top_plate_name:
+                        if migration.plate_name == top_plate_name:
                             top_plate_migration_type = "FADING"
                     else:
                         emerging_plate_count += 1
-                        if plate_name == top_plate_name:
+                        if migration.plate_name == top_plate_name:
                             top_plate_migration_type = "EMERGING"
-                else:
+                elif migration.present_today:
                     emerging_plate_count += 1
-                    if plate_name == top_plate_name:
+                    if migration.plate_name == top_plate_name:
                         top_plate_migration_type = "EMERGING"
             if not top_plate_migration_type and top_plate_name:
                 top_plate_migration_type = "PERSIST" if top_plate_name in yesterday_hot_plate_map else "EMERGING"
@@ -765,7 +836,7 @@ class IntradayContextBuilder:
     def _infer_runtime_mainline_sector(
         self,
         snapshots: list[StockStateSnapshot],
-        hot_plate_map: dict[str, dict],
+        hot_plate_map: dict[str, Any],
     ) -> str:
         plate_scores: dict[str, float] = {}
         plate_leader_counts: dict[str, int] = {}
@@ -825,7 +896,7 @@ class IntradayContextBuilder:
     def _match_hot_plate_signal(
         self,
         plate_names: Iterable[str],
-        hot_plate_map: dict[str, dict],
+        hot_plate_map: dict[str, Any],
     ) -> float:
         if not hot_plate_map:
             return 0.0
@@ -846,34 +917,34 @@ class IntradayContextBuilder:
                 matched_signal = signal
         return matched_signal
 
-    def _hot_plate_metric(self, payload: dict[str, Any]) -> tuple[float, float, float, float]:
+    def _hot_plate_metric(self, payload: Any) -> tuple[float, float, float, float]:
         return (
             self._hot_plate_strength_value(payload),
-            self._hot_plate_capital_behavior_score(payload),
-            float(payload.get("change_pct", 0.0) or 0.0),
-            float(payload.get("net_inflow_yi", 0.0) or 0.0),
-            float(payload.get("hot", 0.0) or 0.0),
+            self._hot_plate_field(payload, "change_pct"),
+            self._hot_plate_field(payload, "net_inflow_yi"),
+            self._hot_plate_field(payload, "hot"),
         )
 
-    def _hot_plate_sort_key(self, item: tuple[str, dict[str, Any]]) -> tuple[float, float, float, float, float, str]:
+    def _hot_plate_sort_key(self, item: tuple[str, Any]) -> tuple[float, float, float, float, int, str]:
         plate_name, payload = item
-        strength, capital_behavior, change_pct, net_inflow_yi, hot = self._hot_plate_metric(payload)
-        return (-strength, -capital_behavior, -change_pct, -net_inflow_yi, -hot, plate_name)
+        strength, change_pct, net_inflow_yi, hot = self._hot_plate_metric(payload)
+        rank = int(self._hot_plate_field(payload, "rank", default=999) or 999)
+        return (-strength, -change_pct, -net_inflow_yi, -hot, rank, plate_name)
 
-    def _hot_plate_strength_value(self, payload: dict[str, Any]) -> float:
-        strength = float(payload.get("strength", 0.0) or 0.0)
+    def _hot_plate_strength_value(self, payload: Any) -> float:
+        strength = self._hot_plate_field(payload, "strength")
         if strength > 0.0:
             return strength
-        return float(payload.get("hot", 0.0) or 0.0)
+        return self._hot_plate_field(payload, "hot")
 
-    def _hot_plate_signal_score(self, payload: dict[str, Any]) -> float:
+    def _hot_plate_signal_score(self, payload: Any) -> float:
         strength = self._hot_plate_strength_value(payload)
         strength_signal = min(strength / 5000.0, 2.5) if strength > 0.0 else 0.0
         return round(strength_signal + self._hot_plate_capital_behavior_score(payload), 4)
 
-    def _hot_plate_capital_behavior_score(self, payload: dict[str, Any]) -> float:
-        change_pct = float(payload.get("change_pct", 0.0) or 0.0)
-        net_inflow_yi = float(payload.get("net_inflow_yi", 0.0) or 0.0)
+    def _hot_plate_capital_behavior_score(self, payload: Any) -> float:
+        change_pct = self._hot_plate_field(payload, "change_pct")
+        net_inflow_yi = self._hot_plate_field(payload, "net_inflow_yi")
         flow_signal = min(abs(net_inflow_yi), 20.0) / 20.0
         price_signal = min(abs(change_pct), 8.0) / 8.0
         if net_inflow_yi > 0 and change_pct > 0:
@@ -938,3 +1009,14 @@ class IntradayContextBuilder:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return 0.0
+
+    def _hot_plate_field(self, payload: Any, field: str, *, default: float = 0.0) -> float:
+        value = default
+        if isinstance(payload, dict):
+            value = payload.get(field, default)
+        else:
+            value = getattr(payload, field, default)
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return float(default or 0.0)

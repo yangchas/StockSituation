@@ -120,10 +120,10 @@ class MarketRuntimeSummaryService:
                 rows,
                 key=lambda item: (
                     self._hot_plate_strength_value(item),
-                    self._hot_plate_capital_behavior_score(item),
                     float(item.get("change_pct", 0.0) or 0.0),
                     float(item.get("net_inflow_yi", 0.0) or 0.0),
                     float(item.get("hot", 0.0) or 0.0),
+                    -float(item.get("rank", 999) or 999),
                 ),
             )
             return {

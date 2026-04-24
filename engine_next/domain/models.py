@@ -140,6 +140,67 @@ class StockProfileAssessment:
 
 
 @dataclass(frozen=True)
+class HotPlateFact:
+    plate_name: str
+    rank: int = 999
+    strength: float = 0.0
+    change_pct: float = 0.0
+    net_inflow_yi: float = 0.0
+    hot: float = 0.0
+
+
+@dataclass(frozen=True)
+class PlateMigrationFact:
+    plate_name: str
+    today_strength: float = 0.0
+    yesterday_strength: float = 0.0
+    strength_delta: float = 0.0
+    today_change_pct: float = 0.0
+    yesterday_change_pct: float = 0.0
+    change_pct_delta: float = 0.0
+    today_net_inflow_yi: float = 0.0
+    yesterday_net_inflow_yi: float = 0.0
+    net_inflow_yi_delta: float = 0.0
+    present_today: bool = False
+    present_yesterday: bool = False
+
+
+@dataclass(frozen=True)
+class ThemeFact:
+    plate_name: str
+    leader_symbol: str = ""
+    top3_symbols: tuple[str, ...] = ()
+    symbol_count: int = 0
+    auction_amount: float = 0.0
+    yest_limit_count: int = 0
+    leader_count: int = 0
+
+
+@dataclass(frozen=True)
+class LadderFact:
+    key: str
+    total_count: int = 0
+    red_open_count: int = 0
+    promoted_count: int = 0
+    representative_symbol: str = ""
+
+
+@dataclass(frozen=True)
+class SessionFacts:
+    fact_set_id: str = ""
+    hot_plate_today: tuple[HotPlateFact, ...] = ()
+    hot_plate_today_map: Dict[str, HotPlateFact] = field(default_factory=dict)
+    hot_plate_yesterday: tuple[HotPlateFact, ...] = ()
+    hot_plate_yesterday_map: Dict[str, HotPlateFact] = field(default_factory=dict)
+    plate_migration: tuple[PlateMigrationFact, ...] = ()
+    plate_migration_map: Dict[str, PlateMigrationFact] = field(default_factory=dict)
+    theme_facts: tuple[ThemeFact, ...] = ()
+    theme_fact_map: Dict[str, ThemeFact] = field(default_factory=dict)
+    ladder_facts: tuple[LadderFact, ...] = ()
+    ladder_fact_map: Dict[str, LadderFact] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class AuctionLadderDecision:
     symbol: str
     setup_id: str
@@ -220,6 +281,7 @@ class IntradayContext:
     yesterday_hot_plate_map: Dict[str, dict]
     yest_limit_map: Dict[str, dict]
     auction_map: Dict[str, dict]
+    session_facts: SessionFacts = field(default_factory=SessionFacts)
     notes: tuple[str, ...] = ()
 
 

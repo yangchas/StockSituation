@@ -51,6 +51,8 @@ class StrategyConsoleState:
     bundle: ContextStrategyBundle | None
     candidates: tuple[AuctionLadderDecision, ...]
     missing_inputs: tuple[str, ...]
+    snapshot_map: dict[str, StockStateSnapshot]
+    decision_map: dict[str, AuctionLadderDecision]
     historical_only: bool = False
     stale_snapshot_only: bool = False
 
@@ -499,9 +501,12 @@ class AuctionRuntimeController:
         )
         bundle = None
         candidates: tuple[AuctionLadderDecision, ...] = ()
+        snapshot_map = {snapshot.symbol: snapshot for snapshot in intraday_context.stock_snapshots}
+        decision_map: dict[str, AuctionLadderDecision] = {}
         if candidate_scope:
             bundle = build_context_strategy_bundle_for_symbols(intraday_context, symbols=candidate_scope)
             candidates = filter_trade_candidates(bundle, min_confidence=min_confidence)
+            decision_map = {decision.symbol: decision for decision in bundle.decisions}
         return StrategyConsoleState(
             context=intraday_context,
             candidate_scope=candidate_scope,
@@ -510,6 +515,8 @@ class AuctionRuntimeController:
             bundle=bundle,
             candidates=candidates,
             missing_inputs=missing_inputs,
+            snapshot_map=snapshot_map,
+            decision_map=decision_map,
             historical_only=historical_only,
             stale_snapshot_only=stale_snapshot_only,
         )
@@ -666,9 +673,9 @@ class AuctionRuntimeController:
 
     def _render_ladder_recap(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
-        high_board_count = sum(1 for snapshot in state.context.stock_snapshots if snapshot.lb_days >= 3)
-        yest_limit_count = sum(1 for snapshot in state.context.stock_snapshots if snapshot.is_yest_limit)
-        locked_count = sum(1 for snapshot in state.context.stock_snapshots if snapshot.is_locked)
+        high_board_count = sum(1 for snapshot in state.snapshot_map.values() if snapshot.lb_days >= 3)
+        yest_limit_count = sum(1 for snapshot in state.snapshot_map.values() if snapshot.is_yest_limit)
+        locked_count = sum(1 for snapshot in state.snapshot_map.values() if snapshot.is_locked)
         return (
             "【高位梯队复盘】指标 | 数值",
             f"  ▲ 三板及以上 | {high_board_count}",
@@ -698,12 +705,10 @@ class AuctionRuntimeController:
         )
 
     def _render_high_board_book(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
-        snapshot_map = {snapshot.symbol: snapshot for snapshot in state.context.stock_snapshots}
-        decision_map = {decision.symbol: decision for decision in (state.bundle.decisions if state.bundle else ())}
         ranked = sorted(
             (
                 snapshot
-                for snapshot in snapshot_map.values()
+                for snapshot in state.snapshot_map.values()
                 if snapshot.symbol in state.candidate_scope and (snapshot.lb_days >= 2 or snapshot.is_yest_limit)
             ),
             key=lambda snapshot: (
@@ -721,7 +726,7 @@ class AuctionRuntimeController:
             buy1_king_symbol = max(ranked, key=lambda item: item.volume_intensity).symbol if ranked else ""
         rows = ["【高标生死簿】标的(题材) | 梯队 | 溢价(竞) | 现价(实) | 状态 | 买一承接 | 特征 | 动作"]
         for snapshot in ranked[:4]:
-            decision = decision_map.get(snapshot.symbol)
+            decision = state.decision_map.get(snapshot.symbol)
             action = self._display_action_label(decision, state, phase_label=phase_label) if decision else "只观察"
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             rows.append(
@@ -898,9 +903,21 @@ class AuctionRuntimeController:
         return tuple(rows)
 
     def _render_ladder_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        if state.context.session_facts.ladder_facts:
+            rows = ["【梯队映射】梯队 | 数量 | 红开率 | 晋级率 | 极值特征 | 层级定性 | 代表"]
+            for fact in state.context.session_facts.ladder_facts[:4]:
+                total = max(fact.total_count, 1)
+                rep_snapshot = state.snapshot_map.get(fact.representative_symbol)
+                rows.append(
+                    f"  {fact.key} | {fact.total_count} | {fact.red_open_count / total:.0%} | {fact.promoted_count / total:.0%} | "
+                    f"{self._ladder_extreme_label(fact.key, red_count=fact.red_open_count, promoted_count=fact.promoted_count, total=fact.total_count)} | "
+                    f"{self._mid_ladder_label(fact.key, red_count=fact.red_open_count, promoted_count=fact.promoted_count, total=fact.total_count)} | "
+                    f"{self._short_stock_name(rep_snapshot) if rep_snapshot is not None else fact.representative_symbol}"
+                )
+            return tuple(rows)
         transitions: dict[str, list[StockStateSnapshot]] = defaultdict(list)
         fallback_groups: dict[str, list[StockStateSnapshot]] = defaultdict(list)
-        for snapshot in state.context.stock_snapshots:
+        for snapshot in state.snapshot_map.values():
             if snapshot.is_yest_limit and snapshot.lb_days >= 1:
                 key = f"{max(snapshot.lb_days - 1, 0)}B->{snapshot.lb_days}B"
                 transitions[key].append(snapshot)
@@ -939,12 +956,10 @@ class AuctionRuntimeController:
         return tuple(rows)
 
     def _render_auction_leader_watch(self, state: StrategyConsoleState) -> tuple[str, ...]:
-        snapshot_map = {snapshot.symbol: snapshot for snapshot in state.context.stock_snapshots}
-        decision_map = {decision.symbol: decision for decision in (state.bundle.decisions if state.bundle else ())}
         leaders = sorted(
             (
                 snapshot
-                for snapshot in snapshot_map.values()
+                for snapshot in state.snapshot_map.values()
                 if snapshot.symbol in state.candidate_scope
                 and (snapshot.auction_amount > 0 or snapshot.lb_days >= 2 or snapshot.is_yest_limit)
             ),
@@ -959,7 +974,7 @@ class AuctionRuntimeController:
             return ("【竞价龙头】暂无竞价观察",)
         rows = ["【竞价龙头】板位 | 个股 | 高开 | 现涨 | 竞价额 | 量比 | 强弱定性 | 机会上车 | 动作"]
         for snapshot in leaders[:5]:
-            decision = decision_map.get(snapshot.symbol)
+            decision = state.decision_map.get(snapshot.symbol)
             action = self._display_action_label(decision, state, phase_label="auction") if decision else "只观察"
             leader_heat = self._leader_truth_label(snapshot)
             entry_tag = self._entry_window_label(snapshot, phase_label="auction")
@@ -1010,11 +1025,10 @@ class AuctionRuntimeController:
     def _render_focus_pool(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
         if state.bundle is None:
             return (("明日观察池" if phase_label == "postmarket" else "核心观察池") + " | 候选样本尚未就绪",)
-        snapshot_map = {snapshot.symbol: snapshot for snapshot in state.context.stock_snapshots}
         selected_symbols = {row.symbol for row in state.candidates[:4]}
         buy_parts: list[str] = []
         for decision in state.candidates[:4]:
-            snapshot = snapshot_map.get(decision.symbol)
+            snapshot = state.snapshot_map.get(decision.symbol)
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             action = self._display_action_label(decision, state, phase_label=phase_label)
             evidence = self._focus_evidence(snapshot, phase_label=phase_label)
@@ -1026,7 +1040,7 @@ class AuctionRuntimeController:
                 continue
             if decision.action in ("avoid_after_failed_promotion", "do_not_chase", "observe_only"):
                 continue
-            snapshot = snapshot_map.get(decision.symbol)
+            snapshot = state.snapshot_map.get(decision.symbol)
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             action = self._display_action_label(decision, state, phase_label=phase_label)
             evidence = self._focus_evidence(snapshot, phase_label=phase_label)
@@ -1063,14 +1077,14 @@ class AuctionRuntimeController:
             )
 
         if phase_label == "intraday" and state.stale_snapshot_only:
-            watch_parts = [self._format_watch_item(decision, snapshot_map) for decision in state.candidates[:4]] or ["无"]
+            watch_parts = [self._format_watch_item(decision, state.snapshot_map) for decision in state.candidates[:4]] or ["无"]
             carry_parts = []
             for decision in state.bundle.decisions:
                 if decision.symbol in selected_symbols:
                     continue
                 if decision.action in ("avoid_after_failed_promotion", "do_not_chase", "observe_only"):
                     continue
-                carry_parts.append(self._format_watch_item(decision, snapshot_map))
+                carry_parts.append(self._format_watch_item(decision, state.snapshot_map))
                 if len(carry_parts) >= 3:
                     break
             if not carry_parts:
@@ -1239,9 +1253,15 @@ class AuctionRuntimeController:
         return ("观察跟踪", "先不出手", "无突出极值")
 
     def _theme_internal_names(self, state: StrategyConsoleState, plate_name: str) -> tuple[str, str, str]:
+        theme_fact = state.context.session_facts.theme_fact_map.get(plate_name)
+        if theme_fact is not None:
+            names = [self._snapshot_name_by_symbol(state.context, symbol) for symbol in theme_fact.top3_symbols[:3]]
+            while len(names) < 3:
+                names.append("-")
+            return names[0], names[1], names[2]
         matched = [
             snapshot
-            for snapshot in state.context.stock_snapshots
+            for snapshot in state.snapshot_map.values()
             if plate_name == snapshot.plate or plate_name in snapshot.real_plate_names
         ]
         matched = sorted(
