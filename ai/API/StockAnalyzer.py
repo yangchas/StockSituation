@@ -45,7 +45,14 @@ class StockAnalyzer:
             result = func(*args, **kwargs)
             self._last_error = None
             
-            # 检查API返回的错误码
+            # 🛠️ 递归适配：多层脱壳，确保最终拿到的是数据字典
+            while isinstance(result, (tuple, list)) and len(result) > 0:
+                if isinstance(result[0], int) and result[0] != 0:
+                    # 如果第一个元素是错误码且非0，记录错误
+                    self._last_error = f"API Error Code: {result[0]}"
+                result = result[1] if len(result) > 1 else result[0]
+            
+            # 检查API返回的内部错误码
             if isinstance(result, dict) and 'errcode' in result:
                 errcode = result.get('errcode', '0')
                 if errcode != '0':
@@ -58,6 +65,37 @@ class StockAnalyzer:
         except Exception as e:
             self._last_error = f"调用{func_name}失败: {str(e)}"
             return None
+
+    def _normalize_date(self, date_str: Optional[str], to_hyphen: bool = True) -> str:
+        """
+        标准化日期格式
+        
+        Args:
+            date_str: 输入日期字符串 (None, YYYY-MM-DD, YYYYMMDD等)
+            to_hyphen: 是否转换为 YYYY-MM-DD 格式。False 则转换为 YYYYMMDD。
+            
+        Returns:
+            标准化后的日期字符串
+        """
+        if not date_str or not str(date_str).strip():
+            return datetime.now().strftime('%Y-%m-%d' if to_hyphen else '%Y%m%d')
+        
+        date_str = str(date_str).strip().split()[0]
+        
+        try:
+            # 尝试识别各种常见格式并解析
+            if '-' in date_str:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+            elif '/' in date_str:
+                dt = datetime.strptime(date_str, '%Y/%m/%d')
+            elif len(date_str) == 8:
+                dt = datetime.strptime(date_str, '%Y%m%d')
+            else:
+                return date_str # 无法识别，原样返回以免破坏
+            
+            return dt.strftime('%Y-%m-%d' if to_hyphen else '%Y%m%d')
+        except Exception:
+            return date_str
     
     # ==================== 股票相关功能 ====================
     
@@ -95,26 +133,8 @@ class StockAnalyzer:
         Returns:
             涨停股票列表
         """
-        # 如果日期为空或格式不正确，使用默认值
-        if date is None or not date.strip():
-            date = datetime.now().strftime('%Y%m%d')
-        else:
-            # 清理日期格式，移除可能的时间部分
-            date = date.split()[0]  # 只取日期部分
-            # 尝试标准化日期格式
-            try:
-                # 如果是YYYY-MM-DD格式，转换为YYYYMMDD
-                if '-' in date:
-                    date_obj = datetime.strptime(date, '%Y-%m-%d')
-                    date = date_obj.strftime('%Y%m%d')
-                # 如果是YYYY/MM/DD格式，转换为YYYYMMDD
-                elif '/' in date:
-                    date_obj = datetime.strptime(date, '%Y/%m/%d')
-                    date = date_obj.strftime('%Y%m%d')
-            except ValueError:
-                # 如果日期格式解析失败，使用今天
-                date = datetime.now().strftime('%Y%m%d')
-        
+        # 注意：此处维持原样转换，或根据 pykaipan 文档统一。如果 pykaipan 全局支持 YYYY-MM-DD 则统一。
+        date = self._normalize_date(date, to_hyphen=True) 
         return self._call_api('getBans', date)
     
     def get_bans_count(self) -> Optional[Dict[str, Any]]:
@@ -186,277 +206,167 @@ class StockAnalyzer:
             分钟数据
         """
         return self._call_api('getPlateMins', plate_code)
+
+    def get_history_bans_pool(self, date: str, max_ban: int = 5) -> List[Dict[str, Any]]:
+        """
+        [V3.5 统一模型] 获取指定日期的全量涨停池 (1-max_ban 梯队)
+        采用 retro_today.py 的黄金标准解析索引
+        """
+        all_bans = []
+        # 将日期标准化为 pykaipan 预期的 YYYY-MM-DD
+        target_date = self._normalize_date(date, to_hyphen=True)
+        
+        for ban_lvl in range(1, max_ban + 1):
+            try:
+                res = self._call_api('getHisBans', date=target_date, ban=str(ban_lvl), size=200)
+                if not res: continue
+                pages = res.get('info', [])
+                if not pages: continue
+                
+                for page in pages:
+                    for rec in page:
+                        if not isinstance(rec, (list, tuple)) or len(rec) < 16: continue
+                        # [黄金索引对齐]
+                        code    = str(rec[0])[-6:].zfill(6)
+                        name    = str(rec[1])
+                        # rec[15] 是准确的连板高度 (由 Kaipanla 云端计算)
+                        lb_days = int(rec[15]) if rec[15] else ban_lvl
+                        # rec[12] 是板块名称
+                        plate   = str(rec[12]) if len(rec) > 12 else "其他"
+                        
+                        seal_time = str(rec[3]) if len(rec) > 3 else "?"
+                        turnover  = float(rec[9]) if len(rec) > 9 and rec[9] else 0.0
+                        close_pct = float(rec[2]) if len(rec) > 2 and rec[2] else 10.0
+                        
+                        all_bans.append({
+                            "code": code, "name": name, "lb_days": lb_days,
+                            "plate": plate, "seal_time": seal_time,
+                            "turnover": turnover, "close_pct": close_pct
+                        })
+            except Exception as e:
+                # 记录最后一次错误但继续执行
+                self._last_error = f"Pool Sync Error at {ban_lvl}B: {e}"
+                continue
+                
+        # 去重 (同一股票可能出现在不同扫描策略的反馈中)
+        seen = set()
+        result = []
+        for b in all_bans:
+            if b['code'] not in seen:
+                seen.add(b['code'])
+                result.append(b)
+        return result
     
     # ==================== 历史数据功能 ====================
     
     def get_his_bans(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史涨停数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史涨停数据
-        """
+        """获取历史涨停数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisBans', date)
     
     def get_his_bans_count(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史涨停数量
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史涨停数量
-        """
+        """获取历史涨停数量"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisBansCount', date)
     
     def get_his_longhu(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史龙虎榜数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史龙虎榜数据
-        """
+        """获取历史龙虎榜数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisLonghu', date)
     
     def get_his_longhu_view(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史龙虎榜视图
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史龙虎榜视图
-        """
+        """获取历史龙虎榜视图"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisLonghuView', date)
     
     def get_his_no_bans(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史非涨停数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史非涨停数据
-        """
+        """获取历史非涨停数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisNoBans', date)
     
     def get_his_stock(self, stock_code: str, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取股票历史数据
-        
-        Args:
-            stock_code: 股票代码
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            股票历史数据
-        """
+        """获取股票历史数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisStock', stock_code, date)
     
     def get_his_stock_dde(self, stock_code: str, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取股票历史DDE数据
-        
-        Args:
-            stock_code: 股票代码
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史DDE数据
-        """
+        """获取股票历史DDE数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisStockDDE', stock_code, date)
     
     def get_his_plate_as(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块A股数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块A股数据
-        """
+        """获取历史板块A股数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlateAs', date)
     
     def get_his_plate_bs(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块B股数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块B股数据
-        """
+        """获取历史板块B股数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlateBs', date)
     
     def get_his_plate_ids(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块ID列表
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块ID列表
-        """
+        """获取历史板块ID列表"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlateIds', date)
     
     def get_his_plate_mins(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块分钟数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块分钟数据
-        """
+        """获取历史板块分钟数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlateMins', date)
     
     def get_his_plate_rangs(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块排名
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块排名
-        """
+        """获取历史板块排名"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlateRangs', date)
     
     def get_his_plates(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史板块数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史板块数据
-        """
+        """获取历史板块数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPlates', date)
     
     def get_his_floor(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史地板数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史地板数据
-        """
+        """获取历史地板数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisFloor', date)
     
     def get_his_have_floor(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史有地板数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史有地板数据
-        """
+        """获取历史有地板数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisHaveFloor', date)
     
     def get_his_open(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史开盘数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史开盘数据
-        """
+        """获取历史开盘数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisOpen', date)
     
     def get_his_open_counts(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史开盘数量统计
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史开盘数量统计
-        """
+        """获取历史开盘数量统计"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisOpenCounts', date)
     
     def get_his_pan_counts(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史盘面统计
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史盘面统计
-        """
+        """获取历史盘面统计"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPanCounts', date)
     
     def get_his_pan_rangs(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史盘面排名
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史盘面排名
-        """
+        """获取历史盘面排名"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPanRangs', date)
     
     def get_his_pan_stock_counts(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史盘面股票数量统计
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史盘面股票数量统计
-        """
+        """获取历史盘面股票数量统计"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisPanStockCounts', date)
     
-    def get_his_pan_vols(self) -> Optional[Dict[str, Any]]:
-        """获取历史盘面成交量"""
-        return self._call_api('getHisPanVols')
-    
     def get_his_weight_counts(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史权重统计
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史权重统计
-        """
+        """获取历史权重统计"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisWeightCounts', date)
     
     def get_his_zha(self, date: str) -> Optional[Dict[str, Any]]:
-        """
-        获取历史炸板数据
-        
-        Args:
-            date: 日期(YYYYMMDD)
-            
-        Returns:
-            历史炸板数据
-        """
+        """获取历史炸板数据"""
+        date = self._normalize_date(date, to_hyphen=True)
         return self._call_api('getHisZha', date)
     
     # ==================== 其他功能 ====================
@@ -594,29 +504,31 @@ def main():
     # 测试股票涨停原因
     stock_code = "300433"
     result = analyzer.get_ban_reasons(stock_code)
+    re = pk.getHisPlates("2026-03-17")
+    print(re)
+    # if 0:
+    #     print(f"获取{stock_code}涨停原因成功")
+        
+    #     # 解析数据
+    #     reasons = analyzer.parse_ban_reasons(result)
+    #     print(f"解析到{len(reasons)}条涨停原因")
+        
+    #     # 转换为DataFrame
+    #     df = analyzer.to_dataframe(reasons)
+    #     print(f"DataFrame形状: {df.shape}")
+        
+    #     # 保存到文件
+    #     analyzer.save_to_json(reasons, f"{stock_code}_ban_reasons.json")
+    #     print("数据已保存到文件")
+    # else:
+    #     print(f"获取失败: {analyzer.last_error}")
     
-    if result:
-        print(f"获取{stock_code}涨停原因成功")
-        
-        # 解析数据
-        reasons = analyzer.parse_ban_reasons(result)
-        print(f"解析到{len(reasons)}条涨停原因")
-        
-        # 转换为DataFrame
-        df = analyzer.to_dataframe(reasons)
-        print(f"DataFrame形状: {df.shape}")
-        
-        # 保存到文件
-        analyzer.save_to_json(reasons, f"{stock_code}_ban_reasons.json")
-        print("数据已保存到文件")
-    else:
-        print(f"获取失败: {analyzer.last_error}")
-    
-    # 测试板块数据
-    plate_result = analyzer.get_plate_inner()
-    if plate_result:
-        plates = analyzer.parse_plate_data(plate_result)
-        print(f"获取到{len(plates)}个板块数据")
+    # # 测试板块数据
+    # plate_result = analyzer.get_plate_inner()
+    # print(plate_result)
+    # if plate_result:
+    #     plates = analyzer.parse_plate_data(plate_result)
+    #     print(f"获取到{len(plates)}个板块数据")
 
 
 if __name__ == "__main__":

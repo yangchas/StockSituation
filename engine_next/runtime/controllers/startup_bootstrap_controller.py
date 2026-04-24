@@ -80,6 +80,19 @@ class StartupBootstrapController:
     def last_audit_trade_date(self) -> str | None:
         return self._last_audit_trade_date
 
+    def refresh_cached_state(
+        self,
+        *,
+        trade_date: str,
+        startup_bundle: StartupExecutionBundle,
+        watermark_snapshot: WatermarkSnapshot,
+        runtime_readiness: dict[str, object],
+    ) -> None:
+        self._last_audit_trade_date = trade_date
+        self._cached_startup_bundle = startup_bundle
+        self._cached_watermark_snapshot = watermark_snapshot
+        self._cached_runtime_readiness = runtime_readiness
+
     def execute(
         self,
         request: StartupBootstrapRequest,
@@ -89,7 +102,7 @@ class StartupBootstrapController:
     ) -> StartupBootstrapResult:
         effective_audit_token = audit_token or f"startup:{request.trade_date}:{request.now.strftime('%H:%M')}"
         if should_run_lifecycle_audit:
-            logger.info(
+            logger.debug(
                 "lifecycle audit decision | run=%s | token=%s | cached=%s",
                 True,
                 effective_audit_token,
@@ -97,7 +110,7 @@ class StartupBootstrapController:
             )
             if self._runtime_readiness_loader is None:
                 raise RuntimeError("StartupBootstrapController requires runtime_readiness_loader for audit path.")
-            logger.info(
+            logger.debug(
                 "runtime readiness audit start | symbols=%s | offline_context_date=%s",
                 len(request.symbols),
                 request.offline_context_date,
@@ -119,9 +132,9 @@ class StartupBootstrapController:
                 redis_factor_cache_ready=request.redis_factor_cache_ready or runtime_readiness["redis_factor_cache_ready"],
                 environment=request.environment,
             )
-            logger.info("watermark preload start | target_date=%s", request.trade_date)
+            logger.debug("watermark preload start | target_date=%s", request.trade_date)
             watermark_snapshot = request.watermark_snapshot or self._offline_executor.preload_watermark_snapshot(preload_request)
-            logger.info(
+            logger.debug(
                 "watermark preload done | kline=%s | dde=%s | factor=%s",
                 len(watermark_snapshot.kline_latest_dates),
                 len(watermark_snapshot.dde_latest_dates),
@@ -144,9 +157,9 @@ class StartupBootstrapController:
                 watermark_snapshot=watermark_snapshot,
                 environment=request.environment,
             )
-            logger.info("startup repair phase start")
+            logger.debug("startup repair phase start")
             startup_bundle = self._startup_coordinator.execute_allowed_repairs(startup_request)
-            logger.info(
+            logger.debug(
                 "startup repair phase done | phase=%s | readiness=%s",
                 startup_bundle.plan.phase.value,
                 startup_bundle.plan.report.readiness.value,
@@ -168,7 +181,7 @@ class StartupBootstrapController:
         watermark_snapshot = request.watermark_snapshot or self._cached_watermark_snapshot
         runtime_readiness = self._cached_runtime_readiness
         if startup_bundle is None or watermark_snapshot is None or runtime_readiness is None:
-            logger.info("lifecycle audit cache missing; forcing startup audit path")
+            logger.debug("lifecycle audit cache missing; forcing startup audit path")
             self._last_audit_token = None
             self._cached_startup_bundle = None
             self._cached_watermark_snapshot = None

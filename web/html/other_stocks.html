@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>其他个股 - 中文题材展示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            background-color: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+        }
+
+        .header h1 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 16px;
+            opacity: 0.9;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 3fr;
+            gap: 20px;
+        }
+
+        .theme-sidebar {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+
+        .theme-sidebar h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #2c3e50;
+        }
+
+        .theme-list {
+            list-style: none;
+        }
+
+        .theme-item {
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border-left: 4px solid transparent;
+        }
+
+        .theme-item:hover {
+            background: #e3f2fd;
+            border-left-color: #1976d2;
+            transform: translateX(5px);
+        }
+
+        .theme-item.active {
+            background: #bbdefb;
+            border-left-color: #1976d2;
+            font-weight: 600;
+        }
+
+        .theme-count {
+            float: right;
+            background: #1976d2;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+
+        .stock-section {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+
+        .stock-section h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            color: #2c3e50;
+        }
+
+        .stock-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 15px;
+        }
+
+        .stock-card {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #e0e0e0;
+            transition: all 0.3s ease;
+        }
+
+        .stock-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+            border-color: #1976d2;
+        }
+
+        .stock-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .stock-code {
+            font-size: 18px;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .stock-name {
+            font-size: 16px;
+            color: #666;
+        }
+
+        .stock-change {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .stock-change.positive {
+            color: #f44336;
+        }
+
+        .stock-change.negative {
+            color: #4caf50;
+        }
+
+        .stock-metrics {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .metric-item {
+            font-size: 14px;
+            color: #666;
+        }
+
+        .metric-label {
+            font-weight: 500;
+            color: #2c3e50;
+        }
+
+        .stock-themes {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .theme-tag {
+            background: #e3f2fd;
+            color: #1976d2;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 100px;
+            font-size: 18px;
+            color: #666;
+        }
+
+        .error {
+            color: #f44336;
+            text-align: center;
+            padding: 50px;
+            font-size: 18px;
+        }
+
+        .empty {
+            text-align: center;
+            padding: 50px;
+            color: #666;
+            font-size: 16px;
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+
+            .stock-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📈 其他个股</h1>
+            <p>展示符合条件的个股及其中文题材</p>
+        </div>
+
+        <div class="main-content">
+            <div class="theme-sidebar">
+                <h2>🏷️ 题材分组</h2>
+                <ul class="theme-list" id="themeList"></ul>
+            </div>
+
+            <div class="stock-section">
+                <h2>📊 股票列表</h2>
+                <div id="stockGrid" class="stock-grid"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentData = null;
+        let currentTheme = null;
+
+        async function loadData() {
+            try {
+                // 加载数据
+                const response = await fetch('/api/other_stocks?min_speed=0.0&min_amount=0.0&min_change=0.0');
+                const data = await response.json();
+
+                currentData = data;
+
+                // 渲染题材列表
+                renderThemes();
+
+                // 渲染所有股票
+                renderStocks();
+
+            } catch (error) {
+                document.getElementById('stockGrid').innerHTML = `
+                    <div class="error">
+                        ❌ 加载数据失败: ${error.message}
+                    </div>
+                `;
+                console.error('加载数据失败:', error);
+            }
+        }
+
+        function renderThemes() {
+            const themeList = document.getElementById('themeList');
+            themeList.innerHTML = '';
+
+            // 添加"全部"选项
+            const allItem = document.createElement('li');
+            allItem.className = 'theme-item active';
+            allItem.innerHTML = `
+                全部个股
+                <span class="theme-count">${currentData.stocks.length}</span>
+            `;
+            allItem.onclick = () => selectTheme(null);
+            themeList.appendChild(allItem);
+
+            // 渲染题材
+            Object.keys(currentData.theme_groups).forEach(theme => {
+                const item = document.createElement('li');
+                item.className = 'theme-item';
+                item.innerHTML = `
+                    ${theme}
+                    <span class="theme-count">${currentData.theme_groups[theme].length}</span>
+                `;
+                item.onclick = () => selectTheme(theme);
+                themeList.appendChild(item);
+            });
+        }
+
+        function selectTheme(theme) {
+            currentTheme = theme;
+
+            // 更新题材列表样式
+            document.querySelectorAll('.theme-item').forEach(item => {
+                item.classList.remove('active');
+            });
+
+            const activeItem = theme ? 
+                document.querySelector(`.theme-item:contains("${theme}")`) : 
+                document.querySelector('.theme-item.active');
+            
+            if (activeItem) {
+                activeItem.classList.add('active');
+            }
+
+            // 渲染股票
+            renderStocks();
+        }
+
+        function renderStocks() {
+            const stockGrid = document.getElementById('stockGrid');
+            stockGrid.innerHTML = '';
+
+            let stocks = currentData.stocks;
+
+            // 如果选择了特定题材，过滤股票
+            if (currentTheme) {
+                const themeStockCodes = currentData.theme_groups[currentTheme] || [];
+                stocks = stocks.filter(stock => themeStockCodes.includes(stock.code));
+            }
+
+            if (stocks.length === 0) {
+                stockGrid.innerHTML = `
+                    <div class="empty">
+                        📭 暂无数据
+                    </div>
+                `;
+                return;
+            }
+
+            // 渲染股票
+            stocks.forEach(stock => {
+                const stockCard = document.createElement('div');
+                stockCard.className = 'stock-card';
+
+                const changeClass = stock.change_pct >= 0 ? 'positive' : 'negative';
+                const changeSign = stock.change_pct >= 0 ? '+' : '';
+
+                stockCard.innerHTML = `
+                    <div class="stock-header">
+                        <div>
+                            <div class="stock-code">${stock.code}</div>
+                            <div class="stock-name">${stock.name}</div>
+                        </div>
+                        <div class="stock-change ${changeClass}">
+                            ${changeSign}${stock.change_pct}%
+                        </div>
+                    </div>
+                    <div class="stock-metrics">
+                        <div class="metric-item">
+                            <span class="metric-label">涨速:</span> ${stock.change_rate_1min}%
+                        </div>
+                        <div class="metric-item">
+                            <span class="metric-label">成交额:</span> ${(stock.amount / 100000000).toFixed(2)}亿
+                        </div>
+                    </div>
+                    <div class="stock-themes">
+                        ${stock.themes.map(theme => `<span class="theme-tag">${theme}</span>`).join('')}
+                    </div>
+                `;
+
+                stockGrid.appendChild(stockCard);
+            });
+        }
+
+        // 页面加载完成后加载数据
+        window.addEventListener('load', loadData);
+    </script>
+</body>
+</html>

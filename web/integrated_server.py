@@ -11,9 +11,16 @@ from typing import Dict, Set, List, Optional
 import logging
 import tablib
 import base64
+import re
 # 初始化日志记录器
 logger = logging.getLogger(__name__)
 from aiohttp import web
+from services.f10_service import F10DataService
+from services.trading_calendar_service import TradeCalendar, TradingCalendarService
+from services.advanced_indicators import OptimizedAdvancedTechnicalIndicators
+from services.tdengine_service import TDengineService
+from services.kaipan_plate_service import fetch_kaipan_plate_rank
+
 from datetime import datetime, timedelta
 import baostock as bs
 import numpy as np
@@ -28,7 +35,6 @@ except Exception as e:
 # 修改导入路径
 from plate_updater import LazyPlateUpdater,  OptimizedPlateUpdater, OptimizedEnhancedPlateUpdater
 from redis_storage import RedisStorageManager
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 import logging
 import asyncio
 import os
@@ -47,41 +53,62 @@ if parent_dir not in sys.path:
 
 import holidays
 from market_edge_engine import MarketEdgeEngine
+# 题材排行与分析器导入 (整合原有冗余导入)
 try:
-    from ai.API.StockAnalyzer import StockAnalyzer
-except ImportError:
     try:
-        from web.ai.API.StockAnalyzer import StockAnalyzer
+        from web.market_edge_theme_ranker import ThemeRanker, SimpleThemeNormalizer
     except ImportError:
-        StockAnalyzer = None
+        from market_edge_theme_ranker import ThemeRanker, SimpleThemeNormalizer
+    logger.info("✅ ThemeRanker & SimpleThemeNormalizer 导入成功")
+except ImportError as e:
+    logger.error(f"❌ 无法导入 ThemeRanker: {e}")
+    ThemeRanker = None
+    SimpleThemeNormalizer = None
 
 try:
-    from web.market_edge_theme_ranker import ThemeRanker
-except ImportError:
     try:
-        from market_edge_theme_ranker import ThemeRanker
+        from ai.API.StockAnalyzer import StockAnalyzer
     except ImportError:
-        ThemeRanker = None
-try:
-    from ai.API.StockAnalyzer import StockAnalyzer
-except ImportError:
-    # If package structure requires different path
-    try:
         from web.ai.API.StockAnalyzer import StockAnalyzer
-    except ImportError:
-        logger.error("Could not import StockAnalyzer")
-        StockAnalyzer = None
-
-try:
-    from web.market_edge_theme_ranker import ThemeRanker
-except ImportError:
-    try:
-        from market_edge_theme_ranker import ThemeRanker
-    except ImportError:
-        logger.error("Could not import ThemeRanker")
-        ThemeRanker = None
+    logger.info("✅ StockAnalyzer 导入成功")
+except ImportError as e:
+    logger.error(f"❌ 无法导入 StockAnalyzer: {e}")
+    StockAnalyzer = None
 
 logger = logging.getLogger(__name__)
+
+
+def setup_logging() -> None:
+    """统一日志输出配置，重点控制噪声，不改变既有日志风格。"""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(fmt)
+    # Python 3.9+ 可重设 stdout/stderr 编码；失败则忽略
+    try:
+        handler.stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    root.handlers.clear()
+    root.addHandler(handler)
+
+    # 常见噪声日志降级
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("aioredis").setLevel(logging.WARNING)
+    # plate_updater 当前文件内存在历史编码问题，先降噪避免污染控制台
+    logging.getLogger("plate_updater").setLevel(
+        getattr(logging, os.getenv("PLATE_UPDATER_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+    )
+
+
+setup_logging()
 # 涨停板数据服务 - ztb_service.py
 import json
 import time
@@ -95,872 +122,10 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-class OptimizedAdvancedTechnicalIndicators:
-    """优化版高级技术指标服务 - 减少重复字段，降低计算频率"""
-    
-    def __init__(self, tdengine_service, redis_storage):
-        self.tdengine = tdengine_service
-        self.redis_storage = redis_storage
-        self.calculated_indicators = {}  # 缓存已计算的指标
-        self.last_calculation_time = {}  # 记录上次计算时间
-        
-    def get_stock_advanced_indicators_optimized(self, symbol: str, force_recalc: bool = False) -> Dict:
-        """获取个股的高级技术指标 - 优化版本"""
-        try:
-            # 检查缓存和是否需要重新计算
-            cache_key = f"advanced_indicators_{symbol}"
-            current_time = time.time()
-            
-            # 如果不在强制重算且缓存有效（5秒内），直接返回缓存
-            if not force_recalc and symbol in self.calculated_indicators:
-                last_time = self.last_calculation_time.get(symbol, 0)
-                if current_time - last_time < 5:  # 5秒缓存
-                    return self.calculated_indicators[symbol]
-            
-            # 从Redis获取基础数据
-            stock_data = self.redis_storage.get_stock_data(symbol)
-            if not stock_data:
-                return {}
-            
-            # 只计算必要的核心指标，避免重复字段
-            indicators = {
-                # 基础字段（直接从Redis获取，确保转换为数字类型）
-                'price': float(stock_data.get('price', 0)),
-                'change_pct': float(stock_data.get('change_pct', 0)),
-                'volume': float(stock_data.get('volume', 0)),
-                'amount': float(stock_data.get('amount', 0)),
-                
-                # 核心高级指标（避免重复计算）
-                'change_rate_1min': self._calculate_change_rate_1min(symbol),
-                'amount_2min': self._calculate_amount_2min(symbol),
-                
-                # 从Redis直接获取的大单净额（确保转换为数字类型）
-                'large_net': float(stock_data.get('large_net', 0)),
-                
-                # 元数据
-                'timestamp': current_time,
-                'update_count': 1  # 用于跟踪更新频率
-            }
-            
-            # 更新缓存
-            self.calculated_indicators[symbol] = indicators
-            self.last_calculation_time[symbol] = current_time
-            
-            # 存储到Redis（短期缓存）
-            self.redis_storage.store_data(
-                cache_key, indicators, expire_seconds=10
-            )
-            
-            return indicators
-            
-        except Exception as e:
-            logger.error(f"❌ 获取个股高级指标失败 {symbol}: {e}")
-            return {}
-    
-    def _calculate_change_rate_1min(self, symbol: str) -> float:
-        """计算1分钟涨速 - 优化版"""
-        try:
-            # 从TDengine获取最近2分钟的收盘价，按时间倒序排列
-            end_time = datetime.now()
-            start_time = end_time - timedelta(minutes=2)
-            
-            # 获取最近的两个价格点
-            sql = f"""
-            SELECT lp as price
-            FROM stock_data 
-            WHERE symbol = '{symbol}' 
-                AND ts >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
-                AND ts <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
-            ORDER BY ts DESC
-            LIMIT 2
-            """
-            
-            cursor = self.tdengine.execute_query(sql)
-            if not cursor:
-                return 0.0
-            
-            rows = cursor.fetchall()
-            if not rows or len(rows) < 2:
-                return 0.0
-            
-            # 计算涨速
-            if rows[0][0] and rows[1][0] and rows[1][0] > 0:
-                return ((rows[0][0] - rows[1][0]) / rows[1][0]) * 100
-            
-            return 0.0
-            
-        except Exception:
-            return 0.0
-    
-    def _calculate_amount_2min(self, symbol: str) -> float:
-        """计算2分钟成交额 - 优化版"""
-        try:
-            # 直接从Redis获取最近的数据，避免频繁查询数据库
-            cache_key = f"amount_2min_{symbol}"
-            cached = self.redis_storage.get_data(cache_key)
-            
-            if cached:
-                return float(cached)
-            
-            # 必要时从TDengine计算
-            end_time = datetime.now()
-            start_time = end_time - timedelta(minutes=2)
-            
-            sql = f"""
-            SELECT SUM(a) as total_amount
-            FROM stock_data 
-            WHERE symbol = '{symbol}' 
-                AND ts >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'
-                AND ts <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'
-            """
-            
-            cursor = self.tdengine.execute_query(sql)
-            if not cursor:
-                return 0.0
-            
-            rows = cursor.fetchall()
-            if rows and rows[0][0]:
-                amount = float(rows[0][0])
-                # 缓存结果
-                self.redis_storage.store_data(cache_key, amount, expire_seconds=60)
-                return amount
-            
-            return 0.0
-            
-        except Exception:
-            return 0.0
-    
-    def batch_get_stocks_advanced_indicators_optimized(self, symbols: List[str]) -> Dict[str, Dict]:
-        """批量获取个股高级指标 - 优化版本"""
-        try:
-            results = {}
-            
-            # 批量从Redis获取基础数据
-            pipeline = self.redis_storage.redis.pipeline()
-            for symbol in symbols:
-                pipeline.hgetall(f"stock:quote:{symbol}")
-            redis_results = pipeline.execute()
-            
-            # 批量计算必要的高级指标
-            for i, symbol in enumerate(symbols):
-                stock_data = redis_results[i]
-                if not stock_data:
-                    continue
-                
-                # 转换数据类型，使用errors='replace'处理无法解码的字符
-                decoded_data = {}
-                for field, value in stock_data.items():
-                    field_str = field.decode('utf-8', errors='replace') if isinstance(field, bytes) else field
-                    value_str = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else str(value)
-                    
-                    if field_str in ['price', 'change_pct', 'change_rate_1min']:
-                        decoded_data[field_str] = float(value_str) if value_str else 0.0
-                    elif field_str in ['volume', 'amount', 'large_net', 'timestamp']:
-                        decoded_data[field_str] = int(value_str) if value_str and '.' not in value_str else float(value_str) if value_str else 0
-                    else:
-                        decoded_data[field_str] = value_str
-                
-                # 构建结果（只包含核心字段）
-                results[symbol] = {
-                    'price': decoded_data.get('price', 0),
-                    'change_pct': decoded_data.get('change_pct', 0),
-                    'volume': decoded_data.get('volume', 0),
-                    'change_rate_1min': decoded_data.get('change_rate_1min', 0),
-                    'amount_2min': decoded_data.get('amount_2min', decoded_data.get('amount', 0)),
-                    'large_net': decoded_data.get('large_net', 0),
-                    'timestamp': int(time.time())
-                }
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"❌ 批量获取个股高级指标失败: {e}")
-            return {}
+# Local duplicated services (OptimizedAdvancedTechnicalIndicators, EnhancedPlateUpdater, TDengineService) 
+# have been removed in favor of imports from the services package and plate_updater module.
 
-class EnhancedPlateUpdater(OptimizedPlateUpdater):
-    """增强的板块更新器 - 集成高级技术指标"""
-    
-    def __init__(self, plate_csv_path: str, stock_plate_csv_path: str, advanced_indicators_service: OptimizedAdvancedTechnicalIndicators):
-        super().__init__(plate_csv_path, stock_plate_csv_path)
-        self.advanced_indicators = advanced_indicators_service
-    
-    def get_all_plate_metrics_with_advanced(self) -> List[Dict]:
-        """获取所有板块指标（包含高级指标）- 使用优化版本"""
-        return self.get_all_plate_metrics_optimized()
-    
-    def get_main_plates_metrics_with_advanced(self) -> List[Dict]:
-        """获取主板块指标（包含高级指标）- 使用优化版本"""
-        all_metrics = self.get_all_plate_metrics_optimized()
-        main_metrics = [m for m in all_metrics if m.get('type') == 'main']
-        return main_metrics
-    
-    def get_plate_stocks(self, plate_id: str) -> List[Dict]:
-        """获取板块个股数据 - 使用优化版本"""
-        return self.get_plate_stocks_optimized(plate_id)
-        
 
-class F10DataService:
-    """F10数据服务 - 按需加载和缓存"""
-    
-    def __init__(self, csv_file_path: str = 'data/f10.csv'):
-        self.csv_file_path = csv_file_path
-        self.data_loaded = False
-        self.f10_data = None
-        self.index_by_code = {}  # 按股票代码索引
-        self.memory_cache = {}   # 内存缓存
-        self.redis_storage = RedisStorageManager()  # 复用Redis缓存
-        
-        # 预加载索引，但不加载全部数据
-        self._load_index()
-    
-    def _load_index(self):
-        """加载数据索引，不加载具体数据"""
-        # try:
-        if not os.path.exists(self.csv_file_path):
-            logger.error(f"❌ F10数据文件不存在: {self.csv_file_path}")
-            return
-        
-        # 只读取股票代码列来构建索引
-        # 将ANSI改为gbk，因为在Windows系统上ANSI通常指的是系统默认编码（在中国通常是gbk）
-        df_codes = pd.read_csv(self.csv_file_path, usecols=['股票代码'],encoding='gbk')
-        for idx, row in df_codes.iterrows():
-            code = self._normalize_stock_code(row['股票代码'])
-            self.index_by_code[code] = idx
-        
-        logger.info(f"✅ F10数据索引加载完成: {len(self.index_by_code)} 只股票")
-            
-        # except Exception as e:
-            # logger.error(f"❌ 加载F10数据索引失败: {e}")
-    
-    def _normalize_stock_code(self, code: str) -> str:
-        """标准化股票代码格式"""
-        if pd.isna(code):
-            return ""
-        
-        code_str = str(code).strip().upper()
-        
-        # 统一格式: 000001.SZ -> 000001
-        if '.' in code_str:
-            code_str = code_str.split('.')[0]
-        
-        return code_str
-    
-    def _load_full_data_if_needed(self):
-        """按需加载完整数据"""
-        if not self.data_loaded:
-            try:
-                # 与_load_index方法保持一致，使用utf-8编码
-                self.f10_data = pd.read_csv(self.csv_file_path, encoding='gbk')
-                self.data_loaded = True
-                logger.info("✅ F10完整数据加载完成")
-            except Exception as e:
-                logger.error(f"❌ 加载F10完整数据失败: {e}")
-    
-    def get_stock_f10(self, stock_code: str) -> Optional[Dict]:
-        """获取单只股票的F10数据"""
-        print("获取单只股票的F10数据")
-        # try:
-        normalized_code = self._normalize_stock_code(stock_code)
-        
-        if not normalized_code:
-            return None
-        
-        # 检查内存缓存
-        cache_key = f"f10_{normalized_code}"
-        if cache_key in self.memory_cache:
-            logger.debug(f"📦 从内存缓存获取F10数据: {normalized_code}")
-            return self.memory_cache[cache_key]
-        
-        # 检查Redis缓存
-        cached_data = self.redis_storage.get_data(cache_key)
-        if cached_data:
-            logger.debug(f"📦 从Redis缓存获取F10数据: {normalized_code}")
-            self.memory_cache[cache_key] = cached_data  # 写入内存缓存
-            return cached_data
-        
-        # 从CSV文件加载
-        if normalized_code not in self.index_by_code:
-            logger.warning(f"⚠️ 未找到股票的F10数据: {stock_code} -> {normalized_code}")
-            return None
-        
-        # 按需加载完整数据
-        self._load_full_data_if_needed()
-        if self.f10_data is None:
-            return None
-        
-        row_index = self.index_by_code[normalized_code]
-        if row_index >= len(self.f10_data):
-            return None
-        
-        row_data = self.f10_data.iloc[row_index]
-        
-        # 转换为字典格式
-        f10_info = self._format_f10_data(row_data)
-        
-        # 更新缓存
-        self.memory_cache[cache_key] = f10_info
-        # Redis缓存1小时
-        self.redis_storage.store_data(cache_key, f10_info, expire_seconds=3600)
-        
-        logger.debug(f"✅ 从CSV文件加载F10数据: {normalized_code}")
-        return f10_info
-            
-        # except Exception as e:
-        #     logger.error(f"❌ 获取F10数据失败 {stock_code}: {e}")
-        #     return None
-    
-    def _format_f10_data(self, row_data) -> Dict:
-        """格式化F10数据"""
-        # 基础信息
-        basic_info = {
-            'stock_code': str(row_data.get('股票代码', '')),
-            'stock_name': str(row_data.get('股票简称', '')),
-            'industry': str(row_data.get('所属同花顺行业', '')),
-            'city': str(row_data.get('城市', '')),
-            'listing_date': str(row_data.get('新股上市日期', ''))
-        }
-        
-        # 财务指标
-        financial_info = {
-            'total_market_cap': self._safe_float(row_data.get('总市值')),
-            'circulating_market_cap': self._safe_float(row_data.get('a股市值(不含限售股)')),
-            'total_shares': self._safe_float(row_data.get('总股本')),
-            'circulating_shares': self._safe_float(row_data.get('流通a股')),
-            'revenue': self._safe_float(row_data.get('营业收入')),
-            'net_profit': self._safe_float(row_data.get('归属于母公司所有者的净利润')),
-            'roe': self._safe_float(row_data.get('净资产收益率roe(加权,公布值)')),
-            'pb': self._safe_float(row_data.get('市净率(pb)')),
-            'pe': self._safe_float(row_data.get('市盈率(pe)')),
-            'debt_ratio': self._safe_float(row_data.get('资产负债率')),
-            'gross_margin': self._safe_float(row_data.get('销售毛利率'))
-        }
-        
-        # 业务信息
-        business_info = {
-            'main_products': self._parse_main_products(row_data.get('主营产品名称')),
-            'product_categories': self._extract_product_categories(row_data.get('主营产品名称'))
-        }
-        
-        return {
-            'basic': basic_info,
-            'financial': financial_info,
-            'business': business_info,
-            'timestamp': pd.Timestamp.now().isoformat()
-        }
-    
-    def _safe_float(self, value):
-        """安全转换为float"""
-        if pd.isna(value) or value == '':
-            return None
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
-    
-    def _parse_main_products(self, products_str):
-        """解析主营产品"""
-        if pd.isna(products_str) or not products_str:
-            return []
-        
-        try:
-            # 按||分割产品
-            products = str(products_str).split('||')
-            return [p.strip() for p in products if p.strip()]
-        except:
-            return []
-    
-    def _extract_product_categories(self, products_str):
-        """提取产品分类"""
-        if pd.isna(products_str) or not products_str:
-            return []
-        
-        products = self._parse_main_products(products_str)
-        
-        # 简单的分类提取（可以根据需要扩展）
-        categories = set()
-        for product in products:
-            if '材料' in product:
-                categories.add('材料')
-            if '设备' in product or '机器' in product:
-                categories.add('设备')
-            if '服务' in product:
-                categories.add('服务')
-            if '技术' in product or '研发' in product:
-                categories.add('技术')
-            if '贸易' in product:
-                categories.add('贸易')
-            if '金融' in product:
-                categories.add('金融')
-        
-        return list(categories)
-    
-    def batch_get_f10(self, stock_codes: list) -> Dict[str, Dict]:
-        """批量获取F10数据"""
-        results = {}
-        
-        for code in stock_codes:
-            f10_data = self.get_stock_f10(code)
-            if f10_data:
-                results[code] = f10_data
-        
-        return results
-    
-    def search_stocks(self, keyword: str, limit: int = 50) -> list:
-        """根据关键词搜索股票"""
-        try:
-            self._load_full_data_if_needed()
-            if self.f10_data is None:
-                return []
-            
-            results = []
-            keyword_lower = keyword.lower()
-            
-            for idx, row in self.f10_data.iterrows():
-                # 搜索股票代码、名称、行业、主营产品
-                stock_code = str(row.get('股票代码', '')).lower()
-                stock_name = str(row.get('股票简称', '')).lower()
-                industry = str(row.get('所属同花顺行业', '')).lower()
-                products = str(row.get('主营产品名称', '')).lower()
-                
-                if (keyword_lower in stock_code or 
-                    keyword_lower in stock_name or 
-                    keyword_lower in industry or 
-                    keyword_lower in products):
-                    
-                    results.append({
-                        'code': row.get('股票代码', ''),
-                        'name': row.get('股票简称', ''),
-                        'industry': row.get('所属同花顺行业', ''),
-                        'match_field': self._get_match_field(keyword_lower, stock_code, stock_name, industry, products)
-                    })
-                
-                if len(results) >= limit:
-                    break
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"❌ 搜索股票失败 {keyword}: {e}")
-            return []
-    
-    def _get_match_field(self, keyword, code, name, industry, products):
-        """获取匹配的字段"""
-        if keyword in code:
-            return 'code'
-        elif keyword in name:
-            return 'name'
-        elif keyword in industry:
-            return 'industry'
-        elif keyword in products:
-            return 'products'
-        return 'other'
-    
-    def clear_cache(self, stock_code: str = None):
-        """清理缓存"""
-        if stock_code:
-            normalized_code = self._normalize_stock_code(stock_code)
-            cache_key = f"f10_{normalized_code}"
-            self.memory_cache.pop(cache_key, None)
-            self.redis_storage.delete_data(cache_key)
-            logger.info(f"🧹 清理F10缓存: {normalized_code}")
-        else:
-            self.memory_cache.clear()
-            logger.info("🧹 清理所有F10内存缓存")
-    
-    def get_cache_stats(self) -> Dict:
-        """获取缓存统计"""
-        return {
-            'memory_cache_size': len(self.memory_cache),
-            'index_size': len(self.index_by_code),
-            'data_loaded': self.data_loaded,
-            'cached_stocks': list(self.memory_cache.keys())[:10]  # 前10个作为样本
-        }
-class TradingCalendarService:
-    """交易日历服务"""
-    
-    def __init__(self):
-        self.cache = {}
-        self.cn_holidays = holidays.CN()  # 中国公共假期
-        self._init_trading_calendar()
-    
-    def _init_trading_calendar(self):
-        """初始化交易日历"""
-        # 中国股市交易时间：周一至周五 9:30-11:30, 13:00-15:00
-        # 不交易的时间：周六、周日、法定节假日
-        self.trading_hours = {
-            'morning_start': '09:30:00',
-            'morning_end': '11:30:00',
-            'afternoon_start': '13:00:00',
-            'afternoon_end': '15:00:00'
-        }
-    
-    def is_trading_day(self, date_str: str) -> bool:
-        """判断是否为交易日"""
-        try:
-            date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-            # 检查是否是周末
-            if date_obj.weekday() >= 5:  # 5=周六, 6=周日
-                return False
-            
-            # 检查是否是法定节假日
-            if date_obj in self.cn_holidays:
-                return False
-            
-            # 这里可以添加更多的特殊日期判断
-            # 比如调休上班的周末等
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 判断交易日失败 {date_str}: {e}")
-            return False
-
-    def get_previous_trade_day(self, date_str: str) -> str:
-        """获取上一个交易日"""
-        try:
-            current_date = datetime.strptime(date_str, '%Y-%m-%d')
-            for _ in range(30): # Safety limit
-                current_date -= timedelta(days=1)
-                date_s = current_date.strftime('%Y-%m-%d')
-                if self.is_trading_day(date_s):
-                    return date_s
-            return date_str # Fallback
-        except Exception as e:
-            logger.error(f"❌ 获取上个交易日失败 {date_str}: {e}")
-            return date_str
-    
-    def get_previous_trading_day(self, date_str: str = None) -> str:
-        """获取前一个交易日"""
-        if not date_str:
-            date_str = datetime.now().strftime('%Y-%m-%d')
-        
-        current_date = datetime.strptime(date_str, '%Y-%m-%d')
-        
-        # 向前查找，最多找30天
-        for i in range(1, 31):
-            prev_date = current_date - timedelta(days=i)
-            prev_date_str = prev_date.strftime('%Y-%m-%d')
-            
-            if self.is_trading_day(prev_date_str):
-                return prev_date_str
-        
-        # 如果没找到，返回30天前的日期
-        return (current_date - timedelta(days=30)).strftime('%Y-%m-%d')
-    
-    def get_next_trading_day(self, date_str: str = None) -> str:
-        """获取下一个交易日"""
-        if not date_str:
-            date_str = datetime.now().strftime('%Y-%m-%d')
-        
-        current_date = datetime.strptime(date_str, '%Y-%m-%d')
-        
-        # 向后查找，最多找30天
-        for i in range(1, 31):
-            next_date = current_date + timedelta(days=i)
-            next_date_str = next_date.strftime('%Y-%m-%d')
-            
-            if self.is_trading_day(next_date_str):
-                return next_date_str
-        
-        # 如果没找到，返回30天后的日期
-        return (current_date + timedelta(days=30)).strftime('%Y-%m-%d')
-    
-    def get_recent_trading_days(self, days: int = 30) -> List[str]:
-        """获取最近N个交易日"""
-        end_date = datetime.now()
-        trading_days = []
-        
-        current_date = end_date
-        while len(trading_days) < days:
-            date_str = current_date.strftime('%Y-%m-%d')
-            if self.is_trading_day(date_str):
-                print("交易日：",date_str)
-                trading_days.append(date_str)
-            current_date -= timedelta(days=1)
-            
-            # 防止无限循环
-            if (end_date - current_date).days > 365:
-                break
-        
-        return sorted(trading_days)
-    
-    def is_trading_time(self, datetime_str: str = None) -> bool:
-        """判断当前是否在交易时间内"""
-        if not datetime_str:
-            datetime_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        try:
-            dt_obj = datetime.strptime(datetime_str, '%Y-%m-%d %H:%M:%S')
-            date_str = dt_obj.strftime('%Y-%m-%d')
-            time_str = dt_obj.strftime('%H:%M:%S')
-            
-            # 首先检查是否是交易日
-            if not self.is_trading_day(date_str):
-                return False
-            
-            # 检查是否在交易时间段内
-            morning_session = (time_str >= self.trading_hours['morning_start'] and 
-                             time_str <= self.trading_hours['morning_end'])
-            afternoon_session = (time_str >= self.trading_hours['afternoon_start'] and 
-                               time_str <= self.trading_hours['afternoon_end'])
-            
-            return morning_session or afternoon_session
-            
-        except Exception as e:
-            logger.error(f"❌ 判断交易时间失败 {datetime_str}: {e}")
-            return False
-    
-    def get_today_trading_status(self) -> Dict:
-        """获取今日交易状态"""
-        today = datetime.now().strftime('%Y-%m-%d')
-        current_time = datetime.now().strftime('%H:%M:%S')
-        
-        is_trading_day = self.is_trading_day(today)
-        is_trading_time = self.is_trading_time()
-        
-        status = "非交易日"
-        if is_trading_day:
-            if is_trading_time:
-                status = "交易中"
-            else:
-                if current_time < self.trading_hours['morning_start']:
-                    status = "开盘前"
-                elif current_time > self.trading_hours['afternoon_end']:
-                    status = "已收盘"
-                else:
-                    status = "午间休市"
-        
-        return {
-            'date': today,
-            'is_trading_day': is_trading_day,
-            'is_trading_time': is_trading_time,
-            'status': status,
-            'trading_hours': self.trading_hours,
-            'current_time': current_time
-        }
-class TDengineService:
-    """TDengine数据库服务 - 基于官方示例的连接方式"""
-    _instance = None
-    
-    def __new__(cls, host: str = '127.0.0.1', port: int = 6030, 
-                 user: str = 'root', password: str = 'taosdata', 
-                 database: str = 'market_data1', config: str = '/etc/taos', 
-                 timezone: str = 'Asia/Shanghai'):
-        # 修复单例模式：只创建一个实例，忽略后续参数差异
-        if cls._instance is None:
-            cls._instance = super(TDengineService, cls).__new__(cls)
-            # 初始化参数
-            cls._instance.host = host
-            cls._instance.port = port
-            cls._instance.user = user
-            cls._instance.password = password
-            cls._instance.database = database
-            cls._instance.config = config
-            cls._instance.timezone = timezone
-            cls._instance.conn = None
-            cls._instance.cursor = None
-            # 建立连接
-            cls._instance._connect()
-        return cls._instance
-    
-    def __init__(self, host: str = '127.0.0.1', port: int = 6030, 
-                 user: str = 'root', password: str = 'taosdata', 
-                 database: str = 'market_data1', config: str = '/etc/taos', 
-                 timezone: str = 'Asia/Shanghai'):
-        # 单例模式下，__init__可能会被多次调用，所以只在__new__中初始化
-        pass
-    
-    def _connect(self):
-        """连接TDengine数据库 - 使用官方示例的连接方式"""
-        try:
-            if taos is not None:
-                self.conn = taos.connect(
-                    host=self.host,
-                    user=self.user,
-                    password=self.password,
-                    database=self.database,
-                    config=self.config,
-                    timezone=self.timezone
-                )
-                self.cursor = self.conn.cursor()
-                logger.info("✅ TDengine连接成功")
-            else:
-                # 模拟连接成功
-                self.conn = "mock_conn"
-                self.cursor = "mock_cursor"
-                logger.info("✅ TDengine连接成功 (模拟)")
-        except Exception as e:
-            logger.error(f"❌ TDengine连接失败: {e}")
-            self.conn = None
-            self.cursor = None
-    
-    def execute_query(self, sql: str):
-        """执行SQL查询 - 使用cursor方式"""
-        if not self.conn:
-            # 连接不存在，重新连接
-            self._connect()
-            if not self.conn:
-                return None
-        
-        try:
-            if taos is not None:
-                self.cursor.execute(sql)
-                return self.cursor
-            else:
-                # 模拟查询结果
-                logger.info(f"✅ 模拟执行SQL查询: {sql}")
-                return "mock_cursor"
-        except Exception as e:
-            logger.error(f"❌ TDengine查询失败: {e}, SQL: {sql}")
-            # 尝试重新连接
-            try:
-                self._connect()
-                if self.conn:
-                    if taos is not None:
-                        self.cursor.execute(sql)
-                        return self.cursor
-                    else:
-                        logger.info(f"✅ 模拟执行SQL查询(重连后): {sql}")
-                        return "mock_cursor"
-            except Exception as reconnect_error:
-                logger.error(f"❌ TDengine重连失败: {reconnect_error}")
-            return None
-    
-    def get_minute_kline(self, symbol: str, start_time: str = None, end_time: str = None, 
-                        days: int = 1) -> List[Dict]:
-        """
-        从TDengine获取分钟K线数据 - 正确处理累计值volume和amount
-        
-        Args:
-            symbol: 股票代码 (如 '000001')
-            start_time: 开始时间 'YYYY-MM-DD HH:MM:SS'
-            end_time: 结束时间 'YYYY-MM-DD HH:MM:SS'
-            days: 获取最近几天的数据
-            
-        Returns:
-            List[Dict]: 分钟K线数据
-        """
-        try:
-            # 设置默认时间范围
-            if not end_time:
-                end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if not start_time:
-                start_time = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 构建SQL查询 - 按1分钟聚合tick数据，正确处理累计值
-            sql = f"""
-            SELECT 
-                _wstart as time,
-                FIRST(lp) as open,
-                MAX(lp) as high,
-                MIN(lp) as low,
-                LAST(lp) as close,
-                LAST(v) - FIRST(v) as volume,  -- 处理累计值：用最后一个值减去第一个值
-                LAST(a) - FIRST(a) as amount   -- 处理累计值：用最后一个值减去第一个值
-            FROM stock_data 
-            WHERE symbol = '{symbol}' 
-                AND ts >= '{start_time}' 
-                AND ts <= '{end_time}'
-            INTERVAL(1m)
-            ORDER BY time
-            """
-            
-            logger.info(f"📊 查询TDengine分钟数据: {symbol}")
-            
-            cursor = self.execute_query(sql)
-            if not cursor:
-                return []
-            
-            # 处理查询结果 - 使用cursor.fetchall()方式，并确保浮点数保留两位小数
-            data = []
-            rows = cursor.fetchall()
-            for row in rows:
-                # row是一个元组，按SELECT字段顺序
-                data.append({
-                    'time': row[0].strftime('%Y-%m-%d %H:%M:%S'),
-                    'open': round(float(row[1]) if row[1] is not None else 0, 2),
-                    'high': round(float(row[2]) if row[2] is not None else 0, 2),
-                    'low': round(float(row[3]) if row[3] is not None else 0, 2),
-                    'close': round(float(row[4]) if row[4] is not None else 0, 2),
-                    'volume': int(row[5]) if row[5] is not None else 0,
-                    'amount': float(row[6]) if row[6] is not None else 0
-                })
-            
-            logger.info(f"✅ 从TDengine获取分钟数据成功: {symbol}, 数据点: {len(data)}")
-            return data
-            
-        except Exception as e:
-            logger.error(f"❌ 获取TDengine分钟数据失败: {e}")
-            return []
-    
-    def get_tick_data(self, symbol: str, start_time: str = None, end_time: str = None, 
-                     limit: int = 1000) -> List[Dict]:
-        """
-        获取原始tick数据（用于调试）
-        
-        Args:
-            symbol: 股票代码
-            start_time: 开始时间
-            end_time: 结束时间
-            limit: 限制条数
-            
-        Returns:
-            List[Dict]: tick数据
-        """
-        try:
-            if not end_time:
-                end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if not start_time:
-                start_time = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            sql = f"""
-            SELECT 
-                ts, lp, o, h, l, lc, a, v, p,
-                ap1, ap2, ap3, ap4, ap5,
-                bp1, bp2, bp3, bp4, bp5,
-                av1, av2, av3, av4, av5,
-                bv1, bv2, bv3, bv4, bv5,
-                inst_vol, inst_amt, large_net
-            FROM stock_data 
-            WHERE symbol = '{symbol}' 
-                AND ts >= '{start_time}' 
-                AND ts <= '{end_time}'
-            ORDER BY ts
-            LIMIT {limit}
-            """
-            
-            cursor = self.execute_query(sql)
-            if not cursor:
-                return []
-            
-            # 获取字段信息
-            fields = [field[0] for field in cursor.description]
-            
-            data = []
-            rows = cursor.fetchall()
-            for row in rows:
-                row_dict = {}
-                for i, field_name in enumerate(fields):
-                    value = row[i]
-                    if isinstance(value, datetime):
-                        row_dict[field_name] = value.strftime('%Y-%m-%d %H:%M:%S.%f')
-                    elif value is None:
-                        row_dict[field_name] = None
-                    else:
-                        row_dict[field_name] = value
-                data.append(row_dict)
-            
-            return data
-            
-        except Exception as e:
-            logger.error(f"❌ 获取TDengine tick数据失败: {e}")
-            return []
-    
-    def close(self):
-        """关闭连接"""
-        if self.conn:
-            self.conn.close()
-            logger.info("🔌 TDengine连接已关闭")
 class StockKLineService:
     """股票K线服务 - 单例模式"""
     _instance = None
@@ -1180,16 +345,6 @@ class StockKLineService:
                     # 'turnover': float(row_data[8]) if row_data[8] else 0,
                     # 'pct_chg': float(row_data[9]) if row_data[9] else 0
                 })
-            
-            # 缓存数据（5分钟缓存）- 使用现有的RedisStorageManager
-            try:
-                cache_time = 300  # 5分钟
-                # 生成缓存键
-                cache_key = self.get_cache_key(code, frequency, start_date, end_date)
-                self.redis_storage.store_data(cache_key, json.dumps(data_list), expire_seconds=cache_time)
-                logger.info(f"💾 缓存K线数据: {code}_{frequency}, 数据点: {len(data_list)}")
-            except Exception as e:
-                logger.error(f"❌ 缓存写入失败: {e}")
             
             return data_list
             
@@ -1473,19 +628,28 @@ class OptimizedIntegratedWebService:
         asyncio.create_task(self.broadcast_stock_updates_optimized())
 
         logger.info("🚀 优化版服务已启动")
+
+    def _is_trading_active(self) -> bool:
+        """判断当前是否处于活跃交易时段 (09:15-11:35, 13:00-15:05)"""
+        now = datetime.now()
+        val = now.hour * 100 + now.minute
+        # 09:15-11:35 or 13:00-15:05
+        return (915 <= val <= 1135) or (1300 <= val <= 1505)
     
     async def refresh_plate_data_optimized(self):
         """优化版板块数据刷新"""
         while True:
             try:
-                # 使用整合计算获取板块数据（包含高级指标）
-                plate_metrics = self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+                # 使用整合计算获取板块数据（包含高级指标）- Offload to executor to prevent event loop blocking
+                loop = asyncio.get_event_loop()
+                plate_metrics = await loop.run_in_executor(None, self.plate_updater.get_all_plate_metrics_with_integrated_advanced)
                 
                 # 缓存到内存供快速访问
                 self.cached_plate_metrics = plate_metrics
                 
-                # 每5秒刷新一次
-                await asyncio.sleep(5)
+                # 动态调整频率：交易时间 10s，非交易时间 60s
+                sleep_time = 6 if self._is_trading_active() else 60
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.error(f"❌ 刷新板块数据失败: {e}")
@@ -1496,8 +660,12 @@ class OptimizedIntegratedWebService:
         while True:
             try:
                 if self.plate_connections:
-                    # 使用缓存数据或实时获取
-                    all_metrics = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+                    # 使用缓存数据或实时获取 - Ensure non-blocking
+                    if self.cached_plate_metrics:
+                        all_metrics = self.cached_plate_metrics
+                    else:
+                        loop = asyncio.get_event_loop()
+                        all_metrics = await loop.run_in_executor(None, self.plate_updater.get_all_plate_metrics_with_integrated_advanced)
                     
                     # 筛选主板块
                     main_metrics = [m for m in all_metrics if m.get('type') == 'main']
@@ -1520,7 +688,9 @@ class OptimizedIntegratedWebService:
                     if self.update_count % 10 == 0:  # 每10次更新记录一次
                         logger.info(f"📤 广播板块更新 #{self.update_count}, 客户端: {len(self.plate_connections)}, 板块数: {len(all_metrics)}")
                 
-                await asyncio.sleep(3)  # 3秒广播一次
+                # 动态调整频率：交易时间 5s，非交易时间 60s
+                sleep_time = 5 if self._is_trading_active() else 60
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.error(f"❌ 广播板块更新失败: {e}")
@@ -1534,7 +704,11 @@ class OptimizedIntegratedWebService:
                 
                 if self.plate_data_connections:
                     # 获取最新板块数据（包含高级指标）
-                    all_plates = self.cached_plate_metrics or self.plate_updater.get_all_plate_metrics_with_integrated_advanced()
+                    if self.cached_plate_metrics:
+                        all_plates = self.cached_plate_metrics
+                    else:
+                        loop = asyncio.get_event_loop()
+                        all_plates = await loop.run_in_executor(None, self.plate_updater.get_all_plate_metrics_with_integrated_advanced)
                     main_plates = [p for p in all_plates if p.get('type') == 'main']
                     
                     update_msg = {
@@ -1548,7 +722,10 @@ class OptimizedIntegratedWebService:
                     
                     # 广播给所有订阅的客户端
                     await self.broadcast_to_connections(update_msg, set(self.plate_data_connections))
-                    
+                
+                # 动态调整频率：交易时间 2s，非交易时间 60s
+                sleep_time = 2 if self._is_trading_active() else 60
+                await asyncio.sleep(sleep_time)
             except Exception as e:
                 logger.error(f"❌ 广播板块数据更新失败: {e}")
                 await asyncio.sleep(5)
@@ -1565,9 +742,10 @@ class OptimizedIntegratedWebService:
                     # 获取所有活跃股票
                     active_stocks = self._get_active_stocks()
                     if active_stocks:
-                        # 使用优化后的批量获取方法
-                        indicators_dict = self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(active_stocks)
-                        all_indicators_dict = indicators_dict.copy()
+                        # 使用优化后的批量获取方法 - Offload CPU intensive processing to executor
+                        loop = asyncio.get_event_loop()
+                        indicators_dict = await loop.run_in_executor(None, self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized, active_stocks)
+                        all_indicators_dict = indicators_dict  # 不再 .copy()，减少 ~5000 个 dict 拷贝
                         
                         # 按板块分组广播
                         for plate_id, connections in self.stock_connections.items():
@@ -1576,8 +754,7 @@ class OptimizedIntegratedWebService:
                                 update_msg = self._build_optimized_stock_update(plate_id, indicators_dict)
                                 await self.broadcast_to_connections(update_msg, set(connections))
                     
-                    # 每3秒记录一次日志
-                    if int(time.time()) % 5 == 0:
+                    if int(time.time()) % 10 == 0: # 降低日志频率
                         active_subscriptions = sum(len(conns) for conns in self.stock_connections.values())
                         logger.info(f"📤 广播个股更新, 活跃订阅: {active_subscriptions}个连接")
                 
@@ -1594,13 +771,16 @@ class OptimizedIntegratedWebService:
                     
                     if all_subscribed_stocks:
                         # 批量获取所有订阅股票的最新数据
-                        subscribed_indicators = self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized(all_subscribed_stocks)
+                        loop = asyncio.get_event_loop()
+                        subscribed_indicators = await loop.run_in_executor(None, self.advanced_indicators.batch_get_stocks_advanced_indicators_optimized, all_subscribed_stocks)
                         all_indicators_dict.update(subscribed_indicators)
                         
                         # 向订阅客户端推送更新
                         await self.broadcast_stock_updates_to_subscribers(subscribed_indicators)
                 
-                await asyncio.sleep(3)  # 3秒更新一次
+                # 动态调整频率：交易时间 5s，非交易时间 60s
+                sleep_time = 5 if self._is_trading_active() else 60
+                await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.error(f"❌ 广播个股更新失败: {e}")
@@ -1675,26 +855,27 @@ class OptimizedIntegratedWebService:
         return list(set(active_stocks))
     
     def _build_optimized_stock_update(self, plate_id: str, indicators_dict: Dict[str, Dict]) -> Dict:
-        """构建优化后的个股更新消息"""
+        """构建优化后的个股更新消息 — 内存优化版
+        
+        优化: 不再逐只调用 get_stock_data() (N+1 Redis 调用)，
+        所有数据已在 indicators_dict 中 (通过 batch pipeline 获取)。
+        """
         # 获取该板块的股票
         stock_ids = self.plate_updater.plate_to_stocks.get(plate_id, [])
         
         stocks_data = []
         for stock_id in stock_ids:
-            if stock_id in indicators_dict:
-                indicators = indicators_dict[stock_id]
-                
-                # 获取股票基础信息
-                stock_data = self.redis_storage.get_stock_data(stock_id) or {}
-                
-                # 构建完整的股票数据
+            indicators = indicators_dict.get(stock_id)
+            if indicators:
+                # 所有字段已在 indicators 中 (含 name, market_cap 等)
+                # 直接引用，不再创建新 dict
                 stock_info = {
                     'code': stock_id,
-                    'name': stock_data.get('name', f"股票{stock_id}"),
+                    'name': indicators.get('name', f"股票{stock_id}"),
                     'change_pct': indicators.get('change_pct', 0),
                     'price': indicators.get('price', 0),
                     'volume': indicators.get('volume', 0),
-                    'market_cap': stock_data.get('market_cap', 0),
+                    'market_cap': indicators.get('market_cap', 0),
                     'large_net': indicators.get('large_net', 0),
                     'timestamp': indicators.get('timestamp', 0),
                     # 高级指标
@@ -2079,8 +1260,11 @@ class OptimizedIntegratedWebService:
                 None, self.kline_service.fetch_kline_data, code, frequency, start_date, end_date
             )
             
-            # 计算技术指标
-            indicators = self.kline_service.calculate_technical_indicators(kline_data)
+            # 计算技术指标 - CPU 密集型，移至线程池
+            loop = asyncio.get_event_loop()
+            indicators = await loop.run_in_executor(
+                None, self.kline_service.calculate_technical_indicators, kline_data
+            )
             
             response_data = {
                 'code': code,
@@ -2108,6 +1292,12 @@ class StockVolatileMonitor:
         self.calendar = TradingCalendarService()  # 避免在监控循环中重复创建
         self.prev_day_cache = None
         self.yesterday_limit_set_cache = set()
+        self.stock_names: Dict[str, str] = {}  # 用于名称解析回退
+        # 去重防抖：避免同一异动事件/首板事件在短时间内重复广播
+        self.recent_alert_dedup: Dict[str, int] = {}
+        self.alert_dedup_window_sec = 8
+        self.symbol_broadcast_cooldown_sec = 30
+        self.symbol_last_broadcast_ts: Dict[str, int] = {}
         
     async def connect_redis(self):
         """连接Redis"""
@@ -2178,6 +1368,70 @@ class StockVolatileMonitor:
         except Exception as e:
             logger.error(f"❌ 初始化最后检查时间戳失败: {e}")
             self.last_check_timestamp = int(time.time() * 1000)
+
+    def _build_alert_dedup_key(self, data: Dict, score_ms: int) -> str:
+        """构建异动事件去重键。"""
+        symbol = str(data.get('symbol', '')).strip()
+        reason = str(data.get('reason', '')).strip()
+        # 以 2 秒时间桶去重，兼顾实时性和抗重复能力
+        bucket = int(score_ms // 2000)
+        return f"{symbol}|{reason}|{bucket}"
+
+    def _clean_stock_name(self, name: str, code: str) -> str:
+        """清理股票名称中重复拼接的代码后缀，如  洲际油气(600759)  -> 洲际油气"""
+        if not name:
+            return name
+        n = str(name).strip()
+        c = str(code).strip()
+        if c:
+            n = re.sub(rf"\({re.escape(c)}\)$", "", n).strip()
+        # 兜底：清理任意末尾6位代码括号
+        n = re.sub(r"\(\d{6}\)$", "", n).strip()
+        return n
+
+    def _should_skip_duplicate_alert(self, data: Dict, score_ms: int) -> bool:
+        """判断是否为短时间重复异动事件。"""
+        now_sec = int(time.time())
+        key = self._build_alert_dedup_key(data, score_ms)
+        expire_at = self.recent_alert_dedup.get(key, 0)
+        if expire_at > now_sec:
+            return True
+        self.recent_alert_dedup[key] = now_sec + self.alert_dedup_window_sec
+
+        # 懒清理过期键，防止字典无限增长
+        if len(self.recent_alert_dedup) > 5000:
+            self.recent_alert_dedup = {
+                k: v for k, v in self.recent_alert_dedup.items() if v > now_sec
+            }
+        return False
+
+    def _should_skip_symbol_cooldown(self, symbol: str, now_ms: int) -> bool:
+        """同一只票的广播冷却，避免短时间反复刷屏。"""
+        if not symbol:
+            return False
+        last_ms = self.symbol_last_broadcast_ts.get(symbol, 0)
+        if last_ms > 0 and now_ms - last_ms < self.symbol_broadcast_cooldown_sec * 1000:
+            return True
+        self.symbol_last_broadcast_ts[symbol] = now_ms
+        if len(self.symbol_last_broadcast_ts) > 8000:
+            threshold = now_ms - self.symbol_broadcast_cooldown_sec * 1000
+            self.symbol_last_broadcast_ts = {k: v for k, v in self.symbol_last_broadcast_ts.items() if v >= threshold}
+        return False
+
+    async def _is_first_limit_new_symbol_today(self, symbol: str, today_str: str) -> bool:
+        """判断今日是否首次触发首板（跨轮询去重）。"""
+        if not symbol:
+            return False
+        if not self.redis:
+            return True
+        key = f"{self.first_limit_key}:seen:{today_str}"
+        try:
+            added = await self.redis.sadd(key, symbol)
+            await self.redis.expire(key, 2 * 24 * 60 * 60)
+            return bool(added)
+        except Exception as e:
+            logger.warning(f"⚠️ 首板去重写入失败，降级放行 {symbol}: {e}")
+            return True
     
     async def monitor_volatile_stocks(self):
         """监控股票异动数据"""
@@ -2242,14 +1496,36 @@ class StockVolatileMonitor:
                 if new_data:
                     logger.info(f"🎯 发现 {len(new_data)} 条新异动数据")
                     
+                    # 当前批次去重，避免同一只票在同一秒多次广播
+                    processed_in_batch = set()
+                    max_seen_score = self.last_check_timestamp
+                    
                     for data_str, score in new_data:
                         try:
+                            score_i = int(score)
+                            if score_i > max_seen_score:
+                                max_seen_score = score_i
+
                             if isinstance(data_str, bytes):
                                 data_str = data_str.decode('utf-8', errors='ignore')
                             
                             data = json.loads(data_str)
+                            symbol = data.get('symbol', '未知')
+
+                            # 简单的去重逻辑：同一秒内同一代码只处理一次核心逻辑
+                            if symbol in processed_in_batch:
+                                continue
+                            processed_in_batch.add(symbol)
+
+                            # 跨批次去重：过滤短时间重复异动
+                            if self._should_skip_duplicate_alert(data, int(score)):
+                                continue
+                            # 同票冷却：避免同一股票短时间重复广播
+                            if self._should_skip_symbol_cooldown(str(symbol), int(score)):
+                                continue
+
                             # print(data)
-                            data['timestamp'] = int(score)
+                            data['timestamp'] = score_i
                             await self.broadcast_volatile_alert(data)
                             
                             # 检查是否为涨停票，如果是则推送首板票
@@ -2294,12 +1570,13 @@ class StockVolatileMonitor:
                                     try:
                                         # 1) 主优先：limit_up_{prev_day}
                                         key_limit_up = f"limit_up_{prev_day}"
-                                        prev_limit_up_result = self.redis_storage.get_data(key_limit_up)
+                                        loop = asyncio.get_event_loop()
+                                        prev_limit_up_result = await loop.run_in_executor(None, self.redis_storage.get_data, key_limit_up)
 
                                         # 2) fallback：cache:comprehensive:prev_limit_up:{prev_day}
                                         if not prev_limit_up_result:
                                             key_prev_limit_up = f"cache:comprehensive:prev_limit_up:{prev_day}"
-                                            prev_limit_up_result = self.redis_storage.get_data(key_prev_limit_up)
+                                            prev_limit_up_result = await loop.run_in_executor(None, self.redis_storage.get_data, key_prev_limit_up)
 
                                         if prev_limit_up_result:
                                             for item in prev_limit_up_result:
@@ -2315,6 +1592,10 @@ class StockVolatileMonitor:
 
                                 # 严格首板：不在昨日涨停集合
                                 if symbol in yesterday_limit_set:
+                                    continue
+
+                                # 今日首板去重：同一只票当天只推送一次首板
+                                if not await self._is_first_limit_new_symbol_today(symbol, today_str):
                                     continue
 
                                 first_limit_data = data.copy()
@@ -2335,16 +1616,20 @@ class StockVolatileMonitor:
                                     logger.error(f"❌ 写入Redis首板数据失败: {e}")
                             
                             # 更新最后检查时间戳
-                            if int(score) > self.last_check_timestamp:
-                                self.last_check_timestamp = int(score)
+                            if score_i > self.last_check_timestamp:
+                                self.last_check_timestamp = score_i
                                 
                         except json.JSONDecodeError as e:
                             logger.error(f"❌ JSON解析错误: {e}, 数据: {data_str[:100]}...")
                         except Exception as e:
                             logger.error(f"❌ 处理数据错误: {e}")
+
+                    # 即使中途 continue 跳过业务处理，也要推进检查时间戳，避免重复抓取同一批数据
+                    if max_seen_score > self.last_check_timestamp:
+                        self.last_check_timestamp = max_seen_score
                     
                     logger.info(f"⏰ 最后检查时间戳更新为: {self.last_check_timestamp}")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(3.0)  # 用户要求改为 3秒
                 else:
                     count = await self.redis.zcard(self.volatile_pool_key)
                     if count > 0:
@@ -2383,7 +1668,7 @@ class StockVolatileMonitor:
         """广播异动警报到所有客户端"""
         alert_message = self.format_volatile_alert(data)
         
-        logger.info(f"📢 广播: {alert_message['symbol']} - {alert_message['action_text']}")
+        logger.info(f"📢 广播: {alert_message['symbol']}({alert_message['name']}) - {alert_message['action_text']}")
         
         if self.connections:
             disconnected = []
@@ -2456,6 +1741,9 @@ class StockVolatileMonitor:
         """格式化首板票警报消息"""
         code = data.get('symbol', '')  # 使用code字段，而不是symbol
         name = data.get('name', '')
+        if not name:
+             name = self.stock_names.get(code, "")
+        name = self._clean_stock_name(name, code)
         change = data.get('change', 0)
         price = data.get('price', 0)
         reason = data.get('reason', '')
@@ -2505,9 +1793,18 @@ class StockVolatileMonitor:
         """格式化异动警报消息"""
         symbol = data.get('symbol', '')
         name_b64 = data.get('name_b64', '')
-        if isinstance(name_b64, str):
-            name_b64 = name_b64.encode('utf-8')
-        name = base64.b64decode(name_b64).decode('utf-8', errors='ignore')
+        name = ""
+        if name_b64:
+            try:
+                if isinstance(name_b64, str):
+                    name_b64 = name_b64.encode('utf-8')
+                name = base64.b64decode(name_b64).decode('utf-8', errors='ignore')
+            except Exception:
+                pass
+        
+        if not name:
+            name = self.stock_names.get(symbol, "")
+        name = self._clean_stock_name(name, symbol)
         change = data.get('change', '')
         amount = data.get('amount', '')
         reason = data.get('reason', '')
@@ -2684,9 +1981,10 @@ async def advanced_indicators_stock_api(request):
         
         logger.info(f"📊 请求个股高级指标: {stock_code}")
         
-        # 尝试从缓存获取
+        # 尝试从缓存获取 - 修正阻塞 I/O
         cache_key = f"advanced_indicators_{stock_code}"
-        cached_data = service.redis_storage.get_data(cache_key)
+        loop = asyncio.get_event_loop()
+        cached_data = await loop.run_in_executor(None, service.redis_storage.get_data, cache_key)
         
         if cached_data:
             return web.json_response({
@@ -3200,6 +2498,70 @@ async def redis_status(request):
             'error': str(e)
         }, status=500)
 
+# 调试接口 - 内存占用分析
+async def debug_memory_api(request):
+    """返回内存中主要数据结构的占用情况"""
+    try:
+        import sys
+        
+        def get_size(obj, seen=None):
+            """Recursively finds size of objects"""
+            size = sys.getsizeof(obj)
+            if seen is None:
+                seen = set()
+            obj_id = id(obj)
+            if obj_id in seen:
+                return 0
+            seen.add(obj_id)
+            if isinstance(obj, dict):
+                size += sum([get_size(v, seen) for v in obj.values()])
+                size += sum([get_size(k, seen) for k in obj.keys()])
+            elif hasattr(obj, '__dict__'):
+                size += get_size(obj.__dict__, seen)
+            elif hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes, bytearray)):
+                size += sum([get_size(i, seen) for i in obj])
+            return size
+
+        memory_stats = {}
+        
+        # 1. Market Edge Engine Caches
+        if hasattr(service, 'market_edge') and service.market_edge:
+            me = service.market_edge
+            memory_stats['MarketEdgeEngine'] = {
+                'stock_state_cache': {'len': len(me.stock_state_cache), 'bytes': get_size(me.stock_state_cache)},
+                'auction_profile_cache': {'len': len(me.auction_profile_cache), 'bytes': get_size(me.auction_profile_cache)},
+                'plate_weight_cache': {'len': len(me.plate_weight_cache), 'bytes': get_size(me.plate_weight_cache)},
+                'return_history': {'len': len(me.return_history), 'bytes': get_size(me.return_history)},
+                'log_last_payload': {'len': len(me.log_last_payload), 'bytes': get_size(me.log_last_payload)},
+                'code_change_history': {'len': len(me.code_change_history), 'bytes': get_size(me.code_change_history)},
+                '_quote_cache': {'len': len(me._quote_cache), 'bytes': get_size(me._quote_cache)},
+                'analysis_universe_cache': {'len': len(me.analysis_universe_cache), 'bytes': get_size(me.analysis_universe_cache)},
+                'intraday_transition_seen': {'len': len(me.intraday_transition_seen), 'bytes': get_size(me.intraday_transition_seen)},
+                'profile_transition_seen': {'len': len(me.profile_transition_seen), 'bytes': get_size(me.profile_transition_seen)},
+            }
+            
+        # 2. Advanced Indicators
+        if hasattr(service, 'advanced_indicators') and service.advanced_indicators:
+            ai = service.advanced_indicators
+            memory_stats['AdvancedIndicators'] = {
+                'calculated_indicators': {'len': len(ai.calculated_indicators), 'bytes': get_size(ai.calculated_indicators)}
+            }
+            
+        # 3. F10 Service
+        if hasattr(service, 'stock_service') and hasattr(service.stock_service, 'f10_data_service'):
+            f10 = service.stock_service.f10_data_service
+            memory_stats['F10Service'] = {
+                'memory_cache': {'len': len(f10.memory_cache), 'bytes': get_size(f10.memory_cache)},
+            }
+            
+        return web.json_response({
+            'status': 'healthy',
+            'memory_stats': memory_stats
+        })
+    except Exception as e:
+        logger.error(f"❌ 内存调试接口错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
 # 调试接口 - 个股数据状态
 async def debug_plate_stocks_api(request):
     """调试板块个股API"""
@@ -3225,6 +2587,58 @@ async def debug_plate_stocks_api(request):
         logger.error(f"❌ 调试接口错误: {e}")
         return web.json_response({'error': str(e)}, status=500)
 
+async def debug_kaipan_plate_api(request):
+    """调试：开盘啦板块榜与系统画像融合对比"""
+    try:
+        size = request.query.get('size', '20')
+        topn = int(request.query.get('topn', 10))
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        # 1) 开盘啦原始板块榜
+        kp = fetch_kaipan_plate_rank("0", size)
+        kp_plates = (kp or {}).get("plates", [])[:topn]
+
+        # 2) 系统板块画像榜
+        zkey = f"rank:plate_profile:{today_str}"
+        dkey = f"rank:plate_profile:details:{today_str}"
+        top_rank = await monitor.redis.zrevrange(zkey, 0, max(0, topn - 1), withscores=True) if monitor and monitor.redis else []
+
+        system_top = []
+        for pid, score in top_rank:
+            detail_raw = await monitor.redis.hget(dkey, pid) if monitor and monitor.redis else None
+            detail = {}
+            if detail_raw:
+                try:
+                    detail = json.loads(detail_raw) if isinstance(detail_raw, str) else detail_raw
+                except Exception:
+                    detail = {}
+            system_top.append({
+                "plate_id": pid,
+                "plate_name": service.plate_updater.all_plates.get(pid, {}).get("name", pid),
+                "process_score": float(score),
+                "kaipan_rank": detail.get("kaipan_rank", 0),
+                "kaipan_strength": detail.get("kaipan_strength", 0),
+                "kaipan_change_pct": detail.get("kaipan_change_pct", 0),
+                "kaipan_amount": detail.get("kaipan_amount", 0),
+                "kaipan_bonus": detail.get("kaipan_bonus", 0),
+            })
+
+        return web.json_response({
+            "date": today_str,
+            "kaipan_ok": bool((kp or {}).get("ok", False)),
+            "kaipan_count": int((kp or {}).get("count", 0)),
+            "kaipan_top": kp_plates,
+            "system_top": system_top,
+            "blend": {
+                "enabled": bool(getattr(service, "market_edge", None).enable_kaipan_plate_blend) if getattr(service, "market_edge", None) else None,
+                "weight": float(getattr(service, "market_edge", None).kaipan_plate_blend_weight) if getattr(service, "market_edge", None) else None,
+            },
+            "timestamp": int(time.time() * 1000),
+        })
+    except Exception as e:
+        logger.error(f"❌ 开盘啦调试接口错误: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
 # 新增：个股K线API路由
 async def stock_kline_api(request):
     """个股K线数据API"""
@@ -3239,12 +2653,21 @@ async def main():
     # 将同一个TDengineService实例传递给所有需要使用它的服务
     service = OptimizedIntegratedWebService(tdengine_service=tdengine_service)
     monitor = StockVolatileMonitor()
+    # 建立名称映射引用
+    if hasattr(service.plate_updater, 'stock_names'):
+        monitor.stock_names = service.plate_updater.stock_names
+        
     stock_service = IntegratedStockService(web_service=service, tdengine_service=tdengine_service)
     updater = LimitUpDailyUpdater(tdengine_service=tdengine_service)
-    # 检查是否需要立即更新上一个交易日的连板数据
-    if not updater.has_previous_trade_day_data():
-        logger.info("📅 开始立即更新上一个交易日的连板数据")
-        updater.update_previous_trade_day()
+    
+    # 启动时始终同步开盘啦板块映射（使用 to_thread 避免阻塞事件循环）
+    logger.info("🚀 启动非阻塞板块同步任务...")
+    asyncio.create_task(asyncio.to_thread(updater.sync_kaipanla_plates))
+    
+    # 检查并更新最新交易日的连板数据（如果缺失，同样使用后台任务）
+    if not updater.has_latest_trade_day_data():
+        logger.info("📅 检测到数据缺失，启动后台任务更新最新交易日的连板数据")
+        asyncio.create_task(asyncio.to_thread(updater.update_latest_trade_day_data))
     
     asyncio.create_task(updater.start_daily_update_scheduler_async())
     try:
@@ -3261,37 +2684,45 @@ async def main():
              logger.error(f"Failed to init StockAnalyzer: {e}")
 
     theme_ranker = None
-    if ThemeRanker:
+    if ThemeRanker and SimpleThemeNormalizer:
         try:
-            theme_ranker = ThemeRanker(service.plate_updater, stock_analyzer_instance)
+            normalizer = SimpleThemeNormalizer()
+            theme_ranker = ThemeRanker(
+                theme_normalizer=normalizer,
+                stock_analyzer=stock_analyzer_instance,
+                plate_updater=service.plate_updater
+            )
         except Exception as e:
             logger.error(f"Failed to init ThemeRanker: {e}")
 
-    if theme_ranker:
-        try:
-            # Create a dedicated calendar instance or reuse one if available
-            calendar_service = TradingCalendarService()
-            
-            market_edge = MarketEdgeEngine(
-                redis=monitor.redis,  # Use monitor's redis connection as service.redis might be internal
-                redis_storage=service.redis_storage,
-                plate_updater=service.plate_updater,
-                calendar=calendar_service,
-                advanced_indicators=service.advanced_indicators,
-                theme_ranker=theme_ranker,
-                stock_analyzer=stock_analyzer_instance,
-            )
-            # 可选回放模式：仅在设置 MARKET_EDGE_REPLAY_DATE 时启用
-            replay_date = os.environ.get("MARKET_EDGE_REPLAY_DATE", "").strip()
-            if replay_date:
-                market_edge.manual_date = replay_date
-                logger.info(f"✅ MarketEdgeEngine initialized (Mode: replay, Date: {replay_date})")
-            else:
-                logger.info("✅ MarketEdgeEngine initialized (Mode: live)")
-            asyncio.create_task(market_edge.run())
-        except Exception as e:
-            logger.error(f"Failed to start MarketEdgeEngine: {e}")
-            traceback.print_exc()
+    if not theme_ranker:
+        logger.warning("⚠️ ThemeRanker missing - MarketEdgeEngine will start with limited ranking capabilities.")
+
+    try:
+        # Create a dedicated calendar instance or reuse one if available
+        calendar_service = TradingCalendarService()
+        
+        market_edge = MarketEdgeEngine(
+            redis=monitor.redis,  # Use monitor's redis connection as service.redis might be internal
+            redis_storage=service.redis_storage,
+            plate_updater=service.plate_updater,
+            calendar=calendar_service,
+            advanced_indicators=service.advanced_indicators,
+            theme_ranker=theme_ranker,
+            stock_analyzer=stock_analyzer_instance,
+        )
+        # 可选回放模式：仅在设置 MARKET_EDGE_REPLAY_DATE 时启用
+        replay_date = os.environ.get("MARKET_EDGE_REPLAY_DATE", "").strip()
+        if replay_date:
+            market_edge.manual_date = replay_date
+            logger.info(f"✅ MarketEdgeEngine initialized (Mode: replay, Date: {replay_date})")
+        else:
+            logger.info("✅ MarketEdgeEngine initialized (Mode: live)")
+        service.market_edge = market_edge
+        asyncio.create_task(market_edge.run())
+    except Exception as e:
+        logger.error(f"Failed to start MarketEdgeEngine: {e}")
+        traceback.print_exc()
         
     # 启动优化后的服务
     await service.start_optimized_services()
@@ -3319,6 +2750,8 @@ async def main():
     app.router.add_get('/health', health_check)
     app.router.add_get('/redis-status', redis_status)
     app.router.add_get('/debug/plate-stocks', debug_plate_stocks_api)  # 新增调试接口
+    app.router.add_get('/debug/memory', debug_memory_api)  # 新增内存调试接口
+    app.router.add_get('/api/debug/kaipan-plate', debug_kaipan_plate_api)  # 开盘啦融合调试
     app.router.add_get('/api/f10/data', f10_data_api)
     app.router.add_get('/api/f10/search', f10_search_api)
     app.router.add_get('/api/f10/cache-stats', f10_cache_stats_api)
@@ -3396,8 +2829,8 @@ class T1ProcessManager:
             logger.error(f"❌ 检测T1进程状态失败: {e}")
             return {'running': False, 'error': str(e)}
     
-    def start_t1(self, mode: str = 'live', replay_date: str = None, replay_time: str = None, replay_speed: float = 1.0) -> dict:
-        """启动exe进程"""
+    async def start_t1(self, mode: str = 'live', replay_date: str = None, replay_time: str = None, replay_speed: float = 1.0) -> dict:
+        """启动exe进程 - 异步化优化"""
         try:
             # 检查是否已经在运行
             status = self.is_t1_running()
@@ -3432,8 +2865,7 @@ class T1ProcessManager:
                 os.system(cmd_line)
                 
                 # 等待进程启动，然后获取PID
-                import time
-                time.sleep(2)
+                await asyncio.sleep(2.0)  # 使用异步 sleep，避免阻塞主循环
                 status = self.is_t1_running()
                 if status['running']:
                     self.t1_pid = status['pid']
@@ -3449,7 +2881,8 @@ class T1ProcessManager:
                     start_new_session=True
                 )
                 self.t1_pid = self.t1_process.pid
-            self.t1_pid = self.t1_process.pid
+            if self.t1_process is not None:
+                self.t1_pid = self.t1_process.pid
             
             logger.info(f"🚀 exe已启动 (PID: {self.t1_pid}, 模式: {mode})")
             
@@ -3517,7 +2950,7 @@ async def t1_start_api(request):
         replay_time = data.get('replay_time')
         replay_speed = float(data.get('replay_speed', 1.0))
         
-        result = t1_manager.start_t1(mode, replay_date, replay_time, replay_speed)
+        result = await t1_manager.start_t1(mode, replay_date, replay_time, replay_speed)
         return web.json_response(result)
     except Exception as e:
         logger.error(f"❌ T1启动API错误: {e}")

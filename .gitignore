@@ -221,3 +221,33 @@ coverage/
 # 依赖锁定文件（根据项目需要决定是否忽略）
 # go.sum
 # package-lock.json
+ai/API/cache_storage
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+*.txt
+
+# Data (根据需求决定是否上传数据文件，通常大文件不上传)
+# web/data/f10.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Custom Excludes (Test & Debug scripts)
+test_*.py
+check_*.py
+debug_*.py
+*_test.py
+*.bak
+*.server_after*
+web/data/*
+*.json
+*.md
+*.csv
+*.txt
+*.png

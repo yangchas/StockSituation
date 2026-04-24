@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Strategy Library
+  short_description: Classify strategy knowledge by domain.
+  default_prompt: Use the project strategy library to classify books, theories, and trading methods by psychology, risk, strategy, quant, and market-structure categories.

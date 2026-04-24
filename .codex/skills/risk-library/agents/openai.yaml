@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Risk Library
+  description: Risk, position sizing, Kelly, drawdown, and exposure-control references.
+  prompt_hint: Use this skill to classify sizing and risk-control ideas for trading systems.

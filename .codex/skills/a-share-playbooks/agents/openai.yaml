@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: A-Share Playbooks
+  description: A-share tactical playbooks for dragon-head, emotion cycle, rotation, and continuation setups.
+  prompt_hint: Use this skill to classify A-share tactical playbooks and tie them to risk and market phase.

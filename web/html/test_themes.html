@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>中文题材展示测试</title>
+    <style>
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .theme-section {
+            margin-bottom: 30px;
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+        }
+        .theme-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 15px;
+        }
+        .stock-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .stock-item {
+            padding: 8px 12px;
+            background-color: #e3f2fd;
+            border-radius: 4px;
+            font-size: 14px;
+            color: #1976d2;
+        }
+        .stock-info {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #fafafa;
+            border-radius: 4px;
+        }
+        .stock-item:hover {
+            background-color: #bbdefb;
+            cursor: pointer;
+        }
+        .loading {
+            text-align: center;
+            font-size: 18px;
+            color: #666;
+            padding: 50px;
+        }
+        .error {
+            color: #f44336;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📈 中文题材展示测试</h1>
+        
+        <div id="loading" class="loading">正在加载数据...</div>
+        <div id="error" class="error" style="display: none;"></div>
+        
+        <div id="content" style="display: none;">
+            <div class="theme-section">
+                <div class="theme-name">🏷️ 题材分组</div>
+                <div id="themeGroups" class="stock-list"></div>
+            </div>
+            
+            <div class="theme-section">
+                <div class="theme-name">📊 股票列表</div>
+                <div id="stockList" class="stock-list"></div>
+            </div>
+            
+            <div class="stock-info">
+                <h3>📋 数据说明</h3>
+                <p>1. 题材分组: 每个题材下的前20只股票</p>
+                <p>2. 股票列表: 所有符合条件的股票，显示代码和名称</p>
+                <p>3. 每个股票的题材信息已转换为中文名称</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 模拟API返回的数据结构
+        const mockData = {
+            stocks: [
+                {
+                    code: '600000',
+                    name: '浦发银行',
+                    change_pct: 2.5,
+                    change_rate_1min: 1.2,
+                    amount: 1500000000,
+                    themes: ['银行', '金融', '上海'],
+                    primary_theme: '银行'
+                },
+                {
+                    code: '000001',
+                    name: '平安银行',
+                    change_pct: 3.2,
+                    change_rate_1min: 0.8,
+                    amount: 2000000000,
+                    themes: ['银行', '金融', '深圳'],
+                    primary_theme: '银行'
+                },
+                {
+                    code: '600036',
+                    name: '招商银行',
+                    change_pct: 1.8,
+                    change_rate_1min: 0.5,
+                    amount: 1200000000,
+                    themes: ['银行', '金融', '零售'],
+                    primary_theme: '银行'
+                }
+            ],
+            theme_groups: {
+                '银行': ['600000', '000001', '600036'],
+                '金融': ['600000', '000001', '600036'],
+                '上海': ['600000'],
+                '深圳': ['000001'],
+                '零售': ['600036']
+            }
+        };
+
+        async function loadData() {
+            try {
+                // 实际API调用
+                // const response = await fetch('/api/other_stocks?min_speed=0.0&min_amount=0.0&min_change=0.0');
+                // const data = await response.json();
+                
+                // 使用模拟数据
+                const data = mockData;
+
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('content').style.display = 'block';
+
+                // 渲染题材分组
+                const themeGroups = document.getElementById('themeGroups');
+                Object.keys(data.theme_groups).forEach(theme => {
+                    const themeDiv = document.createElement('div');
+                    themeDiv.className = 'stock-item';
+                    themeDiv.innerHTML = `${theme} (${data.theme_groups[theme].length}只股票)`;
+                    themeGroups.appendChild(themeDiv);
+                });
+
+                // 渲染股票列表
+                const stockList = document.getElementById('stockList');
+                data.stocks.forEach(stock => {
+                    const stockDiv = document.createElement('div');
+                    stockDiv.className = 'stock-item';
+                    stockDiv.innerHTML = `${stock.code} - ${stock.name} (${stock.change_pct}%)`;
+                    stockDiv.title = `题材: ${stock.themes.join(', ')}`;
+                    stockList.appendChild(stockDiv);
+                });
+
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('error').style.display = 'block';
+                document.getElementById('error').innerHTML = `❌ 加载数据失败: ${error.message}`;
+                console.error('加载数据失败:', error);
+            }
+        }
+
+        // 页面加载完成后开始加载数据
+        window.addEventListener('load', loadData);
+    </script>
+</body>
+</html>

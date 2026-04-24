@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Code Audit
+  short_description: Audit Go-project edits safely.
+  default_prompt: Review code changes in this Go workspace against project timing, source, storage, and performance rules before closing the task.

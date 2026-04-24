@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -17,6 +17,9 @@ from engine_next.runtime.controllers.live_runtime_controller import (
     LiveRuntimeController,
     LiveRuntimeRequest,
 )
+from engine_next.runtime.controllers.night_recap_controller import NightRecapController
+from engine_next.runtime.controllers.postmarket_runtime_controller import PostmarketRuntimeController
+from engine_next.runtime.controllers.settlement_controller import SettlementController
 from engine_next.runtime.controllers.startup_bootstrap_controller import (
     StartupBootstrapController,
     StartupBootstrapRequest,
@@ -29,9 +32,13 @@ from engine_next.runtime.intraday_context_builder import (
 from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryResult, MarketRuntimeSummaryService
 from engine_next.runtime.offline_sync_executor import OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
 from engine_next.runtime.original_timeline import iter_phase_events
-from engine_next.runtime.renderers.live_phase_summary_renderer import LivePhaseSummaryRenderer
+from engine_next.runtime.renderers.live_phase_summary_renderer import (
+    LivePhaseSummaryRenderer,
+    render_quote_freshness_line,
+)
 from engine_next.runtime.startup_runtime_coordinator import (
     RuntimeStartupCoordinator,
+    StartupCoordinatorRequest,
     StartupExecutionBundle,
 )
 from engine_next.runtime.startup_self_check import PREMARKET_HEAVY_SYNC_CUTOFF, infer_run_phase
@@ -177,7 +184,8 @@ class EngineApp:
     DEFAULT_LOOP_INTERVAL_SECONDS = 30
     MIN_STOCK_PLATE_MAPPING_COUNT = 1000
     MIN_FULL_UNIVERSE_SIZE = 1000
-    STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00", "09:25", "17:40")
+    STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00", "17:40")
+    AUCTION_FINALIZE_EARLIEST = dt_time(9, 25, 10)
 
     def __init__(
         self,
@@ -197,6 +205,11 @@ class EngineApp:
             intraday_hub=self._intraday_hub,
             market_runtime_summary_service=self._market_runtime_summary_service,
         )
+        self._postmarket_runtime = PostmarketRuntimeController(
+            intraday_hub=self._intraday_hub,
+            market_runtime_summary_service=self._market_runtime_summary_service,
+            state_writer=self._safe_set,
+        )
         self._startup_bootstrap = StartupBootstrapController(
             startup_coordinator=self._startup_coordinator,
             offline_executor=self._offline_executor,
@@ -205,6 +218,12 @@ class EngineApp:
         self._live_runtime = LiveRuntimeController(
             intraday_context_builder=self._intraday_context_builder,
         )
+        self._settlement = SettlementController(
+            offline_executor=self._offline_executor,
+            auto_discovered_sync_limit=self.AUTO_DISCOVERED_SYNC_LIMIT,
+            redis_client=self.redis,
+        )
+        self._night_recap = NightRecapController()
         self._live_summary_renderer = LivePhaseSummaryRenderer()
         self._last_scheduled_event_token: str | None = None
         self._last_render_token: str | None = None
@@ -267,6 +286,16 @@ class EngineApp:
             return None
         return None
 
+    def _safe_get_json(self, key: str) -> dict[str, object]:
+        raw = self._safe_get(key)
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
     def _safe_hget(self, key: str, field: str) -> str | None:
         try:
             if hasattr(self.redis, "hget"):
@@ -294,6 +323,15 @@ class EngineApp:
         except Exception:
             return False
         return False
+
+    def _hot_plate_freshness_limit_seconds(self, phase: RunPhase) -> int:
+        if phase == RunPhase.PREMARKET:
+            return 96 * 60 * 60
+        if phase in {RunPhase.AUCTION, RunPhase.INTRADAY}:
+            return 45 * 60
+        if phase == RunPhase.POSTMARKET:
+            return 8 * 60 * 60
+        return 24 * 60 * 60
 
     def _extract_symbols_from_json_text(self, payload: str | None) -> tuple[str, ...]:
         if not payload:
@@ -326,6 +364,7 @@ class EngineApp:
             )
         )
         candidates.extend(self._safe_hkeys("market:stock_plate"))
+        candidates.extend(self._safe_hkeys("config:plate_mapping:s2p"))
         quote_keys = self._safe_keys("stock:quote:*")
         candidates.extend(key.replace("stock:quote:", "") for key in quote_keys)
         return _dedupe_symbols(candidates)
@@ -384,7 +423,31 @@ class EngineApp:
             tdengine_writes += len(result.wrote_tdengine)
             redis_writes += len(result.wrote_redis)
 
-        return (
+        partial_details: list[str] = []
+        failed_details: list[str] = []
+        failed_roots: list[str] = []
+        root_counter: dict[str, int] = {}
+        for result in results:
+            missing_parts = self._format_missing_parts(result)
+            if not missing_parts:
+                continue
+            detail = f"{result.symbol}:{'/'.join(missing_parts)}"
+            any_ready = (
+                result.kline_ready
+                or result.dde_ready
+                or result.factor_ready
+                or result.chip_ready
+                or result.redis_cache_ready
+            )
+            if any_ready:
+                partial_details.append(detail)
+            else:
+                failed_details.append(detail)
+                root = self._infer_sync_root_cause(result)
+                failed_roots.append(f"{result.symbol}:{root}")
+                root_counter[root] = root_counter.get(root, 0) + 1
+
+        lines = [
             f"sync.summary | full={fully_ready} | partial={partial_ready} | failed={failed}",
             (
                 "sync.datasets "
@@ -395,7 +458,102 @@ class EngineApp:
                 f"| redis={redis_ready}/{len(results)}"
             ),
             f"sync.writes | tdengine_ops={tdengine_writes} | redis_ops={redis_writes}",
-        )
+        ]
+        if partial_details:
+            lines.append(f"sync.partial_symbols | {', '.join(partial_details[:12])}")
+        if failed_details:
+            lines.append(f"sync.failed_symbols | {', '.join(failed_details[:12])}")
+        if failed_roots:
+            lines.append(f"sync.failed_root | {', '.join(failed_roots[:12])}")
+        if root_counter:
+            summary = ", ".join(
+                f"{root}={count}"
+                for root, count in sorted(root_counter.items(), key=lambda item: (-item[1], item[0]))
+            )
+            lines.append(f"sync.root_summary | {summary}")
+        return tuple(lines)
+
+    def _format_missing_parts(self, result: IntegratedSyncResult) -> list[str]:
+        parts: list[str] = []
+        reasons = self._extract_sync_reason_map(result.notes)
+        for dataset, ready in (
+            ("kline", result.kline_ready),
+            ("dde", result.dde_ready),
+            ("factor", result.factor_ready),
+            ("chip", result.chip_ready),
+            ("redis", result.redis_cache_ready),
+        ):
+            if ready:
+                continue
+            reason = reasons.get(dataset)
+            parts.append(f"{dataset}({reason})" if reason else dataset)
+        return parts
+
+    def _infer_sync_root_cause(self, result: IntegratedSyncResult) -> str:
+        reasons = self._extract_sync_reason_map(result.notes)
+        for dataset, ready in (
+            ("kline", result.kline_ready),
+            ("dde", result.dde_ready),
+            ("factor", result.factor_ready),
+            ("chip", result.chip_ready),
+            ("redis", result.redis_cache_ready),
+        ):
+            if not ready:
+                reason = reasons.get(dataset)
+                return f"{dataset}({reason})" if reason else dataset
+        return "unknown"
+
+    def _extract_sync_reason_map(self, notes: tuple[str, ...]) -> dict[str, str]:
+        reasons: dict[str, str] = {}
+        for raw_note in notes:
+            note = str(raw_note or "").strip()
+            if not note:
+                continue
+            lower = note.lower()
+            datasets = self._infer_note_datasets(lower)
+            if not datasets:
+                continue
+            reason = self._classify_sync_note(lower)
+            if not reason:
+                continue
+            for dataset in datasets:
+                reasons.setdefault(dataset, reason)
+        return reasons
+
+    def _infer_note_datasets(self, lower_note: str) -> tuple[str, ...]:
+        datasets: list[str] = []
+        if "kline" in lower_note or "baostock" in lower_note:
+            datasets.append("kline")
+        if "dde" in lower_note:
+            datasets.append("dde")
+        if "factor" in lower_note:
+            datasets.append("factor")
+        if "chip" in lower_note:
+            datasets.append("chip")
+        if "redis" in lower_note or "cache" in lower_note:
+            datasets.append("redis")
+        return tuple(dict.fromkeys(datasets))
+
+    def _classify_sync_note(self, lower_note: str) -> str | None:
+        if "login failed" in lower_note or "network" in lower_note:
+            return "network"
+        if "stale" in lower_note:
+            return "stale"
+        if "empty payload" in lower_note or "returned empty payload" in lower_note:
+            return "empty"
+        if "missing date column" in lower_note:
+            return "missing_date"
+        if "unable to parse" in lower_note or "parse" in lower_note:
+            return "parse_error"
+        if "history too short" in lower_note or "too short" in lower_note:
+            return "short_history"
+        if "not ready after ensure" in lower_note or "still not ready" in lower_note:
+            return "not_ready"
+        if "save_" in lower_note and "returned false" in lower_note:
+            return "persist_failed"
+        if "deferred" in lower_note and "failed" in lower_note:
+            return "persist_failed"
+        return None
 
     def _load_runtime_readiness(
         self,
@@ -410,14 +568,50 @@ class EngineApp:
         factor_ready_fields = set(self._safe_hkeys(factor_key))
         factor_ready = {symbol: symbol in factor_ready_fields for symbol in symbols}
         hot_plate_date = _hot_plate_cache_date(now, trade_date, previous_trade_date)
+        phase = infer_run_phase(now)
+        runtime_plate_count = self._safe_hlen("market:stock_plate")
+        stock_theme_count = self._safe_hlen("config:plate_mapping:s2p")
+        hot_plate_key = f"cache:hot_plates:{hot_plate_date}"
+        hot_plate_meta = self._safe_get_json(f"cache:hot_plates_meta:{hot_plate_date}")
+        hot_plate_count = self._safe_hlen(hot_plate_key)
+        hot_plate_row_count = 0
+        hot_plate_updated_at_ts = 0
+        try:
+            hot_plate_row_count = int(hot_plate_meta.get("row_count", 0) or 0)
+        except (TypeError, ValueError):
+            hot_plate_row_count = 0
+        try:
+            hot_plate_updated_at_ts = int(float(hot_plate_meta.get("updated_at_ts", 0) or 0))
+        except (TypeError, ValueError):
+            hot_plate_updated_at_ts = 0
+        hot_plate_meta_trade_date = str(hot_plate_meta.get("trade_date") or "").strip()
+        hot_plate_freshness_limit_seconds = self._hot_plate_freshness_limit_seconds(phase)
+        hot_plate_age_seconds = max(int(now.timestamp()) - hot_plate_updated_at_ts, 0) if hot_plate_updated_at_ts > 0 else None
+        hot_plates_ready = (
+            hot_plate_count > 0
+            and hot_plate_row_count > 0
+            and hot_plate_meta_trade_date == hot_plate_date
+            and hot_plate_updated_at_ts > 0
+            and (
+                hot_plate_age_seconds is not None
+                and hot_plate_age_seconds <= hot_plate_freshness_limit_seconds
+            )
+        )
         return {
             "redis_factor_cache_ready": factor_ready,
             "yest_limit_pool_ready": self._safe_hlen(f"cache:yest_limit_pool:{previous_trade_date}") > 0,
-            "hot_plates_ready": self._safe_hlen(f"cache:hot_plates:{hot_plate_date}") > 0,
-            "stock_plate_mapping_ready": self._safe_hlen("market:stock_plate") >= self.MIN_STOCK_PLATE_MAPPING_COUNT,
+            "hot_plates_ready": hot_plates_ready,
+            "stock_plate_mapping_ready": (
+                runtime_plate_count >= self.MIN_STOCK_PLATE_MAPPING_COUNT
+                or stock_theme_count >= self.MIN_STOCK_PLATE_MAPPING_COUNT
+            ),
             "auction_anchor_ready": self._safe_exists(f"market:auction:anchor:{trade_date.replace('-', '')}"),
             "redis_chip_ready_count": self._safe_hlen(f"cache:chip_peaks:{offline_context_date}"),
             "redis_dde_ready_count": self._safe_hlen(f"cache:dde_ready:{offline_context_date}"),
+            "hot_plate_count": hot_plate_count,
+            "hot_plate_row_count": hot_plate_row_count,
+            "hot_plate_cache_date": hot_plate_date,
+            "hot_plate_age_seconds": hot_plate_age_seconds,
         }
 
     def _current_audit_token(self, now: datetime, trade_date: str) -> str | None:
@@ -435,6 +629,31 @@ class EngineApp:
         minute_tag = now.strftime("%H:%M")
         audit_token = self._current_audit_token(now, trade_date)
         phase = infer_run_phase(now)
+        if minute_tag == "09:25":
+            if now.time() < self.AUCTION_FINALIZE_EARLIEST:
+                return RuntimeLoopDecision(
+                    name="auction_anchor_settling",
+                    label="auction anchor settling",
+                    audit_token=None,
+                    should_run_lifecycle_audit=False,
+                )
+            return RuntimeLoopDecision(
+                name="auction_anchor_finalize",
+                label="auction anchor finalize 09:25",
+                audit_token=None,
+                should_run_lifecycle_audit=False,
+                scheduled_event_name="auction_finalize_0925",
+                scheduled_event_label="auction finalize event 09:25",
+            )
+        if minute_tag == "09:26":
+            return RuntimeLoopDecision(
+                name="auction_followup_checkpoint",
+                label="auction follow-up checkpoint 09:26",
+                audit_token=None,
+                should_run_lifecycle_audit=False,
+                scheduled_event_name="auction_followup_0926",
+                scheduled_event_label="auction follow-up event 09:26",
+            )
         if (
             self._startup_bootstrap.last_audit_trade_date != trade_date
             or self._startup_bootstrap.last_audit_token is None
@@ -451,15 +670,6 @@ class EngineApp:
                 label=f"startup checkpoint {minute_tag}",
                 audit_token=audit_token,
                 should_run_lifecycle_audit=bool(audit_token and audit_token != self._startup_bootstrap.last_audit_token),
-            )
-        if minute_tag == "09:26":
-            return RuntimeLoopDecision(
-                name="auction_analysis_checkpoint",
-                label="auction replay checkpoint 09:26",
-                audit_token=None,
-                should_run_lifecycle_audit=False,
-                scheduled_event_name="auction_replay_0926",
-                scheduled_event_label="auction replay event 09:26",
             )
         if minute_tag == "15:05":
             return RuntimeLoopDecision(
@@ -554,22 +764,77 @@ class EngineApp:
             ),
         )
 
+    @staticmethod
+    def _is_opening_strategy_window(now: datetime, phase: RunPhase) -> bool:
+        if phase != RunPhase.INTRADAY:
+            return False
+        minute_tag = now.strftime("%H:%M")
+        return "09:30" <= minute_tag < "09:40"
+
     def _derive_runtime_readiness(
         self,
         *,
         phase: RunPhase,
         runtime_readiness: dict[str, object],
+        primed_runtime_state: PrimedIntradayRuntimeState | None = None,
     ) -> str:
         yest_limit_ready = bool(runtime_readiness.get("yest_limit_pool_ready"))
         hot_plates_ready = bool(runtime_readiness.get("hot_plates_ready"))
         stock_plate_ready = bool(runtime_readiness.get("stock_plate_mapping_ready"))
         auction_ready = bool(runtime_readiness.get("auction_anchor_ready"))
+        fresh_ratio = primed_runtime_state.quote_fresh_ratio if primed_runtime_state is not None else 0.0
+        latest_age_seconds = primed_runtime_state.latest_quote_age_seconds if primed_runtime_state is not None else None
+        stale_threshold_seconds = (
+            primed_runtime_state.quote_stale_threshold_seconds if primed_runtime_state is not None else 0
+        )
+        quote_rows = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+        has_live_quote_feed = (
+            quote_rows > 0
+            and latest_age_seconds is not None
+            and stale_threshold_seconds > 0
+            and latest_age_seconds <= stale_threshold_seconds
+            and fresh_ratio > 0
+        )
 
         if phase in (RunPhase.AUCTION, RunPhase.INTRADAY):
+            quote_feed_healthy = (
+                quote_rows > 0
+                and fresh_ratio >= 0.90
+                and latest_age_seconds is not None
+                and stale_threshold_seconds > 0
+                and latest_age_seconds <= stale_threshold_seconds
+            )
+            quote_feed_degraded = (
+                quote_rows > 0
+                and latest_age_seconds is not None
+                and stale_threshold_seconds > 0
+                and latest_age_seconds <= (stale_threshold_seconds * 4)
+                and fresh_ratio >= 0.20
+            )
+            if phase == RunPhase.AUCTION and auction_ready:
+                return "trade_ready_runtime" if quote_feed_healthy else "anchor_ready_runtime"
             if yest_limit_ready and hot_plates_ready and stock_plate_ready and auction_ready:
-                return "trade_ready_runtime"
+                if quote_feed_healthy:
+                    return "trade_ready_runtime"
+                if quote_feed_degraded:
+                    return "degraded_runtime"
+                return "observe_runtime"
             if yest_limit_ready and stock_plate_ready:
-                return "degraded_runtime"
+                return "degraded_runtime" if quote_feed_healthy or quote_feed_degraded else "observe_runtime"
+            return "observe_runtime"
+
+        if phase == RunPhase.POSTMARKET:
+            if yest_limit_ready and stock_plate_ready and hot_plates_ready:
+                return "postmarket_recap_ready"
+            if yest_limit_ready or stock_plate_ready:
+                return "postmarket_partial"
+            return "postmarket_warming"
+
+        if phase == RunPhase.PREMARKET:
+            if yest_limit_ready and stock_plate_ready and hot_plates_ready:
+                return "trade_ready_runtime" if has_live_quote_feed else "historical_context_only"
+            if yest_limit_ready or stock_plate_ready:
+                return "degraded_runtime" if has_live_quote_feed else "observe_runtime"
             return "observe_runtime"
 
         if yest_limit_ready and stock_plate_ready and hot_plates_ready:
@@ -578,6 +843,31 @@ class EngineApp:
             return "degraded_runtime"
         return "observe_runtime"
 
+    def _render_postmarket_snapshot_line(
+        self,
+        *,
+        primed_runtime_state: PrimedIntradayRuntimeState | None,
+        symbol_count: int,
+    ) -> str | None:
+        if primed_runtime_state is None:
+            return None
+        latest = primed_runtime_state.latest_quote_time or "-"
+        lag = primed_runtime_state.latest_quote_age_seconds
+        lag_text = "-" if lag is None else f"{lag}s"
+        quote_rows = len(primed_runtime_state.quote_rows)
+        mode = "收盘近似快照"
+        if lag is not None and lag > 60 * 30:
+            mode = "盘中冻结快照"
+        return (
+            "close_snapshot "
+            f"| captured={quote_rows}/{symbol_count} "
+            f"| missing={primed_runtime_state.quote_missing_count} "
+            f"| last_tick={latest} "
+            f"| age={lag_text} "
+            f"| mode={mode} "
+            f"| market_closed=yes"
+        )
+
     def _render_postmarket_takeover_summary(
         self,
         *,
@@ -585,25 +875,113 @@ class EngineApp:
         symbols: int,
         intraday_context: IntradayContext | None,
         primed_runtime_state: PrimedIntradayRuntimeState | None,
+        now: datetime | None = None,
     ) -> tuple[str, ...]:
+        quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+        rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
         live_notes = list(
-            self._live_summary_renderer.render(
-                phase=RunPhase.POSTMARKET,
+            self._auction_runtime.render_postmarket_runtime_loop(
                 intraday_context=intraday_context,
-                primed_runtime_state=primed_runtime_state,
                 runtime_readiness_label=runtime_readiness_label,
-                symbol_count=symbols,
+                symbols=symbols,
+                quotes=quote_count,
+                rust=rust_count,
+                now=now or datetime.now(),
+                quote_freshness_line=self._render_postmarket_snapshot_line(
+                    primed_runtime_state=primed_runtime_state,
+                    symbol_count=symbols,
+                ),
             )
         )
-        if live_notes:
-            first_line = live_notes[0]
-            if first_line.startswith("runtime_readiness="):
-                live_notes[0] = f"{first_line} | settlement_window=17:40+"
         return tuple(
             [
                 "runtime_event=postmarket takeover",
                 *live_notes,
             ]
+        )
+
+    def _refresh_startup_state_after_settlement(
+        self,
+        *,
+        request: EngineAppRequest,
+        symbols: tuple[str, ...],
+        offline_context_date: str,
+        startup_bundle: StartupExecutionBundle,
+    ) -> tuple[StartupExecutionBundle, WatermarkSnapshot, dict[str, object]]:
+        refreshed_runtime_readiness = self._load_runtime_readiness(
+            now=request.now,
+            trade_date=request.trade_date,
+            previous_trade_date=request.previous_trade_date,
+            offline_context_date=offline_context_date,
+            symbols=symbols,
+        )
+        refreshed_watermark_snapshot = self._offline_executor.preload_watermark_snapshot(
+            OfflineSyncRequest(
+                now=request.now,
+                target_date=request.trade_date,
+                previous_trade_date=request.previous_trade_date,
+                symbols=symbols,
+                kline_watermarks={},
+                factor_watermarks={},
+                redis_factor_cache_ready=refreshed_runtime_readiness["redis_factor_cache_ready"],
+                environment=request.environment,
+            )
+        )
+        refreshed_plan = self._startup_coordinator.build_plan(
+            StartupCoordinatorRequest(
+                now=request.now,
+                trade_date=request.trade_date,
+                previous_trade_date=request.previous_trade_date,
+                symbols=symbols,
+                kline_watermarks=refreshed_watermark_snapshot.kline_latest_dates,
+                factor_watermarks=refreshed_watermark_snapshot.factor_latest_dates,
+                redis_factor_cache_ready=refreshed_runtime_readiness["redis_factor_cache_ready"],
+                yest_limit_pool_ready=bool(refreshed_runtime_readiness["yest_limit_pool_ready"]),
+                hot_plates_ready=bool(refreshed_runtime_readiness["hot_plates_ready"]),
+                stock_plate_mapping_ready=bool(refreshed_runtime_readiness["stock_plate_mapping_ready"]),
+                auction_anchor_ready=bool(refreshed_runtime_readiness["auction_anchor_ready"]),
+                redis_chip_ready_count=int(refreshed_runtime_readiness["redis_chip_ready_count"] or 0),
+                redis_dde_ready_count=int(refreshed_runtime_readiness["redis_dde_ready_count"] or 0),
+                watermark_snapshot=refreshed_watermark_snapshot,
+                environment=request.environment,
+            )
+        )
+        refreshed_startup_bundle = StartupExecutionBundle(
+            plan=refreshed_plan,
+            stock_plate_result=startup_bundle.stock_plate_result,
+            auction_result=startup_bundle.auction_result,
+            hot_plate_result=startup_bundle.hot_plate_result,
+            yest_limit_result=startup_bundle.yest_limit_result,
+            market_runtime_summary_result=startup_bundle.market_runtime_summary_result,
+        )
+        self._startup_bootstrap.refresh_cached_state(
+            trade_date=request.trade_date,
+            startup_bundle=refreshed_startup_bundle,
+            watermark_snapshot=refreshed_watermark_snapshot,
+            runtime_readiness=refreshed_runtime_readiness,
+        )
+        return refreshed_startup_bundle, refreshed_watermark_snapshot, refreshed_runtime_readiness
+
+    def _render_auction_takeover_summary(
+        self,
+        *,
+        runtime_readiness_label: str,
+        symbols: int,
+        intraday_context: IntradayContext | None,
+        primed_runtime_state: PrimedIntradayRuntimeState | None,
+    ) -> tuple[str, ...]:
+        quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+        rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+        return self._auction_runtime.render_auction_takeover(
+            intraday_context=intraday_context,
+            runtime_readiness_label=runtime_readiness_label,
+            symbols=symbols,
+            quotes=quote_count,
+            rust=rust_count,
+            quote_freshness_line=render_quote_freshness_line(
+                primed_runtime_state,
+                symbol_count=symbols,
+            ),
         )
 
     def _render_scheduled_event_summary(self, event_result: RuntimeScheduledEventResult) -> tuple[str, ...]:
@@ -658,28 +1036,14 @@ class EngineApp:
         if lifecycle_audit_ran or scheduled_event_result.executed:
             self._last_render_token = token
             return True
+        if phase == RunPhase.POSTMARKET:
+            return False
         if self._last_render_token != token:
             self._last_render_token = token
             return True
         if phase not in (RunPhase.AUCTION, RunPhase.INTRADAY, RunPhase.POSTMARKET):
             self._last_render_token = token
             return True
-        return False
-
-    def _should_audit_integrated_sync(
-        self,
-        *,
-        phase: RunPhase,
-        now: datetime,
-        lifecycle_audit_ran: bool,
-        scheduled_event_result: RuntimeScheduledEventResult,
-    ) -> bool:
-        if lifecycle_audit_ran and phase in (RunPhase.PREMARKET, RunPhase.NIGHT):
-            return True
-        if phase == RunPhase.POSTMARKET:
-            if scheduled_event_result.name == "postmarket_settlement_1740" and scheduled_event_result.executed:
-                return True
-            return now.strftime("%H:%M") >= "17:40"
         return False
 
     def _execute_scheduled_event(
@@ -712,8 +1076,18 @@ class EngineApp:
         market_runtime_summary_result = None
         notes: list[str] = []
 
-        if loop_decision.scheduled_event_name == "auction_replay_0926":
-            replay_result = self._auction_runtime.execute_replay_0926(
+        if loop_decision.scheduled_event_name == "auction_finalize_0925":
+            replay_result = self._auction_runtime.execute_auction_finalize_0925(
+                trade_date=request.trade_date,
+                previous_trade_date=request.previous_trade_date,
+                offline_context_date=offline_context_date,
+            )
+            yest_limit_result = replay_result.yest_limit_result
+            auction_result = replay_result.auction_result
+            market_runtime_summary_result = replay_result.market_runtime_summary_result
+            notes.extend(replay_result.notes)
+        elif loop_decision.scheduled_event_name == "auction_followup_0926":
+            replay_result = self._auction_runtime.execute_auction_followup_0926(
                 trade_date=request.trade_date,
                 previous_trade_date=request.previous_trade_date,
                 offline_context_date=offline_context_date,
@@ -723,21 +1097,20 @@ class EngineApp:
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
         elif loop_decision.scheduled_event_name == "market_close_1505":
-            logger.info("scheduled event execute | name=%s", loop_decision.scheduled_event_name)
-            state_written = self._safe_set("market:state:last_phase", "postmarket")
-            date_written = self._safe_set("market:state:last_close_trade_date", request.trade_date)
-            notes.append(
-                f"15:05 close marker persisted | phase_key={'ok' if state_written else 'skip'} | date_key={'ok' if date_written else 'skip'}"
+            close_result = self._postmarket_runtime.execute_close_marker(
+                trade_date=request.trade_date,
             )
+            notes.extend(close_result.notes)
         elif loop_decision.scheduled_event_name == "postmarket_settlement_1740":
-            logger.info("scheduled event execute | name=%s", loop_decision.scheduled_event_name)
-            hot_plate_result = self._intraday_hub.fetch_hot_plates(request.trade_date, RunPhase.POSTMARKET, today_mode=True)
-            yest_limit_result = self._intraday_hub.fetch_yest_limit_pool(request.previous_trade_date, RunPhase.POSTMARKET)
-            market_runtime_summary_result = self._market_runtime_summary_service.build_and_write(
-                request.trade_date,
+            settlement_result = self._postmarket_runtime.execute_settlement_window(
+                trade_date=request.trade_date,
+                previous_trade_date=request.previous_trade_date,
                 offline_context_date=offline_context_date,
             )
-            notes.append("17:40 settlement event refreshed postmarket hot plates, yesterday limit pool, and market runtime summary.")
+            hot_plate_result = settlement_result.hot_plate_result
+            yest_limit_result = settlement_result.yest_limit_result
+            market_runtime_summary_result = settlement_result.market_runtime_summary_result
+            notes.extend(settlement_result.notes)
 
         self._last_scheduled_event_token = event_token
         return RuntimeScheduledEventResult(
@@ -767,18 +1140,18 @@ class EngineApp:
             full_universe = self._discover_full_universe_symbols()
             if full_universe:
                 symbols = full_universe
-                logger.info("startup symbol universe expanded from runtime set to full F10 pool | symbols=%s", len(symbols))
+                logger.debug("startup symbol universe expanded from runtime set to full F10 pool | symbols=%s", len(symbols))
         offline_context_date = request.offline_context_date or request.previous_trade_date
         audit_token = loop_decision.audit_token
         should_run_lifecycle_audit = loop_decision.should_run_lifecycle_audit
         if should_run_lifecycle_audit or loop_decision.scheduled_event_name:
-            logger.info(
+            logger.debug(
                 "engine_next cycle start | now=%s | trade_date=%s | previous_trade_date=%s",
                 request.now.strftime("%Y-%m-%d %H:%M:%S"),
                 request.trade_date,
                 request.previous_trade_date,
             )
-            logger.info(
+            logger.debug(
                 "runtime loop decision | event=%s | label=%s | audit=%s",
                 loop_decision.name,
                 loop_decision.label,
@@ -822,69 +1195,54 @@ class EngineApp:
             environment=request.environment,
         )
 
-        integrated_sync_results: tuple[IntegratedSyncResult, ...] = ()
-        integrated_sync_allowed = bool(request.run_integrated_sync)
-        phase = startup_bundle.plan.phase
+        phase = infer_run_phase(request.now)
         scheduled_event_result = self._execute_scheduled_event(
             loop_decision=loop_decision,
             request=request,
             phase=phase,
             offline_context_date=offline_context_date,
         )
+        if scheduled_event_result.executed:
+            startup_bundle, watermark_snapshot, runtime_readiness = self._refresh_startup_state_after_settlement(
+                request=request,
+                symbols=symbols,
+                offline_context_date=offline_context_date,
+                startup_bundle=startup_bundle,
+            )
         offline_decision = startup_bundle.plan.offline_decision or self._offline_executor.build_decision(effective_offline_request)
-        effective_sync_symbols: tuple[str, ...] = ()
-        should_audit_integrated_sync = self._should_audit_integrated_sync(
+        should_audit_integrated_sync = self._settlement.should_audit_integrated_sync(
             phase=phase,
             now=request.now,
             lifecycle_audit_ran=should_run_lifecycle_audit,
-            scheduled_event_result=scheduled_event_result,
+            scheduled_event_name=scheduled_event_result.name,
+            scheduled_event_executed=scheduled_event_result.executed,
         )
-        if should_audit_integrated_sync:
-            effective_sync_symbols = self._offline_executor.resolve_effective_target_symbols(
-                effective_offline_request,
-                offline_decision,
+        settlement_result = self._settlement.execute(
+            request=effective_offline_request,
+            phase=phase,
+            should_audit_integrated_sync=should_audit_integrated_sync,
+            integrated_sync_requested=request.run_integrated_sync,
+            requested_symbols=requested_symbols,
+            offline_decision=offline_decision,
+            watermark_snapshot=watermark_snapshot,
+        )
+        integrated_sync_results = settlement_result.integrated_sync_results
+        effective_sync_symbols = settlement_result.effective_sync_symbols
+        integrated_sync_allowed = settlement_result.integrated_sync_allowed
+        if integrated_sync_results:
+            startup_bundle, watermark_snapshot, runtime_readiness = self._refresh_startup_state_after_settlement(
+                request=request,
+                symbols=symbols,
+                offline_context_date=offline_context_date,
+                startup_bundle=startup_bundle,
             )
-            logger.info(
-                "integrated sync audit | phase=%s | universe=%s | effective_targets=%s",
-                phase.value,
-                len(symbols),
-                len(effective_sync_symbols),
-            )
-        if (
-            should_audit_integrated_sync
-            and integrated_sync_allowed
-            and not requested_symbols
-            and len(symbols) > self.AUTO_DISCOVERED_SYNC_LIMIT
-        ):
-            allow_large_auto_discovered_sync = (
-                phase == RunPhase.NIGHT
-                or phase == RunPhase.POSTMARKET
-                or (phase == RunPhase.PREMARKET and request.now.time() < PREMARKET_HEAVY_SYNC_CUTOFF)
-            )
-            if len(effective_sync_symbols) <= self.AUTO_DISCOVERED_SYNC_LIMIT:
-                logger.info(
-                    "integrated sync small-gap override | effective_targets=%s <= safe_limit=%s",
-                    len(effective_sync_symbols),
-                    self.AUTO_DISCOVERED_SYNC_LIMIT,
-                )
-            elif not allow_large_auto_discovered_sync:
-                integrated_sync_allowed = False
-        if request.run_integrated_sync:
-            heavy_sync_allowed = phase in (RunPhase.PREMARKET, RunPhase.POSTMARKET, RunPhase.NIGHT)
-            if should_audit_integrated_sync and integrated_sync_allowed and heavy_sync_allowed and effective_sync_symbols:
-                logger.info(
-                    "integrated sync start | phase=%s | effective_targets=%s | universe=%s",
-                    phase.value,
-                    len(effective_sync_symbols),
-                    len(symbols),
-                )
-                integrated_sync_results = tuple(
-                    self._offline_executor.execute_integrated_sync(
-                        effective_offline_request,
-                        watermark_snapshot=watermark_snapshot,
-                    )
-                )
-                logger.info("integrated sync done | results=%s", len(integrated_sync_results))
+        recap_result = self._night_recap.execute(
+            phase=phase,
+            now=request.now,
+            trade_date=request.trade_date,
+            previous_trade_date=request.previous_trade_date,
+            settlement_ready=settlement_result.recap_ready,
+        )
 
         should_render_cycle = self._should_render_cycle(
             request=request,
@@ -894,11 +1252,12 @@ class EngineApp:
         )
         live_runtime_result = self._live_runtime.execute(
             LiveRuntimeRequest(
-                phase=startup_bundle.plan.phase,
+                phase=phase,
                 trade_date=request.trade_date,
                 previous_trade_date=request.previous_trade_date,
                 offline_context_date=offline_context_date,
                 symbols=symbols,
+                now=request.now,
                 minute_index=request.minute_index,
                 require_auction_recovery=request.require_auction_recovery,
             ),
@@ -912,16 +1271,32 @@ class EngineApp:
         runtime_readiness_label = self._derive_runtime_readiness(
             phase=phase,
             runtime_readiness=runtime_readiness,
+            primed_runtime_state=primed_runtime_state,
+        )
+        quote_freshness_line = render_quote_freshness_line(
+            primed_runtime_state,
+            symbol_count=len(symbols),
         )
         notes = [f"runtime_event={loop_decision.label}"]
+        is_auction_takeover = should_run_lifecycle_audit and phase == RunPhase.AUCTION
         is_postmarket_takeover = should_run_lifecycle_audit and phase == RunPhase.POSTMARKET
-        if is_postmarket_takeover:
+        if is_auction_takeover:
+            notes = list(
+                self._render_auction_takeover_summary(
+                    runtime_readiness_label=runtime_readiness_label,
+                    symbols=len(symbols),
+                    intraday_context=intraday_context,
+                    primed_runtime_state=primed_runtime_state,
+                )
+            )
+        elif is_postmarket_takeover:
             notes = list(
                 self._render_postmarket_takeover_summary(
                     runtime_readiness_label=runtime_readiness_label,
                     symbols=len(symbols),
                     intraday_context=intraday_context,
                     primed_runtime_state=primed_runtime_state,
+                    now=request.now,
                 )
             )
         elif should_run_lifecycle_audit:
@@ -934,35 +1309,153 @@ class EngineApp:
                     f"context={'ready' if intraday_context is not None else 'skipped'}",
                 ]
             )
-        else:
-            notes.extend(
-                self._live_summary_renderer.render(
-                    phase=phase,
-                    intraday_context=intraday_context,
-                    primed_runtime_state=primed_runtime_state,
-                    runtime_readiness_label=runtime_readiness_label,
-                    symbol_count=len(symbols),
+            if quote_freshness_line:
+                notes.append(quote_freshness_line)
+            if self._is_opening_strategy_window(request.now, phase):
+                quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                notes.extend(
+                    self._auction_runtime.render_opening_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=None,
+                    )
                 )
-            )
+            elif phase == RunPhase.PREMARKET:
+                quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                notes.extend(
+                    self._auction_runtime.render_premarket_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=None,
+                        startup_report=startup_bundle.plan.report,
+                        historical_only=(runtime_readiness_label == "historical_context_only"),
+                    )
+                )
+            elif phase == RunPhase.INTRADAY:
+                quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                notes.extend(
+                    self._auction_runtime.render_intraday_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=None,
+                    )
+                )
+        else:
+            quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
+            rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
             if phase == RunPhase.AUCTION:
-                notes.extend(self._auction_runtime.render_auction_view(intraday_context))
+                notes.extend(
+                    self._auction_runtime.render_auction_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=quote_freshness_line,
+                    )
+                )
+            elif self._is_opening_strategy_window(request.now, phase):
+                notes.extend(
+                    self._auction_runtime.render_opening_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=quote_freshness_line,
+                    )
+                )
+            elif phase == RunPhase.PREMARKET:
+                notes.extend(
+                    self._auction_runtime.render_premarket_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=quote_freshness_line,
+                        startup_report=startup_bundle.plan.report,
+                        historical_only=(runtime_readiness_label == "historical_context_only"),
+                    )
+                )
+            elif phase == RunPhase.INTRADAY:
+                notes.extend(
+                    self._auction_runtime.render_intraday_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=quote_freshness_line,
+                    )
+                )
+            elif phase == RunPhase.POSTMARKET:
+                notes.extend(
+                    self._auction_runtime.render_postmarket_runtime_loop(
+                        intraday_context=intraday_context,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbols=len(symbols),
+                        quotes=quote_count,
+                        rust=rust_count,
+                        now=request.now,
+                        quote_freshness_line=self._render_postmarket_snapshot_line(
+                            primed_runtime_state=primed_runtime_state,
+                            symbol_count=len(symbols),
+                        ),
+                    )
+                )
+            else:
+                notes.extend(
+                    self._live_summary_renderer.render(
+                        phase=phase,
+                        intraday_context=intraday_context,
+                        primed_runtime_state=primed_runtime_state,
+                        runtime_readiness_label=runtime_readiness_label,
+                        symbol_count=len(symbols),
+                    )
+                )
         if should_expand_full_universe:
             notes.append(f"startup universe expanded to full F10 pool: {len(symbols)}")
         render_execution_summary = getattr(self._startup_coordinator, "render_execution_summary", None)
-        if should_run_lifecycle_audit and not is_postmarket_takeover and callable(render_execution_summary):
+        if should_run_lifecycle_audit and not is_auction_takeover and not is_postmarket_takeover and callable(render_execution_summary):
             notes.extend(render_execution_summary(startup_bundle))
         if request.run_integrated_sync and should_audit_integrated_sync and not integrated_sync_allowed:
             notes.append(
                 f"integrated_sync deferred: effective_targets={len(effective_sync_symbols)} | "
                 f"auto_discovered_universe={len(symbols)} | safe_limit={self.AUTO_DISCOVERED_SYNC_LIMIT}"
             )
+        if settlement_result.settlement_cached:
+            notes.append(f"settlement_cached | trade_date={request.trade_date} | integrated_sync=reused")
+        elif settlement_result.settlement_running:
+            notes.append(f"settlement_running | trade_date={request.trade_date} | integrated_sync=skipped_while_in_progress")
         elif request.run_integrated_sync and should_audit_integrated_sync and effective_sync_symbols:
             notes.append(f"integrated_sync targets={len(effective_sync_symbols)}")
         notes.extend(self._render_scheduled_event_summary(scheduled_event_result))
         notes.extend(self._summarize_integrated_sync(integrated_sync_results))
-        phase_events = tuple(iter_phase_events(startup_bundle.plan.phase)) if should_run_lifecycle_audit else ()
+        if phase == RunPhase.POSTMARKET:
+            notes.extend(self._night_recap.render_summary(recap_result))
+        phase_events = tuple(iter_phase_events(phase)) if should_run_lifecycle_audit else ()
         return EngineAppResult(
-            phase=startup_bundle.plan.phase,
+            phase=phase,
             startup_bundle=startup_bundle,
             watermark_snapshot=watermark_snapshot,
             integrated_sync_results=integrated_sync_results,
@@ -1028,8 +1521,11 @@ def build_default_request(
 
 def render_result_summary(result: EngineAppResult) -> str:
     lines = [f"phase={result.phase.value}"]
-    suppress_internal_header = result.phase == RunPhase.POSTMARKET and any(
-        str(note).startswith("runtime_event=postmarket takeover") for note in result.notes
+    has_strategy_console = any(str(note).startswith("strategy_console |") for note in result.notes)
+    suppress_internal_header = result.phase in (RunPhase.AUCTION, RunPhase.POSTMARKET) and any(
+        str(note).startswith("runtime_event=postmarket takeover")
+        or str(note).startswith("runtime_event=auction takeover")
+        for note in result.notes
     )
     if result.lifecycle_audit_ran and not suppress_internal_header:
         lines.append(
@@ -1038,12 +1534,12 @@ def render_result_summary(result: EngineAppResult) -> str:
             f" | startup_state={'cached' if result.used_cached_startup_state else 'fresh'}"
         )
     lines.extend(result.notes)
-    if result.intraday_context is not None:
+    if result.intraday_context is not None and not has_strategy_console:
         lines.append(
-            f"context_snapshots={len(result.intraday_context.stock_snapshots)} "
-            f"| top_plate={result.intraday_context.market_summary.top_plate_name or ''}"
+            f"上下文快照={len(result.intraday_context.stock_snapshots)} "
+            f"| 主线板块={result.intraday_context.market_summary.top_plate_name or ''}"
         )
-    if result.phase_events and not suppress_internal_header:
+    if result.phase_events and not suppress_internal_header and not has_strategy_console:
         lines.append("phase_events:")
         for event in result.phase_events[:6]:
             lines.append(f"- {event.time_window} | {event.component} | {event.action}")

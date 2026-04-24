@@ -33,6 +33,7 @@ class LazyPlateUpdater:
         
         # 增量更新相关
         self.last_stock_data = {}  # 记录上次股票数据 {stock_id: data}
+        self.stock_names = {}      # 记录股票名称 {stock_id: name}
         self.dirty_plates = set()  # 标记需要更新的板块
         self.last_refresh_time = 0  # 上次刷新时间
         
@@ -46,12 +47,21 @@ class LazyPlateUpdater:
         self.plate_name_to_id = {}
         
         plate_path = os.path.join(script_dir, self.plate_file)
-        with open(plate_path, 'r', encoding='gbk') as f:
+        with open(plate_path, 'r', encoding='gbk', errors='replace') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                plate_id = row['id']
-                plate_name = row['name']
-                market_cap = float(row['流通值']) if row['流通值'] else 0.0
+                plate_id = row.get('id', '')
+                plate_name = row.get('name', '')
+                # 兼容不同编码下的 "流通值" 列名
+                market_cap_val = row.get('流通值')
+                if market_cap_val is None:
+                    # 尝试寻找包含 "值" 的列
+                    for k in row.keys():
+                        if '值' in k or 'cap' in k.lower():
+                            market_cap_val = row[k]
+                            break
+                
+                market_cap = float(market_cap_val) if market_cap_val else 0.0
                 
                 inner_data = []
                 inner_str = row.get('inner', '').strip()
@@ -96,7 +106,7 @@ class LazyPlateUpdater:
         relation_path = os.path.join(script_dir, self.relation_file)
         
         try:
-            with open(relation_path, 'r', encoding='utf-8') as f:
+            with open(relation_path, 'r', encoding='utf-8', errors='replace') as f:
                 reader = csv.reader(f)
                 header = next(reader)
                 
@@ -184,6 +194,10 @@ class LazyPlateUpdater:
                 last_data = self.last_stock_data.get(stock_id, {})
                 if self._has_stock_changed(last_data, current_data) or is_first_run:
                     changed_stocks += 1
+                    # 更新股票名称映射
+                    if 'name' in current_data:
+                        self.stock_names[stock_id] = current_data['name']
+                    
                     # 标记相关板块为脏
                     for plate_id in self.stock_to_plates[stock_id]:
                         self.dirty_plates.add(plate_id)
@@ -208,7 +222,7 @@ class LazyPlateUpdater:
         
         refresh_time = (time.time() - refresh_start) * 1000
         if changed_stocks > 0:
-            logger.info(f"🔄 增量刷新完成: {changed_stocks}只股票变化, {len(self.dirty_plates)}个板块更新, 耗时: {refresh_time:.2f}ms")
+            logger.debug(f"🔄 增量刷新完成: {changed_stocks}只股票变化, {len(self.dirty_plates)}个板块更新, 耗时: {refresh_time:.2f}ms")
         
         self.last_refresh_time = time.time()
         return changed_stocks
@@ -411,8 +425,8 @@ class LazyPlateUpdater:
             timestamp = plate_data.get('timestamp', 0)
             current_time = int(time.time())
             
-            # 如果数据超过60秒，认为已过期
-            if current_time - timestamp > 60:
+            # 如果数据超过 4 小时，认为已过期 (用户指定滞后没问题)
+            if current_time - timestamp > 14400: # 4小时
                 return False
             
             required_fields = ['change_pct', 'total_volume', 'rise_count', 'fall_count']
@@ -472,9 +486,12 @@ class LazyPlateUpdater:
             fall_count = 0
             valid_stock_count = 0
             
+            # 🚀【P0 优化】批量获取板块个股数据，避免 N+1 个 HGETALL
+            stocks_indicators = self.redis_storage.batch_get_stocks_advanced_indicators(stock_ids)
+            
             for stock_id in stock_ids:
-                stock_data = self.redis_storage.get_stock_data(stock_id)
-                if not stock_data:
+                stock_data = stocks_indicators.get(stock_id)
+                if not stock_data: # Keep original logic: if no data, continue
                     continue
                     
                 change = stock_data.get('change_pct', 0.0)
@@ -641,7 +658,11 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
         self.cache_ttl = 5  # 缓存5秒
     
     def refresh_all_stocks_data(self) -> Dict[str, Dict]:
-        """批量刷新所有个股数据"""
+        """批量刷新所有个股数据 — 内存优化版
+        
+        优化: 复用 all_stocks_cache 中已有的 dict 对象，仅更新变化的字段，
+        避免每周期创建 ~5000 个嵌套 formatted_data 字典。
+        """
         current_time = time.time()
         
         # 检查缓存是否有效
@@ -657,18 +678,35 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
         if not all_stock_ids:
             return {}
         
-        # 批量获取所有股票数据
-        all_stocks_data = {}
-        batch_size = 500  # 分批处理，避免内存过大
+        # 复用已有缓存 (核心优化: 不再每次创建新的 all_stocks_data = {})
+        all_stocks_data = self.all_stocks_cache
+        batch_size = 500
         
         for i in range(0, len(all_stock_ids), batch_size):
             batch_ids = all_stock_ids[i:i + batch_size]
             
-            # 批量获取基础数据
-            for stock_id in batch_ids:
-                stock_data = self.redis_storage.get_stock_data(stock_id)
-                if stock_data:
-                    # 格式化数据为basic和advanced结构，并转换数据类型
+            # 🚀【P0 优化】利用 Pipeline 批量获取个股指标，解决碎片化 I/O
+            batch_indicators = self.redis_storage.batch_get_stocks_advanced_indicators(batch_ids)
+            
+            for stock_id, stock_data in batch_indicators.items():
+                # 复用已有的 formatted_data 字典
+                existing = all_stocks_data.get(stock_id)
+                if existing is not None:
+                    # 就地更新已有字典，避免新建对象
+                    basic = existing['basic']
+                    basic['name'] = stock_data.get('name', basic.get('name', f'股票{stock_id}'))
+                    basic['price'] = float(stock_data.get('price', 0.0))
+                    basic['change_pct'] = float(stock_data.get('change_pct', 0.0))
+                    basic['volume'] = int(stock_data.get('volume', 0))
+                    basic['market_cap'] = int(stock_data.get('market_cap', 0))
+                    basic['large_net'] = int(stock_data.get('large_net', 0))
+                    basic['timestamp'] = int(stock_data.get('timestamp', int(time.time())))
+                    
+                    adv = existing['advanced']
+                    adv['change_rate_1min'] = float(stock_data.get('change_rate_1min', 0.0))
+                    adv['amount_2min'] = int(stock_data.get('amount_2min', 0))
+                else:
+                    # 首次创建
                     formatted_data = {
                         'basic': {
                             'name': stock_data.get('name', f'股票{stock_id}'),
@@ -685,14 +723,17 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
                         }
                     }
                     all_stocks_data[stock_id] = formatted_data
-                    
-                    # 如果是第一次运行，标记相关板块为脏
-                    if is_first_run:
-                        for plate_id in self.stock_to_plates[stock_id]:
-                            self.dirty_plates.add(plate_id)
-                    
-                    # 更新股票当前数据
-                    self.last_stock_data[stock_id] = formatted_data
+                
+                # 更新股票名称映射
+                self.stock_names[stock_id] = stock_data.get('name', f'股票{stock_id}')
+                
+                # 如果是第一次运行，标记相关板块为脏
+                if is_first_run:
+                    for plate_id in self.stock_to_plates.get(stock_id, []):
+                        self.dirty_plates.add(plate_id)
+                
+                # 更新股票当前数据 (引用，不是拷贝)
+                self.last_stock_data[stock_id] = all_stocks_data[stock_id]
         
         self.all_stocks_cache = all_stocks_data
         self.last_all_stocks_update = current_time
@@ -708,6 +749,7 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
         
         logger.debug(f"🔄 批量刷新 {len(all_stocks_data)} 只股票数据")
         return all_stocks_data
+
     
     def get_all_plate_metrics_optimized(self) -> List[Dict]:
         """优化版获取所有板块指标"""
@@ -810,7 +852,7 @@ class OptimizedPlateUpdater(LazyPlateUpdater):
             }
             plate_metrics.append(metrics)
         
-        logger.info(f"📊 优化计算完成: {len(plate_metrics)} 个板块")
+        logger.debug(f"📊 优化计算完成: {len(plate_metrics)} 个板块")
         return plate_metrics
     
     def get_plate_stocks_optimized(self, plate_id: str) -> List[Dict]:
@@ -856,6 +898,11 @@ class OptimizedEnhancedPlateUpdater(OptimizedPlateUpdater):
     def get_all_plate_metrics_with_integrated_advanced(self) -> List[Dict]:
         """获取所有板块指标（整合高级指标）- 使用Redis聚合"""
         try:
+            # 🚀【P1 优化】本地 1 秒缓存，降低 GIL 竞争和冗余计算
+            now = time.time()
+            if hasattr(self, '_integrated_plates_cache') and (now - getattr(self, '_last_integrated_plates_update', 0) < 1.0):
+                return self._integrated_plates_cache
+
             # 1. 批量获取所有个股数据
             all_stocks_data = self.refresh_all_stocks_data()
             
@@ -954,6 +1001,10 @@ class OptimizedEnhancedPlateUpdater(OptimizedPlateUpdater):
             
             # 5. 批量更新到Redis（一次性）
             self._batch_update_plate_metrics_to_redis(plate_metrics)
+            
+            # 更新本地缓存
+            self._integrated_plates_cache = plate_metrics
+            self._last_integrated_plates_update = now
             
             logger.debug(f"📊 整合计算完成: {len(plate_metrics)} 个板块")
             return plate_metrics

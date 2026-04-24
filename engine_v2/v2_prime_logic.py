@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any # [V38.4] 补充类型定义
 import redis
 import time
+import io
+import contextlib
+from typing import Dict, List, Optional, Any
 # 尝试导入通用服务
 try:
     from web.services.kaipan_plate_service import fetch_kaipan_plate_rank
@@ -16,12 +18,45 @@ logger = logging.getLogger("CommanderPrime")
 class ResonancePrimeService:
     """
     Commander-Prime: 战略指挥逻辑服务。
-    负责将物理数据 (V5) 与博弈基因 (V1/ZT/Kaipan) 进行深度对撞。
+    负责将物理数据 (V5) 与博弈基因 (V1/ZT/Kaipan) 进行深度对撞信号。
     """
+    
+    def _fallback_fetch_kaipan_plate_rank(self, date_str: str = ""):
+        """[V40.2 Fallback] 当 web/services 模块尚未同步时，直接底层调用 pykaipan"""
+        def _load_pykaipan():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    from pykaipan import pykaipan as kp
+                return kp
+            except:
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        import pykaipan as kp
+                    return kp
+                except: return None
+
+        kp = _load_pykaipan()
+        if not kp or not hasattr(kp, "getHisPlates"): return None
+        
+        try:
+            raw = kp.getHisPlates(str(date_str), "0", "80")
+            rows = raw.get("list") or raw.get("List") or []
+            parsed = []
+            for idx, row in enumerate(rows, start=1):
+                if isinstance(row, (list, tuple)) and len(row) >= 13:
+                    parsed.append({
+                        "name": str(row[1]).strip(),
+                        "strength": float(row[2] or 0),
+                        "main_net": float(row[6] or 0) / 1e8, # [V42.0] 统一为亿
+                        "change_pct": float(row[3] or 0)
+                    })
+            return {"ok": True, "plates": parsed}
+        except: return None
     def __init__(self, r_client: redis.Redis):
         self.r = r_client
-        self.hot_plates_map = {} # {name: {strength, net_amount, rank}}
+        self.hot_plates_map = {} # {name: {strength, net_amount, rank, change_pct, big_order_net}}
         self.last_sync_time = 0
+        self.yest_plates_cache = {} # {name: {strength, net_amount, rank, ...}}
         self.amount_baselines = {} # 存储 2 分钟前的成交额快照
 
     async def sync_kaipan_hotspots(self):
@@ -31,19 +66,21 @@ class ResonancePrimeService:
         if now - self.last_sync_time < 60: return 
         
         try:
-            # fetch_kaipan_plate_rank 是同步函数，且返回字典 {"ok": True, "plates": [...]}
-            res = fetch_kaipan_plate_rank()
+            # [V40.6 Fix] fetch_kaipan_plate_rank 是同步阻塞函数，必须抛到线程池执行，防止锁死主循环
+            res = await asyncio.to_thread(fetch_kaipan_plate_rank)
             if res and res.get('ok'):
                 raw_plates = [p for p in res.get('plates', []) if p and p.get('name')]
                 self.hot_plates_map = {
                     str(p['name']): {
                         'strength': float(p.get('strength', 0) or 0),
-                        'net_amount': float(p.get('main_net', 0) or 0),
+                        'net_amount': float(p.get('main_net', 0) or 0) / 1e8, # [V42.0] 统一为亿
+                        'change_pct': float(p.get('change_pct', 0) or 0),
+                        'big_order_net': float(p.get('big_order_net', 0) or 0) / 1e8, # [V42.0] 统一为亿
                         'rank': i + 1
                     } for i, p in enumerate(raw_plates)
                 }
                 self.last_sync_time = now
-                logger.debug(f"✅ [Commander] 已同步 Kaipanla 板块能级 (Count: {len(self.hot_plates_map)})")
+                logger.debug(f"✅ [Commander] 已同步今日 Kaipanla 板块能级 (Count: {len(self.hot_plates_map)})")
             else:
                 err = res.get('error', 'Unknown error')
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {err}")
@@ -52,6 +89,32 @@ class ResonancePrimeService:
                 logger.debug(f"🤫 [Commander] 网络波动，跳过本次排行同步: {e}")
             else:
                 logger.warning(f"⚠️ [Commander] Kaipanla 排行同步返回错误: {e}")
+    async def fetch_historical_plate_stats(self, date_str: str):
+        """抓取指定日期的板块全量统计，用于迁移对撞"""
+        if not fetch_kaipan_plate_rank or not date_str: return
+        try:
+            # [V40.1 Fix] 兼容性处理：防止远程服务器同步延迟导致的参数不匹配
+            import inspect
+            sig = inspect.signature(fetch_kaipan_plate_rank)
+            if 'date_str' in sig.parameters:
+                res = await asyncio.to_thread(fetch_kaipan_plate_rank, date_str=date_str)
+            else:
+                logger.warning(f"⚠️ [Commander] 远程服务版本较低，启动底层 Fallback 捕获历史数据...")
+                res = await asyncio.to_thread(self._fallback_fetch_kaipan_plate_rank, date_str)
+            
+            if res and res.get('ok'):
+                raw_plates = res.get('plates', [])
+                self.yest_plates_cache = {
+                    str(p['name']): {
+                        'strength': float(p.get('strength', 0) or 0),
+                        'net_amount': float(p.get('main_net', 0) or 0) / 1e8, # [V42.0] 统一为亿
+                        'change_pct': float(p.get('change_pct', 0) or 0),
+                        'rank': i + 1
+                    } for i, p in enumerate(raw_plates)
+                }
+                logger.info(f"📅 [Commander] 已加载历史板块背景 ({date_str}, Count: {len(self.yest_plates_cache)})")
+        except Exception as e:
+            logger.warning(f"⚠️ [Commander] 历史板块加载失败: {e}")
 
     async def calculate_battle_kpis(self, date_str: str) -> Dict:
         """从 Redis 反馈计算盘中战役级别 KPI"""

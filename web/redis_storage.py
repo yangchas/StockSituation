@@ -9,6 +9,11 @@ import numpy as np
 from pykaipan import pykaipan
 logger = logging.getLogger(__name__)
 
+# C++ 端 (t1.cpp) 通过 Logger::amountToWan() 将 amount_2min / volume / large_net
+# 除以 10000 后存入 Redis（单位：万元），Python 消费端期望的是元，需要乘回来。
+REDIS_UNIT_FACTOR = 10000
+
+
 class RedisStorageManager:
     """
     高效Redis存储管理器 - 针对内存使用优化
@@ -78,65 +83,54 @@ class RedisStorageManager:
             return json.loads(compressed_data)
         return json.loads(zlib.decompress(bytes.fromhex(compressed_data)))
     
-    # ==================== 新增：个股高级指标获取方法 ====================
-    
-    def get_stock_advanced_indicators(self, symbol: str) -> Dict[str, Any]:
-        """
-        从Redis获取个股高级技术指标（包含1分钟涨速和2分钟成交额）
-        
-        Args:
-            symbol: 股票代码
+    def _standardize_stock_quote(self, raw_data: Dict[str, Any], symbol: str = "") -> Dict[str, Any]:
+        """统一转换 Redis 原始 HASH 字段类型和单位 (P2 Centralization)"""
+        if not raw_data:
+            return {}
             
-        Returns:
-            Dict: 包含高级指标的字典
-        """
+        standardized = {}
+        for field, value in raw_data.items():
+            f_str = field.decode('utf-8', errors='ignore') if isinstance(field, bytes) else str(field)
+            v_str = value.decode('utf-8', errors='ignore') if isinstance(value, bytes) else str(value)
+            
+            # 1) 类型转换
+            if f_str in ['price', 'change_pct', 'change_rate_1min', 'high', 'low', 'pre_close', 'open', 'last_close', 'book1_amount_yuan']:
+                standardized[f_str] = float(v_str) if v_str and v_str != 'None' else 0.0
+            elif f_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min', 'ts']:
+                # 鲁棒处理浮点字符串转 int
+                try:
+                    standardized[f_str] = int(float(v_str)) if v_str and v_str != 'None' else 0
+                except (ValueError, TypeError):
+                    standardized[f_str] = 0
+            else:
+                standardized[f_str] = v_str
+        
+        # 2) 单位对照 (由 C++ 端按万元存入，Python 端统一转换为元以兼容计算逻辑)
+        if 'amount_2min' in standardized:
+            standardized['amount_2min'] = int(standardized['amount_2min'] * REDIS_UNIT_FACTOR)
+        
+        standardized['large_net'] = standardized.get('large_net', 0)
+            
+        # 3) 基础字段补全 (P0/P2)
+        if 'name' not in standardized and symbol:
+            standardized['name'] = f"股票{symbol}"
+        if 'symbol' not in standardized and symbol:
+            standardized['symbol'] = symbol
+        if 'code' not in standardized and symbol:
+            standardized['code'] = symbol
+            
+        return standardized
+
+    def get_stock_advanced_indicators(self, symbol: str) -> Dict[str, Any]:
+        """从Redis获取个股标准化指标 (P0/P2)"""
         try:
-            # 使用C++存储的格式
             key = f"stock:quote:{symbol}"
             stock_data = self.redis.hgetall(key)
-            
-            if not stock_data:
-                return {}
-            
-            # 转换数据类型
-            indicators = {}
-            for field, value in stock_data.items():
-                field_str = field.decode('utf-8') if isinstance(field, bytes) else field
-                value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
-                
-                # 根据字段名转换数据类型
-                if field_str in ['price', 'change_pct', 'change_rate_1min']:
-                    indicators[field_str] = float(value_str) if value_str else 0.0
-                elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
-                    # amount_2min 可能是浮点数，但这里按整数处理，如果需要可单独处理
-                    indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
-                else:
-                    indicators[field_str] = value_str
-            
-            # 确保包含所有必需字段，提供默认值
-            required_fields = {
-                'change_rate_1min': 0.0,  # 1分钟涨速
-                'amount_2min': 0,         # 2分钟成交额
-                'price': 0.0,             # 当前价格
-                'change_pct': 0.0,        # 涨跌幅
-                'volume': 0,              # 成交量
-                'amount': 0,              # 成交额
-                'large_net': 0,           # 大单净额
-                'timestamp': 0,           # 时间戳
-                'name': f"股票{symbol}",   # 股票名称
-                'market_cap': 0           # 市值
-            }
-            
-            for field, default_value in required_fields.items():
-                if field not in indicators:
-                    indicators[field] = default_value
-            
-            logger.debug(f"✅ 获取个股高级指标: {symbol}, 1分钟涨速: {indicators.get('change_rate_1min', 0)}, 2分钟成交额: {indicators.get('amount_2min', 0)}")
-            return indicators
-            
+            return self._standardize_stock_quote(stock_data, symbol)
         except Exception as e:
             logger.error(f"❌ 获取个股高级指标失败 {symbol}: {e}")
             return {}
+
     
     def get_limit_up_stocks(self) -> List[Dict[str, Any]]:
         """
@@ -455,26 +449,7 @@ class RedisStorageManager:
             for i, symbol in enumerate(symbols):
                 stock_data = results[i]
                 if stock_data:
-                    # 转换数据类型
-                    indicators = {}
-                    for field, value in stock_data.items():
-                        field_str = field.decode('utf-8') if isinstance(field, bytes) else field
-                        value_str = value.decode('utf-8') if isinstance(value, bytes) else str(value)
-                        
-                        if field_str in ['price', 'change_pct', 'change_rate_1min']:
-                            indicators[field_str] = float(value_str) if value_str else 0.0
-                        elif field_str in ['volume', 'amount', 'large_net', 'timestamp', 'market_cap', 'amount_2min']:
-                            indicators[field_str] = float(value_str) if value_str and '.' in value_str else int(value_str) if value_str else 0
-                        else:
-                            indicators[field_str] = value_str
-                    
-                    # 确保包含高级指标字段
-                    if 'change_rate_1min' not in indicators:
-                        indicators['change_rate_1min'] = 0.0
-                    if 'amount_2min' not in indicators:
-                        indicators['amount_2min'] = 0
-                    
-                    indicators_dict[symbol] = indicators
+                    indicators_dict[symbol] = self._standardize_stock_quote(stock_data, symbol)
             
             # logger.info(f"✅ 批量获取 {len(indicators_dict)}/{len(symbols)} 只股票的高级指标")
             return indicators_dict
@@ -556,6 +531,7 @@ class RedisStorageManager:
             if expire_seconds is None:
                 expire_seconds = self.CACHE_TTL
                 
+            if isinstance(key, bytes): key = key.decode('utf-8')
             cache_key = f"{self.CACHE_PREFIX}{key}"
             compressed_data = self._compress_data(data)
             
@@ -571,6 +547,7 @@ class RedisStorageManager:
         从缓存获取通用数据
         """
         try:
+            if isinstance(key, bytes): key = key.decode('utf-8')
             cache_key = f"{self.CACHE_PREFIX}{key}"
             compressed_data = self.redis.get(cache_key)
             
@@ -588,6 +565,7 @@ class RedisStorageManager:
         删除缓存数据
         """
         try:
+            if isinstance(key, bytes): key = key.decode('utf-8')
             cache_key = f"{self.CACHE_PREFIX}{key}"
             return bool(self.redis.delete(cache_key))
         except Exception as e:
@@ -599,6 +577,7 @@ class RedisStorageManager:
         检查缓存数据是否存在
         """
         try:
+            if isinstance(key, bytes): key = key.decode('utf-8')
             cache_key = f"{self.CACHE_PREFIX}{key}"
             return bool(self.redis.exists(cache_key))
         except Exception as e:
@@ -740,19 +719,7 @@ class RedisStorageManager:
             stock_data = self.redis.hgetall(key)
             
             if stock_data:
-                # 转换数据类型
-                decoded_data = {}
-                for field, value in stock_data.items():
-                    field_str = field.decode('utf-8', errors='replace') if isinstance(field, bytes) else field
-                    value_str = value.decode('utf-8', errors='replace') if isinstance(field, bytes) else str(value)
-                    
-                    # 根据字段名转换数据类型
-                    if field_str in ['price', 'change_pct']:
-                        decoded_data[field_str] = float(value_str) if value_str else 0.0
-                    elif field_str in ['volume', 'large_net', 'timestamp', 'market_cap']:
-                        decoded_data[field_str] = int(value_str) if value_str else 0
-                    else:
-                        decoded_data[field_str] = value_str
+                return self._standardize_stock_quote(stock_data, stock_id)
                 
                 # 确保包含所有必需字段
                 required_fields = ['price', 'change_pct', 'volume', 'large_net', 'timestamp', 'name']

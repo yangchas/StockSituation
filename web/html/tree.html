@@ -1,0 +1,2311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌳 资金流向图 - Canvas优化版</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+       
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #0c0c0c 0%, #1a1a2e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 15px;
+        }
+       
+        .container {
+            max-width: 2200px;
+            margin: 0 auto;
+            height: calc(100vh - 30px);
+            display: flex;
+            flex-direction: column;
+        }
+       
+        .header {
+            text-align: center;
+            margin-bottom: 15px;
+            padding: 12px;
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+       
+        .header h1 {
+            color: #d4af37;
+            font-size: 20px;
+            margin-bottom: 5px;
+        }
+       
+        .header p {
+            color: #aaa;
+            font-size: 12px;
+        }
+       
+        .main-content {
+            flex: 1;
+            display: flex;
+            gap: 15px;
+        }
+       
+        .chart-container {
+            flex: 5;
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+            position: relative;
+            overflow: hidden;
+        }
+       
+        #canvasContainer {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+       
+        #mainCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+        }
+       
+        .side-panel {
+            flex: 0.8;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            min-width: 250px;
+        }
+       
+        .panel {
+            background: rgba(26, 26, 46, 0.95);
+            border-radius: 8px;
+            border: 1px solid #333;
+            padding: 12px;
+            overflow: hidden;
+        }
+       
+        .panel-title {
+            color: #d4af37;
+            font-size: 13px;
+            margin-bottom: 8px;
+            padding-bottom: 4px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+       
+        /* 区域分隔样式 */
+        .region-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 0;
+            transform-origin: center;
+        }
+       
+        .region {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.02);
+            border: 1px solid rgba(212, 175, 55, 0.15);
+            transform-origin: center;
+        }
+       
+        .region-label {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            color: #d4af37;
+            border: 1px solid rgba(212, 175, 55, 0.3);
+            transform: translateY(-50%);
+            transform-origin: center;
+        }
+       
+        /* 情绪区分层 */
+        .emotion-floor {
+            position: absolute;
+            left: 0;
+            right: 0;
+            border-top: 1px solid rgba(255, 255, 255, 0.15);
+            transform-origin: center;
+        }
+       
+        .floor-label {
+            position: absolute;
+            left: -25px;
+            transform: translateY(-50%);
+            font-size: 9px;
+            color: #aaa;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 1px 3px;
+            border-radius: 2px;
+            white-space: nowrap;
+            transform-origin: center;
+        }
+       
+        /* 控制面板 */
+        .control-panel {
+            position: absolute;
+            bottom: 12px;
+            right: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            z-index: 100;
+        }
+       
+        .control-btn {
+            background: rgba(40, 40, 60, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            padding: 5px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 10px;
+            transition: all 0.2s;
+        }
+       
+        .control-btn:hover {
+            background: rgba(212, 175, 55, 0.2);
+            border-color: #d4af37;
+        }
+       
+        .control-btn.active {
+            background: rgba(212, 175, 55, 0.3);
+            border-color: #d4af37;
+            color: #d4af37;
+        }
+       
+        /* 缩放控制 */
+        .zoom-controls {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            display: flex;
+            gap: 5px;
+            z-index: 1000;
+        }
+       
+        .zoom-btn {
+            background: rgba(26, 26, 46, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #e0e0e0;
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            transition: all 0.2s;
+        }
+       
+        .zoom-btn:hover {
+            background: rgba(212, 175, 55, 0.2);
+            border-color: #d4af37;
+        }
+       
+        /* 统计面板 */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+        }
+       
+        .stat-item {
+            text-align: center;
+            padding: 6px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 4px;
+        }
+       
+        .stat-value {
+            font-size: 14px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+       
+        .stat-label {
+            font-size: 9px;
+            color: #aaa;
+            margin-top: 2px;
+        }
+       
+        /* 路径详情 */
+        .path-details {
+            font-size: 10px;
+            color: #aaa;
+            line-height: 1.4;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+       
+        .path-item {
+            margin-bottom: 3px;
+            padding: 3px 5px;
+            background: rgba(40, 40, 60, 0.4);
+            border-radius: 3px;
+        }
+       
+        /* 连接线颜色说明 */
+        .connection-list {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+       
+        .connection-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+        }
+       
+        .connection-line {
+            width: 20px;
+            height: 2px;
+            border-radius: 1px;
+        }
+       
+        /* 热门前五 */
+        .top-stocks {
+            max-height: 150px;
+            overflow-y: auto;
+        }
+       
+        .stock-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 6px;
+            margin-bottom: 2px;
+            background: rgba(40, 40, 60, 0.4);
+            border-radius: 3px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+       
+        .stock-item:hover {
+            background: rgba(212, 175, 55, 0.1);
+            transform: translateX(3px);
+        }
+       
+        /* 连板票数量 */
+        .floor-counts {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 4px;
+            margin-top: 8px;
+        }
+       
+        .floor-count {
+            text-align: center;
+            padding: 4px;
+            background: rgba(40, 40, 60, 0.6);
+            border-radius: 3px;
+        }
+       
+        .floor-num {
+            font-size: 12px;
+            font-weight: bold;
+            color: #d4af37;
+        }
+       
+        .floor-label-small {
+            font-size: 8px;
+            color: #aaa;
+        }
+       
+        /* 滚动条 */
+        ::-webkit-scrollbar {
+            width: 4px;
+        }
+       
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 2px;
+        }
+       
+        ::-webkit-scrollbar-thumb {
+            background: rgba(212, 175, 55, 0.5);
+            border-radius: 2px;
+        }
+        
+        /* 工具提示 */
+        .tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.9);
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 8px;
+            font-size: 11px;
+            color: #fff;
+            pointer-events: none;
+            z-index: 1000;
+            max-width: 200px;
+            display: none;
+        }
+        
+        .tooltip-title {
+            color: #d4af37;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .tooltip-content {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+        
+        .tooltip-row {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .tooltip-label {
+            color: #aaa;
+        }
+        
+        .tooltip-value {
+            color: #fff;
+        }
+        
+        /* 密度控制面板 */
+        .density-control {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            background: rgba(40, 40, 60, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+            padding: 8px;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            min-width: 150px;
+        }
+        
+        .density-slider {
+            width: 100%;
+            height: 4px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            outline: none;
+        }
+        
+        .density-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #d4af37;
+            cursor: pointer;
+        }
+        
+        .density-label {
+            font-size: 10px;
+            color: #aaa;
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🌳 资金流向图 - 优化版</h1>
+            <p>修复标签显示 | 资金高亮到个股 | 智能防重叠 | 动态密度控制</p>
+        </div>
+       
+        <div class="main-content">
+            <div class="chart-container">
+                <!-- 区域分隔 -->
+                <div class="region-container" id="regionContainer"></div>
+               
+                <!-- 缩放控制 -->
+                <div class="zoom-controls">
+                    <button class="zoom-btn" onclick="graphManager.zoomOut()">-</button>
+                    <button class="zoom-btn" onclick="graphManager.resetZoom()">100%</button>
+                    <button class="zoom-btn" onclick="graphManager.zoomIn()">+</button>
+                </div>
+               
+                <!-- 密度控制 -->
+                <div class="density-control">
+                    <div class="density-label">
+                        <span>节点密度</span>
+                        <span id="densityValue">中</span>
+                    </div>
+                    <input type="range" min="0" max="4" value="2" step="1" class="density-slider" id="densitySlider">
+                    <div class="density-label">
+                        <span>稀疏</span>
+                        <span>密集</span>
+                    </div>
+                </div>
+               
+                <!-- Canvas绘图区域 -->
+                <div id="canvasContainer">
+                    <canvas id="mainCanvas"></canvas>
+                    <div class="tooltip" id="tooltip"></div>
+                </div>
+               
+                <!-- 控制面板 -->
+                <div class="control-panel">
+                    <button class="control-btn active" onclick="graphManager.showAll()">显示全部</button>
+                    <button class="control-btn" onclick="graphManager.highlightCapital('rush')">抢跑资金</button>
+                    <button class="control-btn" onclick="graphManager.highlightCapital('trial')">试错资金</button>
+                    <button class="control-btn" onclick="graphManager.highlightCapital('allin')">梭哈资金</button>
+                    <button class="control-btn" onclick="graphManager.toggleLabels()">切换标签</button>
+                    <button class="control-btn" onclick="graphManager.exportImage()">导出图片</button>
+                    <button class="control-btn" onclick="graphManager.resetPositions()" title="Ctrl+R">重置位置</button>
+                </div>
+            </div>
+           
+            <div class="side-panel">
+                <!-- 统计面板 -->
+                <div class="panel">
+                    <div class="panel-title">📊 统计概览</div>
+                    <div class="stats">
+                        <div class="stat-item">
+                            <div class="stat-value" id="nodeCount">0</div>
+                            <div class="stat-label">节点数量</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="linkCount">0</div>
+                            <div class="stat-label">连接数量</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value" id="totalFlow">0</div>
+                            <div class="stat-label">总资金(亿)</div>
+                        </div>
+                    </div>
+                    <!-- 连板票数量 -->
+                    <div class="panel-title" style="margin-top: 10px;">📈 连板票统计</div>
+                    <div class="floor-counts">
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor1">58</div>
+                            <div class="floor-label-small">1板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor2">52</div>
+                            <div class="floor-label-small">2板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor3">12</div>
+                            <div class="floor-label-small">3板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor4">5</div>
+                            <div class="floor-label-small">4板</div>
+                        </div>
+                        <div class="floor-count">
+                            <div class="floor-num" id="floor5">3</div>
+                            <div class="floor-label-small">5+板</div>
+                        </div>
+                    </div>
+                </div>
+               
+                <!-- 路径详情 -->
+                <div class="panel">
+                    <div class="panel-title">📍 路径详情</div>
+                    <div class="path-details" id="pathDetails">
+                        鼠标悬停在节点或连线上查看路径详情
+                    </div>
+                </div>
+               
+                <!-- 连接线颜色说明 -->
+                <div class="panel">
+                    <div class="panel-title">🔗 连接线颜色</div>
+                    <div class="connection-list">
+                        <div class="connection-item">
+                            <div class="connection-line" style="background: linear-gradient(90deg, #ff6b6b, rgba(255,107,107,0.5));"></div>
+                            <div class="legend-text">抢跑资金 → 题材</div>
+                        </div>
+                        <div class="connection-item">
+                            <div class="connection-line" style="background: linear-gradient(90deg, #ffa726, rgba(255,167,38,0.5));"></div>
+                            <div class="legend-text">试错资金 → 题材</div>
+                        </div>
+                        <div class="connection-item">
+                            <div class="connection-line" style="background: linear-gradient(90deg, #66bb6a, rgba(102,187,106,0.5));"></div>
+                            <div class="legend-text">梭哈资金 → 题材</div>
+                        </div>
+                        <div class="connection-item">
+                            <div class="connection-line" style="background: linear-gradient(90deg, #3498db, rgba(52,152,219,0.5));"></div>
+                            <div class="legend-text">题材 → 个股</div>
+                        </div>
+                    </div>
+                </div>
+               
+                <!-- 热门前五 -->
+                <div class="panel">
+                    <div class="panel-title">🔥 热门前五</div>
+                    <div class="top-stocks" id="topStocks">
+                        <!-- 动态生成 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ========== 核心状态管理 ==========
+        class GraphManager {
+            constructor() {
+                // Canvas 相关
+                this.canvas = document.getElementById('mainCanvas');
+                this.ctx = this.canvas.getContext('2d');
+                this.tooltip = document.getElementById('tooltip');
+                
+                // 数据
+                this.nodes = [];
+                this.links = [];
+                this.originalNodes = []; // 原始节点位置
+                
+                // 密度控制
+                this.densityLevels = [
+                    { name: '极稀疏', nodeScale: 0.5, labelScale: 0.6, minDistance: 50 },
+                    { name: '稀疏', nodeScale: 0.7, labelScale: 0.8, minDistance: 40 },
+                    { name: '中', nodeScale: 1.0, labelScale: 1.0, minDistance: 30 },
+                    { name: '密集', nodeScale: 1.3, labelScale: 1.2, minDistance: 20 },
+                    { name: '极密集', nodeScale: 1.6, labelScale: 1.4, minDistance: 10 }
+                ];
+                this.currentDensity = 2; // 默认中等密度
+                
+                // 视图状态
+                this.viewState = {
+                    showLabels: true,
+                    zoomLevel: 1,
+                    zoomStep: 0.1,
+                    minZoom: 0.3,
+                    maxZoom: 3,
+                    offsetX: 0,
+                    offsetY: 0,
+                    isDragging: false,
+                    dragStartX: 0,
+                    dragStartY: 0,
+                    dragNode: null,
+                    highlightState: {
+                        highlightedNodes: new Set(),
+                        highlightedLinks: new Set(),
+                        active: false,
+                        type: null
+                    },
+                    // 可视区域
+                    viewport: {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0
+                    }
+                };
+                
+                // 节点位置状态（保存拖拽后的位置）
+                this.nodePositions = new Map();
+                
+                // 颜色配置
+                this.colors = {
+                    rush: '#ff6b6b',
+                    trial: '#ffa726',
+                    allin: '#66bb6a',
+                    theme: '#3498db',
+                    emotion: '#9b59b6',
+                    core: '#2ecc71',
+                    other: '#95a5a6'
+                };
+                
+                // 连板票颜色映射
+                this.floorColors = {
+                    1: '#ff6b6b',
+                    2: '#ffa726',
+                    3: '#52c41a',
+                    4: '#1890ff',
+                    5: '#722ed1'
+                };
+                
+                // 初始化
+                this.init();
+            }
+            
+            init() {
+                // 设置Canvas大小
+                this.resizeCanvas();
+                window.addEventListener('resize', () => this.resizeCanvas());
+                
+                // 创建模拟数据
+                this.createMockData();
+                
+                // 从localStorage加载保存的位置
+                this.loadPositionsFromStorage();
+                
+                // 更新统计信息
+                this.updateStats();
+                
+                // 生成热门前五
+                this.updateTopStocks();
+                
+                // 绘制初始图表
+                this.draw();
+                
+                // 设置事件监听器
+                this.setupEventListeners();
+                
+                // 绘制区域
+                this.drawRegions();
+                
+                // 设置密度控制
+                this.setupDensityControl();
+            }
+            
+            resizeCanvas() {
+                const container = document.getElementById('canvasContainer');
+                this.canvas.width = container.clientWidth;
+                this.canvas.height = container.clientHeight;
+                
+                // 更新可视区域
+                this.viewState.viewport = {
+                    x: 0,
+                    y: 0,
+                    width: this.canvas.width,
+                    height: this.canvas.height
+                };
+                
+                // 重新绘制
+                this.draw();
+                this.drawRegions();
+            }
+            
+            // ========== 数据创建（修复连接问题） ==========
+            createMockData() {
+                this.nodes = [];
+                this.links = [];
+                
+                // 定义区域边界（使用百分比）
+                const regions = {
+                    capital: { x: 0.03, width: 0.07, top: 0.10, bottom: 0.90 },
+                    theme: { x: 0.11, width: 0.28, top: 0.05, bottom: 0.95 },
+                    emotion: { x: 0.50, width: 0.45, top: 0.05, bottom: 0.55 },
+                    core: { x: 0.50, width: 0.20, top: 0.56, bottom: 0.95 },
+                    other: { x: 0.75, width: 0.20, top: 0.56, bottom: 0.95 }
+                };
+                
+                // 1. 资金区节点
+                const capitalTypes = [
+                    { id: 'rush', name: '抢跑资金', value: 85.3, color: this.colors.rush },
+                    { id: 'trial', name: '试错资金', value: 123.7, color: this.colors.trial },
+                    { id: 'allin', name: '梭哈资金', value: 152.4, color: this.colors.allin }
+                ];
+                
+                capitalTypes.forEach((capital, index) => {
+                    const y = regions.capital.top + (index + 0.5) * (regions.capital.bottom - regions.capital.top) / 3;
+                    const node = {
+                        id: capital.id,
+                        name: capital.name,
+                        value: capital.value,
+                        category: 'capital',
+                        color: capital.color,
+                        x: regions.capital.x + regions.capital.width / 2,
+                        y: y,
+                        size: this.calculateNodeSize(capital.value / 10),
+                        fixed: false
+                    };
+                    this.nodes.push(node);
+                });
+                
+                // 2. 题材区节点
+                const themes = [
+                    { id: 'communication', name: '通信', value: 72.5, color: this.colors.theme, row: 0, group: 'strong' },
+                    { id: 'ai', name: '人工智能', value: 68.3, color: '#e74c3c', row: 1, group: 'strong' },
+                    { id: 'chip', name: '芯片', value: 58.9, color: '#8e44ad', row: 2, group: 'strong' },
+                    { id: 'robot', name: '机器人', value: 42.7, color: '#f39c12', row: 3, group: 'strong' },
+                    
+                    { id: 'realestate', name: '房地产', value: -32.1, color: '#7f8c8d', row: 4, group: 'down' },
+                    { id: 'finance', name: '金融', value: -21.5, color: '#7f8c8d', row: 5, group: 'down' },
+                    { id: 'consumption', name: '消费', value: -15.8, color: '#7f8c8d', row: 6, group: 'down' },
+                    
+                    { id: 'military', name: '军工', value: 43.6, color: '#d35400', row: 7, group: 'hot' },
+                    { id: 'battery', name: '锂电池', value: 51.2, color: '#27ae60', row: 8, group: 'hot' },
+                    { id: 'medicine', name: '医药', value: 38.4, color: '#1abc9c', row: 9, group: 'hot' },
+                    { id: 'car', name: '汽车', value: 45.7, color: '#e67e22', row: 10, group: 'hot' },
+                    { id: 'software', name: '软件', value: 32.9, color: '#3498db', row: 11, group: 'hot' }
+                ];
+                
+                themes.forEach(theme => {
+                    const y = regions.theme.top + (theme.row + 0.5) * (regions.theme.bottom - regions.theme.top) / 12;
+                    const node = {
+                        id: theme.id,
+                        name: theme.name,
+                        value: theme.value,
+                        category: 'theme',
+                        group: theme.group,
+                        color: theme.color,
+                        x: regions.theme.x + regions.theme.width / 2,
+                        y: y,
+                        size: this.calculateNodeSize(Math.abs(theme.value)),
+                        fixed: false
+                    };
+                    this.nodes.push(node);
+                });
+                
+                // 3. 情绪区个股
+                const emotionFloors = [
+                    { floor: 1, count: 58, yStart: 0.05, yEnd: 0.20, color: this.floorColors[1], rows: 12 },
+                    { floor: 2, count: 52, yStart: 0.21, yEnd: 0.36, color: this.floorColors[2], rows: 12 },
+                    { floor: 3, count: 12, yStart: 0.37, yEnd: 0.46, color: this.floorColors[3], rows: 6 },
+                    { floor: 4, count: 5, yStart: 0.47, yEnd: 0.52, color: this.floorColors[4], rows: 5 },
+                    { floor: 5, count: 3, yStart: 0.53, yEnd: 0.56, color: this.floorColors[5], rows: 3 }
+                ];
+                
+                // 按题材分组情绪股票
+                const themeToEmotionStocks = {};
+                themes.forEach(theme => {
+                    themeToEmotionStocks[theme.id] = [];
+                });
+                
+                // 分配股票到题材分组
+                emotionFloors.forEach(floorData => {
+                    for (let i = 0; i < floorData.count; i++) {
+                        const themeIndex = Math.floor(Math.random() * themes.length);
+                        const theme = themes[themeIndex];
+                        themeToEmotionStocks[theme.id].push({
+                            floor: floorData.floor,
+                            color: floorData.color
+                        });
+                    }
+                });
+                
+                // 生成情绪区股票
+                let stockIndex = 0;
+                emotionFloors.forEach(floorData => {
+                    const floorHeight = floorData.yEnd - floorData.yStart;
+                    const rowHeight = floorHeight / floorData.rows;
+                    
+                    themes.forEach((theme, themeIndex) => {
+                        const themeStocks = themeToEmotionStocks[theme.id].filter(s => s.floor === floorData.floor);
+                        
+                        if (themeStocks.length > 0) {
+                            const row = themeIndex % floorData.rows;
+                            const y = floorData.yStart + (row + 0.5) * rowHeight;
+                            
+                            // 每行最多显示15只股票
+                            const maxStocksPerRow = 15;
+                            const stocksInRow = Math.min(themeStocks.length, maxStocksPerRow);
+                            
+                            for (let i = 0; i < stocksInRow; i++) {
+                                const col = i;
+                                const x = regions.emotion.x + (col + 0.5) * (regions.emotion.width / maxStocksPerRow);
+                                
+                                const gain = floorData.floor === 1 ? 1.5 + Math.random() * 4 :
+                                            floorData.floor === 2 ? 3 + Math.random() * 6 :
+                                            floorData.floor === 3 ? 6 + Math.random() * 8 :
+                                            floorData.floor === 4 ? 9 + Math.random() * 6 :
+                                            12 + Math.random() * 8;
+                                
+                                const volume = (50 + Math.random() * 150).toFixed(0);
+                                const flow = floorData.floor * (0.5 + Math.random() * 1.5);
+                                const stockId = `emotion_${floorData.floor}_${stockIndex}`;
+                                
+                                this.nodes.push({
+                                    id: stockId,
+                                    name: this.getStockName(stockIndex),
+                                    value: flow,
+                                    gain: gain,
+                                    volume: volume,
+                                    floor: floorData.floor,
+                                    theme: theme.id,
+                                    themeName: theme.name,
+                                    category: 'emotion',
+                                    color: floorData.color,
+                                    x: x,
+                                    y: y,
+                                    size: this.calculateNodeSize(flow),
+                                    fixed: false,
+                                    // 添加小尺寸标记
+                                    isSmall: false
+                                });
+                                
+                                stockIndex++;
+                            }
+                        }
+                    });
+                });
+                
+                // 4. 核心个股
+                const coreCount = 50;
+                const stocksPerTheme = Math.ceil(coreCount / themes.length);
+                
+                themes.forEach((theme, themeIndex) => {
+                    const themeYStart = regions.core.top + (themeIndex * (regions.core.bottom - regions.core.top) / themes.length);
+                    const themeHeight = (regions.core.bottom - regions.core.top) / themes.length;
+                    const themeXStart = regions.core.x;
+                    const themeWidth = regions.core.width;
+                    
+                    for (let i = 0; i < stocksPerTheme; i++) {
+                        const x = themeXStart + ((i % 5) + 0.5) * (themeWidth / 5);
+                        const row = Math.floor(i / 5);
+                        const y = themeYStart + (row + 0.5) * (themeHeight / Math.ceil(stocksPerTheme / 5));
+                        
+                        const gain = -5 + Math.random() * 15;
+                        const volume = (100 + Math.random() * 200).toFixed(0);
+                        const flow = 2 + Math.random() * 8;
+                        const stockId = `core_${theme.id}_${i}`;
+                        
+                        this.nodes.push({
+                            id: stockId,
+                            name: this.getStockName(this.nodes.length),
+                            value: flow,
+                            gain: gain,
+                            volume: volume,
+                            category: 'core',
+                            theme: theme.id,
+                            themeName: theme.name,
+                            color: this.colors.core,
+                            x: x,
+                            y: y,
+                            size: this.calculateNodeSize(flow),
+                            fixed: false,
+                            isSmall: false
+                        });
+                    }
+                });
+                
+                // 5. 其他个股
+                const otherCount = 100;
+                const otherStocksPerTheme = Math.ceil(otherCount / themes.length);
+                
+                themes.forEach((theme, themeIndex) => {
+                    const themeYStart = regions.other.top + (themeIndex * (regions.other.bottom - regions.other.top) / themes.length);
+                    const themeHeight = (regions.other.bottom - regions.other.top) / themes.length;
+                    const themeXStart = regions.other.x;
+                    const themeWidth = regions.other.width;
+                    
+                    for (let i = 0; i < otherStocksPerTheme; i++) {
+                        const x = themeXStart + ((i % 6) + 0.5) * (themeWidth / 6);
+                        const row = Math.floor(i / 6);
+                        const y = themeYStart + (row + 0.5) * (themeHeight / Math.ceil(otherStocksPerTheme / 6));
+                        
+                        const gain = -8 + Math.random() * 16;
+                        const volume = (30 + Math.random() * 120).toFixed(0);
+                        const flow = -2 + Math.random() * 4;
+                        const stockId = `other_${theme.id}_${i}`;
+                        
+                        this.nodes.push({
+                            id: stockId,
+                            name: this.getStockName(this.nodes.length),
+                            value: flow,
+                            gain: gain,
+                            volume: volume,
+                            category: 'other',
+                            theme: theme.id,
+                            themeName: theme.name,
+                            color: this.colors.other,
+                            x: x,
+                            y: y,
+                            size: this.calculateNodeSize(Math.abs(flow)),
+                            fixed: false,
+                            isSmall: false
+                        });
+                    }
+                });
+                
+                // 保存原始节点位置
+                this.originalNodes = JSON.parse(JSON.stringify(this.nodes));
+                
+                // 创建连接关系 - 修复：确保每个个股都有连接
+                // 1. 资金 -> 题材
+                capitalTypes.forEach(capital => {
+                    themes.forEach(theme => {
+                        let weight = 0.5 + Math.random() * 2;
+                        if (capital.id === 'rush' && theme.value > 50) weight *= 1.5;
+                        if (capital.id === 'allin' && theme.value > 0) weight *= 1.3;
+                        if (capital.id === 'trial' && Math.abs(theme.value) > 30) weight *= 1.2;
+                        
+                        if (weight > 0.8) {
+                            const linkId = `link_${capital.id}_${theme.id}`;
+                            this.links.push({
+                                id: linkId,
+                                source: capital.id,
+                                target: theme.id,
+                                value: weight,
+                                color: capital.color,
+                                opacity: 0.8,
+                                width: weight * 0.8
+                            });
+                        }
+                    });
+                });
+                
+                // 2. 题材 -> 个股 - 修复：确保每个题材下的个股都有连接
+                themes.forEach(theme => {
+                    // 连接到情绪股
+                    const emotionStocks = this.nodes.filter(node => 
+                        node.category === 'emotion' && node.theme === theme.id
+                    );
+                    
+                    // 确保每个情绪股都有至少一个连接
+                    emotionStocks.forEach(stock => {
+                        const weight = 0.2 + Math.random() * 1.5;
+                        const linkId = `link_${theme.id}_${stock.id}`;
+                        this.links.push({
+                            id: linkId,
+                            source: theme.id,
+                            target: stock.id,
+                            value: weight,
+                            color: theme.color,
+                            opacity: 0.6,
+                            width: weight * 0.6
+                        });
+                    });
+                    
+                    // 连接到核心股
+                    const coreStocks = this.nodes.filter(node => 
+                        node.category === 'core' && node.theme === theme.id
+                    );
+                    
+                    // 确保每个核心股都有至少一个连接
+                    coreStocks.forEach(stock => {
+                        const weight = 0.5 + Math.random() * 2;
+                        const linkId = `link_${theme.id}_${stock.id}`;
+                        this.links.push({
+                            id: linkId,
+                            source: theme.id,
+                            target: stock.id,
+                            value: weight,
+                            color: theme.color,
+                            opacity: 0.7,
+                            width: weight * 0.7
+                        });
+                    });
+                    
+                    // 连接到其他股
+                    const otherStocks = this.nodes.filter(node => 
+                        node.category === 'other' && node.theme === theme.id
+                    );
+                    
+                    // 确保每个其他股都有至少一个连接
+                    otherStocks.forEach(stock => {
+                        const weight = 0.1 + Math.random() * 0.8;
+                        const linkId = `link_${theme.id}_${stock.id}`;
+                        this.links.push({
+                            id: linkId,
+                            source: theme.id,
+                            target: stock.id,
+                            value: weight,
+                            color: theme.color,
+                            opacity: 0.5,
+                            width: weight * 0.5
+                        });
+                    });
+                });
+                
+                // 应用智能布局，防止初始重叠
+                this.applySmartLayout();
+            }
+            
+            // ========== 智能布局算法 ==========
+            applySmartLayout() {
+                // 对情绪区、核心股、其他股分别应用不同的布局策略
+                
+                // 1. 情绪区：按题材和连板数分组排列
+                const emotionNodes = this.nodes.filter(node => node.category === 'emotion');
+                emotionNodes.forEach(node => {
+                    // 情绪区已经按行列排列，这里主要微调防止重叠
+                    const themeNodes = emotionNodes.filter(n => n.theme === node.theme);
+                    const sameThemeIndex = themeNodes.findIndex(n => n.id === node.id);
+                    
+                    if (sameThemeIndex > 0) {
+                        // 对同题材股票进行微调
+                        const smallOffset = 0.002 * sameThemeIndex;
+                        node.x += smallOffset;
+                    }
+                });
+                
+                // 2. 核心股：按题材分组，应用弹簧布局
+                this.applySpringLayout('core', 0.003);
+                
+                // 3. 其他股：更密集的布局，但避免重叠
+                this.applySpringLayout('other', 0.002);
+            }
+            
+            applySpringLayout(category, repulsion) {
+                const categoryNodes = this.nodes.filter(node => node.category === category);
+                const sameCategoryNodes = [...categoryNodes];
+                
+                // 简单的排斥力布局
+                for (let i = 0; i < 5; i++) { // 迭代5次
+                    sameCategoryNodes.forEach(node => {
+                        let dx = 0, dy = 0;
+                        
+                        sameCategoryNodes.forEach(otherNode => {
+                            if (node.id === otherNode.id) return;
+                            
+                            const distanceX = node.x - otherNode.x;
+                            const distanceY = node.y - otherNode.y;
+                            const distance = Math.sqrt(distanceX * distanceX + distanceY * distanceY);
+                            
+                            if (distance < 0.02) { // 太近了
+                                const force = repulsion / (distance * distance);
+                                dx += (distanceX / distance) * force;
+                                dy += (distanceY / distance) * force;
+                            }
+                        });
+                        
+                        // 应用排斥力
+                        node.x += dx;
+                        node.y += dy;
+                        
+                        // 确保在区域内
+                        const region = category === 'core' ? { x: 0.50, width: 0.20 } : { x: 0.75, width: 0.20 };
+                        node.x = Math.max(region.x, Math.min(region.x + region.width, node.x));
+                        node.y = Math.max(0.56, Math.min(0.95, node.y));
+                    });
+                }
+            }
+            
+            // ========== 工具函数 ==========
+            calculateNodeSize(value) {
+                // 根据密度级别调整基础大小
+                const density = this.densityLevels[this.currentDensity];
+                const baseSize = 6 + (Math.min(Math.abs(value), 20) / 20) * 24;
+                
+                // 根据缩放级别调整
+                const zoomFactor = Math.min(1.5, Math.max(0.5, this.viewState.zoomLevel));
+                
+                return Math.max(4, Math.min(30, baseSize * density.nodeScale * zoomFactor));
+            }
+            
+            calculateNodeSizeForDisplay(value, isSmall = false) {
+                // 根据密度级别调整基础大小
+                const density = this.densityLevels[this.currentDensity];
+                const baseSize = 6 + (Math.min(Math.abs(value), 20) / 20) * 24;
+                
+                // 根据缩放级别调整
+                const zoomFactor = Math.min(1.5, Math.max(0.5, this.viewState.zoomLevel));
+                
+                // 如果是小节点，进一步缩小
+                const sizeMultiplier = isSmall ? 0.7 : 1;
+                
+                return Math.max(3, Math.min(30, baseSize * density.nodeScale * zoomFactor * sizeMultiplier));
+            }
+            
+            getStockName(index) {
+                const prefixes = ['中', '国', '东', '西', '南', '北', '华', '夏', '神', '龙'];
+                const suffixes = ['科技', '股份', '控股', '集团', '实业', '发展', '能源', '制造'];
+                const prefix = prefixes[index % prefixes.length];
+                const suffix = suffixes[Math.floor(index / prefixes.length) % suffixes.length];
+                return prefix + suffix;
+            }
+            
+            getNodeById(id) {
+                return this.nodes.find(node => node.id === id);
+            }
+            
+            getNodeScreenPosition(node) {
+                // 将相对坐标转换为屏幕坐标
+                const x = node.x * this.canvas.width;
+                const y = node.y * this.canvas.height;
+                
+                // 应用缩放和偏移
+                const screenX = (x * this.viewState.zoomLevel) + this.viewState.offsetX;
+                const screenY = (y * this.viewState.zoomLevel) + this.viewState.offsetY;
+                
+                return { x: screenX, y: screenY };
+            }
+            
+            getScreenToRelative(x, y) {
+                // 将屏幕坐标转换为相对坐标
+                const relativeX = (x - this.viewState.offsetX) / this.viewState.zoomLevel / this.canvas.width;
+                const relativeY = (y - this.viewState.offsetY) / this.viewState.zoomLevel / this.canvas.height;
+                
+                return { x: relativeX, y: relativeY };
+            }
+            
+            // ========== 绘制函数（修复标签显示） ==========
+            draw() {
+                // 清除画布
+                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+                
+                // 绘制连接线
+                this.drawLinks();
+                
+                // 绘制节点
+                this.drawNodes();
+            }
+            
+            drawLinks() {
+                this.links.forEach(link => {
+                    const sourceNode = this.getNodeById(link.source);
+                    const targetNode = this.getNodeById(link.target);
+                    
+                    if (!sourceNode || !targetNode) return;
+                    
+                    const sourcePos = this.getNodeScreenPosition(sourceNode);
+                    const targetPos = this.getNodeScreenPosition(targetNode);
+                    
+                    // 检查是否在高亮状态
+                    const isHighlighted = this.viewState.highlightState.highlightedLinks.has(link.id);
+                    const isActive = this.viewState.highlightState.active;
+                    
+                    // 设置线条样式
+                    this.ctx.beginPath();
+                    this.ctx.moveTo(sourcePos.x, sourcePos.y);
+                    this.ctx.lineTo(targetPos.x, targetPos.y);
+                    
+                    // 设置线条属性
+                    const opacity = isActive ? (isHighlighted ? 1 : 0.2) : (link.opacity || 0.6);
+                    const lineWidth = (link.width || 1) * this.viewState.zoomLevel;
+                    const color = isHighlighted ? '#d4af37' : link.color;
+                    
+                    this.ctx.strokeStyle = color;
+                    this.ctx.lineWidth = lineWidth;
+                    this.ctx.globalAlpha = opacity;
+                    this.ctx.stroke();
+                    
+                    // 绘制箭头
+                    this.drawArrow(sourcePos, targetPos, color, lineWidth, opacity);
+                    
+                    // 恢复全局透明度
+                    this.ctx.globalAlpha = 1.0;
+                });
+            }
+            
+            drawArrow(sourcePos, targetPos, color, lineWidth, opacity) {
+                // 计算箭头方向
+                const angle = Math.atan2(targetPos.y - sourcePos.y, targetPos.x - sourcePos.x);
+                const arrowLength = 8 * this.viewState.zoomLevel;
+                
+                // 箭头点
+                const arrowX = targetPos.x - Math.cos(angle) * 5;
+                const arrowY = targetPos.y - Math.sin(angle) * 5;
+                
+                // 绘制箭头
+                this.ctx.save();
+                this.ctx.translate(arrowX, arrowY);
+                this.ctx.rotate(angle);
+                
+                this.ctx.beginPath();
+                this.ctx.moveTo(0, 0);
+                this.ctx.lineTo(-arrowLength, arrowLength / 2);
+                this.ctx.lineTo(-arrowLength, -arrowLength / 2);
+                this.ctx.closePath();
+                
+                this.ctx.fillStyle = color;
+                this.ctx.globalAlpha = opacity;
+                this.ctx.fill();
+                
+                this.ctx.restore();
+            }
+            
+            drawNodes() {
+                // 先绘制所有节点（不包含标签）
+                this.nodes.forEach(node => {
+                    this.drawNode(node, false);
+                });
+                
+                // 然后绘制所有标签（避免节点遮挡标签）
+                if (this.viewState.showLabels) {
+                    this.nodes.forEach(node => {
+                        this.drawNodeLabel(node);
+                    });
+                }
+            }
+            
+            drawNode(node, drawLabel = false) {
+                const pos = this.getNodeScreenPosition(node);
+                
+                // 根据密度和缩放计算实际大小
+                const isSmallNode = this.shouldDrawSmall(node);
+                const size = this.calculateNodeSizeForDisplay(node.value, isSmallNode);
+                
+                // 检查是否在高亮状态
+                const isHighlighted = this.viewState.highlightState.highlightedNodes.has(node.id);
+                const isActive = this.viewState.highlightState.active;
+                
+                // 设置节点样式
+                this.ctx.beginPath();
+                this.ctx.arc(pos.x, pos.y, size, 0, Math.PI * 2);
+                
+                // 填充颜色
+                this.ctx.fillStyle = node.color;
+                this.ctx.globalAlpha = isActive ? (isHighlighted ? 1 : 0.3) : 1;
+                this.ctx.fill();
+                
+                // 边框
+                const borderWidth = (node.value > 5 ? 2 : 1) * this.viewState.zoomLevel;
+                this.ctx.strokeStyle = isHighlighted ? '#d4af37' : '#fff';
+                this.ctx.lineWidth = borderWidth;
+                this.ctx.globalAlpha = 1;
+                this.ctx.stroke();
+                
+                // 如果需要，绘制标签
+                if (drawLabel && this.viewState.showLabels) {
+                    this.drawNodeLabel(node);
+                }
+            }
+            
+            shouldDrawSmall(node) {
+                // 判断是否需要绘制为小节点
+                if (node.category === 'capital' || node.category === 'theme') {
+                    return false;
+                }
+                
+                // 计算节点在屏幕上的大小
+                const screenSize = this.calculateNodeSizeForDisplay(node.value) * this.viewState.zoomLevel;
+                
+                // 如果缩放级别较小，或者节点本身较小，则使用小节点
+                return this.viewState.zoomLevel < 0.8 || screenSize < 8;
+            }
+            
+            drawNodeLabel(node) {
+                if (!this.viewState.showLabels) return;
+                
+                const pos = this.getNodeScreenPosition(node);
+                const isSmallNode = this.shouldDrawSmall(node);
+                const nodeSize = this.calculateNodeSizeForDisplay(node.value, isSmallNode);
+                
+                // 根据密度和缩放计算字体大小
+                const density = this.densityLevels[this.currentDensity];
+                const baseFontSize = 10;
+                const fontSize = Math.max(8, baseFontSize * density.labelScale * this.viewState.zoomLevel);
+                
+                // 对于小节点，使用更小的字体
+                const finalFontSize = isSmallNode ? fontSize * 0.8 : fontSize;
+                
+                this.ctx.font = `${finalFontSize}px 'Microsoft YaHei', sans-serif`;
+                this.ctx.textAlign = 'center';
+                this.ctx.textBaseline = 'middle';
+                
+                // 构建标签文本
+                let labelText = this.getShortName(node.name, isSmallNode);
+                
+                // 对于个股，添加额外信息
+                if ((node.category === 'emotion' || node.category === 'core' || node.category === 'other') && !isSmallNode) {
+                    if (node.floor) {
+                        labelText += `\n${node.floor}板`;
+                    } else if (node.gain !== undefined) {
+                        const gainSymbol = node.gain >= 0 ? '+' : '';
+                        labelText += `\n${gainSymbol}${node.gain.toFixed(1)}%`;
+                    }
+                }
+                
+                const lines = labelText.split('\n');
+                const lineHeight = finalFontSize * 1.2;
+                const totalHeight = lines.length * lineHeight;
+                
+                // 计算标签位置 - 在节点中心
+                const labelX = pos.x;
+                const labelY = pos.y;
+                
+                // 绘制标签背景
+                const maxLineWidth = Math.max(...lines.map(line => this.ctx.measureText(line).width));
+                const padding = 3;
+                
+                this.ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                this.ctx.fillRect(
+                    labelX - maxLineWidth / 2 - padding,
+                    labelY - totalHeight / 2 - padding,
+                    maxLineWidth + padding * 2,
+                    totalHeight + padding * 2
+                );
+                
+                // 绘制标签文本
+                this.ctx.fillStyle = '#fff';
+                lines.forEach((line, index) => {
+                    this.ctx.fillText(
+                        line,
+                        labelX,
+                        labelY - totalHeight / 2 + lineHeight * (index + 0.5)
+                    );
+                });
+            }
+            
+            getShortName(name, isSmall) {
+                if (isSmall) {
+                    // 对于小节点，只显示前2个字符
+                    return name.length > 2 ? name.substring(0, 2) : name;
+                } else {
+                    // 对于正常节点，显示完整名称或截断
+                    return name.length > 4 ? name.substring(0, 4) + '...' : name;
+                }
+            }
+            
+            // ========== 事件处理 ==========
+            setupEventListeners() {
+                // 鼠标事件
+                this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+                this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+                this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
+                this.canvas.addEventListener('wheel', (e) => this.handleMouseWheel(e));
+                
+                // 添加键盘事件支持重置位置
+                document.addEventListener('keydown', (e) => {
+                    if (e.ctrlKey && e.key === 'r') {
+                        e.preventDefault();
+                        this.resetPositions();
+                    }
+                });
+            }
+            
+            setupDensityControl() {
+                const slider = document.getElementById('densitySlider');
+                const valueDisplay = document.getElementById('densityValue');
+                
+                slider.addEventListener('input', (e) => {
+                    this.currentDensity = parseInt(e.target.value);
+                    const densityName = this.densityLevels[this.currentDensity].name;
+                    valueDisplay.textContent = densityName;
+                    
+                    // 重新绘制
+                    this.draw();
+                });
+            }
+            
+            handleMouseDown(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                
+                // 检查是否点击了节点
+                const clickedNode = this.getNodeAtPosition(x, y);
+                
+                if (clickedNode) {
+                    // 开始拖拽节点
+                    this.viewState.isDragging = true;
+                    this.viewState.dragNode = clickedNode;
+                    this.viewState.dragStartX = x;
+                    this.viewState.dragStartY = y;
+                    this.canvas.style.cursor = 'grabbing';
+                    
+                    // 高亮相关节点和连接
+                    this.highlightNodePath(clickedNode.id);
+                } else {
+                    // 开始拖拽画布
+                    this.viewState.isDragging = true;
+                    this.viewState.dragStartX = x - this.viewState.offsetX;
+                    this.viewState.dragStartY = y - this.viewState.offsetY;
+                    this.canvas.style.cursor = 'grabbing';
+                }
+            }
+            
+            handleMouseMove(e) {
+                const rect = this.canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                
+                // 更新工具提示位置
+                this.tooltip.style.left = `${x + 10}px`;
+                this.tooltip.style.top = `${y + 10}px`;
+                
+                // 检查鼠标悬停的节点
+                const hoveredNode = this.getNodeAtPosition(x, y);
+                
+                if (hoveredNode) {
+                    // 显示节点工具提示
+                    this.showNodeTooltip(hoveredNode, x, y);
+                    
+                    // 检查鼠标悬停的连接
+                    const hoveredLink = this.getLinkAtPosition(x, y);
+                    if (hoveredLink) {
+                        this.showLinkTooltip(hoveredLink, x, y);
+                    }
+                } else {
+                    // 检查鼠标悬停的连接
+                    const hoveredLink = this.getLinkAtPosition(x, y);
+                    if (hoveredLink) {
+                        this.showLinkTooltip(hoveredLink, x, y);
+                        this.canvas.style.cursor = 'pointer';
+                    } else {
+                        this.hideTooltip();
+                        this.canvas.style.cursor = this.viewState.isDragging ? 'grabbing' : 'grab';
+                    }
+                }
+                
+                if (this.viewState.isDragging) {
+                    if (this.viewState.dragNode) {
+                        // 拖拽节点
+                        const relativePos = this.getScreenToRelative(x, y);
+                        this.viewState.dragNode.x = relativePos.x;
+                        this.viewState.dragNode.y = relativePos.y;
+                        this.viewState.dragNode.fixed = true;
+                        
+                        // 保存位置
+                        this.saveNodePosition(this.viewState.dragNode.id, relativePos.x, relativePos.y);
+                        
+                        // 防止重叠
+                        this.preventOverlap(this.viewState.dragNode);
+                    } else {
+                        // 拖拽画布
+                        this.viewState.offsetX = x - this.viewState.dragStartX;
+                        this.viewState.offsetY = y - this.viewState.dragStartY;
+                    }
+                    
+                    this.draw();
+                }
+            }
+            
+            preventOverlap(node) {
+                // 防止节点重叠的简单算法
+                const minDistance = this.densityLevels[this.currentDensity].minDistance / this.canvas.width;
+                
+                this.nodes.forEach(otherNode => {
+                    if (node.id === otherNode.id) return;
+                    
+                    const dx = node.x - otherNode.x;
+                    const dy = node.y - otherNode.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < minDistance) {
+                        // 太近了，推开其他节点
+                        const pushForce = (minDistance - distance) / distance * 0.1;
+                        otherNode.x -= dx * pushForce;
+                        otherNode.y -= dy * pushForce;
+                        
+                        // 确保在区域内
+                        const region = this.getNodeRegion(otherNode);
+                        otherNode.x = Math.max(region.x, Math.min(region.x + region.width, otherNode.x));
+                        otherNode.y = Math.max(region.top, Math.min(region.bottom, otherNode.y));
+                    }
+                });
+            }
+            
+            getNodeRegion(node) {
+                // 根据节点类型返回区域边界
+                switch(node.category) {
+                    case 'capital':
+                        return { x: 0.03, width: 0.07, top: 0.10, bottom: 0.90 };
+                    case 'theme':
+                        return { x: 0.11, width: 0.28, top: 0.05, bottom: 0.95 };
+                    case 'emotion':
+                        return { x: 0.50, width: 0.45, top: 0.05, bottom: 0.55 };
+                    case 'core':
+                        return { x: 0.50, width: 0.20, top: 0.56, bottom: 0.95 };
+                    case 'other':
+                        return { x: 0.75, width: 0.20, top: 0.56, bottom: 0.95 };
+                    default:
+                        return { x: 0, width: 1, top: 0, bottom: 1 };
+                }
+            }
+            
+            handleMouseUp(e) {
+                if (this.viewState.isDragging && this.viewState.dragNode) {
+                    // 保存节点位置到localStorage
+                    this.savePositionsToStorage();
+                }
+                
+                this.viewState.isDragging = false;
+                this.viewState.dragNode = null;
+                this.canvas.style.cursor = 'grab';
+            }
+            
+            handleMouseWheel(e) {
+                e.preventDefault();
+                
+                const rect = this.canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const y = e.clientY - rect.top;
+                
+                // 计算缩放前的相对位置
+                const beforeZoomX = (x - this.viewState.offsetX) / this.viewState.zoomLevel;
+                const beforeZoomY = (y - this.viewState.offsetY) / this.viewState.zoomLevel;
+                
+                // 更新缩放级别
+                const delta = e.deltaY > 0 ? -this.viewState.zoomStep : this.viewState.zoomStep;
+                const newZoom = Math.max(
+                    this.viewState.minZoom,
+                    Math.min(this.viewState.maxZoom, this.viewState.zoomLevel + delta)
+                );
+                
+                // 如果缩放变化超过阈值，调整密度
+                if (Math.abs(newZoom - this.viewState.zoomLevel) > 0.2) {
+                    // 根据缩放级别调整密度
+                    if (newZoom < 0.7 && this.currentDensity > 0) {
+                        this.currentDensity = Math.max(0, this.currentDensity - 1);
+                        document.getElementById('densitySlider').value = this.currentDensity;
+                        document.getElementById('densityValue').textContent = 
+                            this.densityLevels[this.currentDensity].name;
+                    } else if (newZoom > 1.3 && this.currentDensity < 4) {
+                        this.currentDensity = Math.min(4, this.currentDensity + 1);
+                        document.getElementById('densitySlider').value = this.currentDensity;
+                        document.getElementById('densityValue').textContent = 
+                            this.densityLevels[this.currentDensity].name;
+                    }
+                }
+                
+                this.viewState.zoomLevel = newZoom;
+                
+                // 调整偏移量以保持鼠标位置不变
+                this.viewState.offsetX = x - beforeZoomX * this.viewState.zoomLevel;
+                this.viewState.offsetY = y - beforeZoomY * this.viewState.zoomLevel;
+                
+                // 重新绘制
+                this.draw();
+                this.drawRegions();
+            }
+            
+            getNodeAtPosition(x, y) {
+                // 从后向前检查（最后绘制的节点在最上面）
+                for (let i = this.nodes.length - 1; i >= 0; i--) {
+                    const node = this.nodes[i];
+                    const pos = this.getNodeScreenPosition(node);
+                    const size = this.calculateNodeSizeForDisplay(node.value) * this.viewState.zoomLevel;
+                    
+                    // 计算距离
+                    const distance = Math.sqrt(
+                        Math.pow(x - pos.x, 2) + Math.pow(y - pos.y, 2)
+                    );
+                    
+                    if (distance <= size) {
+                        return node;
+                    }
+                }
+                return null;
+            }
+            
+            getLinkAtPosition(x, y) {
+                const threshold = 5; // 点击检测阈值
+                
+                for (const link of this.links) {
+                    const sourceNode = this.getNodeById(link.source);
+                    const targetNode = this.getNodeById(link.target);
+                    
+                    if (!sourceNode || !targetNode) continue;
+                    
+                    const sourcePos = this.getNodeScreenPosition(sourceNode);
+                    const targetPos = this.getNodeScreenPosition(targetNode);
+                    
+                    // 计算点到线段的距离
+                    const distance = this.pointToLineDistance(x, y, sourcePos.x, sourcePos.y, targetPos.x, targetPos.y);
+                    
+                    if (distance <= threshold) {
+                        return link;
+                    }
+                }
+                
+                return null;
+            }
+            
+            pointToLineDistance(px, py, x1, y1, x2, y2) {
+                const A = px - x1;
+                const B = py - y1;
+                const C = x2 - x1;
+                const D = y2 - y1;
+                
+                const dot = A * C + B * D;
+                const lenSq = C * C + D * D;
+                let param = -1;
+                
+                if (lenSq !== 0) {
+                    param = dot / lenSq;
+                }
+                
+                let xx, yy;
+                
+                if (param < 0) {
+                    xx = x1;
+                    yy = y1;
+                } else if (param > 1) {
+                    xx = x2;
+                    yy = y2;
+                } else {
+                    xx = x1 + param * C;
+                    yy = y1 + param * D;
+                }
+                
+                const dx = px - xx;
+                const dy = py - yy;
+                
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+            
+            // ========== 工具提示 ==========
+            showNodeTooltip(node, x, y) {
+                let html = `<div class="tooltip-title">${node.name}</div>`;
+                html += '<div class="tooltip-content">';
+                
+                if (node.value !== undefined) {
+                    const valueColor = node.value >= 0 ? '#52c41a' : '#ff4d4f';
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">资金量:</span>
+                        <span class="tooltip-value" style="color: ${valueColor}">${node.value.toFixed(2)}亿</span>
+                    </div>`;
+                }
+                
+                if (node.gain !== undefined) {
+                    const gainColor = node.gain >= 0 ? '#52c41a' : '#ff4d4f';
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">涨跌幅:</span>
+                        <span class="tooltip-value" style="color: ${gainColor}">${node.gain >= 0 ? '+' : ''}${node.gain.toFixed(2)}%</span>
+                    </div>`;
+                }
+                
+                if (node.volume !== undefined) {
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">成交量:</span>
+                        <span class="tooltip-value">${node.volume}万手</span>
+                    </div>`;
+                }
+                
+                if (node.floor !== undefined) {
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">连板数:</span>
+                        <span class="tooltip-value" style="color: ${this.floorColors[node.floor] || '#ff6b6b'}">${node.floor}连板</span>
+                    </div>`;
+                }
+                
+                if (node.themeName) {
+                    html += `<div class="tooltip-row">
+                        <span class="tooltip-label">题材:</span>
+                        <span class="tooltip-value" style="color: #3498db">${node.themeName}</span>
+                    </div>`;
+                }
+                
+                html += '</div>';
+                
+                this.tooltip.innerHTML = html;
+                this.tooltip.style.display = 'block';
+                this.tooltip.style.left = `${x + 15}px`;
+                this.tooltip.style.top = `${y + 15}px`;
+            }
+            
+            showLinkTooltip(link, x, y) {
+                const sourceNode = this.getNodeById(link.source);
+                const targetNode = this.getNodeById(link.target);
+                
+                let html = `<div class="tooltip-title">💰 资金流向</div>`;
+                html += '<div class="tooltip-content">';
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">来源:</span>
+                    <span class="tooltip-value">${sourceNode?.name || link.source}</span>
+                </div>`;
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">目标:</span>
+                    <span class="tooltip-value">${targetNode?.name || link.target}</span>
+                </div>`;
+                html += `<div class="tooltip-row">
+                    <span class="tooltip-label">金额:</span>
+                    <span class="tooltip-value">${link.value.toFixed(2)}亿</span>
+                </div>`;
+                html += '</div>';
+                
+                this.tooltip.innerHTML = html;
+                this.tooltip.style.display = 'block';
+                this.tooltip.style.left = `${x + 15}px`;
+                this.tooltip.style.top = `${y + 15}px`;
+            }
+            
+            hideTooltip() {
+                this.tooltip.style.display = 'none';
+            }
+            
+            // ========== 位置管理 ==========
+            saveNodePosition(nodeId, x, y) {
+                this.nodePositions.set(nodeId, {
+                    x: x,
+                    y: y,
+                    fixed: true,
+                    timestamp: Date.now()
+                });
+            }
+            
+            loadPositionsFromStorage() {
+                try {
+                    const saved = localStorage.getItem('nodePositions');
+                    if (saved) {
+                        const parsed = JSON.parse(saved);
+                        for (const [nodeId, position] of Object.entries(parsed)) {
+                            if (position && position.x !== undefined && position.y !== undefined) {
+                                this.nodePositions.set(nodeId, {
+                                    x: position.x,
+                                    y: position.y,
+                                    fixed: true,
+                                    timestamp: position.timestamp || Date.now()
+                                });
+                                
+                                // 更新节点位置
+                                const node = this.getNodeById(nodeId);
+                                if (node) {
+                                    node.x = position.x;
+                                    node.y = position.y;
+                                    node.fixed = true;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Failed to load positions from storage:', e);
+                }
+            }
+            
+            savePositionsToStorage() {
+                try {
+                    const positions = {};
+                    for (const [nodeId, position] of this.nodePositions.entries()) {
+                        positions[nodeId] = {
+                            x: position.x,
+                            y: position.y,
+                            timestamp: position.timestamp || Date.now()
+                        };
+                    }
+                    localStorage.setItem('nodePositions', JSON.stringify(positions));
+                } catch (e) {
+                    console.warn('Failed to save positions to storage:', e);
+                }
+            }
+            
+            // ========== 控制功能 ==========
+            showAll() {
+                this.clearHighlight();
+                this.updateControlButtons('showAll');
+            }
+            
+            highlightCapital(capitalType) {
+                this.clearHighlight();
+                
+                const highlightedNodes = new Set([capitalType]);
+                const highlightedLinks = new Set();
+                
+                // 深度优先遍历，找到该资金类型的所有下游节点（包括个股）
+                const stack = [capitalType];
+                while (stack.length > 0) {
+                    const currentNodeId = stack.pop();
+                    
+                    this.links.forEach(link => {
+                        if (link.source === currentNodeId) {
+                            highlightedLinks.add(link.id);
+                            if (!highlightedNodes.has(link.target)) {
+                                highlightedNodes.add(link.target);
+                                stack.push(link.target);
+                            }
+                        }
+                    });
+                }
+                
+                this.viewState.highlightState = {
+                    highlightedNodes,
+                    highlightedLinks,
+                    active: true,
+                    type: 'capital-type'
+                };
+                
+                this.draw();
+                this.updateControlButtons(capitalType);
+                
+                // 显示路径详情
+                const capitalNode = this.getNodeById(capitalType);
+                this.showCapitalPathDetails(capitalNode, highlightedNodes.size - 1, highlightedLinks.size);
+            }
+            
+            highlightNodePath(nodeId) {
+                const highlightedNodes = new Set([nodeId]);
+                const highlightedLinks = new Set();
+                
+                // 找到节点的上游和直接下游
+                this.links.forEach(link => {
+                    if (link.source === nodeId || link.target === nodeId) {
+                        highlightedLinks.add(link.id);
+                        if (link.source === nodeId) highlightedNodes.add(link.target);
+                        if (link.target === nodeId) highlightedNodes.add(link.source);
+                    }
+                });
+                
+                this.viewState.highlightState = {
+                    highlightedNodes,
+                    highlightedLinks,
+                    active: true,
+                    type: 'node'
+                };
+                
+                // 显示节点详情
+                const node = this.getNodeById(nodeId);
+                this.showNodePathDetails(node, highlightedLinks.size);
+                
+                this.draw();
+            }
+            
+            clearHighlight() {
+                this.viewState.highlightState = {
+                    highlightedNodes: new Set(),
+                    highlightedLinks: new Set(),
+                    active: false,
+                    type: null
+                };
+                
+                // 清除路径详情
+                document.getElementById('pathDetails').innerHTML = '鼠标悬停在节点或连线上查看路径详情';
+                
+                this.draw();
+            }
+            
+            updateControlButtons(activeType) {
+                const buttons = document.querySelectorAll('.control-btn');
+                buttons.forEach(btn => btn.classList.remove('active'));
+                
+                if (activeType === 'showAll') {
+                    document.querySelector('.control-panel button:first-child').classList.add('active');
+                } else {
+                    // 找到对应按钮
+                    const buttonTexts = {
+                        'rush': '抢跑资金',
+                        'trial': '试错资金',
+                        'allin': '梭哈资金'
+                    };
+                    
+                    Array.from(buttons).forEach(btn => {
+                        if (btn.textContent === buttonTexts[activeType]) {
+                            btn.classList.add('active');
+                        }
+                    });
+                }
+            }
+            
+            toggleLabels() {
+                this.viewState.showLabels = !this.viewState.showLabels;
+                this.draw();
+                
+                // 更新按钮文本
+                const buttons = document.querySelectorAll('.control-btn');
+                Array.from(buttons).forEach(btn => {
+                    if (btn.textContent === '切换标签' || btn.textContent === '隐藏标签') {
+                        btn.textContent = this.viewState.showLabels ? '隐藏标签' : '切换标签';
+                    }
+                });
+            }
+            
+            resetPositions() {
+                if (confirm('确定要重置所有节点位置吗？')) {
+                    this.nodePositions.clear();
+                    localStorage.removeItem('nodePositions');
+                    
+                    // 恢复原始位置
+                    this.nodes.forEach((node, index) => {
+                        const originalNode = this.originalNodes[index];
+                        if (originalNode) {
+                            node.x = originalNode.x;
+                            node.y = originalNode.y;
+                            node.fixed = false;
+                        }
+                    });
+                    
+                    // 应用智能布局
+                    this.applySmartLayout();
+                    
+                    // 重置视图状态
+                    this.viewState.offsetX = 0;
+                    this.viewState.offsetY = 0;
+                    this.viewState.zoomLevel = 1;
+                    
+                    this.draw();
+                    this.drawRegions();
+                }
+            }
+            
+            // ========== 缩放功能 ==========
+            zoomIn() {
+                if (this.viewState.zoomLevel < this.viewState.maxZoom) {
+                    this.viewState.zoomLevel += this.viewState.zoomStep;
+                    this.applyZoom();
+                }
+            }
+            
+            zoomOut() {
+                if (this.viewState.zoomLevel > this.viewState.minZoom) {
+                    this.viewState.zoomLevel -= this.viewState.zoomStep;
+                    this.applyZoom();
+                }
+            }
+            
+            resetZoom() {
+                this.viewState.zoomLevel = 1;
+                this.applyZoom();
+            }
+            
+            applyZoom() {
+                // 调整偏移量以保持中心点不变
+                const centerX = this.canvas.width / 2;
+                const centerY = this.canvas.height / 2;
+                
+                this.viewState.offsetX = centerX - (centerX - this.viewState.offsetX) * this.viewState.zoomLevel;
+                this.viewState.offsetY = centerY - (centerY - this.viewState.offsetY) * this.viewState.zoomLevel;
+                
+                // 根据缩放级别调整密度
+                if (this.viewState.zoomLevel < 0.7 && this.currentDensity > 0) {
+                    this.currentDensity = Math.max(0, this.currentDensity - 1);
+                    document.getElementById('densitySlider').value = this.currentDensity;
+                    document.getElementById('densityValue').textContent = 
+                        this.densityLevels[this.currentDensity].name;
+                } else if (this.viewState.zoomLevel > 1.3 && this.currentDensity < 4) {
+                    this.currentDensity = Math.min(4, this.currentDensity + 1);
+                    document.getElementById('densitySlider').value = this.currentDensity;
+                    document.getElementById('densityValue').textContent = 
+                        this.densityLevels[this.currentDensity].name;
+                }
+                
+                this.draw();
+                this.drawRegions();
+            }
+            
+            // ========== 其他功能 ==========
+            updateStats() {
+                document.getElementById('nodeCount').textContent = this.nodes.length;
+                document.getElementById('linkCount').textContent = this.links.length;
+                const totalFlow = this.nodes.reduce((sum, node) => sum + Math.abs(node.value || 0), 0);
+                document.getElementById('totalFlow').textContent = totalFlow.toFixed(1);
+            }
+            
+            updateTopStocks() {
+                const stockNodes = this.nodes.filter(node =>
+                    ['emotion', 'core', 'other'].includes(node.category)
+                );
+                
+                // 按资金量排序
+                const topStocks = stockNodes
+                    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
+                    .slice(0, 5);
+                
+                const container = document.getElementById('topStocks');
+                container.innerHTML = '';
+                
+                topStocks.forEach((stock, index) => {
+                    const item = document.createElement('div');
+                    item.className = 'stock-item';
+                    item.innerHTML = `
+                        <div>
+                            <span style="color: ${stock.color}">${index + 1}.</span>
+                            <span style="margin-left: 3px;">${stock.name}</span>
+                        </div>
+                        <div style="text-align: right;">
+                            <div style="color: ${stock.value >= 0 ? '#52c41a' : '#ff4d4f'}; font-weight: ${Math.abs(stock.value) > 5 ? 'bold' : 'normal'}">
+                                ${stock.value >= 0 ? '+' : ''}${stock.value.toFixed(1)}亿
+                            </div>
+                            <div style="font-size: 8px; color: #aaa;">
+                                ${stock.gain >= 0 ? '+' : ''}${stock.gain?.toFixed(1) || '0.0'}%
+                            </div>
+                        </div>
+                    `;
+                    
+                    item.addEventListener('click', () => {
+                        this.highlightNodePath(stock.id);
+                    });
+                    
+                    container.appendChild(item);
+                });
+            }
+            
+            showCapitalPathDetails(capitalNode, connectedNodes, connectedLinks) {
+                const details = document.getElementById('pathDetails');
+                
+                details.innerHTML = `
+                    <div class="path-item" style="color: #d4af37;">💰 ${capitalNode.name}</div>
+                    <div class="path-item">总资金: <span style="color: #52c41a">${capitalNode.value.toFixed(1)}亿</span></div>
+                    <div class="path-item">影响节点: <span style="color: #ff6b6b">${connectedNodes}个</span></div>
+                    <div class="path-item">连接数量: <span style="color: #ff6b6b">${connectedLinks}条</span></div>
+                    <div class="path-item">路径深度: <span style="color: #3498db">直达个股</span></div>
+                `;
+            }
+            
+            showNodePathDetails(node, connectedLinks) {
+                const details = document.getElementById('pathDetails');
+                
+                let html = `<div class="path-item" style="color: #d4af37;">📈 ${node.name}</div>`;
+                
+                if (node.value !== undefined) {
+                    const valueColor = node.value >= 0 ? '#52c41a' : '#ff4d4f';
+                    html += `<div class="path-item">资金量: <span style="color: ${valueColor}">${node.value.toFixed(2)}亿</span></div>`;
+                }
+                
+                if (node.gain !== undefined) {
+                    const gainColor = node.gain >= 0 ? '#52c41a' : '#ff4d4f';
+                    html += `<div class="path-item">涨跌幅: <span style="color: ${gainColor}">${node.gain >= 0 ? '+' : ''}${node.gain.toFixed(2)}%</span></div>`;
+                }
+                
+                if (node.volume !== undefined) {
+                    html += `<div class="path-item">成交量: <span style="color: #aaa">${node.volume}万手</span></div>`;
+                }
+                
+                if (node.themeName) {
+                    html += `<div class="path-item">题材: <span style="color: #3498db">${node.themeName}</span></div>`;
+                }
+                
+                html += `<div class="path-item">连接数量: <span style="color: #ff6b6b">${connectedLinks}条</span></div>`;
+                
+                details.innerHTML = html;
+            }
+            
+            exportImage() {
+                // 创建一个临时canvas用于导出
+                const tempCanvas = document.createElement('canvas');
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                // 设置临时canvas大小
+                tempCanvas.width = this.canvas.width * 2;
+                tempCanvas.height = this.canvas.height * 2;
+                
+                // 绘制背景
+                tempCtx.fillStyle = '#1a1a2e';
+                tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+                
+                // 保存当前状态
+                const originalZoom = this.viewState.zoomLevel;
+                const originalOffsetX = this.viewState.offsetX;
+                const originalOffsetY = this.viewState.offsetY;
+                const originalShowLabels = this.viewState.showLabels;
+                
+                // 临时设置为适合导出的状态
+                this.viewState.zoomLevel = 1;
+                this.viewState.offsetX = 0;
+                this.viewState.offsetY = 0;
+                this.viewState.showLabels = true;
+                
+                // 重新绘制到临时canvas
+                this.drawToCanvas(tempCtx, tempCanvas.width, tempCanvas.height);
+                
+                // 恢复状态
+                this.viewState.zoomLevel = originalZoom;
+                this.viewState.offsetX = originalOffsetX;
+                this.viewState.offsetY = originalOffsetY;
+                this.viewState.showLabels = originalShowLabels;
+                
+                // 导出图片
+                const link = document.createElement('a');
+                link.href = tempCanvas.toDataURL('image/png');
+                link.download = '资金流向图.png';
+                link.click();
+                
+                // 重新绘制主canvas
+                this.draw();
+            }
+            
+            drawToCanvas(ctx, width, height) {
+                // 清除画布
+                ctx.clearRect(0, 0, width, height);
+                
+                // 绘制连接线
+                this.links.forEach(link => {
+                    const sourceNode = this.getNodeById(link.source);
+                    const targetNode = this.getNodeById(link.target);
+                    
+                    if (!sourceNode || !targetNode) return;
+                    
+                    const sourceX = sourceNode.x * width;
+                    const sourceY = sourceNode.y * height;
+                    const targetX = targetNode.x * width;
+                    const targetY = targetNode.y * height;
+                    
+                    // 设置线条样式
+                    ctx.beginPath();
+                    ctx.moveTo(sourceX, sourceY);
+                    ctx.lineTo(targetX, targetY);
+                    
+                    ctx.strokeStyle = link.color;
+                    ctx.lineWidth = link.width || 1;
+                    ctx.globalAlpha = link.opacity || 0.6;
+                    ctx.stroke();
+                    
+                    // 绘制箭头
+                    this.drawArrowToCanvas(ctx, sourceX, sourceY, targetX, targetY, link.color, link.width || 1);
+                    
+                    // 恢复全局透明度
+                    ctx.globalAlpha = 1.0;
+                });
+                
+                // 绘制节点
+                this.nodes.forEach(node => {
+                    const x = node.x * width;
+                    const y = node.y * height;
+                    const size = this.calculateNodeSize(node.value);
+                    
+                    // 设置节点样式
+                    ctx.beginPath();
+                    ctx.arc(x, y, size, 0, Math.PI * 2);
+                    
+                    // 填充颜色
+                    ctx.fillStyle = node.color;
+                    ctx.fill();
+                    
+                    // 边框
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = node.value > 5 ? 2 : 1;
+                    ctx.stroke();
+                    
+                    // 绘制标签
+                    this.drawNodeLabelToCanvas(ctx, node, x, y, width, height);
+                });
+            }
+            
+            drawArrowToCanvas(ctx, sourceX, sourceY, targetX, targetY, color, lineWidth) {
+                // 计算箭头方向
+                const angle = Math.atan2(targetY - sourceY, targetX - sourceX);
+                const arrowLength = 8;
+                
+                // 箭头点
+                const arrowX = targetX - Math.cos(angle) * 5;
+                const arrowY = targetY - Math.sin(angle) * 5;
+                
+                // 绘制箭头
+                ctx.save();
+                ctx.translate(arrowX, arrowY);
+                ctx.rotate(angle);
+                
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(-arrowLength, arrowLength / 2);
+                ctx.lineTo(-arrowLength, -arrowLength / 2);
+                ctx.closePath();
+                
+                ctx.fillStyle = color;
+                ctx.fill();
+                
+                ctx.restore();
+            }
+            
+            drawNodeLabelToCanvas(ctx, node, x, y, width, height) {
+                const fontSize = 10;
+                ctx.font = `${fontSize}px 'Microsoft YaHei', sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                
+                let labelText = node.name;
+                if (node.category === 'emotion' && node.floor) {
+                    labelText += `\n${node.floor}板`;
+                } else if ((node.category === 'core' || node.category === 'other') && node.gain !== undefined) {
+                    const gainSymbol = node.gain >= 0 ? '+' : '';
+                    labelText += `\n${gainSymbol}${node.gain.toFixed(1)}%`;
+                } else if (labelText.length > 4) {
+                    labelText = labelText.substring(0, 4) + '...';
+                }
+                
+                const lines = labelText.split('\n');
+                const lineHeight = fontSize * 1.2;
+                const totalHeight = lines.length * lineHeight;
+                
+                // 绘制标签背景
+                const maxLineWidth = Math.max(...lines.map(line => ctx.measureText(line).width));
+                const padding = 3;
+                
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(
+                    x - maxLineWidth / 2 - padding,
+                    y - totalHeight / 2 - padding,
+                    maxLineWidth + padding * 2,
+                    totalHeight + padding * 2
+                );
+                
+                // 绘制标签文本
+                ctx.fillStyle = '#fff';
+                lines.forEach((line, index) => {
+                    ctx.fillText(
+                        line,
+                        x,
+                        y - totalHeight / 2 + lineHeight * (index + 0.5)
+                    );
+                });
+            }
+            
+            // ========== 区域分隔绘制 ==========
+            drawRegions() {
+                const container = document.getElementById('regionContainer');
+                container.innerHTML = '';
+                
+                // 应用缩放变换
+                container.style.transform = `scale(${this.viewState.zoomLevel})`;
+                
+                // 定义区域
+                const regions = [
+                    {
+                        name: '资金区',
+                        left: '3%', width: '7%', top: '10%', bottom: '90%'
+                    },
+                    {
+                        name: '题材区',
+                        left: '11%', width: '28%', top: '5%', bottom: '95%'
+                    },
+                    {
+                        name: '情绪区',
+                        left: '50%', width: '45%', top: '5%', bottom: '55%'
+                    },
+                    {
+                        name: '核心股',
+                        left: '50%', width: '20%', top: '56%', bottom: '95%'
+                    },
+                    {
+                        name: '其他股',
+                        left: '75%', width: '20%', top: '56%', bottom: '95%'
+                }
+                ];
+                
+                // 绘制主区域
+                regions.forEach(region => {
+                    const regionDiv = document.createElement('div');
+                    regionDiv.className = 'region';
+                    regionDiv.style.left = region.left;
+                    regionDiv.style.width = region.width;
+                    regionDiv.style.top = region.top;
+                    regionDiv.style.height = `calc(${region.bottom} - ${region.top})`;
+                    container.appendChild(regionDiv);
+                    
+                    // 区域标签
+                    const label = document.createElement('div');
+                    label.className = 'region-label';
+                    label.style.left = `calc(${region.left} + 5px)`;
+                    label.style.top = region.top;
+                    label.textContent = region.name;
+                    container.appendChild(label);
+                });
+                
+                // 绘制情绪区分层线
+                const emotionFloors = [
+                    { floor: 1, top: '5%', height: '15%', rows: 12 },
+                    { floor: 2, top: '21%', height: '15%', rows: 12 },
+                    { floor: 3, top: '37%', height: '9%', rows: 6 },
+                    { floor: 4, top: '47%', height: '5%', rows: 5 },
+                    { floor: 5, top: '53%', height: '3%', rows: 3 }
+                ];
+                
+                emotionFloors.forEach(floor => {
+                    // 分层线
+                    const floorLine = document.createElement('div');
+                    floorLine.className = 'emotion-floor';
+                    floorLine.style.top = `calc(${floor.top} + ${floor.height})`;
+                    container.appendChild(floorLine);
+                    
+                    // 分层标签
+                    const floorLabel = document.createElement('div');
+                    floorLabel.className = 'floor-label';
+                    floorLabel.style.top = `calc(${floor.top} + ${floor.height} / 2)`;
+                    floorLabel.style.left = '49%';
+                    floorLabel.textContent = `${floor.floor}板`;
+                    container.appendChild(floorLabel);
+                });
+            }
+        }
+        
+        // 初始化图表管理器
+        let graphManager;
+        
+        window.addEventListener('load', () => {
+            graphManager = new GraphManager();
+            console.log('提示: 按 Ctrl+R 可以重置所有节点位置');
+            console.log('提示: 使用左侧密度控制滑块调整节点密度');
+        });
+    </script>
+</body>
+</html>

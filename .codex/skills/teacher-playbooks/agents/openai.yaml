@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Teacher Playbooks
+  description: Teacher notes, strategy families, and case archives from strategy_archive.
+  prompt_hint: Use this skill to map teacher notes into market rules, families, triggers, vetoes, and recap explanations.

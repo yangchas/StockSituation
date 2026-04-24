@@ -59,10 +59,7 @@ class StockBreakoutAnalyzer:
             try:
                 data.index = pd.to_datetime(data.index)
             except:
-                # 修复时间戳运算兼容性问题
-                end_date = pd.Timestamp.now()
-                start_date = end_date - pd.Timedelta(days=len(data)-1)
-                data.index = pd.date_range(start=start_date, end=end_date, freq='D')
+                data.index = pd.date_range(end=pd.Timestamp.now(), periods=len(data), freq='D')
         
         data = data.sort_index()
         
@@ -814,7 +811,7 @@ class StockBreakoutAnalyzer:
                            days_to_analyze: int = 30,
                            min_breakout_pct: float = 3.0) -> Dict:
         """
-        分析突破 V5
+        分析突破 V5 - 添加横盘突破检测
         """
         print(f"🔍 分析最近{days_to_analyze}天的突破V5...")
         
@@ -831,6 +828,9 @@ class StockBreakoutAnalyzer:
         big_up_days = []
         valid_breakout_days = []
         
+        # 横盘区
+        horizontal_zones = self.detect_horizontal_zones(lookback_days=days_to_analyze)
+        
         for i in range(1, len(recent_data)):
             date = recent_data.index[i]
             close = recent_data['close'].iloc[i]
@@ -842,7 +842,13 @@ class StockBreakoutAnalyzer:
             daily_change = (close - prev_close) / prev_close * 100
             is_big_up = daily_change > 3.0
             
-            if is_big_up:
+            # 检查横盘突破
+            broken_horizontal = []
+            for zone in horizontal_zones:
+                if close > zone['high'] and date > zone['end']:
+                    broken_horizontal.append(zone)
+            
+            if is_big_up or broken_horizontal:
                 if i >= 10:
                     avg_volume = recent_data['turnover'].iloc[max(0, i-10):i].mean()
                     volume_ratio = volume / avg_volume if avg_volume > 0 else 1
@@ -866,7 +872,8 @@ class StockBreakoutAnalyzer:
                     'volume_ratio': volume_ratio,
                     'amplitude_pct': amplitude,
                     'broken_clusters': broken_clusters,
-                    'is_breakout': len(broken_clusters) > 0,
+                    'broken_horizontal': broken_horizontal,
+                    'is_breakout': len(broken_clusters) > 0 or len(broken_horizontal) > 0,
                     'is_valid_breakout': False
                 }
                 
@@ -1426,7 +1433,7 @@ class StockBreakoutAnalyzer:
         
         report += "\n买卖预案（基于近点位）:\n"
         if near_pressure < float('inf'):
-            report += f" - 若强势突破{near_pressure:.2f}，可买入，目标远压力\n"
+            report += f" - 若突破近压力{near_pressure:.2f}，买入，目标远压力\n"
         if near_support > 0:
             report += f" - 若跌破{near_support:.2f}，变盘卖出，止损\n"
         else:
@@ -1572,7 +1579,7 @@ def update_stock_data(analyzer, stock_code='300433', realtime=False):
     
     try:
         # 获取最新数据（默认获取最近30天）
-        new_data = get_real_stock_data(stock_code, days=100, realtime=realtime)
+        new_data = get_real_stock_data(stock_code, days=30, realtime=realtime)
         
         # 更新分析器数据
         analyzer.data = new_data
@@ -1904,3 +1911,4 @@ def main():
     print("6. 实时数据: python StockBreakoutAnalyzer.py -r")
 if __name__ == "__main__":
     main()
+

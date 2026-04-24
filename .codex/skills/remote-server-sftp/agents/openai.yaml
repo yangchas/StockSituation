@@ -1,0 +1,2 @@
+name: remote-server-sftp
+description: Remote server execution and SFTP-aware sync workflow for the Go project.

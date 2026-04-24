@@ -1,0 +1,5 @@
+version: 1
+interface:
+  display_name: Psychology Library
+  description: Trading psychology, behavioral finance, herd behavior, and bias references.
+  prompt_hint: Use this skill to interpret trader behavior and crowd dynamics with classic sources.

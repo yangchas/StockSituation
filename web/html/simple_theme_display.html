@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>简单中文题材展示</title>
+    <style>
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .theme-container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .theme-item {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        .theme-name {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #2c3e50;
+            margin-bottom: 15px;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .stock-list {
+            list-style: none;
+            padding: 0;
+        }
+        .stock-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            margin-bottom: 8px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .stock-info {
+            display: flex;
+            flex-direction: column;
+        }
+        .stock-code {
+            font-weight: bold;
+            color: #333;
+        }
+        .stock-name {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        .stock-change {
+            font-weight: bold;
+            color: #e74c3c;
+        }
+        .stock-change.positive {
+            color: #27ae60;
+        }
+        .no-data {
+            text-align: center;
+            color: #666;
+            font-size: 1.2rem;
+            padding: 50px;
+        }
+    </style>
+</head>
+<body>
+    <h1>📈 中文题材展示</h1>
+    <div class="theme-container">
+        <div id="loading">加载中...</div>
+        <div id="content"></div>
+    </div>
+
+    <script>
+        async function loadData() {
+            const loading = document.getElementById('loading');
+            const content = document.getElementById('content');
+
+            try {
+                const response = await fetch('/api/other_stocks?min_speed=0.0&min_amount=0.0&min_change=0.0');
+                const data = await response.json();
+
+                loading.style.display = 'none';
+
+                if (data.theme_groups && Object.keys(data.theme_groups).length > 0) {
+                    const themes = Object.entries(data.theme_groups);
+                    themes.sort(([nameA], [nameB]) => nameA.localeCompare(nameB, 'zh-CN'));
+
+                    themes.forEach(([themeName, stockCodes]) => {
+                        const themeItem = document.createElement('div');
+                        themeItem.className = 'theme-item';
+
+                        const themeNameElement = document.createElement('div');
+                        themeNameElement.className = 'theme-name';
+                        themeNameElement.textContent = themeName;
+
+                        const stockList = document.createElement('ul');
+                        stockList.className = 'stock-list';
+
+                        stockCodes.forEach(code => {
+                            const stock = data.stocks.find(s => s.code === code);
+                            if (stock) {
+                                const stockItem = document.createElement('li');
+                                stockItem.className = 'stock-item';
+
+                                const stockInfo = document.createElement('div');
+                                stockInfo.className = 'stock-info';
+
+                                const stockCode = document.createElement('div');
+                                stockCode.className = 'stock-code';
+                                stockCode.textContent = stock.code;
+
+                                const stockName = document.createElement('div');
+                                stockName.className = 'stock-name';
+                                stockName.textContent = stock.name;
+
+                                stockInfo.appendChild(stockCode);
+                                stockInfo.appendChild(stockName);
+
+                                const stockChange = document.createElement('div');
+                                stockChange.className = `stock-change ${stock.change_pct > 0 ? 'positive' : ''}`;
+                                stockChange.textContent = `${stock.change_pct > 0 ? '+' : ''}${stock.change_pct.toFixed(2)}%`;
+
+                                stockItem.appendChild(stockInfo);
+                                stockItem.appendChild(stockChange);
+                                stockList.appendChild(stockItem);
+                            }
+                        });
+
+                        themeItem.appendChild(themeNameElement);
+                        themeItem.appendChild(stockList);
+                        content.appendChild(themeItem);
+                    });
+                } else {
+                    content.innerHTML = '<div class="no-data">暂无数据</div>';
+                }
+            } catch (error) {
+                loading.style.display = 'none';
+                content.innerHTML = `<div class="no-data">加载失败: ${error.message}</div>`;
+                console.error('Error:', error);
+            }
+        }
+
+        window.onload = loadData;
+    </script>
+</body>
+</html>

@@ -504,34 +504,33 @@ class LimitUpDailyUpdater:
         self.wencai_first_limit_cache_prefix = "cache:wencai:first_limit:"  # + YYYY-MM-DD
         self.wencai_meta_cache_prefix = "cache:wencai:meta:"  # + YYYY-MM-DD
     
-    def has_previous_trade_day_data(self):
+    def has_latest_trade_day_data(self):
         """
-        检查数据库是否有上一个交易日的连板数据
+        检查数据库是否有最近一个交易日的连板数据 (如果今天是交易日且已收盘，检查今天)
         
         Returns:
             bool: 如果有数据返回True，否则返回False
         """
         try:
-            # 获取上一个交易日
-            prev_day = self.calendar.get_previous_trade_day()
-            if not prev_day:
-                logger.error("❌ 无法获取上一个交易日")
+            # 获取最近一个交易日 (针对盘后逻辑优化)
+            latest_day = self.calendar.get_latest_trade_day()
+            if not latest_day:
+                logger.error("❌ 无法获取最近交易日")
                 return False
             
-            logger.info(f"🔍 检查上一个交易日 [{prev_day}] 的连板数据是否存在")
+            logger.info(f"🔍 检查最近交易日 [{latest_day}] 的连板数据是否存在")
             
             # 先检查Redis缓存
-            cache_key = f"limit_up_{prev_day}"
+            cache_key = f"limit_up_{latest_day}"
             cached_data = self.redis_storage.get_data(cache_key)
-            #print(cached_data)
             if cached_data:
-                logger.info(f"✅ Redis缓存中存在上一个交易日 [{prev_day}] 的连板数据")
+                logger.info(f"✅ Redis缓存中存在最近交易日 [{latest_day}] 的连板数据")
                 return True
             
             # 再检查TDEngine数据库
-            db_data = self.td_storage.query_limit_up_by_date(prev_day)
+            db_data = self.td_storage.query_limit_up_by_date(latest_day)
             if db_data and len(db_data) > 0:
-                logger.info(f"✅ TDEngine数据库中存在上一个交易日 [{prev_day}] 的连板数据")
+                logger.info(f"✅ TDEngine数据库中存在最近交易日 [{latest_day}] 的连板数据")
                 # 缓存到Redis
                 self.redis_storage.store_data(
                     cache_key, 
@@ -541,11 +540,11 @@ class LimitUpDailyUpdater:
                 return True
             
             # 如果没有数据，直接返回False
-            logger.warning(f"⚠️ 未找到上一个交易日 [{prev_day}] 的连板数据")
+            logger.warning(f"⚠️ 未找到最近交易日 [{latest_day}] 的连板数据")
             return False
             
         except Exception as e:
-            logger.error(f"❌ 检查上一个交易日数据失败: {e}")
+            logger.error(f"❌ 检查最近交易日数据失败: {e}")
             return False
     
     async def update_wencai_baseline_today(self, timeout_sec: int = 25, expire_seconds: int = 86400) -> bool:
@@ -632,22 +631,47 @@ class LimitUpDailyUpdater:
             logger.warning(f"⚠️ 问财baseline刷新失败: {today}, {e}")
             return False
 
-    def update_previous_trade_day(self):
-        """更新上一个交易日的连板数据"""
+    def sync_kaipanla_plates(self):
+        """独立的开盘啦板块同步方法 — 可在启动时和每日19:30独立调用"""
         try:
-            # 获取上一个交易日
-            prev_day = self.calendar.get_previous_trade_day()
-            if not prev_day:
-                logger.error("❌ 无法获取上一个交易日")
+            from services.kaipanla_plate_sync import KaipanlaPlateSync
+            sync_service = KaipanlaPlateSync()
+            
+            # 1. 增量同步昨日涨停数据 (日常维护，耗时极短)
+            logger.info("执行开盘啦昨日涨停原因增量同步...")
+            sync_service.sync_recent_plates(days=1)
+            
+            # 2. 仅在初始启动或映射缺失时执行全量同步 (支持断点续传)
+            full_sync_info = self.redis_storage.redis.get("config:plate_mapping:full_sync_info")
+            s2p_count = self.redis_storage.redis.hlen("config:plate_mapping:s2p")
+            
+            if not full_sync_info or s2p_count < 4500:
+                logger.info(f"检测到板块映射库不完善 (当前量: {s2p_count})，继续执行增量式全量更新...")
+                sync_service.sync_all_stocks_ban_reasons()
+            
+            logger.info("开盘啦数据同步任务处理完成")
+        except Exception as e:
+            logger.error(f"开盘啦同步失败: {e}")
+
+    def update_latest_trade_day_data(self):
+        """更新最近交易日的连板数据 (如果今天是交易日且已收盘，更新今天)"""
+        try:
+            # 获取最近一个交易日 (针对盘后逻辑优化)
+            latest_day = self.calendar.get_latest_trade_day()
+            if not latest_day:
+                logger.error("❌ 无法获取最近交易日")
                 return
             
-            logger.info(f"📅 开始更新交易日: {prev_day}")
+            # 每次更新连板数据时同步开盘啦概念
+            self.sync_kaipanla_plates()
+            
+            logger.info(f"📅 开始更新交易日: {latest_day}")
             
             # 获取所有连板数据
             all_limit_up = []
             for ban_type in ["1", "2", "3", "4", "5"]:
                 data = self.ztb_service.get_ztb_data(
-                    date_str=prev_day.replace('-', ''), 
+                    date_str=latest_day.replace('-', ''), 
                     ban_type=ban_type, 
                     count="200"
                 )
@@ -659,14 +683,14 @@ class LimitUpDailyUpdater:
                     logger.info(f"📊 {ban_type}板无数据, 累计: {len(all_limit_up)}条")
             
             if not all_limit_up:
-                logger.warning(f"⚠️ 未获取到连板数据: {prev_day}")
+                logger.warning(f"⚠️ 未获取到连板数据: {latest_day}")
                 return
             # 存储到TDEngine
-            self.td_storage.store_limit_up_data(prev_day, all_limit_up)
+            self.td_storage.store_limit_up_data(latest_day, all_limit_up)
             
             
             # 缓存到Redis（供快速访问）
-            cache_key = f"limit_up_{prev_day}"
+            cache_key = f"limit_up_{latest_day}"
             self.redis_storage.store_data(
                 cache_key, 
                 all_limit_up, 
@@ -674,9 +698,9 @@ class LimitUpDailyUpdater:
             )
             
             # 更新统计信息
-            self._update_daily_stats(prev_day, all_limit_up)
+            self._update_daily_stats(latest_day, all_limit_up)
             
-            logger.info(f"✅ 连板数据更新完成: {prev_day}, 数量: {len(all_limit_up)}")
+            logger.info(f"✅ 连板数据更新完成: {latest_day}, 数量: {len(all_limit_up)}")
             
         except Exception as e:
             logger.error(f"❌ 更新连板数据失败: {e}")
@@ -739,10 +763,10 @@ class LimitUpDailyUpdater:
     
     def start_daily_update_scheduler(self):
         """启动每日定时更新"""
-        # 每天下午 18:00 更新前一天的连板数据
-        schedule.every().day.at("18:00").do(self.update_previous_trade_day)
+        # 每天下午 19:30 更新最近交易日的连板数据 (避开 16:00 开始的筹码批算)
+        schedule.every().day.at("19:30").do(self.update_latest_trade_day_data)
         
-        logger.info("⏰ 每日连板数据更新调度器已启动 (18:00)")
+        logger.info("⏰ 每日连板数据更新调度器已启动 (19:30)")
         
         # 运行调度器
         while True:

@@ -5,6 +5,28 @@ from engine_next.domain.models import IntradayContext
 from engine_next.runtime.intraday_context_builder import PrimedIntradayRuntimeState
 
 
+def render_quote_freshness_line(
+    primed_runtime_state: PrimedIntradayRuntimeState | None,
+    *,
+    symbol_count: int,
+) -> str | None:
+    if primed_runtime_state is None:
+        return None
+
+    latest = primed_runtime_state.latest_quote_time or "-"
+    latest_age = primed_runtime_state.latest_quote_age_seconds
+    lag = "-" if latest_age is None else f"{latest_age}s"
+    return (
+        "quote_freshness "
+        f"| fresh={primed_runtime_state.quote_fresh_count}/{symbol_count} "
+        f"| stale={primed_runtime_state.quote_stale_count} "
+        f"| missing={primed_runtime_state.quote_missing_count} "
+        f"| latest={latest} "
+        f"| lag={lag} "
+        f"| tol={primed_runtime_state.quote_stale_threshold_seconds}s"
+    )
+
+
 class LivePhaseSummaryRenderer:
     """Builds operator-facing runtime summaries per phase."""
 
@@ -28,16 +50,25 @@ class LivePhaseSummaryRenderer:
         quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
         rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
         coverage_ratio = (quote_count / symbol_count) if symbol_count else 0.0
+        fresh_line = render_quote_freshness_line(
+            primed_runtime_state,
+            symbol_count=symbol_count,
+        )
 
         header = (
             f"runtime_readiness={runtime_readiness_label} "
             f"| quotes={quote_count}/{symbol_count} "
             f"| rust={rust_count}"
         )
-        coverage = f"runtime_coverage={coverage_ratio:.1%} | snapshots={len(intraday_context.stock_snapshots)}"
+        quote_fresh_ratio = primed_runtime_state.quote_fresh_ratio if primed_runtime_state is not None else 0.0
+        coverage = (
+            f"runtime_coverage={coverage_ratio:.1%} "
+            f"| quote_fresh={quote_fresh_ratio:.1%} "
+            f"| snapshots={len(intraday_context.stock_snapshots)}"
+        )
 
         if phase == RunPhase.AUCTION:
-            return (
+            lines = [
                 header,
                 (
                     f"auction_focus | top_plate={market_summary.top_plate_name or '-'} "
@@ -51,11 +82,14 @@ class LivePhaseSummaryRenderer:
                     f"| promotion={market_summary.promotion_rate:.1%} "
                     f"| battle={market_summary.battle_status or '-'}"
                 ),
-                coverage,
-            )
+            ]
+            if fresh_line:
+                lines.append(fresh_line)
+            lines.append(coverage)
+            return tuple(lines)
 
         if phase == RunPhase.POSTMARKET:
-            return (
+            lines = [
                 header,
                 (
                     f"settlement_wait | top_plate={market_summary.top_plate_name or '-'} "
@@ -67,10 +101,13 @@ class LivePhaseSummaryRenderer:
                     f"| promotion={market_summary.promotion_rate:.1%} "
                     f"| headshot={market_summary.headshot_rate:.1%}"
                 ),
-                coverage,
-            )
+            ]
+            if fresh_line:
+                lines.append(fresh_line)
+            lines.append(coverage)
+            return tuple(lines)
 
-        return (
+        lines = [
             header,
             (
                 f"market_pulse | top_plate={market_summary.top_plate_name or '-'} "
@@ -84,5 +121,8 @@ class LivePhaseSummaryRenderer:
                 f"| red_open={market_summary.red_open_rate:.1%} "
                 f"| headshot={market_summary.headshot_rate:.1%}"
             ),
-            coverage,
-        )
+        ]
+        if fresh_line:
+            lines.append(fresh_line)
+        lines.append(coverage)
+        return tuple(lines)

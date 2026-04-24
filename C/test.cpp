@@ -908,12 +908,7 @@ public:
             current_tick.inst_amt = current_tick.amount - state.prev_tick.amount;
             current_tick.large_net = state.prev_tick.large_net;
             // 计算大单净额
-            // calculateLargeOrder(current_tick, state);
-            // if (is_auction_period) {
-            //     calculateAuctionLargeOrder(current_tick, state);
-            // } else {
-            calculateTradeLargeOrder(current_tick, state);
-            // }
+            calculateLargeOrder(current_tick, state);
         } else {
             current_tick.inst_vol = 0;
             current_tick.inst_amt = 0;
@@ -958,7 +953,6 @@ public:
     }
     
 private:
-
 //     bool tryLoadPreviousTickFromTDengine(const StockData& current_tick, StockTickState& state) {
 //     try {
 //         // 直接创建TDengineConnection对象
@@ -1092,120 +1086,111 @@ private:
 //     }
 // }
 
-    // 修改后的解析函数，添加字段信息参数
-    StockData parseTDRowToStockData(TAOS_ROW row, int num_fields, TAOS_FIELD* fields) {
-        StockData data;
-        
-        if (!row || !fields) {
-            return data;
-        }
-        
-        for (int i = 0; i < num_fields; i++) {
-            if (row[i] == NULL) continue;
-            
-            std::string field_name = fields[i].name;
-            
-            // 安全地解析每个字段
-            try {
-                if (field_name == "symbol") {
-                    data.symbol = std::string((char*)row[i]);
-                }
-                else if (field_name == "ts") {
-                    // 解析时间戳，TDengine返回的是Unix时间戳（毫秒）
-                    data.timestamp = *((int64_t*)row[i]);
-                }
-                else if (field_name == "lp") {
-                    data.last_price = *((double*)row[i]);
-                }
-                else if (field_name == "o") {
-                    data.open = *((double*)row[i]);
-                }
-                else if (field_name == "h") {
-                    data.high = *((double*)row[i]);
-                }
-                else if (field_name == "l") {
-                    data.low = *((double*)row[i]);
-                }
-                else if (field_name == "lc") {
-                    data.close = *((double*)row[i]);
-                }
-                else if (field_name == "a") {
-                    data.amount = *((double*)row[i]);
-                }
-                else if (field_name == "v") {
-                    data.volume = *((int64_t*)row[i]);
-                }
-                else if (field_name == "ap1") { data.ask_prices[0] = *((double*)row[i]); }
-                else if (field_name == "ap2") { data.ask_prices[1] = *((double*)row[i]); }
-                else if (field_name == "ap3") { data.ask_prices[2] = *((double*)row[i]); }
-                else if (field_name == "ap4") { data.ask_prices[3] = *((double*)row[i]); }
-                else if (field_name == "ap5") { data.ask_prices[4] = *((double*)row[i]); }
-                else if (field_name == "bp1") { data.bid_prices[0] = *((double*)row[i]); }
-                else if (field_name == "bp2") { data.bid_prices[1] = *((double*)row[i]); }
-                else if (field_name == "bp3") { data.bid_prices[2] = *((double*)row[i]); }
-                else if (field_name == "bp4") { data.bid_prices[3] = *((double*)row[i]); }
-                else if (field_name == "bp5") { data.bid_prices[4] = *((double*)row[i]); }
-                else if (field_name == "av1") { data.ask_volumes[0] = *((int64_t*)row[i]); }
-                else if (field_name == "av2") { data.ask_volumes[1] = *((int64_t*)row[i]); }
-                else if (field_name == "av3") { data.ask_volumes[2] = *((int64_t*)row[i]); }
-                else if (field_name == "av4") { data.ask_volumes[3] = *((int64_t*)row[i]); }
-                else if (field_name == "av5") { data.ask_volumes[4] = *((int64_t*)row[i]); }
-                else if (field_name == "bv1") { data.bid_volumes[0] = *((int64_t*)row[i]); }
-                else if (field_name == "bv2") { data.bid_volumes[1] = *((int64_t*)row[i]); }
-                else if (field_name == "bv3") { data.bid_volumes[2] = *((int64_t*)row[i]); }
-                else if (field_name == "bv4") { data.bid_volumes[3] = *((int64_t*)row[i]); }
-                else if (field_name == "bv5") { data.bid_volumes[4] = *((int64_t*)row[i]); }
-                else if (field_name == "inst_vol") { data.inst_vol = *((double*)row[i]); }
-                else if (field_name == "inst_amt") { data.inst_amt = *((double*)row[i]); }
-                else if (field_name == "large_net") { data.large_net = *((double*)row[i]); }
-            } catch (const std::exception& e) {
-                // 忽略单个字段解析错误，继续处理其他字段
-                if (global_logger) {
-                    global_logger->warn("Failed to parse field " + field_name + ": " + std::string(e.what()));
-                }
-            }
-        }
-        
+// 修改后的解析函数，添加字段信息参数
+StockData parseTDRowToStockData(TAOS_ROW row, int num_fields, TAOS_FIELD* fields) {
+    StockData data;
+    
+    if (!row || !fields) {
         return data;
     }
-    void calculateAuctionLargeOrder(StockData& current_tick, StockTickState& state) {
-        double delta_bid = current_tick.bid_volumes[0] + current_tick.bid_volumes[1] - state.prev_tick.volume; // 简例，实际调整
-        double instant_amount = delta_bid * current_tick.last_price * 100;
-        if (std::abs(instant_amount) > large_order_threshold_) {
-            current_tick.large_net = (delta_bid > 0) ? instant_amount : -instant_amount;
-            state.cumulative_large_net += current_tick.large_net;
-        } else {
-            current_tick.large_net = 0;
+    
+    for (int i = 0; i < num_fields; i++) {
+        if (row[i] == NULL) continue;
+        
+        std::string field_name = fields[i].name;
+        
+        // 安全地解析每个字段
+        try {
+            if (field_name == "symbol") {
+                data.symbol = std::string((char*)row[i]);
+            }
+            else if (field_name == "ts") {
+                // 解析时间戳，TDengine返回的是Unix时间戳（毫秒）
+                data.timestamp = *((int64_t*)row[i]);
+            }
+            else if (field_name == "lp") {
+                data.last_price = *((double*)row[i]);
+            }
+            else if (field_name == "o") {
+                data.open = *((double*)row[i]);
+            }
+            else if (field_name == "h") {
+                data.high = *((double*)row[i]);
+            }
+            else if (field_name == "l") {
+                data.low = *((double*)row[i]);
+            }
+            else if (field_name == "lc") {
+                data.close = *((double*)row[i]);
+            }
+            else if (field_name == "a") {
+                data.amount = *((double*)row[i]);
+            }
+            else if (field_name == "v") {
+                data.volume = *((int64_t*)row[i]);
+            }
+            else if (field_name == "ap1") { data.ask_prices[0] = *((double*)row[i]); }
+            else if (field_name == "ap2") { data.ask_prices[1] = *((double*)row[i]); }
+            else if (field_name == "ap3") { data.ask_prices[2] = *((double*)row[i]); }
+            else if (field_name == "ap4") { data.ask_prices[3] = *((double*)row[i]); }
+            else if (field_name == "ap5") { data.ask_prices[4] = *((double*)row[i]); }
+            else if (field_name == "bp1") { data.bid_prices[0] = *((double*)row[i]); }
+            else if (field_name == "bp2") { data.bid_prices[1] = *((double*)row[i]); }
+            else if (field_name == "bp3") { data.bid_prices[2] = *((double*)row[i]); }
+            else if (field_name == "bp4") { data.bid_prices[3] = *((double*)row[i]); }
+            else if (field_name == "bp5") { data.bid_prices[4] = *((double*)row[i]); }
+            else if (field_name == "av1") { data.ask_volumes[0] = *((int64_t*)row[i]); }
+            else if (field_name == "av2") { data.ask_volumes[1] = *((int64_t*)row[i]); }
+            else if (field_name == "av3") { data.ask_volumes[2] = *((int64_t*)row[i]); }
+            else if (field_name == "av4") { data.ask_volumes[3] = *((int64_t*)row[i]); }
+            else if (field_name == "av5") { data.ask_volumes[4] = *((int64_t*)row[i]); }
+            else if (field_name == "bv1") { data.bid_volumes[0] = *((int64_t*)row[i]); }
+            else if (field_name == "bv2") { data.bid_volumes[1] = *((int64_t*)row[i]); }
+            else if (field_name == "bv3") { data.bid_volumes[2] = *((int64_t*)row[i]); }
+            else if (field_name == "bv4") { data.bid_volumes[3] = *((int64_t*)row[i]); }
+            else if (field_name == "bv5") { data.bid_volumes[4] = *((int64_t*)row[i]); }
+            else if (field_name == "inst_vol") { data.inst_vol = *((double*)row[i]); }
+            else if (field_name == "inst_amt") { data.inst_amt = *((double*)row[i]); }
+            else if (field_name == "large_net") { data.large_net = *((double*)row[i]); }
+        } catch (const std::exception& e) {
+            // 忽略单个字段解析错误，继续处理其他字段
+            if (global_logger) {
+                global_logger->warn("Failed to parse field " + field_name + ": " + std::string(e.what()));
+            }
         }
     }
-
-    void calculateTradeLargeOrder(StockData& current_tick, StockTickState& state) {
+    
+    return data;
+}
+    
+    void calculateLargeOrder(StockData& current_tick, StockTickState& state) {
         double instant_amount = current_tick.inst_amt;
         
         if (std::abs(instant_amount) > large_order_threshold_) {
             // 判断大单方向
-            if(current_tick.last_price == state.prev_tick.last_price){
+            if (current_tick.last_price > state.prev_tick.last_price) {
+                current_tick.large_net = instant_amount; // 买入大单
+            } else if (current_tick.last_price < state.prev_tick.last_price) {
+                current_tick.large_net = -instant_amount; // 卖出大单
+            } else {
                 // 价格不变，根据买卖盘变化判断
                 double bid_change = current_tick.bid_volumes[0] - state.prev_tick.bid_volumes[0];
                 double ask_change = current_tick.ask_volumes[0] - state.prev_tick.ask_volumes[0];
                 current_tick.large_net = (bid_change > ask_change) ? instant_amount : -instant_amount;
-            }else{
-                // 价格改变，根据价高判断
-                current_tick.large_net = (current_tick.last_price > state.prev_tick.last_price) ? instant_amount : -instant_amount;
             }
             
             // 更新累计大单净额
             state.cumulative_large_net += current_tick.large_net;
             
             // 大单日志
-            // if (global_logger && std::abs(current_tick.large_net) > large_order_threshold_ * 4) {
-            //     std::string direction = current_tick.large_net > 0 ? "买入" : "卖出";
-            //     global_logger->infoWithTickTime("大单|" + stock_mapper_.getStockDisplayName(current_tick.symbol) 
-            //     +"|瞬时:"+std::to_string(int(current_tick.inst_amt*0.0001))+"万"
-            //     +"|涨幅:"+std::to_string(std::round((current_tick.last_price-current_tick.close)*10000/current_tick.close)/100)+ "|" + direction + "|" 
-            //     + std::to_string(int(current_tick.large_net / 10000)) + "万元 |净额: "+std::to_string(int(state.cumulative_large_net / 10000)) + "万元",
-            //     current_tick.timestamp);
-            // }   
+            if (global_logger && std::abs(current_tick.large_net) > large_order_threshold_ * 4) {
+                std::string direction = current_tick.large_net > 0 ? "买入" : "卖出";
+                global_logger->infoWithTickTime("大单|" + stock_mapper_.getStockDisplayName(current_tick.symbol) 
+                +"|瞬时:"+std::to_string(int(current_tick.inst_amt*0.0001))+"万"
+                +"|涨幅:"+std::to_string(std::round((current_tick.last_price-current_tick.close)*10000/current_tick.close)/100)+ "|" + direction + "|" 
+                + std::to_string(int(current_tick.large_net / 10000)) + "万元 |净额: "+std::to_string(int(state.cumulative_large_net / 10000)) + "万元",
+                current_tick.timestamp);
+            }   
         } else {
             current_tick.large_net = 0;
         }
@@ -2426,7 +2411,7 @@ private:
         // 竞价结束时间（9:25）
         else if (current_time == "09:25:00" && current_time <= "09:25:09") {
             report_time=report_time+1;
-            if(report_time<4000)  return;
+            if(report_time<2000)  return;
             // std::cout<<"竞价结束时间（9"<<std::endl;
             generateEnhancedAuctionReport("竞价结束总结 ", timestamp);
             last_summary_time_ = current_time;
@@ -2828,12 +2813,14 @@ public:
         auto last_report = std::chrono::steady_clock::now();
         
         while (running_) {
+            // 获取单条消息
+            std::vector<PendingMessage> messages;
+            
             // 每条消息休息指定时间
             if (config_.enable_rate_limiting) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing_delay_ms));
             }
-            // 获取单条消息
-            std::vector<PendingMessage> messages;
+            
             bool has_messages = consumer_->consumeMessages(messages, config_.messages_per_batch);
             
             if (!has_messages) {
@@ -2932,6 +2919,7 @@ public:
                 total_records = 0;
                 failed_messages = 0;
                 resetDelayStats();
+                // exit(0);
             }
         }
         

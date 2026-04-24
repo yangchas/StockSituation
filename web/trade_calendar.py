@@ -1,8 +1,18 @@
 import time
 import requests
 import json
+import logging
 from datetime import datetime, timedelta
+from calendar import monthrange
 import bisect
+
+try:
+    import holidays
+except ImportError:
+    holidays = None
+
+
+logger = logging.getLogger(__name__)
 
 class TradeCalendar:
     def __init__(self, cache_expire_seconds=300):
@@ -11,6 +21,7 @@ class TradeCalendar:
             cache_expire_seconds: 缓存过期时间（秒），默认5分钟
         """
         self.cache_expire_seconds = cache_expire_seconds
+        self._cn_holidays = holidays.CN() if holidays else None
         self._month_cache = {}  # 缓存格式: {month_str: (timestamp, trade_days_list)}
     
     def _get_cached_month_data(self, month):
@@ -24,6 +35,21 @@ class TradeCalendar:
     def _set_month_cache(self, month, data):
         """设置月份缓存"""
         self._month_cache[month] = (time.time(), data)
+    
+    def _build_local_trade_days(self, month):
+        year_str, month_str = month.split('-')
+        year = int(year_str)
+        month_num = int(month_str)
+        days_in_month = monthrange(year, month_num)[1]
+        trade_days = []
+        for day in range(1, days_in_month + 1):
+            date_obj = datetime(year, month_num, day)
+            if date_obj.weekday() >= 5:
+                continue
+            if self._cn_holidays and date_obj.date() in self._cn_holidays:
+                continue
+            trade_days.append(date_obj.strftime('%Y-%m-%d'))
+        return trade_days
     
     def get_trade_days_of_month(self, month=None):
         """获取指定月份的所有交易日
@@ -39,6 +65,9 @@ class TradeCalendar:
         cached_data = self._get_cached_month_data(month)
         if cached_data is not None:
             return cached_data.copy()
+        trade_days = self._build_local_trade_days(month)
+        self._set_month_cache(month, trade_days)
+        return trade_days.copy()
         
         # 请求数据
         url = f'https://www.szse.cn/api/report/exchange/onepersistenthour/monthList?month={month}&random={time.time()}'
@@ -151,10 +180,10 @@ class TradeCalendar:
         # 收集最多max_lookback个月的交易日数据
         all_trade_days = []
         
-        for i in range(max_lookback):
-            # 计算要查询的月份
-            month_date = ref_date - timedelta(days=30*i)
-            month_str = month_date.strftime('%Y-%m')
+        month_cursor = ref_date.replace(day=1)
+        for _ in range(max_lookback):
+            # 逐月回溯，避免“减30天”跨月错误（例如3月回溯到1月，跳过2月）
+            month_str = month_cursor.strftime('%Y-%m')
             
             # 获取该月交易日
             month_trade_days = self.get_trade_days_of_month(month_str)
@@ -171,6 +200,9 @@ class TradeCalendar:
                 pos = bisect.bisect_left(all_trade_days, ref_date_str)
                 if pos > 0:
                     return all_trade_days[pos - 1]
+
+            # 移动到上一个自然月
+            month_cursor = (month_cursor - timedelta(days=1)).replace(day=1)
         
         # 如果循环结束还没找到，尝试排序后查找
         if all_trade_days:
@@ -244,6 +276,43 @@ class TradeCalendar:
         
         return None
     
+    def get_latest_trade_day(self, date_input=None, max_lookback=2):
+        """获取最近的一个交易日（如果今天是交易日且已收盘，返回今天；否则返回上一个交易日）
+        Args:
+            date_input: 参考日期，默认为当前时间
+            max_lookback: 回溯月份
+        Returns:
+            str: 交易日日期 'YYYY-MM-DD'
+        """
+        if date_input is None:
+            ref_dt = datetime.now()
+        else:
+            # 借用 get_previous_trade_day 的解析逻辑
+            # 由于当前文件内解析逻辑分散，这里简单假设是 YYYY-MM-DD
+            try:
+                if isinstance(date_input, str):
+                    ref_dt = datetime.strptime(date_input.split(' ')[0], '%Y-%m-%d')
+                else:
+                    ref_dt = datetime.fromtimestamp(date_input)
+            except:
+                ref_dt = datetime.now()
+
+        today_str = ref_dt.strftime('%Y-%m-%d')
+        
+        # 核心逻辑：如果是交易日，且已经超过 15:30（收盘后），则返回今天
+        if self.is_trade_day(today_str):
+            # 如果参考日期就是今天，检查时间
+            now = datetime.now()
+            if today_str == now.strftime('%Y-%m-%d'):
+                if now.hour > 15 or (now.hour == 15 and now.minute >= 30):
+                    return today_str
+            else:
+                # 如果传入的是过去的日期字符串，默认该日已结束
+                return today_str
+                
+        # 否则回退到上一个交易日
+        return self.get_previous_trade_day(today_str, max_lookback)
+
     def clear_cache(self):
         """清空缓存"""
         self._month_cache.clear()

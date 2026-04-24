@@ -98,7 +98,10 @@ class PatternFactory:
         speed_1m: float = 0.0,
         amount_2m: float = 0.0,
         is_intra_day: bool = False,
-        history_meta: dict = None
+        history_meta: dict = None,
+        # 🐉 [V41.0] 物理穿透：龙头状态注入
+        dragon_locked: bool = False,
+        dragon_real_plates: List[str] = None
     ) -> Optional[dict]:
         """
         返回格式: {"setup_id": str, "action": str, "reason": str, "conf_bonus": int}
@@ -130,6 +133,19 @@ class PatternFactory:
                     "action": "弱转强买入",
                     "reason": f"🚀 超预期强修复(Weak2Strong)·筹码净区",
                     "conf_bonus": score,
+                })
+
+        # ── E. 新题材首板 (new_theme_first_board) ────────────────────────
+        if "new_theme_first_board" in allowed_setups:
+            # 逻辑：首板 + 板块高共振 (说明是当日涌现的新题材) + 量能倍增
+            if (lb_days == 0 and plate_resonance > 1.5 and vol_ratio > 3.0 
+                and -0.02 < open_pct < 0.06 and resistance_gap < 0.02):
+                score = 25 + (10 if is_alpha_seed else 0)
+                candidates.append({
+                    "setup_id": "SETUP_NEW_THEME_FIRST",
+                    "action": "题材首板",
+                    "reason": f"🆕 新题材涌现: 板块强度{plate_resonance:.1f} | 量能异动·首板确认",
+                    "conf_bonus": score
                 })
 
         # ── C. 反包先锋 (Counter-Attack / Rebound) 🚀 [V39.5] ──────────────
@@ -169,6 +185,21 @@ class PatternFactory:
                     "action": "核心低吸",
                     "reason": f"💡 龙头分歧回踩·零压筹码",
                     "conf_bonus": 18,
+                })
+
+        # ── F. 龙头补涨 (dragon_follower) ───────────────────────────────
+        if dragon_locked and dragon_real_plates and "follower_chase" in allowed_setups:
+            # 🐉 [V41.1] 物理穿透匹配：属于超级龙头的实时审计板块(名称) + 低位 + 尚未涨停
+            # 兼容处理：可能 plate 是逗号分隔的多个板块名
+            stock_plates = plate.replace('、', '+').replace(',', '+').split('+')
+            is_in_dragon_sector = any(p in dragon_real_plates for p in stock_plates if p) 
+            
+            if is_in_dragon_sector and lb_days == 0 and open_pct < 0.05 and vol_ratio > 1.5:
+                candidates.append({
+                    "setup_id": "SETUP_DRAGON_FOLLOW",
+                    "action": "龙头补涨",
+                    "reason": f"🐉 跟着大哥肉: 龙头锁死·板块共振({Plate_Name_Match := next((p for p in stock_plates if p in dragon_real_plates), '未知')})",
+                    "conf_bonus": 30
                 })
 
         if not candidates:

@@ -262,9 +262,14 @@ struct StockAuctionMetrics {
     std::string volatility_level = "none";
     AuctionMetrics auction_metrics;
     SimpleTickData prev_tick_data;
-   
+
+    // 竞价快照字段：用于0920/0924/0925结构化输出
+    double last_bp1 = 0.0;
+    double last_ap1 = 0.0;
+    double last_lp = 0.0;
+
     static const int HISTORY_SIZE = 20*15; // 优化: 减小到10
-   
+
     StockAuctionMetrics() {
         price_history = std::deque<double>(HISTORY_SIZE, 0.0);
         bid_amount_history = std::deque<double>(HISTORY_SIZE, 0.0);
@@ -372,14 +377,27 @@ public:
             now.time_since_epoch()).count();
     }
    
-    static std::string formatTimestamp(long long timestamp) {
-        auto time = std::chrono::system_clock::from_time_t(timestamp / 1000);
+    static std::string formatTimestamp(long long timestamp_ms) {
+        auto time = std::chrono::system_clock::from_time_t(timestamp_ms / 1000);
         auto tt = std::chrono::system_clock::to_time_t(time);
         std::tm tm;
         localtime_r(&tt, &tm);
        
         std::ostringstream oss;
         oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        return oss.str();
+    }
+
+    static std::string formatTimestampWithMs(long long timestamp_ms) {
+        auto time = std::chrono::system_clock::from_time_t(timestamp_ms / 1000);
+        auto tt = std::chrono::system_clock::to_time_t(time);
+        std::tm tm;
+        localtime_r(&tt, &tm);
+
+        const int ms = static_cast<int>(timestamp_ms % 1000);
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+            << "." << std::setw(3) << std::setfill('0') << ms;
         return oss.str();
     }
     
@@ -795,8 +813,35 @@ public:
                 "bv1 BIGINT, bv2 BIGINT, bv3 BIGINT, bv4 BIGINT, bv5 BIGINT, "
                 "inst_vol FLOAT, inst_amt FLOAT, large_net FLOAT"
                 ") TAGS (symbol BINARY(20))";
-           
             connection_->execute(create_stable_sql);
+
+            // 竞价快照-市场汇总表
+            const std::string create_summary_sql =
+                "CREATE TABLE IF NOT EXISTS market_auction_summary ("
+                "ts TIMESTAMP, "
+                "trade_date BINARY(8), "
+                "auction_tag BINARY(4), "
+                "total_stocks INT, "
+                "high_open_count INT, "
+                "low_open_count INT, "
+                "flat_open_count INT, "
+                "limit_up_count INT, "
+                "limit_down_count INT, "
+                "total_auction_amount_yuan BIGINT, "
+                "total_limit_up_bid_amount_yuan BIGINT"
+                ")";
+            connection_->execute(create_summary_sql);
+
+            // 竞价快照-TopN成交额明细表 (超级表)
+            const std::string create_top_amount_stable_sql =
+                "CREATE STABLE IF NOT EXISTS market_auction_top_amount ("
+                "ts TIMESTAMP, "
+                "price_ref DOUBLE, "
+                "change_pct DOUBLE, "
+                "auction_amount_yuan BIGINT, "
+                "bid_amount_yuan BIGINT"
+                ") TAGS (symbol BINARY(20), trade_date BINARY(8), auction_tag BINARY(4))";
+            connection_->execute(create_top_amount_stable_sql);
         } catch (const std::exception& e) {
             std::cerr << "Failed to initialize database: " << e.what() << std::endl;
             return false;
@@ -1020,13 +1065,14 @@ private:
                 << "inst_vol, inst_amt, large_net "
                 << "FROM " << config_.tdengine_replay_table << " "
                 << "WHERE ts >= " << current_replay_time_ << " "
-                << "AND ts <= " << replay_end_time_ << " "
-                << "ORDER BY ts ASC "
-                << "LIMIT " << config_.replay_batch_size;
+                << "AND ts < " << (current_replay_time_ + config_.replay_tick_interval_ms) << " "
+                << "ORDER BY ts ASC ";
             
-            TAOS_RES* res = connection_->query(sql.str());
+            std::string sql_str = sql.str();
+            // std::cerr << "[replay] loadNextBatch sql=" << sql_str << std::endl;
+            TAOS_RES* res = connection_->query(sql_str);
             if (!res) {
-                std::cerr << "Failed to query TDengine" << std::endl;
+                std::cerr << "[replay] loadNextBatch failed" << std::endl;
                 return;
             }
             
@@ -1069,8 +1115,8 @@ private:
                 last_queried_time_ = std::max(last_queried_time_, slice_time);
             }
             
-            // 检查是否还有更多数据
-            has_more_data_ = (time_slices.size() >= config_.replay_batch_size);
+            // 仅查询当前时间窗口：不需要“更多数据”概念，避免阻止后续窗口加载
+            has_more_data_ = true;
             
         } catch (const std::exception& e) {
             std::cerr << "Error loading replay data: " << e.what() << std::endl;
@@ -1168,11 +1214,18 @@ StockData parseTDengineRow(TAOS_ROW row, TAOS_FIELD* fields, int num_fields) {
         
         if (field_name == "symbol") {
             // 处理字符串类型（BINARY/NCHAR）
+            std::string raw_symbol;
             if (field_type == TSDB_DATA_TYPE_BINARY || field_type == TSDB_DATA_TYPE_NCHAR) {
                 int32_t charLen = varDataLen((char *)row[i] - VARSTR_HEADER_SIZE);
-                data.symbol = std::string(static_cast<char*>(row[i]), charLen);
+                raw_symbol = std::string(static_cast<char*>(row[i]), charLen);
             } else {
-                data.symbol = std::string(static_cast<char*>(row[i]));
+                raw_symbol = std::string(static_cast<char*>(row[i]));
+            }
+            // 归一化代码：只保留前6位数字 (针对 A 股 6 位代码)
+            if (raw_symbol.length() > 6) {
+                data.symbol = raw_symbol.substr(0, 6);
+            } else {
+                data.symbol = raw_symbol;
             }
         } else if (field_name == "ts") {
             // 时间戳直接赋值
@@ -2067,6 +2120,7 @@ public:
 };
 
 // ==================== 竞价分析器 ====================
+
 class AuctionAnalyzer {
 private:
     struct AuctionThresholds {
@@ -2113,10 +2167,153 @@ private:
     std::mutex metrics_mutex_; // 专门用于保护stock_auction_metrics_
     const int MAX_CONCURRENT_THREADS = 10; // 控制并发数，避免被服务器封禁
 
-    
+    struct AuctionStockSnapshot;
+    struct AuctionMarketSnapshot;
+
 public:
     AuctionAnalyzer(IExternalDataProvider* provider = new DefaultExternalProvider())
         : stock_mapper_(StockNameMapper::getInstance()), external_provider_(provider) {}
+
+    static std::string formatTradeDateYYYYMMDD(long long timestamp_ms) {
+        std::string date_str = TimeUtils::formatTimestamp(timestamp_ms).substr(0, 10); // YYYY-MM-DD
+        std::string yyyymmdd;
+        yyyymmdd.reserve(8);
+        for (char c : date_str) {
+            if (c != '-') yyyymmdd.push_back(c);
+        }
+        return yyyymmdd;
+    }
+
+    static std::string escapeJsonString(const std::string& s) {
+        std::string out;
+        out.reserve(s.size() + 16);
+        for (char c : s) {
+            switch (c) {
+                case '\\': out += "\\\\"; break;
+                case '"': out += "\\\""; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        // skip control chars
+                    } else {
+                        out.push_back(c);
+                    }
+            }
+        }
+        return out;
+    }
+
+    static std::string toJsonMarketSnapshot(const AuctionMarketSnapshot& s, const std::string& tag, long long ts) {
+        std::ostringstream oss;
+        oss << "{";
+        oss << "\"ts\":" << ts << ",";
+        oss << "\"tag\":\"" << tag << "\",";
+        oss << "\"total_stocks\":" << s.total_stocks << ",";
+        oss << "\"high_open_count\":" << s.high_open_count << ",";
+        oss << "\"low_open_count\":" << s.low_open_count << ",";
+        oss << "\"flat_open_count\":" << s.flat_open_count << ",";
+        oss << "\"limit_up_count\":" << s.limit_up_count << ",";
+        oss << "\"limit_down_count\":" << s.limit_down_count << ",";
+        oss << "\"total_auction_amount_yuan\":" << static_cast<long long>(s.total_auction_amount_yuan) << ",";
+        oss << "\"total_limit_up_bid_amount_yuan\":" << static_cast<long long>(s.total_limit_up_bid_amount_yuan);
+        oss << "}";
+        return oss.str();
+    }
+
+    static std::string toJsonTopAmount(const std::vector<AuctionStockSnapshot>& items) {
+        std::ostringstream oss;
+        oss << "[";
+        for (size_t i = 0; i < items.size(); i++) {
+            const auto& s = items[i];
+            if (i > 0) oss << ",";
+            oss << "{";
+            oss << "\"symbol\":\"" << escapeJsonString(s.symbol) << "\",";
+            oss << "\"price\":" << s.price_ref << ",";
+            oss << "\"change_pct\":" << s.change_pct << ",";
+            oss << "\"auction_amount_yuan\":" << static_cast<long long>(s.auction_amount_yuan) << ",";
+            oss << "\"bid_amount_yuan\":" << static_cast<long long>(s.bid_amount_yuan);
+            oss << "}";
+        }
+        oss << "]";
+        return oss.str();
+    }
+
+    static std::string toJsonMeta(const std::string& tag, long long ts) {
+        std::ostringstream oss;
+        oss << "{";
+        oss << "\"ts\":" << ts << ",";
+        oss << "\"tag\":\"" << tag << "\",";
+        oss << "\"date\":\"" << formatTradeDateYYYYMMDD(ts) << "\"";
+        oss << "}";
+        return oss.str();
+    }
+
+    void storeAuctionSnapshotToRedis(RedisClient& redis, const std::string& tag, long long ts, int ttl_seconds = 172800, int top_n = 1000) {
+        if (!redis.connect()) {
+            return;
+        }
+        const std::string date = formatTradeDateYYYYMMDD(ts);
+        const std::string key = "market:auction:" + date + ":" + tag;
+        const std::string latest_key = "market:auction:" + date + ":latest";
+
+        AuctionMarketSnapshot ms = getMarketSnapshot();
+        auto top = getTopAmountSnapshot(top_n);
+
+        redis.hset(key, "summary", toJsonMarketSnapshot(ms, tag, ts));
+        redis.hset(key, "top_amount", toJsonTopAmount(top));
+        redis.hset(key, "meta", toJsonMeta(tag, ts));
+        redis.expire(key, ttl_seconds);
+
+        redis.hset(latest_key, "tag", tag);
+        redis.hset(latest_key, "ts", std::to_string(ts));
+        redis.expire(latest_key, ttl_seconds);
+    }
+
+    void ensureAuctionSnapshotTables(TDengineConnection& conn) {
+        conn.execute("CREATE TABLE IF NOT EXISTS market_auction_summary (ts TIMESTAMP, trade_date BINARY(8), auction_tag BINARY(4), total_stocks INT, high_open_count INT, low_open_count INT, flat_open_count INT, limit_up_count INT, limit_down_count INT, total_auction_amount DOUBLE, total_limit_up_bid_amount DOUBLE)");
+        conn.execute("CREATE TABLE IF NOT EXISTS market_auction_top_amount (ts TIMESTAMP, trade_date BINARY(8), tag BINARY(4), symbol BINARY(20), price DOUBLE, change_pct DOUBLE, auction_amount DOUBLE, bid_amount DOUBLE)");
+    }
+
+    void storeAuctionSnapshotToTDengine(TDengineConnection& conn, const std::string& tag, long long ts, int top_n = 1000) {
+        // 竞价快照写TDengine：仅在主流程已连接时写，避免这里额外 connect/破坏原有连接管理
+        try {
+            if (!conn.isConnected()) {
+                return;
+            }
+            ensureAuctionSnapshotTables(conn);
+
+            const std::string date = formatTradeDateYYYYMMDD(ts);
+            AuctionMarketSnapshot ms = getMarketSnapshot();
+            auto top = getTopAmountSnapshot(top_n);
+
+            // summary
+            {
+                std::ostringstream sql;
+                sql << "INSERT INTO market_auction_summary VALUES (" << ts << ",'" << date << "','" << tag << "',";
+                sql << ms.total_stocks << "," << ms.high_open_count << "," << ms.low_open_count << "," << ms.flat_open_count << ",";
+                sql << ms.limit_up_count << "," << ms.limit_down_count << ",";
+                sql << ms.total_auction_amount_yuan << "," << ms.total_limit_up_bid_amount_yuan << ")";
+                conn.execute(sql.str());
+            }
+
+            // top amount (batch insert)
+            if (!top.empty()) {
+                std::ostringstream sql;
+                sql << "INSERT INTO market_auction_top_amount VALUES ";
+                for (size_t i = 0; i < top.size(); i++) {
+                    const auto& s = top[i];
+                    if (i > 0) sql << ",";
+                    sql << "(" << ts << ",'" << date << "','" << tag << "','" << s.symbol << "',";
+                    sql << s.price_ref << "," << s.change_pct << "," << s.auction_amount_yuan << "," << s.bid_amount_yuan << ")";
+                }
+                conn.execute(sql.str());
+            }
+        } catch (...) {
+            // 保守：不影响主流程
+        }
+    }
     
     ~AuctionAnalyzer() { delete external_provider_; }
     
@@ -2135,6 +2332,11 @@ public:
         const std::string& symbol = data.symbol;
         
         StockAuctionMetrics& metrics = stock_auction_metrics_[symbol];
+
+        // 缓存竞价快照字段（用于0920/0924/0925结构化输出）
+        metrics.last_bp1 = data.bid_prices[0];
+        metrics.last_ap1 = data.ask_prices[0];
+        metrics.last_lp = data.last_price;
         
         // 获取卖一量和买一量
         double av1 = data.ask_volumes[0];
@@ -3265,6 +3467,99 @@ private:
         std::vector<std::pair<std::string, double>> amount_ranking;
     };
     
+    struct AuctionStockSnapshot {
+        std::string symbol;
+        double price_ref = 0.0;
+        double change_pct = 0.0;
+        double auction_amount_yuan = 0.0;
+        double bid_amount_yuan = 0.0;
+    };
+
+    struct AuctionMarketSnapshot {
+        int total_stocks = 0;
+        int high_open_count = 0;
+        int low_open_count = 0;
+        int flat_open_count = 0;
+        int limit_up_count = 0;
+        int limit_down_count = 0;
+        double total_auction_amount_yuan = 0.0;
+        double total_limit_up_bid_amount_yuan = 0.0;
+    };
+
+public:
+    AuctionMarketSnapshot getMarketSnapshot() {
+        AuctionMarketSnapshot snap;
+        auto summary = calculateEnhancedMarketSummary();
+        snap.total_stocks = summary.total_stocks;
+        snap.high_open_count = summary.high_open_count;
+        snap.low_open_count = summary.low_open_count;
+        snap.flat_open_count = summary.total_stocks - summary.high_open_count - summary.low_open_count;
+        snap.limit_up_count = static_cast<int>(summary.limit_up_stocks.size());
+        snap.limit_down_count = static_cast<int>(summary.limit_down_stocks.size());
+
+        // 汇总成交金额/封单金额（单位：元）
+        for (const auto& pair : stock_auction_metrics_) {
+            const auto& symbol = pair.first;
+            const auto& metrics = pair.second;
+            snap.total_auction_amount_yuan += metrics.auction_volume;
+            if (metrics.auction_metrics.is_limit_up) {
+                snap.total_limit_up_bid_amount_yuan += metrics.auction_metrics.bid_amount;
+            }
+        }
+
+        return snap;
+    }
+
+public:
+    std::vector<AuctionStockSnapshot> getTopAmountSnapshot(int top_n = 1000) {
+        std::vector<AuctionStockSnapshot> result;
+        if (stock_auction_metrics_.empty() || top_n <= 0) {
+            return result;
+        }
+
+        std::vector<std::pair<std::string, double>> amounts;
+        amounts.reserve(stock_auction_metrics_.size());
+        for (const auto& pair : stock_auction_metrics_) {
+            amounts.emplace_back(pair.first, pair.second.auction_volume);
+        }
+
+        // 按成交额（元）降序
+        std::sort(amounts.begin(), amounts.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        int n = std::min(static_cast<int>(amounts.size()), top_n);
+        result.reserve(n);
+
+        for (int i = 0; i < n; i++) {
+            const std::string& symbol = amounts[i].first;
+            auto it = stock_auction_metrics_.find(symbol);
+            if (it == stock_auction_metrics_.end()) {
+                continue;
+            }
+
+            const auto& metrics = it->second;
+
+            // 价格：买一/卖一任取（优先bp1，再ap1，再lp）
+            double price_ref = 0.0;
+            if (metrics.last_bp1 > 0) {
+                price_ref = metrics.last_bp1;
+            } else if (metrics.last_ap1 > 0) {
+                price_ref = metrics.last_ap1;
+            } else {
+                price_ref = metrics.last_lp;
+            }
+
+            AuctionStockSnapshot s;
+            s.symbol = symbol;
+            s.price_ref = price_ref;
+            s.change_pct = metrics.auction_metrics.price_change;
+            s.auction_amount_yuan = metrics.auction_volume;
+            s.bid_amount_yuan = metrics.auction_metrics.bid_amount;
+            result.push_back(std::move(s));
+        }
+
+        return result;
+    }
+
     EnhancedMarketSummary calculateEnhancedMarketSummary() {
         EnhancedMarketSummary summary;
         std::vector<std::pair<std::string, double>> large_nets;
@@ -3645,8 +3940,22 @@ private:
         // 存储到Redis哈希表中，与Python脚本格式匹配
         redis_client_->hset(key, "price", std::to_string(data.last_price));
         redis_client_->hset(key, "change_pct", std::to_string(change));
+        // 盘中过程字段：用于深V/冲高回落识别
+        redis_client_->hset(key, "high", std::to_string(data.high));
+        redis_client_->hset(key, "low", std::to_string(data.low));
+        // 昨收（lc）统一双写，兼容 Python 侧不同字段名读取
+        redis_client_->hset(key, "pre_close", std::to_string(data.close));
+        redis_client_->hset(key, "last_close", std::to_string(data.close));
+        // 成交额（元）：供Python侧计算封成比
+        redis_client_->hset(key, "amount", std::to_string(data.amount));
         redis_client_->hset(key, "volume", Logger::amountToWan(data.amount));
         redis_client_->hset(key, "large_net", Logger::amountToWan(data.large_net));
+
+        // L1盘口金额（元）：买一+卖一，供Python侧统一读取，不区分方向
+        const double bid1_amount_yuan = data.bid_prices[0] * data.bid_volumes[0] * 100.0;
+        const double ask1_amount_yuan = data.ask_prices[0] * data.ask_volumes[0] * 100.0;
+        const double book1_amount_yuan = bid1_amount_yuan + ask1_amount_yuan;
+        redis_client_->hset(key, "book1_amount_yuan", std::to_string(book1_amount_yuan));
          
         // 新增：存储高级指标
         redis_client_->hset(key, "change_rate_1min", std::to_string(change_rate_1min));
@@ -3841,7 +4150,17 @@ private:
     std::unique_ptr<PhaseDispatcher> phase_dispatcher_;
     std::unique_ptr<Logger> logger_;
     std::unique_ptr<RedisClient> redis_;
+    std::unique_ptr<TDengineConnection> td_conn_;
     StockNameMapper& stock_mapper_;
+
+    void store_auction_snapshot_to_redis(const std::string& tag, long long ts_ms) {
+        if (!redis_) return;
+        if (!redis_->connect()) return;
+        if (!auction_analyzer_) return;
+
+        // 统一写入逻辑：由 AuctionAnalyzer 负责序列化与 key 规范
+        auction_analyzer_->storeAuctionSnapshotToRedis(*redis_, tag, ts_ms);
+    }
    
     // 服务器时间延迟统计
     std::atomic<long long> max_server_timestamp_{0};
@@ -3985,21 +4304,24 @@ public:
                 last_timestamp = all_records.back().timestamp;
                 std::string last_time_str = TimeUtils::formatTimestamp(last_timestamp);
                 std::string time_part = last_time_str.substr(11, 8);
-                if (!auction_report_emitted_092003 && "09:20:05"> time_part  && time_part >= "09:20:03")
+                if (!auction_report_emitted_092003 && "09:24:00" > time_part  && time_part >= "09:20:03")
                 {
                     auction_analyzer_->generateEnhancedAuctionReport("试盘结束总结", last_timestamp);
+                    store_auction_snapshot_to_redis("0920", last_timestamp);
                     auction_report_emitted_092003 = true;
-                }else if (!auction_report_emitted_092410 && "09:24:13" > time_part && time_part>= "09:24:10")
+                }else if (!auction_report_emitted_092410 && "09:25:00" > time_part && time_part >= "09:24:10")
                 {
                     auction_analyzer_->generateEnhancedAuctionReport("竞价接近结束总结", last_timestamp);
+                    store_auction_snapshot_to_redis("0924", last_timestamp);
                     auction_report_emitted_092410 = true;
                 }
-                // else if (!auction_report_emitted_092510 && "09:25:13" > time_part  && time_part >= "09:25:10")
-                // {
+                else if (!auction_report_emitted_092510 && "09:30:00" > time_part  && time_part >= "09:25:10")
+                {
 
-                //     auction_analyzer_->generateEnhancedAuctionReport("竞价结束总结", last_timestamp);
-                //     auction_report_emitted_092510 = true;
-                // }
+                    auction_analyzer_->generateEnhancedAuctionReport("竞价结束总结", last_timestamp);
+                    store_auction_snapshot_to_redis("0925", last_timestamp);
+                    auction_report_emitted_092510 = true;
+                }
                
             }
            
@@ -4011,6 +4333,7 @@ public:
                 if (local_time->tm_hour == 9 && local_time->tm_min == 25 && local_time->tm_sec >= 10) {
                     auction_analyzer_->getKaipan();
                     auction_analyzer_->generateEnhancedAuctionReport("竞价结束总结", last_timestamp);
+                    store_auction_snapshot_to_redis("0925", last_timestamp);
                     auction_report_emitted_092510 = true;
                 }
             }

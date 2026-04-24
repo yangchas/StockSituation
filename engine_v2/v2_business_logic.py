@@ -56,17 +56,16 @@ class V2BusinessLogicService:
 
     # --- 1. Sentiment Cycle (情绪周期) ---
 
-    def predict_market_phase(
-        self,
-        st_score: float,
-        red_green_ratio: float,
-        max_lb: int,
-        consensus_score: float = 20.0,
-        effectiveness: float = 0.5,
-        fade_count: int = 0,
-        one_word_break_rate: float = 0.0,
-        seal_ratio_front20: float = 1.0
-    ) -> EmotionPhaseResult:
+    def predict_market_phase(self, 
+                             st_score: float, 
+                             red_green_ratio: float, 
+                             max_lb: int, 
+                             dragon_locked: bool = False,
+                             fade_count: int = 0,
+                             one_word_break_rate: float = 0.0,
+                             top_sector_capital: float = 0.0, # 💰 [V42.0] 主线板块主力净额(亿)
+                             top_sector_pct: float = 0.0,      # 📈 [V42.0] 主线板块涨幅(%)
+                             **kwargs) -> EmotionPhaseResult:
         """
         核心情绪状态机逻辑。
         """
@@ -78,12 +77,19 @@ class V2BusinessLogicService:
         confidence = 0.5
 
         # RETREAT (退潮)
-        if red_green_ratio < 0.7 or (effectiveness < 0.25 and fade_count > 20):
+        if red_green_ratio < 0.7 or (st_score < 0.25 and fade_count > 20):
             phase = "retreat"
             pos_cap = 0.15
             allowed = []
+            # 🐉 [V41.0] 龙头锁死例外：退潮期如果有 5B+ 核心龙头封死，允许题材补涨与核心低吸
+            if dragon_locked and max_lb >= 5:
+                allowed = ["follower_chase", "core_dip_buying"]
+                transition = "RETREAT_DRAGON_HOLD"
+                pos_cap = 0.10 # 极致控仓
+            else:
+                transition = "PANIC_RETREAT"
+            
             blocked = ["blind_relay", "high_board_chase", "follower_chase", "late_rotation"]
-            transition = "PANIC_RETREAT"
             confidence = 0.85
             if red_green_ratio < 0.4: transition = "BROAD_CRASH"
         
@@ -121,8 +127,24 @@ class V2BusinessLogicService:
             phase = "start"
             pos_cap = 0.45
             allowed = ["new_theme_first_board", "low_level_relay"]
-            transition = "REPAIR_IGNITION"
+            # 🐉 [V41.1] 启动期龙头锁死例外：允许题材补涨
+            if dragon_locked and max_lb >= 5:
+                allowed.append("follower_chase")
+                transition = "IGNITION_DRAGON_LED"
+            else:
+                transition = "REPAIR_IGNITION"
             confidence = 0.75
+
+        # 🚀 [V42.0] Capital Flow Exception (资金流量对撞判定)
+        # 即使在 retreat/ice_point 阶段，如果主线板块净流入 > 40亿 且板块涨幅 > 1%
+        # 说明大机构正在暴力进场换码，强制开启板块共振战法
+        if top_sector_capital > 40.0 and top_sector_pct > 1.0:
+            if "sector_momentum_buy" not in allowed:
+                allowed.append("sector_momentum_buy")
+                transition += " + SECTOR_CAP_RESONANCE"
+                # 在超级资金流量加持下，风险门槛放宽
+                if phase in ("retreat", "ice_point"):
+                    pos_cap = max(pos_cap, 0.35) 
 
         return EmotionPhaseResult(
             ts=int(time.time() * 1000),

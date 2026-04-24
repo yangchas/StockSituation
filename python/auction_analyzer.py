@@ -592,7 +592,7 @@ def main():
         while True:
             # 检查是否为竞价时间段
             current_time = datetime.now().time()
-            if 1:#dt_time(9, 15) <= current_time <= dt_time(9, 25):
+            if dt_time(9, 15) <= current_time <= dt_time(9, 25):
                 analysis_engine.run_analysis_cycle()
                 # 竞价阶段每10秒分析一次
                 time.sleep(10)

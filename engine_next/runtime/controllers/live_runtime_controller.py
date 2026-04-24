@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from engine_next.domain.enums import RunPhase
 from engine_next.domain.models import IntradayContext
@@ -22,6 +23,7 @@ class LiveRuntimeRequest:
     previous_trade_date: str
     offline_context_date: str
     symbols: tuple[str, ...]
+    now: datetime | None = None
     minute_index: int | None = None
     require_auction_recovery: bool = False
 
@@ -78,6 +80,7 @@ class LiveRuntimeController:
             phase=request.phase,
             trade_date=request.trade_date,
             previous_trade_date=request.previous_trade_date,
+            now=request.now,
             offline_context_date=request.offline_context_date,
             symbols=request.symbols,
             require_auction_recovery=request.require_auction_recovery,

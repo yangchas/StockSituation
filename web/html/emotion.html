@@ -1,0 +1,1241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚔️ 实时卡位竞争分析系统</title>
+    <style>
+        /* 基础样式 */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Microsoft YaHei', sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            font-size: 12px;
+        }
+        
+        .container {
+            display: grid;
+            grid-template-columns: 320px 1fr 320px;
+            gap: 8px;
+            padding: 8px;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        /* 面板样式 */
+        .panel {
+            background: #141414;
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .panel-title {
+            color: #ffaa00;
+            font-size: 13px;
+            font-weight: bold;
+            margin-bottom: 8px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        /* 竞价卡位组件 */
+        .auction-compete-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        .auction-card {
+            background: #1a1a1a;
+            border-radius: 5px;
+            padding: 10px;
+            border: 1px solid #333;
+            transition: all 0.3s;
+            position: relative;
+        }
+        
+        .auction-card.winning {
+            border-color: #ff4444;
+            background: rgba(255, 68, 68, 0.08);
+        }
+        
+        .auction-card.losing {
+            border-color: #00aa00;
+            background: rgba(0, 170, 0, 0.08);
+        }
+        
+        .auction-card.fighting {
+            border-color: #ffaa00;
+            background: rgba(255, 170, 0, 0.08);
+        }
+        
+        .auction-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        
+        .stock-name {
+            font-weight: bold;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .stock-tag {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: #333;
+        }
+        
+        .auction-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+        
+        .metric-item {
+            text-align: center;
+        }
+        
+        .metric-value {
+            font-size: 14px;
+            font-weight: bold;
+        }
+        
+        .metric-label {
+            font-size: 10px;
+            color: #888;
+            margin-top: 2px;
+        }
+        
+        .auction-timeline {
+            height: 3px;
+            background: #333;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 8px;
+            position: relative;
+        }
+        
+        .timeline-fill {
+            height: 100%;
+            border-radius: 2px;
+        }
+        
+        /* 分时卡位组件 */
+        .minute-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        .minute-chart-container {
+            height: 150px;
+            background: #111;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+            border: 1px solid #333;
+        }
+        
+        .minute-chart {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        
+        .chart-grid {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            grid-template-rows: repeat(3, 1fr);
+        }
+        
+        .grid-line {
+            border-right: 1px dashed #333;
+        }
+        
+        .price-line {
+            position: absolute;
+            left: 0;
+            width: 100%;
+            height: 1px;
+            background: #444;
+        }
+        
+        .chart-line {
+            position: absolute;
+            left: 0;
+            bottom: 50%;
+            width: 100%;
+            height: 1px;
+            background: #ff4444;
+            transition: all 0.5s;
+        }
+        
+        /* 竞争关系图 */
+        .compete-graph {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 8px;
+            height: 150px;
+        }
+        
+        .relation-node {
+            background: #1a1a1a;
+            border-radius: 5px;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            border: 2px solid #333;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .relation-node.winner {
+            border-color: #ff4444;
+            background: rgba(255, 68, 68, 0.1);
+        }
+        
+        .relation-node.loser {
+            border-color: #00aa00;
+            background: rgba(0, 170, 0, 0.1);
+        }
+        
+        /* 板块联动分析 */
+        .plate-linkage {
+            margin-top: 8px;
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .linkage-item {
+            display: flex;
+            align-items: center;
+            padding: 6px 8px;
+            margin-bottom: 3px;
+            background: #1a1a1a;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        
+        .linkage-item:hover {
+            background: #222;
+        }
+        
+        .linkage-arrow {
+            margin: 0 8px;
+            color: #888;
+        }
+        
+        .linkage-status {
+            margin-left: auto;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        
+        .status-success { background: rgba(0, 170, 0, 0.2); color: #00aa00; }
+        .status-failure { background: rgba(255, 68, 68, 0.2); color: #ff4444; }
+        .status-warning { background: rgba(255, 170, 0, 0.2); color: #ffaa00; }
+        
+        /* 数据表格 */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        .data-table th {
+            background: #222;
+            color: #ffaa00;
+            padding: 6px;
+            font-weight: bold;
+            text-align: left;
+            border-bottom: 1px solid #333;
+            position: sticky;
+            top: 0;
+        }
+        
+        .data-table td {
+            padding: 6px;
+            border-bottom: 1px solid #222;
+        }
+        
+        /* 操作按钮 */
+        .action-btn {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 4px;
+            background: linear-gradient(135deg, #ff4444, #ff8800);
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            width: 100%;
+            margin-top: 8px;
+        }
+        
+        .action-btn:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        
+        /* 滚动条美化 */
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #1a1a1a;
+            border-radius: 2px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #444;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 左侧：竞价卡位分析 -->
+        <div class="panel">
+            <div class="panel-title">
+                <span>🎯 竞价卡位分析 (09:15-09:25)</span>
+                <span style="color: #ff4444;">强卡位: 3个</span>
+            </div>
+            
+            <div class="auction-compete-container">
+                <!-- AI龙头卡位 -->
+                <div class="auction-card winning" id="auction-card-1">
+                    <div class="auction-header">
+                        <div class="stock-name">
+                            <span>汉王科技</span>
+                            <span class="stock-tag" style="background: #ff4444;">空间板</span>
+                        </div>
+                        <div style="color: #ff4444; font-weight: bold; font-size: 14px;">
+                            +9.8%
+                        </div>
+                    </div>
+                    
+                    <div class="auction-metrics">
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #ff4444;">3.2亿</div>
+                            <div class="metric-label">封单金额</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #ffaa00;">85%</div>
+                            <div class="metric-label">大单占比</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #00aa00;">0.8%</div>
+                            <div class="metric-label">换手率</div>
+                        </div>
+                    </div>
+                    
+                    <div style="font-size: 10px; color: #888; margin-top: 6px;">
+                        <span style="color: #ff4444;">▶ 竞价卡位成功:</span> 
+                        封单从2.1亿→3.2亿，大单主动买入
+                    </div>
+                    
+                    <div class="auction-timeline">
+                        <div class="timeline-fill" style="width: 92%; background: linear-gradient(90deg, #00aa00, #ffaa00, #ff4444);"></div>
+                    </div>
+                </div>
+                
+                <!-- 机器人卡位 -->
+                <div class="auction-card fighting" id="auction-card-2">
+                    <div class="auction-header">
+                        <div class="stock-name">
+                            <span>赛为智能</span>
+                            <span class="stock-tag" style="background: #ffaa00;">换手龙</span>
+                        </div>
+                        <div style="color: #ffaa00; font-weight: bold; font-size: 14px;">
+                            +6.5%
+                        </div>
+                    </div>
+                    
+                    <div class="auction-metrics">
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #ffaa00;">1.8亿</div>
+                            <div class="metric-label">封单金额</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #ffaa00;">62%</div>
+                            <div class="metric-label">大单占比</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #00aa00;">1.2%</div>
+                            <div class="metric-label">换手率</div>
+                        </div>
+                    </div>
+                    
+                    <div style="font-size: 10px; color: #888; margin-top: 6px;">
+                        <span style="color: #ffaa00;">▶ 竞价卡位中:</span> 
+                        试图卡位AI，但封单弱于汉王
+                    </div>
+                    
+                    <div class="auction-timeline">
+                        <div class="timeline-fill" style="width: 68%; background: linear-gradient(90deg, #00aa00, #ffaa00);"></div>
+                    </div>
+                </div>
+                
+                <!-- 新能源掉队 -->
+                <div class="auction-card losing" id="auction-card-3">
+                    <div class="auction-header">
+                        <div class="stock-name">
+                            <span>宁德时代</span>
+                            <span class="stock-tag" style="background: #00aa00;">中军</span>
+                        </div>
+                        <div style="color: #00aa00; font-weight: bold; font-size: 14px;">
+                            -1.2%
+                        </div>
+                    </div>
+                    
+                    <div class="auction-metrics">
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #00aa00;">0.3亿</div>
+                            <div class="metric-label">封单金额</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #00aa00;">28%</div>
+                            <div class="metric-label">大单占比</div>
+                        </div>
+                        <div class="metric-item">
+                            <div class="metric-value" style="color: #ff4444;">1.8%</div>
+                            <div class="metric-label">换手率</div>
+                        </div>
+                    </div>
+                    
+                    <div style="font-size: 10px; color: #888; margin-top: 6px;">
+                        <span style="color: #00aa00;">▶ 竞价卡位失败:</span> 
+                        资金流出明显，板块掉队
+                    </div>
+                    
+                    <div class="auction-timeline">
+                        <div class="timeline-fill" style="width: 32%; background: linear-gradient(90deg, #00aa00, #2962ff);"></div>
+                    </div>
+                </div>
+                
+                <!-- 竞价卡位总结 -->
+                <div style="margin-top: 10px; padding: 8px; background: rgba(40, 40, 60, 0.5); border-radius: 4px;">
+                    <div style="color: #ffaa00; font-weight: bold; margin-bottom: 4px;">
+                        🎯 竞价卡位结论:
+                    </div>
+                    <div style="font-size: 11px; color: #aaa;">
+                        1. <span style="color: #ff4444;">AI卡位成功</span>，成为日内主线<br>
+                        2. <span style="color: #ffaa00;">机器人试图卡位</span>，但力度不足<br>
+                        3. <span style="color: #00aa00;">新能源掉队</span>，资金被抽离
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 中间：分时卡位分析 -->
+        <div class="panel">
+            <div class="panel-title">
+                <span>📊 分时卡位实时监控</span>
+                <span style="font-size: 12px;">当前时间: <span id="currentTime">09:45:21</span></span>
+            </div>
+            
+            <div class="minute-container">
+                <!-- 分时走势对比 -->
+                <div class="panel-title" style="margin-top: 0; padding-top: 0;">
+                    <span>📈 分时走势对比</span>
+                    <span style="font-size: 11px;">红色: 汉王科技 | 黄色: 赛为智能 | 绿色: 宁德时代</span>
+                </div>
+                
+                <div class="minute-chart-container">
+                    <!-- 网格线 -->
+                    <div class="chart-grid">
+                        <div class="grid-line"></div>
+                        <div class="grid-line"></div>
+                        <div class="grid-line"></div>
+                        <div style="border-right: 0;"></div>
+                    </div>
+                    
+                    <!-- 价格线 -->
+                    <div class="price-line" style="top: 25%;"></div>
+                    <div class="price-line" style="top: 50%;"></div>
+                    <div class="price-line" style="top: 75%;"></div>
+                    
+                    <!-- 分时线容器 -->
+                    <div class="minute-chart" id="minuteChart">
+                        <!-- 分时线通过JS动态绘制 -->
+                    </div>
+                </div>
+                
+                <!-- 关键卡位点 -->
+                <div style="margin-top: 8px;">
+                    <div style="color: #ffaa00; font-weight: bold; margin-bottom: 6px;">
+                        ⚡ 关键卡位点:
+                    </div>
+                    <div style="display: flex; overflow-x: auto; gap: 10px; padding-bottom: 5px;">
+                        <div style="background: rgba(255, 68, 68, 0.1); padding: 6px; border-radius: 4px; min-width: 120px;">
+                            <div style="color: #ff4444; font-size: 11px;">09:30 开盘</div>
+                            <div style="font-size: 10px; color: #aaa;">汉王+9.8%，确立优势</div>
+                        </div>
+                        <div style="background: rgba(255, 170, 0, 0.1); padding: 6px; border-radius: 4px; min-width: 120px;">
+                            <div style="color: #ffaa00; font-size: 11px;">09:35 首次分歧</div>
+                            <div style="font-size: 10px; color: #aaa;">赛为试图卡位失败</div>
+                        </div>
+                        <div style="background: rgba(0, 170, 0, 0.1); padding: 6px; border-radius: 4px; min-width: 120px;">
+                            <div style="color: #00aa00; font-size: 11px;">09:42 资金回流</div>
+                            <div style="font-size: 10px; color: #aaa;">汉王封单增至4亿</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 分时卡位分析 -->
+                <div style="margin-top: 8px; flex: 1; overflow-y: auto;">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>卡位动作</th>
+                                <th>结果</th>
+                                <th>影响</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>09:30</td>
+                                <td>汉王科技开盘秒板</td>
+                                <td><span style="color: #ff4444;">卡位成功</span></td>
+                                <td>带动AI板块整体高开</td>
+                            </tr>
+                            <tr>
+                                <td>09:35</td>
+                                <td>赛为智能拉升卡位</td>
+                                <td><span style="color: #ffaa00;">卡位失败</span></td>
+                                <td>机器人跟风不足</td>
+                            </tr>
+                            <tr>
+                                <td>09:40</td>
+                                <td>宁德时代杀跌</td>
+                                <td><span style="color: #00aa00;">掉队确认</span></td>
+                                <td>新能源板块资金流出</td>
+                            </tr>
+                            <tr>
+                                <td>09:42</td>
+                                <td>汉王封单增至4亿</td>
+                                <td><span style="color: #ff4444;">优势扩大</span></td>
+                                <td>AI后排跟风涨停</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 右侧：板块联动与预警 -->
+        <div class="panel">
+            <div class="panel-title">
+                <span>🔄 板块联动分析</span>
+                <span style="color: #ffaa00;">联动强度: 85%</span>
+            </div>
+            
+            <!-- 竞争关系图 -->
+            <div class="compete-graph">
+                <div class="relation-node winner" id="winnerNode">
+                    <div style="color: #ff4444; font-weight: bold; font-size: 14px;">汉王科技</div>
+                    <div style="font-size: 10px; color: #aaa; margin-top: 4px;">AI龙头</div>
+                    <div style="color: #ff4444; font-size: 12px; margin-top: 6px;">+10.0%</div>
+                </div>
+                
+                <div class="relation-node loser" id="loserNode">
+                    <div style="color: #00aa00; font-weight: bold; font-size: 14px;">宁德时代</div>
+                    <div style="font-size: 10px; color: #aaa; margin-top: 4px;">新能源中军</div>
+                    <div style="color: #00aa00; font-size: 12px; margin-top: 6px;">-1.5%</div>
+                </div>
+            </div>
+            
+            <!-- 连线动画 -->
+            <div style="position: relative; height: 20px; margin: 8px 0;">
+                <div style="position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: #333;"></div>
+                <div id="arrowLine" style="position: absolute; left: 25%; right: 25%; top: 50%; height: 2px; background: linear-gradient(90deg, #00aa00, #ff4444);"></div>
+                <div style="position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #141414; padding: 0 8px;">
+                    <span style="color: #ffaa00;">← 资金流向 →</span>
+                </div>
+            </div>
+            
+            <!-- 板块联动详情 -->
+            <div class="plate-linkage">
+                <div class="panel-title" style="margin-top: 0;">
+                    <span>📈 龙头带动效应</span>
+                </div>
+                
+                <div class="linkage-item">
+                    <span style="color: #ff4444; font-weight: bold;">汉王科技</span>
+                    <span class="linkage-arrow">→</span>
+                    <span style="color: #ffaa00;">赛为智能</span>
+                    <span class="linkage-status status-success">+8.5%</span>
+                </div>
+                
+                <div class="linkage-item">
+                    <span style="color: #ff4444; font-weight: bold;">汉王科技</span>
+                    <span class="linkage-arrow">→</span>
+                    <span style="color: #ffaa00;">视觉中国</span>
+                    <span class="linkage-status status-success">+6.2%</span>
+                </div>
+                
+                <div class="linkage-item">
+                    <span style="color: #ff4444; font-weight: bold;">汉王科技</span>
+                    <span class="linkage-arrow">→</span>
+                    <span style="color: #ffaa00;">科大讯飞</span>
+                    <span class="linkage-status status-warning">+4.1%</span>
+                </div>
+                
+                <div class="linkage-item">
+                    <span style="color: #00aa00; font-weight: bold;">宁德时代</span>
+                    <span class="linkage-arrow">→</span>
+                    <span style="color: #888;">比亚迪</span>
+                    <span class="linkage-status status-failure">-2.3%</span>
+                </div>
+            </div>
+            
+            <!-- 风险预警 -->
+            <div style="margin-top: 12px;">
+                <div class="panel-title">
+                    <span>⚠️ 风险预警</span>
+                    <span style="color: #ff4444;">高风险: 2个</span>
+                </div>
+                
+                <div style="padding: 8px; background: rgba(255, 68, 68, 0.1); border-radius: 4px; margin-top: 6px;">
+                    <div style="color: #ff4444; font-weight: bold; margin-bottom: 4px;">
+                        🔴 后排掉队风险:
+                    </div>
+                    <div style="font-size: 11px; color: #ff8888;">
+                        赛为智能封单减少(1.8亿→1.2亿)，后排跟风不足
+                    </div>
+                </div>
+                
+                <div style="padding: 8px; background: rgba(255, 170, 0, 0.1); border-radius: 4px; margin-top: 6px;">
+                    <div style="color: #ffaa00; font-weight: bold; margin-bottom: 4px;">
+                        🟡 反包可能:
+                    </div>
+                    <div style="font-size: 11px; color: #ffcc88;">
+                        宁德时代承接较好，午后可能有资金回流反包
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 操作建议 -->
+            <button class="action-btn" id="actionButton" onclick="executeAction()">
+                🎯 执行操作: 买入AI龙头 (F1)
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // 实时卡位竞争分析系统
+        class RealTimeCompeteSystem {
+            constructor() {
+                this.data = {
+                    auction: {},          // 竞价数据
+                    minute: [],           // 分时数据
+                    compete: [],          // 竞争数据
+                    plateLinkage: [],     // 板块联动数据
+                    warnings: []          // 预警数据
+                };
+                
+                this.init();
+                this.startRealTimeUpdate();
+            }
+            
+            init() {
+                this.loadMockData();
+                this.renderMinuteChart();
+                this.setupEventListeners();
+                this.updateCurrentTime();
+                
+                // 设置键盘快捷键
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'F1' || e.key === 'f1') {
+                        this.executeAction('buy');
+                    } else if (e.key === 'F2' || e.key === 'f2') {
+                        this.executeAction('sell');
+                    } else if (e.key === 'F3' || e.key === 'f3') {
+                        this.showDetail();
+                    } else if (e.key === 'F5' || e.key === 'f5') {
+                        this.refreshData();
+                    }
+                });
+            }
+            
+            // 加载模拟数据
+            loadMockData() {
+                this.data = {
+                    auction: {
+                        stocks: [
+                            {
+                                name: '汉王科技',
+                                tag: '空间板',
+                                change: 0.098,
+                                sealAmount: 320000000,
+                                largeRatio: 0.85,
+                                turnover: 0.008,
+                                status: 'winning',
+                                strength: 0.92
+                            },
+                            {
+                                name: '赛为智能',
+                                tag: '换手龙',
+                                change: 0.065,
+                                sealAmount: 180000000,
+                                largeRatio: 0.62,
+                                turnover: 0.012,
+                                status: 'fighting',
+                                strength: 0.68
+                            },
+                            {
+                                name: '宁德时代',
+                                tag: '中军',
+                                change: -0.012,
+                                sealAmount: 30000000,
+                                largeRatio: 0.28,
+                                turnover: 0.018,
+                                status: 'losing',
+                                strength: 0.32
+                            }
+                        ]
+                    },
+                    minute: {
+                        timeSlots: ['09:30', '09:35', '09:40', '09:45', '09:50', '09:55', '10:00'],
+                        stocks: [
+                            {
+                                name: '汉王科技',
+                                prices: [0.098, 0.100, 0.099, 0.100, 0.100, 0.100, 0.100],
+                                color: '#ff4444'
+                            },
+                            {
+                                name: '赛为智能',
+                                prices: [0.065, 0.075, 0.072, 0.068, 0.066, 0.064, 0.063],
+                                color: '#ffaa00'
+                            },
+                            {
+                                name: '宁德时代',
+                                prices: [-0.012, -0.015, -0.018, -0.015, -0.013, -0.012, -0.011],
+                                color: '#00aa00'
+                            }
+                        ]
+                    },
+                    compete: [
+                        {
+                            time: '09:30',
+                            action: '汉王科技开盘秒板',
+                            result: 'winning',
+                            impact: '带动AI板块整体高开'
+                        },
+                        {
+                            time: '09:35',
+                            action: '赛为智能拉升卡位',
+                            result: 'fighting',
+                            impact: '机器人跟风不足'
+                        },
+                        {
+                            time: '09:40',
+                            action: '宁德时代杀跌',
+                            result: 'losing',
+                            impact: '新能源板块资金流出'
+                        },
+                        {
+                            time: '09:42',
+                            action: '汉王封单增至4亿',
+                            result: 'winning',
+                            impact: 'AI后排跟风涨停'
+                        }
+                    ],
+                    plateLinkage: [
+                        {
+                            leader: '汉王科技',
+                            follower: '赛为智能',
+                            change: 0.085,
+                            status: 'success'
+                        },
+                        {
+                            leader: '汉王科技',
+                            follower: '视觉中国',
+                            change: 0.062,
+                            status: 'success'
+                        },
+                        {
+                            leader: '汉王科技',
+                            follower: '科大讯飞',
+                            change: 0.041,
+                            status: 'warning'
+                        },
+                        {
+                            leader: '宁德时代',
+                            follower: '比亚迪',
+                            change: -0.023,
+                            status: 'failure'
+                        }
+                    ],
+                    warnings: [
+                        {
+                            type: 'risk',
+                            title: '后排掉队风险',
+                            content: '赛为智能封单减少(1.8亿→1.2亿)，后排跟风不足',
+                            level: 'high',
+                            color: '#ff4444'
+                        },
+                        {
+                            type: 'opportunity',
+                            title: '反包可能',
+                            content: '宁德时代承接较好，午后可能有资金回流反包',
+                            level: 'medium',
+                            color: '#ffaa00'
+                        }
+                    ]
+                };
+            }
+            
+            // 渲染分时图
+            renderMinuteChart() {
+                const container = document.getElementById('minuteChart');
+                if (!container) return;
+                
+                container.innerHTML = '';
+                
+                const { timeSlots, stocks } = this.data.minute;
+                const containerWidth = container.clientWidth;
+                const containerHeight = container.clientHeight;
+                
+                // 绘制每个股票的分时线
+                stocks.forEach(stock => {
+                    const pathData = this.calculatePathData(stock.prices, timeSlots.length, containerWidth, containerHeight);
+                    
+                    // 创建SVG路径
+                    const svgNS = "http://www.w3.org/2000/svg";
+                    const svg = document.createElementNS(svgNS, "svg");
+                    svg.setAttribute("width", "100%");
+                    svg.setAttribute("height", "100%");
+                    svg.style.position = "absolute";
+                    svg.style.top = "0";
+                    svg.style.left = "0";
+                    
+                    // 创建路径
+                    const path = document.createElementNS(svgNS, "path");
+                    path.setAttribute("d", pathData);
+                    path.setAttribute("fill", "none");
+                    path.setAttribute("stroke", stock.color);
+                    path.setAttribute("stroke-width", "2");
+                    path.setAttribute("stroke-linecap", "round");
+                    path.setAttribute("stroke-linejoin", "round");
+                    
+                    svg.appendChild(path);
+                    container.appendChild(svg);
+                });
+            }
+            
+            // 计算路径数据
+            calculatePathData(prices, count, width, height) {
+                const points = [];
+                const padding = 10;
+                const chartWidth = width - padding * 2;
+                const chartHeight = height - padding * 2;
+                
+                // 找到价格范围
+                const minPrice = Math.min(...prices);
+                const maxPrice = Math.max(...prices);
+                const priceRange = maxPrice - minPrice;
+                
+                // 计算每个点
+                for (let i = 0; i < count; i++) {
+                    const x = padding + (i / (count - 1)) * chartWidth;
+                    
+                    // 归一化价格到Y坐标
+                    let y;
+                    if (priceRange === 0) {
+                        y = padding + chartHeight / 2;
+                    } else {
+                        const normalizedPrice = (prices[i] - minPrice) / priceRange;
+                        // 反转Y轴（因为SVG的Y轴向下）
+                        y = padding + chartHeight - (normalizedPrice * chartHeight);
+                    }
+                    
+                    points.push({ x, y });
+                }
+                
+                // 生成路径字符串
+                if (points.length === 0) return '';
+                
+                let path = `M ${points[0].x} ${points[0].y}`;
+                for (let i = 1; i < points.length; i++) {
+                    path += ` L ${points[i].x} ${points[i].y}`;
+                }
+                
+                return path;
+            }
+            
+            // 设置事件监听
+            setupEventListeners() {
+                // 竞价卡片点击
+                document.querySelectorAll('.auction-card').forEach(card => {
+                    card.addEventListener('click', (e) => {
+                        const stockName = card.querySelector('.stock-name span').textContent;
+                        this.showAuctionDetail(stockName);
+                    });
+                });
+                
+                // 竞争节点点击
+                document.getElementById('winnerNode')?.addEventListener('click', () => {
+                    this.showCompeteDetail('winner');
+                });
+                
+                document.getElementById('loserNode')?.addEventListener('click', () => {
+                    this.showCompeteDetail('loser');
+                });
+                
+                // 联动项点击
+                document.querySelectorAll('.linkage-item').forEach(item => {
+                    item.addEventListener('click', () => {
+                        const leader = item.querySelector('span:first-child').textContent;
+                        const follower = item.querySelector('span:nth-child(3)').textContent;
+                        this.showLinkageDetail(leader, follower);
+                    });
+                });
+            }
+            
+            // 显示竞价详情
+            showAuctionDetail(stockName) {
+                const stock = this.data.auction.stocks.find(s => s.name === stockName);
+                if (!stock) return;
+                
+                const detail = `
+                    <div style="padding: 15px;">
+                        <h3 style="color: ${stock.status === 'winning' ? '#ff4444' : stock.status === 'losing' ? '#00aa00' : '#ffaa00'}; margin-bottom: 10px;">
+                            ${stock.name} - 竞价分析
+                        </h3>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #888;">竞价涨幅:</span>
+                            <span style="color: ${stock.change > 0 ? '#ff4444' : '#00aa00'}; font-weight: bold;">
+                                ${(stock.change * 100).toFixed(2)}%
+                            </span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #888;">封单金额:</span>
+                            <span style="color: #ffaa00; font-weight: bold;">
+                                ${this.formatAmount(stock.sealAmount)}
+                            </span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #888;">大单占比:</span>
+                            <span style="color: #ffaa00; font-weight: bold;">
+                                ${(stock.largeRatio * 100).toFixed(1)}%
+                            </span>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <span style="color: #888;">竞价强度:</span>
+                            <span style="color: #ff4444; font-weight: bold;">
+                                ${(stock.strength * 100).toFixed(0)}%
+                            </span>
+                        </div>
+                        <div style="margin-top: 15px; font-size: 12px; color: #aaa;">
+                            <div>📊 卡位分析:</div>
+                            <div>${this.getAuctionAnalysis(stock)}</div>
+                        </div>
+                    </div>
+                `;
+                
+                this.showModal('竞价卡位详情', detail);
+            }
+            
+            // 显示竞争详情
+            showCompeteDetail(type) {
+                const isWinner = type === 'winner';
+                const detail = `
+                    <div style="padding: 15px;">
+                        <h3 style="color: ${isWinner ? '#ff4444' : '#00aa00'}; margin-bottom: 10px;">
+                            ${isWinner ? '卡位成功方' : '卡位失败方'} - 详细分析
+                        </h3>
+                        <div style="margin-bottom: 10px;">
+                            <div style="color: #ffaa00; font-weight: bold; margin-bottom: 5px;">核心因素:</div>
+                            <div style="font-size: 12px; color: #aaa;">
+                                ${isWinner ? 
+                                    '1. 竞价封单从2.1亿增至3.2亿<br>2. 大单主动买入占比85%<br>3. 板块效应明显' :
+                                    '1. 竞价资金流出明显<br>2. 板块内个股跟风不足<br>3. 主线切换'
+                                }
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 10px;">
+                            <div style="color: #ffaa00; font-weight: bold; margin-bottom: 5px;">板块影响:</div>
+                            <div style="font-size: 12px; color: #aaa;">
+                                ${isWinner ? 
+                                    '带动AI板块整体上涨，后排跟风涨停' :
+                                    '拖累新能源板块下跌，资金被抽离'
+                                }
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px; padding: 8px; background: rgba(255, 170, 0, 0.1); border-radius: 4px;">
+                            <div style="color: #ffaa00; font-weight: bold;">预判:</div>
+                            <div style="font-size: 12px; color: #ffcc88;">
+                                ${isWinner ? 
+                                    '有望继续走强，成为空间板龙头' :
+                                    '如果承接较好，午后可能有资金回流反包'
+                                }
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                this.showModal('竞争分析', detail);
+            }
+            
+            // 显示联动详情
+            showLinkageDetail(leader, follower) {
+                const linkage = this.data.plateLinkage.find(l => l.leader === leader && l.follower === follower);
+                if (!linkage) return;
+                
+                const detail = `
+                    <div style="padding: 15px;">
+                        <h3 style="color: #ffaa00; margin-bottom: 10px;">
+                            ${leader} → ${follower}
+                        </h3>
+                        <div style="display: flex; justify-content: space-around; margin-bottom: 15px;">
+                            <div style="text-align: center;">
+                                <div style="color: #888; font-size: 11px;">带动强度</div>
+                                <div style="color: ${linkage.status === 'success' ? '#ff4444' : linkage.status === 'failure' ? '#00aa00' : '#ffaa00'}; font-size: 20px; font-weight: bold;">
+                                    ${Math.abs(linkage.change * 100).toFixed(1)}%
+                                </div>
+                            </div>
+                            <div style="text-align: center;">
+                                <div style="color: #888; font-size: 11px;">联动关系</div>
+                                <div style="color: #ffaa00; font-size: 20px; font-weight: bold;">
+                                    ${this.getRelationType(linkage.change)}
+                                </div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px; font-size: 12px; color: #aaa;">
+                            <div>📈 联动分析:</div>
+                            <div>${this.getLinkageAnalysis(leader, follower, linkage)}</div>
+                        </div>
+                    </div>
+                `;
+                
+                this.showModal('板块联动详情', detail);
+            }
+            
+            // 获取竞价分析
+            getAuctionAnalysis(stock) {
+                if (stock.status === 'winning') {
+                    return '竞价阶段资金强势介入，封单持续增加，成功卡位成为日内龙头';
+                } else if (stock.status === 'fighting') {
+                    return '竞价阶段试图卡位，但力度弱于竞争对手，需观察开盘后资金态度';
+                } else {
+                    return '竞价阶段资金流出明显，未能成功卡位，需注意风险';
+                }
+            }
+            
+            // 获取关系类型
+            getRelationType(change) {
+                if (change > 0.05) return '强联动';
+                if (change > 0.02) return '中联动';
+                if (change > 0) return '弱联动';
+                return '负联动';
+            }
+            
+            // 获取联动分析
+            getLinkageAnalysis(leader, follower, linkage) {
+                if (linkage.status === 'success') {
+                    return `${leader}的强势表现成功带动${follower}上涨，形成板块效应`;
+                } else if (linkage.status === 'failure') {
+                    return `${leader}的弱势表现拖累${follower}下跌，形成板块负反馈`;
+                } else {
+                    return `${leader}对${follower}的带动效应一般，需进一步观察`;
+                }
+            }
+            
+            // 格式化金额
+            formatAmount(amount) {
+                if (amount >= 100000000) {
+                    return (amount / 100000000).toFixed(1) + '亿';
+                } else if (amount >= 10000) {
+                    return (amount / 10000).toFixed(0) + '万';
+                }
+                return amount.toFixed(0);
+            }
+            
+            // 执行操作
+            executeAction(type = 'buy') {
+                const actions = {
+                    buy: { name: '买入', target: '汉王科技', reason: '竞价卡位成功，板块效应明显' },
+                    sell: { name: '卖出', target: '宁德时代', reason: '卡位失败，板块掉队' },
+                    switch: { name: '切换', target: '赛为智能', reason: '分时承接较好，可能有反包机会' }
+                };
+                
+                const action = actions[type];
+                const confirmMsg = `确认${action.name}【${action.target}】？\n\n理由：${action.reason}\n\n⚠️ 风险提示：\n1. 市场情绪可能变化\n2. 注意仓位控制\n3. 设置止损位`;
+                
+                if (confirm(confirmMsg)) {
+                    alert(`✅ ${action.name}指令已发送\n📊 目标：${action.target}\n⏰ 时间：${new Date().toLocaleTimeString()}`);
+                    
+                    // 记录交易
+                    this.logTrade({
+                        action: action.name,
+                        target: action.target,
+                        time: new Date().toLocaleTimeString(),
+                        reason: action.reason
+                    });
+                }
+            }
+            
+            // 记录交易
+            logTrade(trade) {
+                console.log('交易记录:', trade);
+                
+                // 更新按钮文本
+                const btn = document.getElementById('actionButton');
+                if (btn) {
+                    const oldText = btn.textContent;
+                    btn.textContent = `✅ ${trade.action}指令已发送`;
+                    btn.style.background = 'linear-gradient(135deg, #00aa00, #00cc00)';
+                    
+                    // 3秒后恢复
+                    setTimeout(() => {
+                        btn.textContent = oldText;
+                        btn.style.background = 'linear-gradient(135deg, #ff4444, #ff8800)';
+                    }, 3000);
+                }
+            }
+            
+            // 显示详情
+            showDetail() {
+                this.showModal('系统详情', `
+                    <div style="padding: 15px;">
+                        <h3 style="color: #ffaa00; margin-bottom: 10px;">实时卡位竞争分析系统</h3>
+                        <div style="margin-bottom: 10px;">
+                            <div style="color: #888; font-size: 11px;">核心功能:</div>
+                            <div style="font-size: 12px; color: #aaa; margin-top: 5px;">
+                                <div>🎯 竞价卡位分析：识别开盘前的资金态度</div>
+                                <div>📊 分时卡位监控：实时跟踪资金博弈</div>
+                                <div>🔄 板块联动分析：分析龙头带动效应</div>
+                                <div>⚠️ 风险预警：提前发现风险与机会</div>
+                            </div>
+                        </div>
+                        <div style="margin-top: 15px;">
+                            <div style="color: #888; font-size: 11px;">快捷键:</div>
+                            <div style="font-size: 12px; color: #aaa; margin-top: 5px;">
+                                <div>F1: 执行买入</div>
+                                <div>F2: 执行卖出</div>
+                                <div>F3: 查看详情</div>
+                                <div>F5: 刷新数据</div>
+                            </div>
+                        </div>
+                    </div>
+                `);
+            }
+            
+            // 刷新数据
+            refreshData() {
+                // 模拟数据更新
+                this.data.minute.stocks.forEach(stock => {
+                    const lastPrice = stock.prices[stock.prices.length - 1];
+                    const newPrice = lastPrice + (Math.random() - 0.5) * 0.005;
+                    stock.prices.push(parseFloat(newPrice.toFixed(4)));
+                    stock.prices.shift(); // 移除第一个数据
+                });
+                
+                this.renderMinuteChart();
+                
+                // 更新当前时间
+                this.updateCurrentTime();
+                
+                // 提示
+                alert('数据已刷新！');
+            }
+            
+            // 更新当前时间
+            updateCurrentTime() {
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString();
+                const timeElement = document.getElementById('currentTime');
+                if (timeElement) {
+                    timeElement.textContent = timeStr;
+                }
+            }
+            
+            // 开始实时更新
+            startRealTimeUpdate() {
+                // 每10秒更新一次分时数据
+                setInterval(() => {
+                    this.data.minute.stocks.forEach(stock => {
+                        const lastPrice = stock.prices[stock.prices.length - 1];
+                        const newPrice = lastPrice + (Math.random() - 0.5) * 0.002;
+                        stock.prices.push(parseFloat(newPrice.toFixed(4)));
+                        stock.prices.shift();
+                    });
+                    
+                    this.renderMinuteChart();
+                    this.updateCurrentTime();
+                }, 10000); // 10秒
+            }
+            
+            // 显示模态框
+            showModal(title, content) {
+                const modal = document.createElement('div');
+                modal.style.cssText = `
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    background: #1a1a1a;
+                    border: 2px solid #333;
+                    border-radius: 8px;
+                    z-index: 1000;
+                    min-width: 300px;
+                    max-width: 400px;
+                    box-shadow: 0 0 30px rgba(0,0,0,0.5);
+                `;
+                
+                modal.innerHTML = `
+                    <div style="padding: 15px; border-bottom: 1px solid #333; background: #222; border-radius: 6px 6px 0 0;">
+                        <div style="color: #ffaa00; font-weight: bold;">${title}</div>
+                    </div>
+                    ${content}
+                    <div style="padding: 10px; text-align: right; border-top: 1px solid #333;">
+                        <button onclick="this.parentElement.parentElement.remove()" 
+                                style="padding: 6px 12px; background: #333; border: none; color: #fff; border-radius: 4px; cursor: pointer;">
+                            关闭
+                        </button>
+                    </div>
+                `;
+                
+                document.body.appendChild(modal);
+            }
+        }
+        
+        // 初始化系统
+        const competeSystem = new RealTimeCompeteSystem();
+        
+        // 全局函数
+        window.executeAction = () => competeSystem.executeAction('buy');
+        window.showDetail = () => competeSystem.showDetail();
+    </script>
+</body>
+</html>

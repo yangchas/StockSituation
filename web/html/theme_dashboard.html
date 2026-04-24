@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>中文题材展示</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            color: white;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 1rem;
+            color: #666;
+        }
+
+        .theme-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .theme-card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .theme-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.15);
+        }
+
+        .theme-name {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+
+        .stock-list {
+            list-style: none;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .stock-item {
+            padding: 10px;
+            margin-bottom: 8px;
+            background: #f8f9fa;
+            border-radius: 5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .stock-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .stock-code {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .stock-name {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .stock-change {
+            font-weight: bold;
+            color: #dc3545;
+        }
+
+        .stock-change.positive {
+            color: #28a745;
+        }
+
+        .loading {
+            text-align: center;
+            color: white;
+            font-size: 1.5rem;
+            padding: 50px;
+        }
+
+        .error {
+            text-align: center;
+            color: #dc3545;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px auto;
+            max-width: 600px;
+        }
+
+        .filter-bar {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .filter-label {
+            font-weight: bold;
+            color: #666;
+        }
+
+        .filter-input {
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 1rem;
+            width: 150px;
+        }
+
+        .filter-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .filter-button {
+            padding: 8px 20px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 1rem;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+
+        .filter-button:hover {
+            background: #5568d3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 中文题材展示</h1>
+        
+        <div class="filter-bar">
+            <div class="filter-group">
+                <label class="filter-label">最小涨速:</label>
+                <input type="number" id="minSpeed" class="filter-input" value="0.5" step="0.1">
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">最小成交额(亿):</label>
+                <input type="number" id="minAmount" class="filter-input" value="0.5" step="0.1">
+            </div>
+            <div class="filter-group">
+                <label class="filter-label">最小涨幅(%):</label>
+                <input type="number" id="minChange" class="filter-input" value="0.5" step="0.1">
+            </div>
+            <div class="filter-group">
+                <button class="filter-button" onclick="loadData()">🔍 筛选</button>
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-number" id="stockCount">0</div>
+                <div class="stat-label">股票数量</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="themeCount">0</div>
+                <div class="stat-label">题材数量</div>
+            </div>
+        </div>
+
+        <div id="loading" class="loading">加载中...</div>
+        <div id="error" class="error" style="display: none;"></div>
+        <div id="themeGrid" class="theme-grid"></div>
+    </div>
+
+    <script>
+        async function loadData() {
+            const minSpeed = document.getElementById('minSpeed').value;
+            const minAmount = document.getElementById('minAmount').value;
+            const minChange = document.getElementById('minChange').value;
+
+            const loading = document.getElementById('loading');
+            const error = document.getElementById('error');
+            const themeGrid = document.getElementById('themeGrid');
+
+            loading.style.display = 'block';
+            error.style.display = 'none';
+            themeGrid.innerHTML = '';
+
+            try {
+                const response = await fetch(`/api/other_stocks?min_speed=${minSpeed}&min_amount=${minAmount}&min_change=${minChange}`);
+                const data = await response.json();
+
+                loading.style.display = 'none';
+
+                // 更新统计数据
+                document.getElementById('stockCount').textContent = data.stocks ? data.stocks.length : 0;
+                document.getElementById('themeCount').textContent = data.theme_groups ? Object.keys(data.theme_groups).length : 0;
+
+                // 展示题材分组
+                if (data.theme_groups) {
+                    const themes = Object.entries(data.theme_groups);
+                    themes.sort(([nameA], [nameB]) => nameA.localeCompare(nameB, 'zh-CN'));
+
+                    themes.forEach(([themeName, stockCodes]) => {
+                        const themeCard = document.createElement('div');
+                        themeCard.className = 'theme-card';
+
+                        const themeNameElement = document.createElement('div');
+                        themeNameElement.className = 'theme-name';
+                        themeNameElement.textContent = themeName;
+
+                        const stockList = document.createElement('ul');
+                        stockList.className = 'stock-list';
+
+                        stockCodes.forEach(code => {
+                            const stock = data.stocks.find(s => s.code === code);
+                            if (stock) {
+                                const stockItem = document.createElement('li');
+                                stockItem.className = 'stock-item';
+
+                                const stockInfo = document.createElement('div');
+                                stockInfo.className = 'stock-info';
+
+                                const stockCode = document.createElement('div');
+                                stockCode.className = 'stock-code';
+                                stockCode.textContent = stock.code;
+
+                                const stockName = document.createElement('div');
+                                stockName.className = 'stock-name';
+                                stockName.textContent = stock.name;
+
+                                stockInfo.appendChild(stockCode);
+                                stockInfo.appendChild(stockName);
+
+                                const stockChange = document.createElement('div');
+                                stockChange.className = `stock-change ${stock.change_pct > 0 ? 'positive' : ''}`;
+                                stockChange.textContent = `${stock.change_pct > 0 ? '+' : ''}${stock.change_pct.toFixed(2)}%`;
+
+                                stockItem.appendChild(stockInfo);
+                                stockItem.appendChild(stockChange);
+                                stockList.appendChild(stockItem);
+                            }
+                        });
+
+                        themeCard.appendChild(themeNameElement);
+                        themeCard.appendChild(stockList);
+                        themeGrid.appendChild(themeCard);
+                    });
+                } else {
+                    error.textContent = '没有找到符合条件的股票';
+                    error.style.display = 'block';
+                }
+            } catch (err) {
+                loading.style.display = 'none';
+                error.textContent = `加载失败: ${err.message}`;
+                error.style.display = 'block';
+                console.error('Error loading data:', err);
+            }
+        }
+
+        // 页面加载时自动加载数据
+        window.onload = loadData;
+    </script>
+</body>
+</html>
