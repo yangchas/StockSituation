@@ -573,8 +573,6 @@ class AuctionRuntimeController:
         scope_lead = top.plate_name if top else "-"
         scope_expect = self._expectation_text(self.EXPECTATION_LABELS.get(top.expectation, top.expectation)) if top else "-"
         scope_secondary = second.plate_name if second else "-"
-        top_turnover = "、".join(self._snapshot_name_by_symbol(state.context, symbol) for symbol in summary.top_turnover_symbols[:3]) or "-"
-        top_turnover = "ã€".join(self._snapshot_name_by_symbol(state, symbol) for symbol in summary.top_turnover_symbols[:3]) or "-"
         top_turnover = ", ".join(self._snapshot_name_by_symbol(state, symbol) for symbol in summary.top_turnover_symbols[:3]) or "-"
         volume_pred = self._fmt_amount_yi(summary.market_predicted_full_day_amount)
         switch_badge = "⇄" if summary.mainline_switch else "→"
@@ -616,7 +614,6 @@ class AuctionRuntimeController:
             return ("??????????????",)
         rows = ["?????????? | ?? | ?? | ??? | ?? | ?? | ???? | ???? | ??"]
         for row in state.plate_stats[:3]:
-            representative = self._snapshot_name_by_symbol(state.context, row.sample_symbols[0]) if row.sample_symbols else "-"
             representative = self._snapshot_name_by_symbol(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             rows.append(
                 "  "
@@ -759,42 +756,6 @@ class AuctionRuntimeController:
         )
         rows = ["【高标生死簿】标的(题材) | 梯队 | 溢价(竞) | 现价(实) | 状态 | 买一承接 | 特征 | 动作"]
         for snapshot in ranked:
-            decision = state.decision_map.get(snapshot.symbol)
-            action = self._display_action_label(decision, state, phase_label=phase_label) if decision else "只观察"
-            plate = self._display_plate_name(snapshot, prefer_high_board=True)
-            rows.append(
-                "  "
-                f"{self._short_stock_name(snapshot)}({plate})"
-                f" | {self._high_board_ladder_text(snapshot)}"
-                f" | {self._high_board_open_text(snapshot, phase_label=phase_label, historical_only=state.historical_only)}"
-                f" | {self._fmt_pct(snapshot.current_pct)}"
-                f" | {self._high_board_state_label(snapshot, phase_label=phase_label, historical_only=state.historical_only)}"
-                f" | {self._high_board_buy1_text(snapshot, phase_label=phase_label, historical_only=state.historical_only)}"
-                f" | {self._high_board_feature_tags(snapshot, top_board=top_board, buy1_king_symbol=buy1_king_symbol, historical_only=state.historical_only)}"
-                f" | {action}"
-            )
-        return tuple(rows)
-        ranked = sorted(
-            (
-                snapshot
-                for snapshot in state.snapshot_map.values()
-                if snapshot.symbol in state.candidate_scope and (snapshot.lb_days >= 2 or snapshot.is_yest_limit)
-            ),
-            key=lambda snapshot: (
-                -snapshot.lb_days,
-                snapshot.leader_rank_in_theme,
-                -snapshot.current_pct,
-                -snapshot.auction_amount,
-            ),
-        )
-        if not ranked:
-            return ("【高位梯队】暂无高位样本",)
-        top_board = max((snapshot.lb_days for snapshot in ranked), default=0)
-        buy1_king_symbol = ""
-        if not (phase_label == "premarket" and state.historical_only):
-            buy1_king_symbol = max(ranked, key=lambda item: item.volume_intensity).symbol if ranked else ""
-        rows = ["【高标生死簿】标的(题材) | 梯队 | 溢价(竞) | 现价(实) | 状态 | 买一承接 | 特征 | 动作"]
-        for snapshot in ranked[:4]:
             decision = state.decision_map.get(snapshot.symbol)
             action = self._display_action_label(decision, state, phase_label=phase_label) if decision else "只观察"
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
