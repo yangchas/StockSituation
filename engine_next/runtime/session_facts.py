@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from heapq import nsmallest
 from typing import Any, Iterable
 
 from engine_next.domain.models import (
@@ -207,7 +208,8 @@ def _build_theme_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[ThemeFa
 
     facts: list[ThemeFact] = []
     for plate_name, bucket in buckets.items():
-        ranked = sorted(
+        ranked = nsmallest(
+            3,
             bucket.symbols,
             key=lambda snapshot: (
                 -snapshot.lb_days,
@@ -216,7 +218,7 @@ def _build_theme_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[ThemeFa
                 -snapshot.current_pct,
             ),
         )
-        top3_symbols = tuple(snapshot.symbol for snapshot in ranked[:3])
+        top3_symbols = tuple(snapshot.symbol for snapshot in ranked)
         facts.append(
             ThemeFact(
                 plate_name=plate_name,
@@ -261,14 +263,14 @@ def _build_ladder_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[Ladder
     groups = transitions or fallback_groups
     facts: list[LadderFact] = []
     for key, bucket in groups.items():
-        rep = sorted(
+        rep = min(
             bucket.snapshots,
             key=lambda snapshot: (
                 snapshot.leader_rank_in_theme,
                 -snapshot.current_pct,
                 -snapshot.auction_amount,
             ),
-        )[0]
+        )
         facts.append(
             LadderFact(
                 key=key,
