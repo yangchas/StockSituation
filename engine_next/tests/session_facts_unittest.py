@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from engine_next.domain.models import StockStateSnapshot
+from engine_next.domain.enums import RunPhase
+from engine_next.domain.models import PlateMigrationFact, StockStateSnapshot
+from engine_next.runtime.intraday_context_builder import IntradayContextBuilder
 from engine_next.runtime.session_facts import (
     build_session_facts,
     session_facts_from_payload,
@@ -10,7 +12,33 @@ from engine_next.runtime.session_facts import (
 )
 
 
+class _FakeRedis:
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
+    def set(self, key: str, value: str) -> None:
+        self._store[key] = value
+
+    def get(self, key: str) -> str | None:
+        return self._store.get(key)
+
+
+class _FakeHub:
+    def __init__(self) -> None:
+        self.redis = _FakeRedis()
+
+
 class SessionFactsTests(unittest.TestCase):
+    def _build_builder(self) -> IntradayContextBuilder:
+        builder = IntradayContextBuilder.__new__(IntradayContextBuilder)
+        builder._hub = _FakeHub()
+        builder._scoped_cache_token = None
+        builder._json_hash_cache = {}
+        builder._string_hash_cache = {}
+        builder._string_key_cache = {}
+        builder._primed_runtime_state = None
+        return builder
+
     def test_hot_plate_sort_prefers_strength_then_change_pct_then_inflow(self) -> None:
         facts = build_session_facts(
             trade_date="2026-04-25",
@@ -43,6 +71,85 @@ class SessionFactsTests(unittest.TestCase):
         self.assertAlmostEqual(restored.plate_migration_map["通信"].strength_delta, 400.0)
         self.assertIn("1B->2B", restored.ladder_fact_map)
         self.assertEqual(restored.theme_fact_map["通信"].leader_symbol, "000001")
+
+    def test_session_fact_cache_invalidates_when_structure_signature_changes(self) -> None:
+        builder = self._build_builder()
+        facts = build_session_facts(
+            trade_date="2026-04-25",
+            phase_name="auction",
+            snapshots=(),
+            hot_plate_map={"通信": {"strength": 3200, "change_pct": 1.5, "net_inflow_yi": 8.0}},
+            yesterday_hot_plate_map={},
+        )
+        builder._write_cached_session_facts(
+            trade_date="2026-04-25",
+            phase=RunPhase.AUCTION,
+            latest_quote_timestamp_ms=1000,
+            symbol_count=5000,
+            hot_plate_cache_trade_date="2026-04-25",
+            hot_plate_updated_at_ts=2000,
+            hot_plate_signature="hot-a",
+            yest_limit_signature="yl-a",
+            auction_signature="auc-a",
+            facts=facts,
+        )
+        hit = builder._load_cached_session_facts(
+            trade_date="2026-04-25",
+            phase=RunPhase.AUCTION,
+            latest_quote_timestamp_ms=1000,
+            symbol_count=5000,
+            hot_plate_cache_trade_date="2026-04-25",
+            hot_plate_updated_at_ts=2000,
+            hot_plate_signature="hot-a",
+            yest_limit_signature="yl-a",
+            auction_signature="auc-a",
+        )
+        miss = builder._load_cached_session_facts(
+            trade_date="2026-04-25",
+            phase=RunPhase.AUCTION,
+            latest_quote_timestamp_ms=1000,
+            symbol_count=5000,
+            hot_plate_cache_trade_date="2026-04-25",
+            hot_plate_updated_at_ts=2000,
+            hot_plate_signature="hot-b",
+            yest_limit_signature="yl-a",
+            auction_signature="auc-a",
+        )
+        self.assertIsNotNone(hit)
+        self.assertIsNone(miss)
+
+    def test_migration_classification_does_not_mislabel_weakening_as_emerging(self) -> None:
+        builder = self._build_builder()
+        weakening = PlateMigrationFact(
+            plate_name="通信",
+            today_strength=2600,
+            yesterday_strength=3200,
+            strength_delta=-600,
+            today_change_pct=-1.5,
+            yesterday_change_pct=2.0,
+            change_pct_delta=-3.5,
+            today_net_inflow_yi=-4.0,
+            yesterday_net_inflow_yi=8.0,
+            net_inflow_yi_delta=-12.0,
+            present_today=True,
+            present_yesterday=True,
+        )
+        emerging = PlateMigrationFact(
+            plate_name="电力",
+            today_strength=2100,
+            yesterday_strength=0.0,
+            strength_delta=2100,
+            today_change_pct=1.0,
+            yesterday_change_pct=0.0,
+            change_pct_delta=1.0,
+            today_net_inflow_yi=3.0,
+            yesterday_net_inflow_yi=0.0,
+            net_inflow_yi_delta=3.0,
+            present_today=True,
+            present_yesterday=False,
+        )
+        self.assertEqual(builder._classify_plate_migration(weakening), "FADING")
+        self.assertEqual(builder._classify_plate_migration(emerging), "EMERGING")
 
 
 if __name__ == "__main__":

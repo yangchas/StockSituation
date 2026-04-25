@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
+from heapq import nlargest
 from typing import Any, Iterable
 
 from engine_next.domain.enums import RunPhase
@@ -75,6 +77,11 @@ class PrimedIntradayRuntimeState:
     latest_quote_time: str = ""
     latest_quote_age_seconds: int | None = None
     quote_fresh_ratio: float = 0.0
+    hot_plate_cache_trade_date: str = ""
+    hot_plate_updated_at_ts: int = 0
+    hot_plate_signature: str = ""
+    yest_limit_signature: str = ""
+    auction_signature: str = ""
     notes: tuple[str, ...] = ()
 
 
@@ -210,8 +217,11 @@ class IntradayContextBuilder:
         hot_plate_map = self._load_json_hash(f"cache:hot_plates:{request.trade_date}")
         yesterday_hot_plate_map = self._load_json_hash(f"cache:hot_plates:{request.previous_trade_date}")
         effective_hot_plate_map = hot_plate_map
+        effective_hot_plate_trade_date = request.trade_date
         if request.phase == RunPhase.PREMARKET and not effective_hot_plate_map and yesterday_hot_plate_map:
             effective_hot_plate_map = yesterday_hot_plate_map
+            effective_hot_plate_trade_date = request.previous_trade_date
+        hot_plate_meta = self._load_hot_plate_meta(effective_hot_plate_trade_date)
         stock_plate_map = self._load_string_hash("market:stock_plate")
         stock_theme_map = self._load_list_hash(PLATE_MAPPING_S2P_KEY)
         stock_reason_map = self._load_string_hash("market:stock_reason")
@@ -267,6 +277,17 @@ class IntradayContextBuilder:
             latest_quote_time=str(quote_health["latest_time"]),
             latest_quote_age_seconds=quote_health["latest_age_seconds"],
             quote_fresh_ratio=float(quote_health["fresh_ratio"]),
+            hot_plate_cache_trade_date=effective_hot_plate_trade_date,
+            hot_plate_updated_at_ts=int(float(hot_plate_meta.get("updated_at_ts", 0) or 0)),
+            hot_plate_signature=self._hot_plate_signature(
+                effective_hot_plate_map,
+                trade_date=effective_hot_plate_trade_date,
+            ),
+            yest_limit_signature=self._yest_limit_signature(
+                primed_trade_date=request.previous_trade_date,
+                yest_limit_map=yest_limit_map,
+            ),
+            auction_signature=self._auction_signature(auction_rows),
             notes=(
                 f"quotes={len(quotes_result.rows)}",
                 (
@@ -283,6 +304,7 @@ class IntradayContextBuilder:
                 f"hot_plates_today={len(hot_plate_map)}",
                 f"hot_plates_yesterday={len(yesterday_hot_plate_map)}",
                 f"hot_plates_effective={len(effective_hot_plate_map)}",
+                f"hot_plate_meta_ts={int(float(hot_plate_meta.get('updated_at_ts', 0) or 0))}",
             ),
         )
         self._primed_runtime_state = primed_state
@@ -388,6 +410,11 @@ class IntradayContextBuilder:
             phase=primed.phase,
             latest_quote_timestamp_ms=primed.latest_quote_timestamp_ms,
             symbol_count=len(ranked_snapshots),
+            hot_plate_cache_trade_date=primed.hot_plate_cache_trade_date,
+            hot_plate_updated_at_ts=primed.hot_plate_updated_at_ts,
+            hot_plate_signature=primed.hot_plate_signature,
+            yest_limit_signature=primed.yest_limit_signature,
+            auction_signature=primed.auction_signature,
         )
         if session_facts is None:
             session_facts = build_session_facts(
@@ -402,6 +429,11 @@ class IntradayContextBuilder:
                 phase=primed.phase,
                 latest_quote_timestamp_ms=primed.latest_quote_timestamp_ms,
                 symbol_count=len(ranked_snapshots),
+                hot_plate_cache_trade_date=primed.hot_plate_cache_trade_date,
+                hot_plate_updated_at_ts=primed.hot_plate_updated_at_ts,
+                hot_plate_signature=primed.hot_plate_signature,
+                yest_limit_signature=primed.yest_limit_signature,
+                auction_signature=primed.auction_signature,
                 facts=session_facts,
             )
         market_summary = self._build_market_summary(
@@ -528,6 +560,10 @@ class IntradayContextBuilder:
         self._string_key_cache[redis_key] = {}
         return None
 
+    def _load_hot_plate_meta(self, trade_date: str) -> dict[str, Any]:
+        payload = self._load_json_string(f"cache:hot_plates_meta:{trade_date}")
+        return payload if isinstance(payload, dict) else {}
+
     def _prepare_scope_cache(self, trade_date: str, minute_index: int | None) -> None:
         token = (trade_date, minute_index)
         if self._scoped_cache_token == token:
@@ -550,6 +586,11 @@ class IntradayContextBuilder:
         phase: RunPhase,
         latest_quote_timestamp_ms: int,
         symbol_count: int,
+        hot_plate_cache_trade_date: str,
+        hot_plate_updated_at_ts: int,
+        hot_plate_signature: str,
+        yest_limit_signature: str,
+        auction_signature: str,
     ):
         meta = self._load_json_string(self._session_facts_meta_key(trade_date, phase))
         if not isinstance(meta, dict):
@@ -557,9 +598,18 @@ class IntradayContextBuilder:
         try:
             meta_quote_ts = int(float(meta.get("latest_quote_timestamp_ms", 0) or 0))
             meta_symbol_count = int(meta.get("symbol_count", 0) or 0)
+            meta_hot_plate_ts = int(float(meta.get("hot_plate_updated_at_ts", 0) or 0))
         except (TypeError, ValueError):
             return None
-        if meta_quote_ts != latest_quote_timestamp_ms or meta_symbol_count != symbol_count:
+        if (
+            meta_quote_ts != latest_quote_timestamp_ms
+            or meta_symbol_count != symbol_count
+            or str(meta.get("hot_plate_cache_trade_date") or "") != hot_plate_cache_trade_date
+            or meta_hot_plate_ts != hot_plate_updated_at_ts
+            or str(meta.get("hot_plate_signature") or "") != hot_plate_signature
+            or str(meta.get("yest_limit_signature") or "") != yest_limit_signature
+            or str(meta.get("auction_signature") or "") != auction_signature
+        ):
             return None
         payload = self._load_json_string(self._session_facts_cache_key(trade_date, phase))
         if not isinstance(payload, dict):
@@ -576,6 +626,11 @@ class IntradayContextBuilder:
         phase: RunPhase,
         latest_quote_timestamp_ms: int,
         symbol_count: int,
+        hot_plate_cache_trade_date: str,
+        hot_plate_updated_at_ts: int,
+        hot_plate_signature: str,
+        yest_limit_signature: str,
+        auction_signature: str,
         facts,
     ) -> None:
         payload = session_facts_to_payload(facts)
@@ -585,6 +640,11 @@ class IntradayContextBuilder:
             "phase": phase.value,
             "latest_quote_timestamp_ms": latest_quote_timestamp_ms,
             "symbol_count": symbol_count,
+            "hot_plate_cache_trade_date": hot_plate_cache_trade_date,
+            "hot_plate_updated_at_ts": hot_plate_updated_at_ts,
+            "hot_plate_signature": hot_plate_signature,
+            "yest_limit_signature": yest_limit_signature,
+            "auction_signature": auction_signature,
         }
         self.hub.redis.set(
             self._session_facts_cache_key(trade_date, phase),
@@ -709,26 +769,26 @@ class IntradayContextBuilder:
             if top_strengths:
                 resonance_score = round(sum(top_strengths) / len(top_strengths), 2)
             for migration in session_facts.plate_migration:
+                migration_type = self._classify_plate_migration(migration)
                 if migration.present_today and migration.present_yesterday:
                     yest_hot_plate_match_count += 1
-                    today_change_pct = migration.today_change_pct
-                    today_net_inflow_yi = migration.today_net_inflow_yi
-                    if migration.strength_delta >= 0:
+                    if migration_type == "PERSIST":
                         persistent_plate_count += 1
-                        if migration.plate_name == top_plate_name:
-                            top_plate_migration_type = "PERSIST"
-                    elif today_net_inflow_yi < 0 and today_change_pct > 0:
+                    elif migration_type == "FADING":
                         fading_plate_count += 1
-                        if migration.plate_name == top_plate_name:
-                            top_plate_migration_type = "FADING"
                     else:
                         emerging_plate_count += 1
-                        if migration.plate_name == top_plate_name:
-                            top_plate_migration_type = "EMERGING"
                 elif migration.present_today:
-                    emerging_plate_count += 1
-                    if migration.plate_name == top_plate_name:
-                        top_plate_migration_type = "EMERGING"
+                    if migration_type == "EMERGING":
+                        emerging_plate_count += 1
+                    elif migration_type == "FADING":
+                        fading_plate_count += 1
+                    else:
+                        persistent_plate_count += 1
+                elif migration.present_yesterday and migration_type == "FADING":
+                    fading_plate_count += 1
+                if migration.plate_name == top_plate_name:
+                    top_plate_migration_type = migration_type
             if not top_plate_migration_type and top_plate_name:
                 top_plate_migration_type = "PERSIST" if top_plate_name in yesterday_hot_plate_map else "EMERGING"
             mainline_switch = bool(previous_top_plate_name and top_plate_name and previous_top_plate_name != top_plate_name)
@@ -828,6 +888,7 @@ class IntradayContextBuilder:
                 "top turnover comes from Rust _EXTREMES_ snapshot when available",
                 "hot-plate strength/change_pct/net inflow follow Kaipan normalized contract when present",
                 "net inflow is interpreted together with change_pct to distinguish buying pressure from distribution",
+                "plate migration is classified only from strength/change_pct/net inflow deltas plus today/yesterday presence",
                 "context_* fields are derived from the requested symbol set only",
                 "market_* fields must come from explicit runtime summary cache, not from watchlist subset inference",
             ),
@@ -869,7 +930,7 @@ class IntradayContextBuilder:
                     plate_leader_counts[plate_name] = plate_leader_counts.get(plate_name, 0) + 1
         if not plate_scores:
             return ""
-        ranked = sorted(
+        return min(
             plate_scores.items(),
             key=lambda item: (
                 -item[1],
@@ -877,8 +938,7 @@ class IntradayContextBuilder:
                 -self._match_hot_plate_signal((item[0],), hot_plate_map),
                 item[0],
             ),
-        )
-        return ranked[0][0] if ranked else ""
+        )[0]
 
     def _runtime_plate_names(self, snapshot: StockStateSnapshot) -> tuple[str, ...]:
         names: list[str] = []
@@ -1010,6 +1070,25 @@ class IntradayContextBuilder:
         except (TypeError, ValueError):
             return 0.0
 
+    def _classify_plate_migration(self, migration: Any) -> str:
+        if migration.present_today and not migration.present_yesterday:
+            return "EMERGING"
+        if migration.present_yesterday and not migration.present_today:
+            return "FADING"
+
+        up_votes = int(migration.strength_delta > 0) + int(migration.change_pct_delta > 0) + int(migration.net_inflow_yi_delta > 0)
+        down_votes = int(migration.strength_delta < 0) + int(migration.change_pct_delta < 0) + int(migration.net_inflow_yi_delta < 0)
+
+        if down_votes >= 2:
+            return "FADING"
+        if up_votes >= 2:
+            return "PERSIST"
+        if migration.strength_delta < 0 and (migration.change_pct_delta < 0 or migration.net_inflow_yi_delta < 0):
+            return "FADING"
+        if migration.strength_delta > 0 and (migration.change_pct_delta > 0 or migration.net_inflow_yi_delta > 0):
+            return "PERSIST"
+        return "PERSIST" if migration.today_strength >= migration.yesterday_strength else "FADING"
+
     def _hot_plate_field(self, payload: Any, field: str, *, default: float = 0.0) -> float:
         value = default
         if isinstance(payload, dict):
@@ -1020,3 +1099,75 @@ class IntradayContextBuilder:
             return float(value or 0.0)
         except (TypeError, ValueError):
             return float(default or 0.0)
+
+    def _hot_plate_signature(self, hot_plate_map: dict[str, dict], *, trade_date: str) -> str:
+        compact_rows = [
+            {
+                "plate": str(plate_name or "").strip(),
+                "rank": int(payload.get("rank", 999) or 999),
+                "strength": round(float(payload.get("strength", payload.get("hot", 0.0)) or 0.0), 2),
+                "change_pct": round(float(payload.get("change_pct", 0.0) or 0.0), 3),
+                "net_inflow_yi": round(float(payload.get("net_inflow_yi", 0.0) or 0.0), 2),
+            }
+            for plate_name, payload in hot_plate_map.items()
+            if isinstance(payload, dict)
+        ]
+        compact_rows.sort(key=lambda item: (-item["strength"], -item["change_pct"], -item["net_inflow_yi"], item["rank"], item["plate"]))
+        return self._stable_signature(
+            {
+                "trade_date": trade_date,
+                "row_count": len(compact_rows),
+                "top_rows": compact_rows[:12],
+            }
+        )
+
+    def _yest_limit_signature(self, *, primed_trade_date: str, yest_limit_map: dict[str, dict]) -> str:
+        compact_rows = [
+            {
+                "symbol": symbol,
+                "lb_days": int(payload.get("lb_days", 0) or 0),
+                "plate": str(payload.get("plate") or "").strip(),
+            }
+            for symbol, payload in sorted(yest_limit_map.items())
+            if isinstance(payload, dict)
+        ]
+        return self._stable_signature(
+            {
+                "trade_date": primed_trade_date,
+                "row_count": len(compact_rows),
+                "rows": compact_rows,
+            }
+        )
+
+    def _auction_signature(self, auction_rows: Iterable[dict[str, Any]]) -> str:
+        rows = [row for row in auction_rows if isinstance(row, dict)]
+        top_rows = nlargest(
+            12,
+            rows,
+            key=lambda item: float(item.get("amount", 0.0) or 0.0),
+        )
+        source_counts: dict[str, int] = {}
+        compact_top_rows: list[dict[str, Any]] = []
+        for row in rows:
+            source = str(row.get("source") or "").strip() or "-"
+            source_counts[source] = source_counts.get(source, 0) + 1
+        for row in top_rows:
+            compact_top_rows.append(
+                {
+                    "symbol": _normalize_symbol(row.get("symbol")),
+                    "amount": round(float(row.get("amount", 0.0) or 0.0), 2),
+                    "change_pct": round(float(row.get("change_pct", 0.0) or 0.0), 3),
+                    "source": str(row.get("source") or "").strip() or "-",
+                }
+            )
+        return self._stable_signature(
+            {
+                "row_count": len(rows),
+                "source_counts": source_counts,
+                "top_rows": compact_top_rows,
+            }
+        )
+
+    def _stable_signature(self, payload: Any) -> str:
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.md5(encoded.encode("utf-8")).hexdigest()
