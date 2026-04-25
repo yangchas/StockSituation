@@ -611,8 +611,8 @@ class AuctionRuntimeController:
 
     def _render_auction_attack_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
-            return ("??????????????",)
-        rows = ["?????????? | ?? | ?? | ??? | ?? | ?? | ???? | ???? | ??"]
+            return ("【竞价攻击图】暂无题材样本",)
+        rows = ["【竞价攻击图】定位 | 题材 | 强度 | 竞价额 | 龙头数 | 昨板 | 主力净额 | 资金定性 | 代表"]
         for row in state.plate_stats[:3]:
             representative = self._snapshot_name_by_symbol(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             rows.append(
@@ -826,8 +826,8 @@ class AuctionRuntimeController:
 
     def _render_plate_heat(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
-            return ("????????????",)
-        rows = ["???????? | ?? | ???? | ?? | ???? | ???? | ??? | ?? | ???? | ??? | ????"]
+            return ("【题材分桶】暂无题材样本",)
+        rows = ["【题材分桶】定位 | 题材 | 题材强度 | 涨幅 | 主力净额 | 资金定性 | 竞价额 | 昨板 | 机会类型 | 下手层 | 情绪先锋"]
         for row in state.plate_stats[:4]:
             leader = self._snapshot_name_by_symbol(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             theme_state, trade_state, _ = self._theme_trade_profile(row)
@@ -1262,7 +1262,7 @@ class AuctionRuntimeController:
 
     def _theme_trade_profile(self, row: AuctionPlateBucketStat) -> tuple[str, str, str]:
         if row.expectation == "distribution":
-            return ("????", "????", "???????")
+            return ("兑现观察", "先不出手", "冲高兑现为主")
         if row.generic:
             return ("大题材泛化", "只看辨识度", "量大但太散")
         if row.expectation == "attack":
@@ -2067,7 +2067,7 @@ class AuctionRuntimeController:
 
     def _bucket_text(self, row: AuctionPlateBucketStat) -> str:
         if row.expectation == "distribution":
-            return "????"
+            return "兑现"
         mapping = {
             "attack": "主攻题材",
             "follow": "跟随题材",
@@ -2140,17 +2140,17 @@ class AuctionRuntimeController:
 
     def _fmt_net_inflow_yi(self, value: float) -> str:
         if abs(value) < 0.005:
-            return "0.00?"
-        return f"{value:+.2f}?"
+            return "0.00亿"
+        return f"{value:+.2f}亿"
 
     def _capital_behavior_text(self, value: float) -> str:
         if value >= 1.2:
-            return "????"
+            return "主力流入"
         if value >= 0.35:
-            return "????"
+            return "偏强流入"
         if value <= -0.3:
-            return "????"
-        return "????"
+            return "主力流出"
+        return "分歧震荡"
 
     def _infer_close_verdict(self, summary) -> str:
         if summary.sentiment_score >= 6.0 and summary.headshot_rate <= 0.05:

@@ -1503,7 +1503,12 @@ def build_default_request(
     run_integrated_sync: bool = True,
 ) -> EngineAppRequest:
     effective_now = now or datetime.now()
-    effective_trade_date = trade_date or effective_now.strftime("%Y-%m-%d")
+    if trade_date:
+        effective_trade_date = trade_date
+    else:
+        calendar = TradingCalendarService()
+        today_str = effective_now.strftime("%Y-%m-%d")
+        effective_trade_date = today_str if calendar.is_trading_day(today_str) else calendar.get_previous_trading_day(today_str)
     effective_previous_trade_date = previous_trade_date or _default_previous_trade_date(effective_trade_date)
     effective_symbols = _dedupe_symbols(symbols)
     return EngineAppRequest(

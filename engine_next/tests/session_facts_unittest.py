@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
+import sys
+import types
 
 from engine_next.domain.enums import RunPhase
 from engine_next.domain.models import PlateMigrationFact, StockStateSnapshot
+from engine_next.runtime.controllers.auction_runtime_controller import AuctionRuntimeController
 from engine_next.runtime.intraday_context_builder import IntradayContextBuilder
 from engine_next.runtime.session_facts import (
     build_session_facts,
@@ -150,6 +154,26 @@ class SessionFactsTests(unittest.TestCase):
         )
         self.assertEqual(builder._classify_plate_migration(weakening), "FADING")
         self.assertEqual(builder._classify_plate_migration(emerging), "EMERGING")
+
+    def test_build_default_request_uses_latest_trading_day_on_weekend(self) -> None:
+        sys.modules.setdefault("talib", types.ModuleType("talib"))
+        holidays_stub = types.ModuleType("holidays")
+        holidays_stub.CN = lambda: set()
+        sys.modules.setdefault("holidays", holidays_stub)
+        from engine_next.app_main import build_default_request
+
+        request = build_default_request(now=datetime(2026, 4, 25, 12, 0, 0), run_integrated_sync=False)
+        self.assertEqual(request.trade_date, "2026-04-24")
+        self.assertEqual(request.previous_trade_date, "2026-04-23")
+
+    def test_capital_text_and_net_inflow_format_are_human_readable(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        self.assertEqual(controller._fmt_net_inflow_yi(0.0), "0.00亿")
+        self.assertEqual(controller._fmt_net_inflow_yi(12.345), "+12.35亿")
+        self.assertEqual(controller._capital_behavior_text(1.3), "主力流入")
+        self.assertEqual(controller._capital_behavior_text(0.5), "偏强流入")
+        self.assertEqual(controller._capital_behavior_text(-0.4), "主力流出")
+        self.assertEqual(controller._capital_behavior_text(0.0), "分歧震荡")
 
 
 if __name__ == "__main__":
