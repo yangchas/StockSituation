@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
@@ -110,6 +111,38 @@ def _hot_plate_cache_date(now: datetime, trade_date: str, previous_trade_date: s
     return trade_date
 
 
+def _resolve_default_request_now(
+    *,
+    wall_now: datetime,
+    effective_trade_date: str,
+    now_explicit: bool,
+) -> datetime:
+    if now_explicit:
+        return wall_now
+    target_date = str(effective_trade_date or "").strip()
+    if not target_date or wall_now.strftime("%Y-%m-%d") == target_date:
+        return wall_now
+    return datetime.strptime(
+        f"{target_date} {wall_now.strftime('%H:%M:%S')}",
+        "%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _is_historical_replay_request(
+    *,
+    wall_now: datetime,
+    effective_trade_date: str,
+    now_explicit: bool,
+) -> bool:
+    if now_explicit:
+        return False
+    return wall_now.strftime("%Y-%m-%d") != str(effective_trade_date or "").strip()
+
+
+def _is_live_target_session(now: datetime, trade_date: str) -> bool:
+    return now.strftime("%Y-%m-%d") == str(trade_date or "").strip()
+
+
 @dataclass(frozen=True)
 class EngineAppRequest:
     now: datetime
@@ -126,10 +159,17 @@ class EngineAppRequest:
     redis_factor_cache_ready: dict[str, bool] | None = None
     yest_limit_pool_ready: bool = False
     hot_plates_ready: bool = False
+    hot_plates_today_ready: bool = False
+    hot_plates_effective_ready: bool = False
+    hot_plates_effective_trade_date: str = ""
     stock_plate_mapping_ready: bool = False
     auction_anchor_ready: bool = False
     redis_chip_ready_count: int = 0
     redis_dde_ready_count: int = 0
+    cached_listing_dates: dict[str, str] | None = None
+    cached_kline_row_counts: dict[str, int] | None = None
+    cached_structural_factor_gap: dict[str, bool] | None = None
+    historical_replay: bool = False
     run_integrated_sync: bool = True
 
 
@@ -227,6 +267,9 @@ class EngineApp:
         self._live_summary_renderer = LivePhaseSummaryRenderer()
         self._last_scheduled_event_token: str | None = None
         self._last_render_token: str | None = None
+        self._last_auction_cleanup_trade_date: str | None = None
+        self._last_intraday_auction_recap_trade_date: str | None = None
+        self._last_opening_validation_checkpoint_token: str | None = None
 
     @property
     def redis(self):
@@ -250,6 +293,9 @@ class EngineApp:
 
     def _safe_keys(self, pattern: str) -> tuple[str, ...]:
         try:
+            if hasattr(self.redis, "scan_iter"):
+                values = self.redis.scan_iter(match=pattern, count=512)
+                return tuple(str(value) for value in values if str(value))
             if hasattr(self.redis, "keys"):
                 values = self.redis.keys(pattern) or []
                 return tuple(str(value) for value in values if str(value))
@@ -315,6 +361,69 @@ class EngineApp:
             return 0
         return 0
 
+    def _safe_hmget_count(self, key: str, fields: tuple[str, ...]) -> int:
+        if not fields:
+            return 0
+        try:
+            if hasattr(self.redis, "hmget"):
+                values = self.redis.hmget(key, list(fields)) or []
+                return sum(1 for value in values if value not in (None, ""))
+            if hasattr(self.redis, "hget"):
+                return sum(1 for field in fields if self.redis.hget(key, field) not in (None, ""))
+        except Exception:
+            return 0
+        return 0
+
+    def _safe_hmget_presence_map(self, key: str, fields: tuple[str, ...]) -> dict[str, bool]:
+        if not fields:
+            return {}
+        payloads: dict[str, bool] = {str(field): False for field in fields if str(field)}
+        try:
+            if hasattr(self.redis, "hmget"):
+                values = self.redis.hmget(key, list(fields)) or []
+                for field, raw in zip(fields, values):
+                    payloads[str(field)] = raw not in (None, "")
+                return payloads
+            if hasattr(self.redis, "hget"):
+                for field in fields:
+                    payloads[str(field)] = self.redis.hget(key, field) not in (None, "")
+                return payloads
+        except Exception:
+            return payloads
+        return payloads
+
+    def _safe_hmget_json_map(self, key: str, fields: tuple[str, ...]) -> dict[str, dict[str, object]]:
+        if not fields:
+            return {}
+        payloads: dict[str, dict[str, object]] = {}
+        try:
+            if hasattr(self.redis, "hmget"):
+                values = self.redis.hmget(key, list(fields)) or []
+                for field, raw in zip(fields, values):
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        payloads[str(field)] = parsed
+                return payloads
+            if hasattr(self.redis, "hget"):
+                for field in fields:
+                    raw = self.redis.hget(key, field)
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict):
+                        payloads[str(field)] = parsed
+        except Exception:
+            return {}
+        return payloads
+
     def _safe_set(self, key: str, value: str) -> bool:
         try:
             if hasattr(self.redis, "set"):
@@ -324,6 +433,84 @@ class EngineApp:
             return False
         return False
 
+    def _safe_delete(self, keys: Iterable[str]) -> int:
+        normalized = tuple(dict.fromkeys(str(key) for key in keys if str(key)))
+        if not normalized:
+            return 0
+        try:
+            if hasattr(self.redis, "delete"):
+                deleted = self.redis.delete(*normalized)
+                return int(deleted or 0)
+        except Exception:
+            return 0
+        return 0
+
+    def _cleanup_auction_temp_state_if_needed(
+        self,
+        *,
+        now: datetime,
+        trade_date: str,
+    ) -> tuple[str, ...]:
+        if self._last_auction_cleanup_trade_date == trade_date:
+            return ()
+        if infer_run_phase(now) != RunPhase.PREMARKET:
+            return ()
+        if now.strftime("%H:%M") >= "09:15":
+            return ()
+        tag = trade_date.replace("-", "")
+        keys = {
+            f"market:auction:anchor:{tag}",
+            f"market:auction:{tag}:latest",
+            f"market:auction:{tag}:0920",
+            f"market:auction:{tag}:0924",
+            f"market:auction:{tag}:0925",
+        }
+        keys.update(self._safe_keys(f"market:auction:{tag}:09*"))
+        deleted = self._safe_delete(keys)
+        self._last_auction_cleanup_trade_date = trade_date
+        return (f"auction_temp_cleanup | trade_date={trade_date} | deleted={deleted}",)
+
+    def _should_emit_intraday_startup_auction_recap(
+        self,
+        *,
+        phase: RunPhase,
+        trade_date: str,
+        lifecycle_audit_ran: bool,
+    ) -> bool:
+        if phase != RunPhase.INTRADAY or not lifecycle_audit_ran:
+            return False
+        if self._last_intraday_auction_recap_trade_date == trade_date:
+            return False
+        self._last_intraday_auction_recap_trade_date = trade_date
+        return True
+
+    def _persist_opening_validation_checkpoint_if_needed(
+        self,
+        *,
+        request: EngineAppRequest,
+        phase: RunPhase,
+        intraday_context: IntradayContext | None,
+    ) -> tuple[str, ...]:
+        if request.historical_replay or phase != RunPhase.INTRADAY:
+            return ()
+        minute_tag = request.now.strftime("%H:%M")
+        if minute_tag < "09:31" or minute_tag > "09:33":
+            return ()
+        token = f"{request.trade_date}:opening_validation_window"
+        if self._last_opening_validation_checkpoint_token == token:
+            return ()
+        if self._auction_runtime.has_opening_validation_checkpoint(request.trade_date):
+            self._last_opening_validation_checkpoint_token = token
+            return ()
+        notes = self._auction_runtime.persist_opening_validation_checkpoint(
+            trade_date=request.trade_date,
+            intraday_context=intraday_context,
+            now=request.now,
+        )
+        if notes and notes[0] == "opening_validation_checkpoint persisted":
+            self._last_opening_validation_checkpoint_token = token
+        return notes
+
     def _hot_plate_freshness_limit_seconds(self, phase: RunPhase) -> int:
         if phase == RunPhase.PREMARKET:
             return 96 * 60 * 60
@@ -332,6 +519,18 @@ class EngineApp:
         if phase == RunPhase.POSTMARKET:
             return 8 * 60 * 60
         return 24 * 60 * 60
+
+    def _analytics_fact_cache_date(
+        self,
+        *,
+        now: datetime,
+        trade_date: str,
+        offline_context_date: str,
+    ) -> str:
+        phase = infer_run_phase(now)
+        if phase in {RunPhase.POSTMARKET, RunPhase.NIGHT} and now.time().strftime("%H:%M") >= "17:30":
+            return trade_date
+        return offline_context_date
 
     def _extract_symbols_from_json_text(self, payload: str | None) -> tuple[str, ...]:
         if not payload:
@@ -368,6 +567,45 @@ class EngineApp:
         quote_keys = self._safe_keys("stock:quote:*")
         candidates.extend(key.replace("stock:quote:", "") for key in quote_keys)
         return _dedupe_symbols(candidates)
+
+    def _filter_active_runtime_symbols(
+        self,
+        symbols: tuple[str, ...],
+        *,
+        now: datetime,
+        trade_date: str,
+        previous_trade_date: str,
+        historical_replay: bool = False,
+    ) -> tuple[str, ...]:
+        phase = infer_run_phase(now)
+        if phase in {RunPhase.PREMARKET, RunPhase.NIGHT}:
+            return symbols
+        if historical_replay:
+            return symbols
+        if not _is_live_target_session(now, trade_date):
+            return symbols
+
+        focus_symbols = set(self._safe_hkeys(f"cache:yest_limit_pool:{previous_trade_date}"))
+        focus_symbols.update(self._extract_symbols_from_json_text(self._safe_get("market:alpha:candidates")))
+        focus_symbols.update(
+            self._extract_symbols_from_json_text(
+                self._safe_hget(f"market:auction:{trade_date.replace('-', '')}:0925", "top_amount")
+            )
+        )
+        active_quote_symbols = {
+            key.replace("stock:quote:", "")
+            for key in self._safe_keys("stock:quote:*")
+            if str(key).startswith("stock:quote:")
+        }
+        if not active_quote_symbols:
+            return symbols
+
+        active_symbols = tuple(
+            symbol
+            for symbol in symbols
+            if symbol in active_quote_symbols or symbol in focus_symbols
+        )
+        return active_symbols or symbols
 
     def _discover_full_universe_symbols(self) -> tuple[str, ...]:
         try:
@@ -460,17 +698,40 @@ class EngineApp:
             f"sync.writes | tdengine_ops={tdengine_writes} | redis_ops={redis_writes}",
         ]
         if partial_details:
-            lines.append(f"sync.partial_symbols | {', '.join(partial_details[:12])}")
+            shown = partial_details[:5]
+            suffix = f" ...等{len(partial_details)}只" if len(partial_details) > len(shown) else ""
+            lines.append(f"sync.partial_symbols | {', '.join(shown)}{suffix}")
         if failed_details:
-            lines.append(f"sync.failed_symbols | {', '.join(failed_details[:12])}")
+            shown = failed_details[:5]
+            suffix = f" ...等{len(failed_details)}只" if len(failed_details) > len(shown) else ""
+            lines.append(f"sync.failed_symbols | {', '.join(shown)}{suffix}")
         if failed_roots:
-            lines.append(f"sync.failed_root | {', '.join(failed_roots[:12])}")
+            shown = failed_roots[:5]
+            suffix = f" ...等{len(failed_roots)}只" if len(failed_roots) > len(shown) else ""
+            lines.append(f"sync.failed_root | {', '.join(shown)}{suffix}")
         if root_counter:
             summary = ", ".join(
                 f"{root}={count}"
                 for root, count in sorted(root_counter.items(), key=lambda item: (-item[1], item[0]))
             )
             lines.append(f"sync.root_summary | {summary}")
+        remaining_kline = max(len(results) - kline_ready, 0)
+        remaining_dde = max(len(results) - dde_ready, 0)
+        remaining_factor = max(len(results) - factor_ready, 0)
+        remaining_chip = max(len(results) - chip_ready, 0)
+        sync_digest = (
+            "同步结果 | "
+            f"已全量补齐{fully_ready}只，部分补齐{partial_ready}只，仍失败{failed}只；"
+            f"当前剩余缺口为日线{remaining_kline}只，DDE{remaining_dde}只，"
+            f"因子{remaining_factor}只，筹码{remaining_chip}只。"
+        )
+        if root_counter:
+            root_summary = ", ".join(
+                f"{root}={count}"
+                for root, count in sorted(root_counter.items(), key=lambda item: (-item[1], item[0]))
+            )
+            sync_digest += f" 主失败根因为 {root_summary}。"
+        lines.insert(1, sync_digest)
         return tuple(lines)
 
     def _format_missing_parts(self, result: IntegratedSyncResult) -> list[str]:
@@ -555,6 +816,24 @@ class EngineApp:
             return "persist_failed"
         return None
 
+    def _render_runtime_cache_counters(
+        self,
+        *,
+        runtime_readiness: dict[str, object],
+        symbol_count: int,
+    ) -> str:
+        factor_prev_ready_count = int(runtime_readiness.get("redis_factor_ready_count", 0) or 0)
+        factor_current_ready_count = int(runtime_readiness.get("current_trade_factor_ready_count", 0) or 0)
+        chip_prev_ready_count = int(runtime_readiness.get("redis_chip_ready_count", 0) or 0)
+        chip_current_ready_count = int(runtime_readiness.get("current_trade_chip_ready_count", 0) or 0)
+        return (
+            "runtime_cache_counts "
+            f"| factor_prev={factor_prev_ready_count}/{symbol_count} "
+            f"| factor_current={factor_current_ready_count}/{symbol_count} "
+            f"| chip_prev={chip_prev_ready_count}/{symbol_count} "
+            f"| chip_current={chip_current_ready_count}/{symbol_count}"
+        )
+
     def _load_runtime_readiness(
         self,
         *,
@@ -563,55 +842,134 @@ class EngineApp:
         previous_trade_date: str,
         offline_context_date: str,
         symbols: tuple[str, ...],
+        historical_replay: bool = False,
     ) -> dict[str, object]:
+        def _load_hot_plate_cache_state(cache_date: str) -> dict[str, object]:
+            cache_key = f"cache:hot_plates:{cache_date}"
+            meta = self._safe_get_json(f"cache:hot_plates_meta:{cache_date}")
+            count = self._safe_hlen(cache_key)
+            row_count = 0
+            updated_at_ts = 0
+            try:
+                row_count = int(meta.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                row_count = 0
+            try:
+                updated_at_ts = int(float(meta.get("updated_at_ts", 0) or 0))
+            except (TypeError, ValueError):
+                updated_at_ts = 0
+            meta_trade_date = str(meta.get("trade_date") or "").strip()
+            return {
+                "count": count,
+                "row_count": row_count,
+                "updated_at_ts": updated_at_ts,
+                "meta_trade_date": meta_trade_date,
+                "ready": (
+                    count > 0
+                    and row_count > 0
+                    and meta_trade_date == cache_date
+                    and updated_at_ts > 0
+                ),
+            }
+
+        symbol_fields = tuple(str(symbol) for symbol in symbols if str(symbol))
         factor_key = f"cache:stock_extra:{offline_context_date}"
-        factor_ready_fields = set(self._safe_hkeys(factor_key))
-        factor_ready = {symbol: symbol in factor_ready_fields for symbol in symbols}
+        factor_ready = self._safe_hmget_presence_map(factor_key, symbol_fields)
+        current_trade_factor_ready = self._safe_hmget_presence_map(f"cache:stock_extra:{trade_date}", symbol_fields)
+        current_trade_chip_ready = self._safe_hmget_presence_map(f"cache:chip_peaks:{trade_date}", symbol_fields)
+        redis_chip_ready = self._safe_hmget_presence_map(f"cache:chip_peaks:{offline_context_date}", symbol_fields)
+        redis_dde_ready = self._safe_hmget_presence_map(f"cache:dde_ready:{offline_context_date}", symbol_fields)
         hot_plate_date = _hot_plate_cache_date(now, trade_date, previous_trade_date)
         phase = infer_run_phase(now)
+        analytics_cache_date = self._analytics_fact_cache_date(
+            now=now,
+            trade_date=trade_date,
+            offline_context_date=offline_context_date,
+        )
+        analytics_readiness_map = self._safe_hmget_json_map(
+            f"cache:analytics_readiness:{analytics_cache_date}",
+            symbol_fields,
+        )
+        symbol_meta_map = self._safe_hmget_json_map(
+            f"cache:symbol_meta:{analytics_cache_date}",
+            symbol_fields,
+        )
         runtime_plate_count = self._safe_hlen("market:stock_plate")
         stock_theme_count = self._safe_hlen("config:plate_mapping:s2p")
         hot_plate_key = f"cache:hot_plates:{hot_plate_date}"
+        hot_plate_state = _load_hot_plate_cache_state(hot_plate_date)
+        today_hot_plate_state = _load_hot_plate_cache_state(trade_date)
+        yesterday_hot_plate_state = _load_hot_plate_cache_state(previous_trade_date)
         hot_plate_meta = self._safe_get_json(f"cache:hot_plates_meta:{hot_plate_date}")
-        hot_plate_count = self._safe_hlen(hot_plate_key)
-        hot_plate_row_count = 0
-        hot_plate_updated_at_ts = 0
-        try:
-            hot_plate_row_count = int(hot_plate_meta.get("row_count", 0) or 0)
-        except (TypeError, ValueError):
-            hot_plate_row_count = 0
-        try:
-            hot_plate_updated_at_ts = int(float(hot_plate_meta.get("updated_at_ts", 0) or 0))
-        except (TypeError, ValueError):
-            hot_plate_updated_at_ts = 0
-        hot_plate_meta_trade_date = str(hot_plate_meta.get("trade_date") or "").strip()
+        hot_plate_count = int(hot_plate_state["count"] or 0)
+        hot_plate_row_count = int(hot_plate_state["row_count"] or 0)
+        hot_plate_updated_at_ts = int(hot_plate_state["updated_at_ts"] or 0)
         hot_plate_freshness_limit_seconds = self._hot_plate_freshness_limit_seconds(phase)
         hot_plate_age_seconds = max(int(now.timestamp()) - hot_plate_updated_at_ts, 0) if hot_plate_updated_at_ts > 0 else None
-        hot_plates_ready = (
-            hot_plate_count > 0
-            and hot_plate_row_count > 0
-            and hot_plate_meta_trade_date == hot_plate_date
-            and hot_plate_updated_at_ts > 0
-            and (
+        live_target_session = (not historical_replay) and _is_live_target_session(now, trade_date)
+        previous_settlement_payload = self._safe_get_json(
+            f"market:settlement:{previous_trade_date.replace('-', '')}:done"
+        )
+        hot_plate_cache_ready = bool(hot_plate_state["ready"])
+        hot_plates_today_ready = bool(today_hot_plate_state["ready"])
+        effective_hot_plate_state = today_hot_plate_state
+        effective_hot_plate_trade_date = trade_date
+        if (
+            phase in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY)
+            and not bool(effective_hot_plate_state["ready"])
+            and bool(yesterday_hot_plate_state["ready"])
+        ):
+            effective_hot_plate_state = yesterday_hot_plate_state
+            effective_hot_plate_trade_date = previous_trade_date
+        hot_plates_live_fresh = hot_plate_cache_ready and (
+            not live_target_session
+            or (
                 hot_plate_age_seconds is not None
                 and hot_plate_age_seconds <= hot_plate_freshness_limit_seconds
             )
         )
         return {
             "redis_factor_cache_ready": factor_ready,
+            "current_trade_factor_cache_ready": current_trade_factor_ready,
+            "redis_factor_ready_count": sum(1 for ok in factor_ready.values() if ok),
+            "current_trade_factor_ready_count": sum(1 for ok in current_trade_factor_ready.values() if ok),
             "yest_limit_pool_ready": self._safe_hlen(f"cache:yest_limit_pool:{previous_trade_date}") > 0,
-            "hot_plates_ready": hot_plates_ready,
+            "hot_plates_ready": hot_plate_cache_ready,
+            "hot_plates_today_ready": hot_plates_today_ready,
+            "hot_plates_effective_ready": bool(effective_hot_plate_state["ready"]),
+            "hot_plates_effective_trade_date": effective_hot_plate_trade_date,
+            "hot_plates_live_fresh": hot_plates_live_fresh,
             "stock_plate_mapping_ready": (
                 runtime_plate_count >= self.MIN_STOCK_PLATE_MAPPING_COUNT
                 or stock_theme_count >= self.MIN_STOCK_PLATE_MAPPING_COUNT
             ),
             "auction_anchor_ready": self._safe_exists(f"market:auction:anchor:{trade_date.replace('-', '')}"),
-            "redis_chip_ready_count": self._safe_hlen(f"cache:chip_peaks:{offline_context_date}"),
-            "redis_dde_ready_count": self._safe_hlen(f"cache:dde_ready:{offline_context_date}"),
+            "redis_chip_ready_count": sum(1 for ok in redis_chip_ready.values() if ok),
+            "current_trade_chip_ready_count": sum(1 for ok in current_trade_chip_ready.values() if ok),
+            "current_trade_chip_cache_ready": current_trade_chip_ready,
+            "redis_dde_ready_count": sum(1 for ok in redis_dde_ready.values() if ok),
             "hot_plate_count": hot_plate_count,
             "hot_plate_row_count": hot_plate_row_count,
             "hot_plate_cache_date": hot_plate_date,
+            "analytics_cache_date": analytics_cache_date,
             "hot_plate_age_seconds": hot_plate_age_seconds,
+            "live_target_session": live_target_session,
+            "previous_settlement_payload": previous_settlement_payload,
+            "cached_listing_dates": {
+                symbol: str((payload.get("listing_date") or "")).strip()
+                for symbol, payload in symbol_meta_map.items()
+                if str(payload.get("listing_date") or "").strip()
+            },
+            "cached_kline_row_counts": {
+                symbol: int(payload.get("kline_rows", 0) or 0)
+                for symbol, payload in analytics_readiness_map.items()
+                if int(payload.get("kline_rows", 0) or 0) > 0
+            },
+            "cached_structural_factor_gap": {
+                symbol: True
+                for symbol, payload in analytics_readiness_map.items()
+                if bool(payload.get("structural_factor_gap"))
+            },
         }
 
     def _current_audit_token(self, now: datetime, trade_date: str) -> str | None:
@@ -736,6 +1094,9 @@ class EngineApp:
         daily_kline = status_map["daily_kline"]
         daily_factors = status_map["daily_factors"]
         hot_plates_ready = bool(runtime_readiness.get("hot_plates_ready"))
+        hot_plates_today_ready = bool(runtime_readiness.get("hot_plates_today_ready"))
+        hot_plates_effective_ready = bool(runtime_readiness.get("hot_plates_effective_ready", hot_plates_ready))
+        hot_plates_effective_trade_date = str(runtime_readiness.get("hot_plates_effective_trade_date") or "-")
         yest_limit_ready = bool(runtime_readiness.get("yest_limit_pool_ready"))
         stock_plate_ready = bool(runtime_readiness.get("stock_plate_mapping_ready"))
         auction_ready = bool(runtime_readiness.get("auction_anchor_ready"))
@@ -744,7 +1105,8 @@ class EngineApp:
         return (
             (
                 "cached_audit "
-                f"| formal={report.formal_offline_date} "
+                f"| trade_date={report.target_trade_date} "
+                f"| offline_formal={report.formal_offline_date} "
                 f"| readiness={report.readiness.value} "
                 f"| symbols={symbol_count}"
             ),
@@ -755,10 +1117,16 @@ class EngineApp:
                 f"| chip_peaks={max(symbol_count - redis_chip_ready_count, 0)}/{symbol_count} "
                 f"| daily_dde={max(symbol_count - redis_dde_ready_count, 0)}/{symbol_count}"
             ),
+            self._render_runtime_cache_counters(
+                runtime_readiness=runtime_readiness,
+                symbol_count=symbol_count,
+            ),
             (
                 "runtime_cache "
                 f"| yest_limit_pool={'ok' if yest_limit_ready else 'missing'} "
                 f"| hot_plates={'ok' if hot_plates_ready else 'missing'} "
+                f"| hot_plates_today={'ok' if hot_plates_today_ready else 'missing'} "
+                f"| hot_plates_effective={'ok' if hot_plates_effective_ready else 'missing'}@{hot_plates_effective_trade_date} "
                 f"| stock_plate_mapping={'ok' if stock_plate_ready else 'missing'} "
                 f"| auction_anchor={'ok' if auction_ready else 'missing'}"
             ),
@@ -914,6 +1282,7 @@ class EngineApp:
             previous_trade_date=request.previous_trade_date,
             offline_context_date=offline_context_date,
             symbols=symbols,
+            historical_replay=request.historical_replay,
         )
         refreshed_watermark_snapshot = self._offline_executor.preload_watermark_snapshot(
             OfflineSyncRequest(
@@ -936,8 +1305,13 @@ class EngineApp:
                 kline_watermarks=refreshed_watermark_snapshot.kline_latest_dates,
                 factor_watermarks=refreshed_watermark_snapshot.factor_latest_dates,
                 redis_factor_cache_ready=refreshed_runtime_readiness["redis_factor_cache_ready"],
+                current_trade_factor_cache_ready=refreshed_runtime_readiness["current_trade_factor_cache_ready"],
+                current_trade_chip_cache_ready=refreshed_runtime_readiness["current_trade_chip_cache_ready"],
                 yest_limit_pool_ready=bool(refreshed_runtime_readiness["yest_limit_pool_ready"]),
                 hot_plates_ready=bool(refreshed_runtime_readiness["hot_plates_ready"]),
+                hot_plates_today_ready=bool(refreshed_runtime_readiness.get("hot_plates_today_ready", False)),
+                hot_plates_effective_ready=bool(refreshed_runtime_readiness.get("hot_plates_effective_ready", refreshed_runtime_readiness["hot_plates_ready"])),
+                hot_plates_effective_trade_date=str(refreshed_runtime_readiness.get("hot_plates_effective_trade_date") or ""),
                 stock_plate_mapping_ready=bool(refreshed_runtime_readiness["stock_plate_mapping_ready"]),
                 auction_anchor_ready=bool(refreshed_runtime_readiness["auction_anchor_ready"]),
                 redis_chip_ready_count=int(refreshed_runtime_readiness["redis_chip_ready_count"] or 0),
@@ -1024,6 +1398,29 @@ class EngineApp:
         details.extend(event_result.notes)
         return tuple(details)
 
+    def _render_settlement_quality(self, payload: dict[str, object] | None) -> tuple[str, ...]:
+        if not payload:
+            return ()
+        effective_targets = int(payload.get("effective_targets", 0) or 0)
+        result_count = int(payload.get("result_count", 0) or 0)
+        if effective_targets <= 0 and result_count <= 0:
+            return ()
+        return (
+            (
+                "settlement_quality "
+                f"| targets={effective_targets} "
+                f"| results={result_count} "
+                f"| full={int(payload.get('full_ready_count', 0) or 0)} "
+                f"| partial={int(payload.get('partial_ready_count', 0) or 0)} "
+                f"| failed={int(payload.get('failed_count', 0) or 0)} "
+                f"| short_history={int(payload.get('short_history_count', 0) or 0)} "
+                f"| factor_cache_gap={int(payload.get('factor_cache_gap_count', 0) or 0)} "
+                f"| startup_fact={int(payload.get('startup_fact_analytics_count', 0) or 0)} "
+                f"| symbol_meta={int(payload.get('startup_fact_symbol_meta_count', 0) or 0)} "
+                f"| structural={int(payload.get('startup_fact_structural_count', 0) or 0)}"
+            ),
+        )
+
     def _should_render_cycle(
         self,
         *,
@@ -1036,15 +1433,48 @@ class EngineApp:
         if lifecycle_audit_ran or scheduled_event_result.executed:
             self._last_render_token = token
             return True
-        if phase == RunPhase.POSTMARKET:
+        if phase in (RunPhase.PREMARKET, RunPhase.POSTMARKET, RunPhase.NIGHT):
             return False
         if self._last_render_token != token:
             self._last_render_token = token
             return True
-        if phase not in (RunPhase.AUCTION, RunPhase.INTRADAY, RunPhase.POSTMARKET):
-            self._last_render_token = token
-            return True
         return False
+
+    def _next_trade_day_checkpoint(self, now: datetime, clock_time: dt_time) -> datetime:
+        date_text = now.strftime("%Y-%m-%d")
+        try:
+            next_trade_date = TradingCalendarService().get_next_trading_day(date_text)
+        except Exception:
+            next_trade_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        return datetime.strptime(
+            f"{next_trade_date} {clock_time.strftime('%H:%M:%S')}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+
+    def _resolve_loop_sleep_seconds(
+        self,
+        *,
+        now: datetime,
+        phase: RunPhase,
+        default_interval_seconds: int,
+    ) -> int:
+        target: datetime | None = None
+        if phase == RunPhase.PREMARKET and now.time() < dt_time(8, 30):
+            target = datetime.combine(now.date(), dt_time(8, 30))
+        elif phase == RunPhase.POSTMARKET:
+            if now.time() < dt_time(15, 5):
+                target = datetime.combine(now.date(), dt_time(15, 5))
+            elif now.time() < dt_time(17, 40):
+                target = datetime.combine(now.date(), dt_time(17, 40))
+            else:
+                target = self._next_trade_day_checkpoint(now, dt_time(8, 30))
+        elif phase == RunPhase.NIGHT:
+            target = self._next_trade_day_checkpoint(now, dt_time(8, 30))
+
+        if target is None:
+            return max(1, int(default_interval_seconds))
+        delta_seconds = int((target - now).total_seconds())
+        return max(1, delta_seconds)
 
     def _execute_scheduled_event(
         self,
@@ -1059,6 +1489,17 @@ class EngineApp:
                 name="",
                 label="",
                 executed=False,
+            )
+
+        if request.historical_replay and loop_decision.scheduled_event_name in {
+            "market_close_1505",
+            "postmarket_settlement_1740",
+        }:
+            return RuntimeScheduledEventResult(
+                name=loop_decision.scheduled_event_name,
+                label=loop_decision.scheduled_event_label,
+                executed=False,
+                notes=("scheduled event skipped for historical replay.",),
             )
 
         event_token = f"{request.trade_date}:{loop_decision.scheduled_event_name}:{request.now.strftime('%H:%M')}"
@@ -1083,6 +1524,7 @@ class EngineApp:
                 offline_context_date=offline_context_date,
             )
             yest_limit_result = replay_result.yest_limit_result
+            hot_plate_result = replay_result.hot_plate_result
             auction_result = replay_result.auction_result
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
@@ -1093,6 +1535,7 @@ class EngineApp:
                 offline_context_date=offline_context_date,
             )
             yest_limit_result = replay_result.yest_limit_result
+            hot_plate_result = replay_result.hot_plate_result
             auction_result = replay_result.auction_result
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
@@ -1126,8 +1569,22 @@ class EngineApp:
 
     def run(self, request: EngineAppRequest) -> EngineAppResult:
         loop_decision = self._build_loop_decision(request.now, request.trade_date)
+        preflight_notes = list(
+            self._cleanup_auction_temp_state_if_needed(
+                now=request.now,
+                trade_date=request.trade_date,
+            )
+        )
         requested_symbols = _dedupe_symbols(request.symbols)
-        symbols = requested_symbols or self._discover_runtime_symbols(request.trade_date, request.previous_trade_date)
+        discovered_symbols = requested_symbols or self._discover_runtime_symbols(request.trade_date, request.previous_trade_date)
+        symbols = discovered_symbols if requested_symbols else self._filter_active_runtime_symbols(
+            discovered_symbols,
+            now=request.now,
+            trade_date=request.trade_date,
+            previous_trade_date=request.previous_trade_date,
+            historical_replay=request.historical_replay,
+        )
+        active_universe_dropped = max(len(discovered_symbols) - len(symbols), 0)
         should_expand_full_universe = (
             not requested_symbols
             and (
@@ -1136,11 +1593,13 @@ class EngineApp:
             )
             and len(symbols) < self.MIN_FULL_UNIVERSE_SIZE
         )
+        expanded_full_universe = False
         if should_expand_full_universe:
             full_universe = self._discover_full_universe_symbols()
             if full_universe:
-                symbols = full_universe
-                logger.debug("startup symbol universe expanded from runtime set to full F10 pool | symbols=%s", len(symbols))
+                symbols = _dedupe_symbols((*symbols, *full_universe))
+                expanded_full_universe = True
+                logger.debug("startup symbol universe expanded by union with full F10 pool | symbols=%s", len(symbols))
         offline_context_date = request.offline_context_date or request.previous_trade_date
         audit_token = loop_decision.audit_token
         should_run_lifecycle_audit = loop_decision.should_run_lifecycle_audit
@@ -1171,10 +1630,15 @@ class EngineApp:
                 redis_factor_cache_ready=request.redis_factor_cache_ready,
                 yest_limit_pool_ready=request.yest_limit_pool_ready,
                 hot_plates_ready=request.hot_plates_ready,
+                hot_plates_live_fresh=False,
                 stock_plate_mapping_ready=request.stock_plate_mapping_ready,
                 auction_anchor_ready=request.auction_anchor_ready,
                 redis_chip_ready_count=request.redis_chip_ready_count,
                 redis_dde_ready_count=request.redis_dde_ready_count,
+                live_target_session=(not request.historical_replay) and _is_live_target_session(request.now, request.trade_date),
+                cached_listing_dates=request.cached_listing_dates,
+                cached_kline_row_counts=request.cached_kline_row_counts,
+                cached_structural_factor_gap=request.cached_structural_factor_gap,
             ),
             should_run_lifecycle_audit=should_run_lifecycle_audit,
             audit_token=audit_token,
@@ -1217,6 +1681,8 @@ class EngineApp:
             scheduled_event_name=scheduled_event_result.name,
             scheduled_event_executed=scheduled_event_result.executed,
         )
+        if request.historical_replay and phase == RunPhase.POSTMARKET:
+            should_audit_integrated_sync = False
         settlement_result = self._settlement.execute(
             request=effective_offline_request,
             phase=phase,
@@ -1267,6 +1733,11 @@ class EngineApp:
         )
         intraday_context = live_runtime_result.intraday_context
         primed_runtime_state: PrimedIntradayRuntimeState | None = live_runtime_result.primed_runtime_state
+        opening_validation_notes = self._persist_opening_validation_checkpoint_if_needed(
+            request=request,
+            phase=phase,
+            intraday_context=intraday_context,
+        )
 
         runtime_readiness_label = self._derive_runtime_readiness(
             phase=phase,
@@ -1277,7 +1748,21 @@ class EngineApp:
             primed_runtime_state,
             symbol_count=len(symbols),
         )
+        auction_recap_notes: list[str] = []
+        if self._should_emit_intraday_startup_auction_recap(
+            phase=phase,
+            trade_date=request.trade_date,
+            lifecycle_audit_ran=should_run_lifecycle_audit,
+        ):
+            recap_lines = self._auction_runtime.render_auction_view(intraday_context)
+            if recap_lines:
+                auction_recap_notes = [
+                    "runtime_event=intraday startup auction recap",
+                    *recap_lines,
+                ]
         notes = [f"runtime_event={loop_decision.label}"]
+        if opening_validation_notes:
+            notes.extend(opening_validation_notes)
         is_auction_takeover = should_run_lifecycle_audit and phase == RunPhase.AUCTION
         is_postmarket_takeover = should_run_lifecycle_audit and phase == RunPhase.POSTMARKET
         if is_auction_takeover:
@@ -1303,6 +1788,10 @@ class EngineApp:
             notes.extend(
                 [
                     self._startup_coordinator.render_console_summary(startup_bundle.plan),
+                    self._render_runtime_cache_counters(
+                        runtime_readiness=runtime_readiness,
+                        symbol_count=len(symbols),
+                    ),
                     f"formal_readiness={startup_bundle.plan.report.readiness.value} | runtime_readiness={runtime_readiness_label}",
                     f"symbols={len(symbols)}",
                     f"integrated_sync={len(integrated_sync_results)}",
@@ -1311,6 +1800,33 @@ class EngineApp:
             )
             if quote_freshness_line:
                 notes.append(quote_freshness_line)
+            render_execution_summary = getattr(self._startup_coordinator, "render_execution_summary", None)
+            if not is_auction_takeover and not is_postmarket_takeover and callable(render_execution_summary):
+                notes.extend(render_execution_summary(startup_bundle))
+            if request.run_integrated_sync and should_audit_integrated_sync and not integrated_sync_allowed:
+                notes.append(
+                    f"integrated_sync deferred: effective_targets={len(effective_sync_symbols)} | "
+                    f"pipe={settlement_result.sync_pipeline_targets} | "
+                    f"net={settlement_result.sync_network_targets} | "
+                    f"calc={settlement_result.sync_analytics_targets} | "
+                    f"factor_cache_gap={settlement_result.sync_factor_cache_gaps} | "
+                    f"load={settlement_result.sync_load_units} | "
+                    f"auto_discovered_universe={len(symbols)} | safe_limit={self.AUTO_DISCOVERED_SYNC_LIMIT}"
+                )
+            if settlement_result.settlement_cached:
+                notes.append(f"settlement_cached | trade_date={request.trade_date} | integrated_sync=reused")
+            elif settlement_result.settlement_running:
+                notes.append(f"settlement_running | trade_date={request.trade_date} | integrated_sync=skipped_while_in_progress")
+            elif request.run_integrated_sync and should_audit_integrated_sync and effective_sync_symbols:
+                notes.append(
+                    f"integrated_sync targets={len(effective_sync_symbols)} | "
+                    f"pipe={settlement_result.sync_pipeline_targets} | "
+                    f"net={settlement_result.sync_network_targets} | "
+                    f"calc={settlement_result.sync_analytics_targets} | "
+                    f"factor_cache_gap={settlement_result.sync_factor_cache_gaps} | "
+                    f"load={settlement_result.sync_load_units}"
+                )
+            notes.extend(self._summarize_integrated_sync(integrated_sync_results))
             if self._is_opening_strategy_window(request.now, phase):
                 quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
                 rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
@@ -1433,24 +1949,18 @@ class EngineApp:
                         symbol_count=len(symbols),
                     )
                 )
-        if should_expand_full_universe:
+        if expanded_full_universe:
             notes.append(f"startup universe expanded to full F10 pool: {len(symbols)}")
-        render_execution_summary = getattr(self._startup_coordinator, "render_execution_summary", None)
-        if should_run_lifecycle_audit and not is_auction_takeover and not is_postmarket_takeover and callable(render_execution_summary):
-            notes.extend(render_execution_summary(startup_bundle))
-        if request.run_integrated_sync and should_audit_integrated_sync and not integrated_sync_allowed:
+        elif active_universe_dropped > 0:
             notes.append(
-                f"integrated_sync deferred: effective_targets={len(effective_sync_symbols)} | "
-                f"auto_discovered_universe={len(symbols)} | safe_limit={self.AUTO_DISCOVERED_SYNC_LIMIT}"
+                f"active_universe | selected={len(symbols)} | discovered={len(discovered_symbols)} | dropped={active_universe_dropped}"
             )
-        if settlement_result.settlement_cached:
-            notes.append(f"settlement_cached | trade_date={request.trade_date} | integrated_sync=reused")
-        elif settlement_result.settlement_running:
-            notes.append(f"settlement_running | trade_date={request.trade_date} | integrated_sync=skipped_while_in_progress")
-        elif request.run_integrated_sync and should_audit_integrated_sync and effective_sync_symbols:
-            notes.append(f"integrated_sync targets={len(effective_sync_symbols)}")
+        if preflight_notes:
+            notes = list(preflight_notes) + notes
+        if auction_recap_notes:
+            notes = auction_recap_notes + notes
+        notes.extend(self._render_settlement_quality(settlement_result.settlement_payload))
         notes.extend(self._render_scheduled_event_summary(scheduled_event_result))
-        notes.extend(self._summarize_integrated_sync(integrated_sync_results))
         if phase == RunPhase.POSTMARKET:
             notes.extend(self._night_recap.render_summary(recap_result))
         phase_events = tuple(iter_phase_events(phase)) if should_run_lifecycle_audit else ()
@@ -1478,7 +1988,8 @@ class EngineApp:
     ) -> None:
         cycles = 0
         while max_cycles is None or cycles < max_cycles:
-            result = self.run(request_builder())
+            request = request_builder()
+            result = self.run(request)
             if result.should_render:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{timestamp}]", flush=True)
@@ -1487,7 +1998,12 @@ class EngineApp:
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
                 break
-            time.sleep(max(1, int(interval_seconds)))
+            sleep_seconds = self._resolve_loop_sleep_seconds(
+                now=request.now,
+                phase=result.phase,
+                default_interval_seconds=interval_seconds,
+            )
+            time.sleep(sleep_seconds)
 
 
 def build_default_request(
@@ -1502,13 +2018,23 @@ def build_default_request(
     require_auction_recovery: bool = False,
     run_integrated_sync: bool = True,
 ) -> EngineAppRequest:
-    effective_now = now or datetime.now()
+    wall_now = now or datetime.now()
     if trade_date:
         effective_trade_date = trade_date
     else:
         calendar = TradingCalendarService()
-        today_str = effective_now.strftime("%Y-%m-%d")
+        today_str = wall_now.strftime("%Y-%m-%d")
         effective_trade_date = today_str if calendar.is_trading_day(today_str) else calendar.get_previous_trading_day(today_str)
+    effective_now = _resolve_default_request_now(
+        wall_now=wall_now,
+        effective_trade_date=effective_trade_date,
+        now_explicit=now is not None,
+    )
+    historical_replay = _is_historical_replay_request(
+        wall_now=wall_now,
+        effective_trade_date=effective_trade_date,
+        now_explicit=now is not None,
+    )
     effective_previous_trade_date = previous_trade_date or _default_previous_trade_date(effective_trade_date)
     effective_symbols = _dedupe_symbols(symbols)
     return EngineAppRequest(
@@ -1520,35 +2046,303 @@ def build_default_request(
         offline_context_date=offline_context_date or effective_previous_trade_date,
         minute_index=minute_index if minute_index is not None else _infer_minute_index(effective_now),
         require_auction_recovery=require_auction_recovery,
+        historical_replay=historical_replay,
         run_integrated_sync=run_integrated_sync,
     )
 
 
 def render_result_summary(result: EngineAppResult) -> str:
-    lines = [f"phase={result.phase.value}"]
-    has_strategy_console = any(str(note).startswith("strategy_console |") for note in result.notes)
-    suppress_internal_header = result.phase in (RunPhase.AUCTION, RunPhase.POSTMARKET) and any(
-        str(note).startswith("runtime_event=postmarket takeover")
-        or str(note).startswith("runtime_event=auction takeover")
-        for note in result.notes
+    phase_text = {
+        RunPhase.PREMARKET: "盘前",
+        RunPhase.AUCTION: "竞价",
+        RunPhase.INTRADAY: "盘中",
+        RunPhase.POSTMARKET: "盘后",
+        RunPhase.NIGHT: "夜间",
+    }.get(result.phase, result.phase.value)
+
+    raw_lines: list[str] = []
+    for note in result.notes:
+        raw_lines.extend(str(note).splitlines())
+
+    def find_first(*prefixes: str) -> str | None:
+        for line in raw_lines:
+            if any(line.startswith(prefix) for prefix in prefixes):
+                return line
+        return None
+
+    def collect_block(start_prefix: str, stop_prefixes: tuple[str, ...]) -> list[str]:
+        start = -1
+        for idx, line in enumerate(raw_lines):
+            if line.startswith(start_prefix):
+                start = idx
+                break
+        if start < 0:
+            return []
+        block: list[str] = []
+        for idx in range(start, len(raw_lines)):
+            line = raw_lines[idx]
+            if idx > start and any(line.startswith(prefix) for prefix in stop_prefixes):
+                break
+            block.append(line)
+        return block
+
+    def trim_prefixed_body(line: str, prefix: str) -> str:
+        body = line[len(prefix):].strip()
+        return body.lstrip("| ").strip()
+
+    def format_diagnostic_line(prefix: str, line: str) -> str:
+        body = trim_prefixed_body(line, prefix)
+        if prefix == "integrated_sync targets=" and body:
+            target, _, remainder = body.partition("|")
+            target = target.strip()
+            remainder = remainder.strip()
+            if remainder:
+                return f"targets={target} | {remainder}"
+            return f"targets={target}"
+        return body
+
+    engineering_stop_prefixes = (
+        "active_universe |",
+        "startup universe expanded to full F10 pool:",
+        "settlement_quality ",
+        "recap_wait |",
+        "recap_status=",
+        "recap_failed |",
+        "recap_enrichment |",
+        "recap_degraded |",
+        "recap_sources |",
+        "self_check ",
+        "integrated_sync targets=",
+        "sync.summary |",
+        "sync.datasets |",
+        "sync.partial_symbols |",
+        "sync.failed_symbols |",
+        "sync.failed_root |",
+        "sync.root_summary |",
+        "上下文快照=",
+        "phase_events:",
     )
-    if result.lifecycle_audit_ran and not suppress_internal_header:
-        lines.append(
-            f"loop_event={result.loop_event}"
-            f" | audit={'fresh' if result.lifecycle_audit_ran else 'cached'}"
-            f" | startup_state={'cached' if result.used_cached_startup_state else 'fresh'}"
+
+    status_line = find_first("状态摘要 |")
+    data_gap_line = find_first("数据缺口 |")
+    impact_line = find_first("影响判断 |")
+    sync_digest_line = find_first("同步结果 |")
+    quote_line = find_first("quote_freshness |")
+    runtime_line = find_first("运行状态=")
+    integrated_sync_line = find_first("integrated_sync targets=")
+
+    target_trade_date = ""
+    formal_date = ""
+    readiness = ""
+    if status_line:
+        matched = re.search(
+            r"目标交易日=(\d{4}-\d{2}-\d{2})，正式离线日=(\d{4}-\d{2}-\d{2})，readiness=([A-Za-z0-9_]+)",
+            status_line,
         )
-    lines.extend(result.notes)
-    if result.intraday_context is not None and not has_strategy_console:
-        lines.append(
-            f"上下文快照={len(result.intraday_context.stock_snapshots)} "
-            f"| 主线板块={result.intraday_context.market_summary.top_plate_name or ''}"
+        if matched:
+            target_trade_date, formal_date, readiness = matched.groups()
+
+    runtime_state = ""
+    quote_coverage = ""
+    rust_count = ""
+    if runtime_line:
+        matched = re.search(r"运行状态=([^|]+)\s*\|\s*行情=([^|]+)\s*\|\s*Rust=(.+)$", runtime_line)
+        if matched:
+            runtime_state, quote_coverage, rust_count = [part.strip() for part in matched.groups()]
+
+    latest_quote = ""
+    lag_seconds = ""
+    missing_quotes = ""
+    fresh_quotes = ""
+    if quote_line:
+        matched = re.search(
+            r"fresh=(\d+)/\d+\s*\|\s*stale=\d+\s*\|\s*missing=(\d+)\s*\|\s*latest=([^|]+)\s*\|\s*lag=(\d+)s",
+            quote_line,
         )
-    if result.phase_events and not suppress_internal_header and not has_strategy_console:
-        lines.append("phase_events:")
-        for event in result.phase_events[:6]:
-            lines.append(f"- {event.time_window} | {event.component} | {event.action}")
-    return "\n".join(lines)
+        if matched:
+            fresh_quotes, missing_quotes, latest_quote, lag_seconds = [part.strip() for part in matched.groups()]
+
+    overview_section = [
+        f"当前阶段：{phase_text}",
+        f"系统状态：{runtime_state or '-'}",
+    ]
+    if target_trade_date:
+        overview_section.append(f"目标交易日：{target_trade_date}")
+    if formal_date:
+        overview_section.append(f"正式数据日：{formal_date}")
+    quote_summary_bits: list[str] = []
+    if quote_coverage:
+        quote_summary_bits.append(f"覆盖 {quote_coverage}")
+    if latest_quote:
+        quote_summary_bits.append(f"最新 {latest_quote}")
+    if lag_seconds:
+        quote_summary_bits.append(f"滞后 {lag_seconds} 秒")
+    if missing_quotes:
+        quote_summary_bits.append(f"缺失 {missing_quotes} 只")
+    if fresh_quotes:
+        quote_summary_bits.append(f"实时可用 {fresh_quotes} 只")
+    if rust_count:
+        quote_summary_bits.append(f"Rust {rust_count}")
+    if quote_summary_bits:
+        overview_section.append("行情状态：" + "，".join(quote_summary_bits))
+    if readiness:
+        overview_section.append(f"就绪等级：{readiness}")
+
+    gap_section: list[str] = []
+    if data_gap_line:
+        gap_section.append("数据缺口：" + data_gap_line.split("|", 1)[1].strip())
+    if sync_digest_line:
+        gap_section.append("同步结果：" + sync_digest_line.split("|", 1)[1].strip())
+    if impact_line:
+        gap_section.append("影响判断：" + impact_line.split("|", 1)[1].strip())
+
+    strategy_lines: list[str] = []
+    for prefix in ("策略看板 |", "情绪总览 |"):
+        line = find_first(prefix)
+        if line:
+            strategy_lines.append(line)
+    plan_mode_line = find_first("盘前预案 |")
+    if plan_mode_line:
+        strategy_lines.append(plan_mode_line)
+    strategy_lines.extend(
+        collect_block(
+            "【收盘定性】",
+            ("【全天回放】", "【主线复盘】", "【今日热点】", "【涨停板块】", "【竞价结局】", "【高位梯队复盘】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【全天回放】",
+            ("【主线复盘】", "【今日热点】", "【涨停板块】", "【竞价结局】", "【高位梯队复盘】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【主线复盘】",
+            ("【今日热点】", "【涨停板块】", "【竞价结局】", "【高位梯队复盘】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【今日热点】",
+            ("【涨停板块】", "【竞价结局】", "【高位梯队复盘】", "【高标生死簿】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【涨停板块】",
+            ("【竞价结局】", "【高位梯队复盘】", "【高标生死簿】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【竞价结局】",
+            ("【高位梯队复盘】", "【高标生死簿】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【高位梯队复盘】",
+            ("【高标生死簿】", "【梯队映射】", "【明日预案】", "【明日观察池】", "【复盘风控】", "【风险提示】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【主线脉络】",
+            ("【高标生死簿】", "【题材分桶】", "【题材层级】", "【梯队映射】", "【核心观察池】", "【明日观察池】", "【风险提示】", "【复盘风控】"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【高标生死簿】",
+            (
+                "【竞价极值榜】",
+                "【承接转强榜】",
+                "【题材分桶】",
+                "【题材层级】",
+                "【梯队映射】",
+                "【核心观察池】",
+                "【明日观察池】",
+                "【风险提示】",
+                "【复盘风控】",
+            ),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【梯队映射】",
+            ("【明日预案】", "【核心观察池】", "【明日观察池】", "【风险提示】", "【复盘风控】", "上下文快照", "phase_events:"),
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【明日预案】",
+            ("【核心观察池】", "【明日观察池】", "【风险提示】", "【复盘风控】", "上下文快照=", "phase_events:"),
+        )
+    )
+    focus_block = collect_block(
+        "【核心观察池】",
+        ("【风险提示】", "【复盘风控】", "上下文快照=", "phase_events:"),
+    )
+    if not focus_block:
+        focus_block = collect_block(
+            "【明日观察池】",
+            ("【风险提示】", "【复盘风控】", "上下文快照=", "phase_events:"),
+        )
+    strategy_lines.extend(focus_block)
+    strategy_lines.extend(
+        collect_block(
+            "【风险提示】",
+            engineering_stop_prefixes,
+        )
+    )
+    strategy_lines.extend(
+        collect_block(
+            "【复盘风控】",
+            engineering_stop_prefixes,
+        )
+    )
+
+    detailed_section: list[str] = []
+    if result.lifecycle_audit_ran and find_first("self_check "):
+        detailed_section.append("详细诊断：")
+        diagnostic_map = {
+            "self_check ": "自检缺口 | ",
+            "self_check.sync_scope ": "同步范围 | ",
+            "self_check.factor_breakdown ": "因子拆解 | ",
+            "integrated_sync targets=": "本轮同步 | ",
+            "sync.datasets ": "同步明细 | ",
+            "sync.partial_symbols ": "部分补齐 | ",
+            "sync.failed_symbols ": "失败个股 | ",
+            "sync.failed_root ": "失败根因明细 | ",
+            "sync.root_summary ": "失败根因汇总 | ",
+        }
+        for prefix, label in diagnostic_map.items():
+            line = find_first(prefix)
+            if line:
+                detailed_section.append(label + format_diagnostic_line(prefix, line))
+
+    phase_section: list[str] = []
+    if result.phase_events:
+        phase_section.append("时序提示：")
+        for event in result.phase_events[:3]:
+            phase_section.append(f"- {event.time_window} | {event.component} | {event.action}")
+
+    output: list[str] = []
+    output.extend(overview_section)
+    if gap_section:
+        output.append("")
+        output.extend(gap_section)
+    if strategy_lines:
+        output.append("")
+        output.extend(strategy_lines)
+    if detailed_section:
+        output.append("")
+        output.extend(detailed_section)
+    if phase_section:
+        output.append("")
+        output.extend(phase_section)
+    return "\n".join(output)
 
 
 def _parse_now(value: str | None) -> datetime | None:

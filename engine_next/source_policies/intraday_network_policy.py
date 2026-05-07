@@ -33,9 +33,9 @@ INTRADAY_NETWORK_RULES: tuple[IntradayNetworkRule, ...] = (
     IntradayNetworkRule(
         name="stock_plate_enrichment",
         intent=FetchIntent.STOCK_PLATE_ENRICHMENT,
-        allowed_phases=(RunPhase.AUCTION, RunPhase.INTRADAY),
+        allowed_phases=(RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY, RunPhase.POSTMARKET),
         preferred_sources=(SourceName.KAIPAN,),
-        max_symbols_per_request=30,
+        max_symbols_per_request=120,
         max_requests_per_minute=1,
         redis_write_key="market:stock_plate",
         reason="当个股板块过于泛化或缺失时，允许调用 Kaipan 涨停原因中的所属板块做精修，并回写 Redis。",
@@ -59,6 +59,16 @@ INTRADAY_NETWORK_RULES: tuple[IntradayNetworkRule, ...] = (
         max_requests_per_minute=1,
         redis_write_key="cache:yest_limit_pool:{date}",
         reason="Yesterday limit pool is a startup-critical lightweight context dataset and may be repaired on demand.",
+    ),
+    IntradayNetworkRule(
+        name="limit_truth_build",
+        intent=FetchIntent.LIMIT_TRUTH_BUILD,
+        allowed_phases=(RunPhase.POSTMARKET,),
+        preferred_sources=(SourceName.WENCAI,),
+        max_symbols_per_request=500,
+        max_requests_per_minute=1,
+        redis_write_key="cache:limit_truth:{date}",
+        reason="当日最终涨停真值只在盘后生成，优先使用问财并按 trade_date 回写缓存，避免与盘中曾涨停轨迹混淆。",
     ),
 )
 

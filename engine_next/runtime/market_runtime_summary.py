@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 
@@ -30,11 +31,84 @@ class MarketRuntimeSummaryService:
     def redis(self) -> Any:
         return self._redis
 
+    def _summary_key(self, trade_date: str) -> str:
+        return f"market:runtime:summary:{trade_date}"
+
+    def _latest_key(self) -> str:
+        return "market:runtime:summary:latest"
+
+    def load_cached(
+        self,
+        trade_date: str,
+        *,
+        offline_context_date: str | None = None,
+        max_age_seconds: int | None = None,
+    ) -> MarketRuntimeSummaryResult | None:
+        try:
+            raw = self.redis.get(self._summary_key(trade_date))
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if str(payload.get("trade_date") or "") != trade_date:
+            return None
+        expected_context_date = str(offline_context_date or trade_date)
+        cached_context_date = str(payload.get("offline_context_date") or "")
+        if cached_context_date and cached_context_date != expected_context_date:
+            return None
+        if max_age_seconds is not None:
+            try:
+                updated_at_ts = int(payload.get("updated_at_ts", 0) or 0)
+            except (TypeError, ValueError):
+                updated_at_ts = 0
+            if updated_at_ts <= 0:
+                return None
+            age_seconds = max(int(datetime.now().timestamp()) - updated_at_ts, 0)
+            if age_seconds > max_age_seconds:
+                return None
+        return MarketRuntimeSummaryResult(
+            trade_date=trade_date,
+            summary=payload,
+            redis_keys_written=(),
+            notes=("market runtime summary cache hit",),
+        )
+
+    def get_or_build(
+        self,
+        trade_date: str,
+        *,
+        offline_context_date: str | None = None,
+        max_age_seconds: int | None = None,
+        force_rebuild: bool = False,
+    ) -> MarketRuntimeSummaryResult:
+        if not force_rebuild:
+            cached = self.load_cached(
+                trade_date,
+                offline_context_date=offline_context_date,
+                max_age_seconds=max_age_seconds,
+            )
+            if cached is not None:
+                return cached
+        return self.build_and_write(trade_date, offline_context_date=offline_context_date)
+
     def build_and_write(self, trade_date: str, *, offline_context_date: str | None = None) -> MarketRuntimeSummaryResult:
         summary = self.build_summary(trade_date, offline_context_date=offline_context_date)
+        now = datetime.now()
+        summary.update(
+            {
+                "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "updated_at_ts": int(now.timestamp()),
+            }
+        )
         keys = (
-            f"market:runtime:summary:{trade_date}",
-            "market:runtime:summary:latest",
+            self._summary_key(trade_date),
+            self._latest_key(),
         )
         payload = json.dumps(summary, ensure_ascii=False)
         self.redis.set(keys[0], payload)

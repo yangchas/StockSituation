@@ -22,6 +22,7 @@
 #include <deque>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <queue> // 新增 for priority_queue
 
 // 网络请求相关头文件
@@ -333,6 +334,7 @@ class IVolatilityDetector {
 public:
     virtual ~IVolatilityDetector() = default;
     virtual bool detectVolatility(const StockData& data, double change, double bid_amount,double ask_amount) = 0; // 优化: 传入统一计算的指标
+    virtual void cleanupState(long long reference_timestamp_ms, long long stale_window_ms) {}
     // virtual void cleanVolOldData() = 0;
 };
 
@@ -376,6 +378,14 @@ public:
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()).count();
     }
+
+    static int extractTimeOfDayHms(long long timestamp_ms) {
+        auto time = std::chrono::system_clock::from_time_t(timestamp_ms / 1000);
+        auto tt = std::chrono::system_clock::to_time_t(time);
+        std::tm tm;
+        localtime_r(&tt, &tm);
+        return tm.tm_hour * 10000 + tm.tm_min * 100 + tm.tm_sec;
+    }
    
     static std::string formatTimestamp(long long timestamp_ms) {
         auto time = std::chrono::system_clock::from_time_t(timestamp_ms / 1000);
@@ -417,14 +427,30 @@ public:
     static bool isAuctionTime(const std::string& time_str) {
         return time_str >= "09:15:00" && time_str <= "09:26:00";
     }
+
+    static bool isAuctionTime(long long timestamp_ms) {
+        const int hms = extractTimeOfDayHms(timestamp_ms);
+        return hms >= 91500 && hms <= 92600;
+    }
    
     static bool isTrialPeriod(const std::string& time_str) {
         return time_str >= "09:15:00" && time_str < "09:20:00";
+    }
+
+    static bool isTrialPeriod(long long timestamp_ms) {
+        const int hms = extractTimeOfDayHms(timestamp_ms);
+        return hms >= 91500 && hms < 92000;
     }
    
     static bool isTradeTime(const std::string& time_str) {
         return (time_str >= "09:30:00" && time_str <= "11:30:00") ||
                (time_str >= "13:00:00" && time_str <= "15:00:00");
+    }
+
+    static bool isTradeTime(long long timestamp_ms) {
+        const int hms = extractTimeOfDayHms(timestamp_ms);
+        return (hms >= 93000 && hms <= 113000) ||
+               (hms >= 130000 && hms <= 150000);
     }
 };
 
@@ -1476,7 +1502,6 @@ public:
         // state.has_previous = true;
         if (state.history.size() > config_.max_history_ticks) {
             state.history.pop_front();  // 删除最旧的，保持 <= 40
-            state.history.shrink_to_fit(); 
         }
         state.last_update = current_tick.timestamp;
     }
@@ -1606,6 +1631,22 @@ public:
             calculate_1min_change_rate(symbol, current_timestamp, current_price),
             calculate_2min_amount(symbol, current_timestamp, current_amount)
         );
+    }
+
+    void cleanupState(long long reference_timestamp_ms, long long stale_window_ms) {
+        if (reference_timestamp_ms <= 0 || stale_window_ms <= 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        const long long cutoff_time = reference_timestamp_ms - stale_window_ms;
+        auto it = stock_states_.begin();
+        while (it != stock_states_.end()) {
+            if (it->second.last_update > 0 && it->second.last_update < cutoff_time) {
+                it = stock_states_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
 private:
@@ -1952,6 +1993,7 @@ private:
     std::string host_;
     int port_;
     int db_;
+    int pending_pipeline_replies_ = 0;
    
 public:
     RedisClient(const std::string& host, int port, int db)
@@ -1988,6 +2030,7 @@ public:
             redisFree(context_);
             context_ = nullptr;
         }
+        pending_pipeline_replies_ = 0;
     }
    
     bool isConnected() const {
@@ -2057,6 +2100,22 @@ public:
         freeReplyObject(reply);
         return success;
     }
+
+    bool zrem(const std::string& key, const std::string& member) {
+        if (!context_ && !connect()) return false;
+
+        redisReply* reply = (redisReply*)redisCommand(context_,
+                                                    "ZREM %s %s",
+                                                    key.c_str(), member.c_str());
+        if (!reply) {
+            disconnect();
+            return false;
+        }
+
+        bool success = (reply->type != REDIS_REPLY_ERROR);
+        freeReplyObject(reply);
+        return success;
+    }
      // 添加hset方法用于存储哈希表字段
     bool hset(const std::string& key, const std::string& field, const std::string& value) {
         if (!context_ && !connect()) return false;
@@ -2073,18 +2132,112 @@ public:
         freeReplyObject(reply);
         return success;
     }
+
+    bool hsetMulti(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields) {
+        if (fields.empty()) return true;
+        if (!context_ && !connect()) return false;
+
+        const size_t argc = 2 + fields.size() * 2;
+        std::vector<const char*> argv;
+        std::vector<size_t> argvlen;
+        argv.reserve(argc);
+        argvlen.reserve(argc);
+
+        argv.push_back("HSET");
+        argvlen.push_back(4);
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+
+        for (const auto& item : fields) {
+            argv.push_back(item.first.c_str());
+            argvlen.push_back(item.first.size());
+            argv.push_back(item.second.c_str());
+            argvlen.push_back(item.second.size());
+        }
+
+        redisReply* reply = static_cast<redisReply*>(
+            redisCommandArgv(context_, static_cast<int>(argc), argv.data(), argvlen.data())
+        );
+        if (!reply) {
+            disconnect();
+            return false;
+        }
+
+        bool success = (reply->type != REDIS_REPLY_ERROR);
+        freeReplyObject(reply);
+        return success;
+    }
+
+    bool appendHsetMulti(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields) {
+        if (fields.empty()) return true;
+        if (!context_ && !connect()) return false;
+
+        const size_t argc = 2 + fields.size() * 2;
+        std::vector<const char*> argv;
+        std::vector<size_t> argvlen;
+        argv.reserve(argc);
+        argvlen.reserve(argc);
+
+        argv.push_back("HSET");
+        argvlen.push_back(4);
+        argv.push_back(key.c_str());
+        argvlen.push_back(key.size());
+
+        for (const auto& item : fields) {
+            argv.push_back(item.first.c_str());
+            argvlen.push_back(item.first.size());
+            argv.push_back(item.second.c_str());
+            argvlen.push_back(item.second.size());
+        }
+
+        if (redisAppendCommandArgv(context_, static_cast<int>(argc), argv.data(), argvlen.data()) != REDIS_OK) {
+            disconnect();
+            return false;
+        }
+        pending_pipeline_replies_++;
+        return true;
+    }
+
+    bool appendExpire(const std::string& key, int seconds) {
+        if (!context_ && !connect()) return false;
+        if (redisAppendCommand(context_, "EXPIRE %s %d", key.c_str(), seconds) != REDIS_OK) {
+            disconnect();
+            return false;
+        }
+        pending_pipeline_replies_++;
+        return true;
+    }
     
     // 批量执行命令（可选，用于优化性能）
     bool startPipeline() {
         if (!context_ && !connect()) return false;
-        // Redis hiredis 库会自动处理pipeline
+        pending_pipeline_replies_ = 0;
         return true;
     }
     
     // 执行pipeline中的所有命令
     bool executePipeline() {
         if (!context_) return false;
-        // 对于hiredis，不需要特殊处理，命令会立即发送
+        while (pending_pipeline_replies_ > 0) {
+            void* reply_void = nullptr;
+            if (redisGetReply(context_, &reply_void) != REDIS_OK) {
+                if (reply_void) {
+                    freeReplyObject(reply_void);
+                }
+                disconnect();
+                return false;
+            }
+            redisReply* reply = static_cast<redisReply*>(reply_void);
+            bool success = reply && reply->type != REDIS_REPLY_ERROR;
+            if (reply) {
+                freeReplyObject(reply);
+            }
+            pending_pipeline_replies_--;
+            if (!success) {
+                disconnect();
+                return false;
+            }
+        }
         return true;
     }
     
@@ -2318,13 +2471,12 @@ public:
     ~AuctionAnalyzer() { delete external_provider_; }
     
     bool isAuctionPeriod(long long timestamp) {
-        std::string time_str = TimeUtils::formatTimestamp(timestamp).substr(11, 8);
-        return time_str >= "09:15:00" && time_str <= "09:25:00";
+        const int hms = TimeUtils::extractTimeOfDayHms(timestamp);
+        return hms >= 91500 && hms <= 92500;
     }
     
     bool isTrialPeriod(long long timestamp) {
-        std::string time_str = TimeUtils::formatTimestamp(timestamp).substr(11, 8);
-        return time_str >= "09:15:00" && time_str < "09:20:00";
+        return TimeUtils::isTrialPeriod(timestamp);
     }
     
     void processAuctionData(const StockData& data, double change, double bid_amount, double ask_amount) {
@@ -2343,8 +2495,8 @@ public:
         double bv1 = data.bid_volumes[0];
         double auction_volume = std::min(bid_amount, ask_amount);
         metrics.auction_volume = auction_volume;
-        std::string current_time = TimeUtils::formatTimestamp(data.timestamp);
-        if(current_time >= "09:25:00" && av1 != bv1){
+        const int current_hms = TimeUtils::extractTimeOfDayHms(data.timestamp);
+        if(current_hms >= 92500 && av1 != bv1){
             metrics.auction_volume = data.volume * data.last_price * 100;
         }
         // 更新历史数据（增加买卖量历史）
@@ -2359,7 +2511,7 @@ public:
         // std::cout<<data.symbol<<"| 匹配量："<<metrics.auction_volume<<"万 "<<av1<<" "<<bv1<<" "<<data.last_price<<std::endl;
         
         
-        if (current_time >= "09:20:00") {
+        if (current_hms >= 92000) {
             analyzeAccumulationPattern(symbol, data.timestamp, data.last_price, bid_amount, data.close);
         }
         
@@ -2376,10 +2528,12 @@ public:
         // checkKeyTimepoints(data.timestamp);
     }
     
-    void cleanAuctOldData() {
+    void cleanAuctOldData(long long reference_time, long long stale_window_ms = 30 * 60 * 1000) {
+        if (reference_time <= 0 || stale_window_ms <= 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(data_mutex_);
-        long long current_time = TimeUtils::getCurrentTimestamp();
-        long long cutoff_time = current_time - 30*60*1000; // 30min
+        long long cutoff_time = reference_time - stale_window_ms;
         
         auto it = stock_auction_metrics_.begin();
         while (it != stock_auction_metrics_.end()) {
@@ -2389,6 +2543,19 @@ public:
                 ++it;
             }
         }
+
+        auto post_it = post_20_data_.begin();
+        while (post_it != post_20_data_.end()) {
+            if (stock_auction_metrics_.find(post_it->first) == stock_auction_metrics_.end()) {
+                post_it = post_20_data_.erase(post_it);
+            } else {
+                ++post_it;
+            }
+        }
+    }
+
+    void cleanAuctOldData() {
+        cleanAuctOldData(TimeUtils::getCurrentTimestamp());
     }
 
     // 获取开盘数据 - 多线程版本
@@ -3611,14 +3778,23 @@ int AuctionAnalyzer::report_time = 0;
 // ==================== 开盘异动检测器 ====================
 class VolatilityDetector : public IVolatilityDetector {
 private:
+    static constexpr long long POOL_EXPIRE_REFRESH_MS = 60 * 1000;
+    static constexpr long long POOL_CLEANUP_INTERVAL_MS = 3000;
     const Config& config_;
     std::unordered_map<std::string, std::deque<SimpleTickData>> stock_history_; // 优化: 限50
+    std::unordered_map<std::string, long long> symbol_last_update_;
     StockNameMapper& stock_mapper_;
     IExternalDataProvider* external_provider_;
     std::mutex data_mutex_;
     std::unique_ptr<RedisClient> redis_; 
         // 存储股票最后异动时间的内存变量
     std::unordered_map<std::string, long long> last_volatility_time_;
+    std::unordered_map<std::string, std::string> latest_volatile_member_;
+    std::unordered_map<std::string, std::string> latest_limit_member_;
+    long long volatile_last_expire_refresh_ms_ = 0;
+    long long limit_last_expire_refresh_ms_ = 0;
+    long long volatile_last_cleanup_ms_ = 0;
+    long long limit_last_cleanup_ms_ = 0;
 public:
     VolatilityDetector(const Config& config, IExternalDataProvider* provider = new DefaultExternalProvider())
         : config_(config), stock_mapper_(StockNameMapper::getInstance()), external_provider_(provider), 
@@ -3626,6 +3802,35 @@ public:
         }
    
     ~VolatilityDetector() { delete external_provider_; }
+
+    void cleanupState(long long reference_timestamp_ms, long long stale_window_ms) override {
+        if (reference_timestamp_ms <= 0 || stale_window_ms <= 0) {
+            return;
+        }
+
+        const long long cutoff_time = reference_timestamp_ms - stale_window_ms;
+
+        auto update_it = symbol_last_update_.begin();
+        while (update_it != symbol_last_update_.end()) {
+            if (update_it->second > 0 && update_it->second < cutoff_time) {
+                stock_history_.erase(update_it->first);
+                last_volatility_time_.erase(update_it->first);
+                latest_volatile_member_.erase(update_it->first);
+                latest_limit_member_.erase(update_it->first);
+                update_it = symbol_last_update_.erase(update_it);
+            } else {
+                ++update_it;
+            }
+        }
+
+        for (auto it = last_volatility_time_.begin(); it != last_volatility_time_.end(); ) {
+            if (it->second > 0 && it->second < cutoff_time) {
+                it = last_volatility_time_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
    
     bool checkLastVolatilityTime(const std::string& symbol, long long current_time, int threshold_ms = 10000) {
         // 检查股票最近指定时间内是否已经提醒过
@@ -3709,8 +3914,8 @@ private:
         history.push_back(SimpleTickData::fromStockData(data));
         if (history.size() > config_.max_history_ticks) {
             history.pop_front();
-            history.shrink_to_fit();
         }
+        symbol_last_update_[data.symbol] = data.timestamp;
     }
    
     TimeWindowStats calculateTimeWindowStats(const StockData& data) {
@@ -3834,6 +4039,37 @@ private:
         
         return out;
     }
+
+    void upsertPoolMember(
+        const std::string& key,
+        std::unordered_map<std::string, std::string>& latest_member_cache,
+        long long& last_expire_refresh_ms,
+        long long& last_cleanup_ms,
+        const std::string& symbol,
+        const std::string& member_json,
+        long long timestamp_ms,
+        long long keep_rank
+    ) {
+        auto it = latest_member_cache.find(symbol);
+        if (it != latest_member_cache.end() && it->second != member_json) {
+            redis_->zrem(key, it->second);
+        }
+        redis_->zadd(key, timestamp_ms, member_json);
+        latest_member_cache[symbol] = member_json;
+
+        if (last_expire_refresh_ms <= 0 || (timestamp_ms - last_expire_refresh_ms) >= POOL_EXPIRE_REFRESH_MS) {
+            redis_->expire(key, config_.volatile_expire);
+            last_expire_refresh_ms = timestamp_ms;
+        }
+
+        if (last_cleanup_ms <= 0 || (timestamp_ms - last_cleanup_ms) >= POOL_CLEANUP_INTERVAL_MS) {
+            redis_->zremrangebyrank(key, 0, keep_rank);
+            long long cutoff_time = timestamp_ms - (config_.volatile_expire * 1000);
+            redis_->zremrangebyscore(key, 0, cutoff_time);
+            last_cleanup_ms = timestamp_ms;
+        }
+    }
+
     void storeToRedis(const StockData& data, const std::string& reason, double strength, const TimeWindowStats& stats, const std::string& change) {
         std::string reason_encoded = base64_encode(reason);
         std::string name_encoded = base64_encode(stock_mapper_.getStockDisplayName(data.symbol));
@@ -3849,6 +4085,33 @@ private:
             << "\"large_net_5min\":" << Logger::f2s(stats.large_net_5min) 
             << ",\"change_5min\":" << Logger::f2s(stats.change_5min) 
             << ",\"amount_5min\":" << Logger::f2s(stats.amount_5min) << "}";
+
+        bool fast_limit_up = reason.find("Top") != std::string::npos;
+        if (fast_limit_up) {
+            upsertPoolMember(
+                config_.first_limit_up_key,
+                latest_limit_member_,
+                limit_last_expire_refresh_ms_,
+                limit_last_cleanup_ms_,
+                data.symbol,
+                json.str(),
+                data.timestamp,
+                -201
+            );
+        } else {
+            upsertPoolMember(
+                config_.volatile_pool_key,
+                latest_volatile_member_,
+                volatile_last_expire_refresh_ms_,
+                volatile_last_cleanup_ms_,
+                data.symbol,
+                json.str(),
+                data.timestamp,
+                -501
+            );
+        }
+        return;
+#if 0
 
         // 判断是否是涨停（根据reason包含"涨停"或"Top"且涨幅为10%/20%）
         bool is_limit_up = reason.find("Top") != std::string::npos;
@@ -3886,23 +4149,61 @@ private:
             long long cutoff_time = data.timestamp - (config_.volatile_expire * 1000);
             redis_->zremrangebyscore(config_.volatile_pool_key, 0, cutoff_time);
         }
+#endif
     }
 };
 
 // ==================== 阶段分流器 (新) ====================
 class PhaseDispatcher {
 private:
+    struct QuoteRedisState {
+        long long last_write_ts_ms = 0;
+        long long last_expire_refresh_ms = 0;
+        long long last_static_refresh_ms = 0;
+        double last_price = std::numeric_limits<double>::quiet_NaN();
+        double last_amount = -1.0;
+        double last_book1_amount = -1.0;
+    };
+
     TickAnalysisEngine* tick_engine_;
     AuctionAnalyzer* auction_analyzer_;
     IVolatilityDetector* volatility_detector_;
     std::unique_ptr<RedisClient> redis_client_;
     const Config& config_;
     StockNameMapper& stock_mapper_;
+    std::unordered_map<std::string, QuoteRedisState> quote_redis_state_;
+
+    static constexpr long long QUOTE_WRITE_INTERVAL_MS = 300;
+    static constexpr long long QUOTE_EXPIRE_REFRESH_MS = 60 * 1000;
+    static constexpr long long QUOTE_STATIC_REFRESH_MS = 10 * 60 * 1000;
+    static constexpr double QUOTE_AMOUNT_DELTA_THRESHOLD = 50000.0;
+    static constexpr double QUOTE_BOOK1_DELTA_THRESHOLD = 20000.0;
 public:
     PhaseDispatcher(TickAnalysisEngine* te, AuctionAnalyzer* aa, IVolatilityDetector* vd, const Config& config)
         : tick_engine_(te), auction_analyzer_(aa), volatility_detector_(vd), config_(config), stock_mapper_(StockNameMapper::getInstance()){
             redis_client_ = std::make_unique<RedisClient>(config.redis_host, config.redis_port, config.redis_db);
         }
+
+    bool flushRedisWrites() {
+        if (!redis_client_) return true;
+        if (!redis_client_->isConnected()) return true;
+        return redis_client_->executePipeline();
+    }
+
+    void cleanupState(long long reference_timestamp_ms, long long stale_window_ms) {
+        if (reference_timestamp_ms <= 0 || stale_window_ms <= 0) {
+            return;
+        }
+        const long long cutoff_time = reference_timestamp_ms - stale_window_ms;
+        auto it = quote_redis_state_.begin();
+        while (it != quote_redis_state_.end()) {
+            if (it->second.last_write_ts_ms > 0 && it->second.last_write_ts_ms < cutoff_time) {
+                it = quote_redis_state_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
    
     void dispatch(StockData& data) {
         //过滤
@@ -3913,15 +4214,14 @@ public:
         double bid_amount = (data.bid_volumes[0] + data.bid_volumes[1]) * data.last_price * 100;
         double ask_amount = (data.ask_volumes[0] + data.ask_volumes[1]) * data.last_price * 100;
         
-        std::string time_str = TimeUtils::formatTimestamp(data.timestamp).substr(11, 8);
-        bool is_auction = TimeUtils::isAuctionTime(time_str);
+        bool is_auction = TimeUtils::isAuctionTime(data.timestamp);
         
         tick_engine_->processTickData(data, is_auction);
         // 然后基于更新后的stock_states_计算高级指标
         auto [change_rate_1min, amount_2min] = tick_engine_->get_advanced_indicators(
             data.symbol, data.timestamp, data.last_price, data.amount);
          // 存储股票数据到Redis（新增）
-        storeStockDataToRedis(data, change, change_rate_1min, amount_2min);
+        storeStockDataToRedis(data, change, change_rate_1min, amount_2min, is_auction);
         if (is_auction) {
             auction_analyzer_->processAuctionData(data, change, bid_amount, ask_amount);
         } else{
@@ -3929,46 +4229,77 @@ public:
         }
     }
 private:
-    void storeStockDataToRedis(const StockData& data, double change, double change_rate_1min, double amount_2min) {
+    bool shouldWriteQuoteRedis(
+        const StockData& data,
+        const QuoteRedisState& state,
+        bool is_auction,
+        double book1_amount_yuan,
+        long long timestamp_ms
+    ) const {
+        if (is_auction) return true;
+        if (state.last_write_ts_ms <= 0) return true;
+        if (timestamp_ms - state.last_write_ts_ms >= QUOTE_WRITE_INTERVAL_MS) return true;
+        if (std::isnan(state.last_price) || std::fabs(data.last_price - state.last_price) >= 0.0001) return true;
+        if (std::fabs(data.amount - state.last_amount) >= QUOTE_AMOUNT_DELTA_THRESHOLD) return true;
+        if (std::fabs(book1_amount_yuan - state.last_book1_amount) >= QUOTE_BOOK1_DELTA_THRESHOLD) return true;
+        return false;
+    }
+
+    void storeStockDataToRedis(const StockData& data, double change, double change_rate_1min, double amount_2min, bool is_auction) {
         if (!redis_client_->connect()) {
             return;
         }
         
         // 使用与Python脚本相同的键格式: stock:quote:{symbol}
         std::string key = "stock:quote:" + data.symbol;
-        
-        // 存储到Redis哈希表中，与Python脚本格式匹配
-        redis_client_->hset(key, "price", std::to_string(data.last_price));
-        redis_client_->hset(key, "change_pct", std::to_string(change));
-        // 盘中过程字段：用于深V/冲高回落识别
-        redis_client_->hset(key, "high", std::to_string(data.high));
-        redis_client_->hset(key, "low", std::to_string(data.low));
-        // 昨收（lc）统一双写，兼容 Python 侧不同字段名读取
-        redis_client_->hset(key, "pre_close", std::to_string(data.close));
-        redis_client_->hset(key, "last_close", std::to_string(data.close));
-        // 成交额（元）：供Python侧计算封成比
-        redis_client_->hset(key, "amount", std::to_string(data.amount));
-        redis_client_->hset(key, "volume", Logger::amountToWan(data.amount));
-        redis_client_->hset(key, "large_net", Logger::amountToWan(data.large_net));
 
         // L1盘口金额（元）：买一+卖一，供Python侧统一读取，不区分方向
         const double bid1_amount_yuan = data.bid_prices[0] * data.bid_volumes[0] * 100.0;
         const double ask1_amount_yuan = data.ask_prices[0] * data.ask_volumes[0] * 100.0;
         const double book1_amount_yuan = bid1_amount_yuan + ask1_amount_yuan;
-        redis_client_->hset(key, "book1_amount_yuan", std::to_string(book1_amount_yuan));
-         
-        // 新增：存储高级指标
-        redis_client_->hset(key, "change_rate_1min", std::to_string(change_rate_1min));
-        redis_client_->hset(key, "amount_2min", Logger::amountToWan(amount_2min));
-        // 修复：将时间戳转换为整数（毫秒）
         long long timestamp_ms = static_cast<long long>(data.timestamp);
-        redis_client_->hset(key, "timestamp", std::to_string(timestamp_ms));
-        redis_client_->hset(key, "name", stock_mapper_.getStockDisplayName(data.symbol));
-         long long market_cap = static_cast<long long>(calculateMarketCap(data));
-        redis_client_->hset(key, "market_cap", std::to_string(market_cap));
-        
-        // 设置过期时间，与Python脚本一致
-        redis_client_->expire(key, 60*60*24); // 5分钟过期
+        auto& state = quote_redis_state_[data.symbol];
+        if (!shouldWriteQuoteRedis(data, state, is_auction, book1_amount_yuan, timestamp_ms)) {
+            return;
+        }
+
+        std::vector<std::pair<std::string, std::string>> fields;
+        fields.reserve(15);
+        fields.emplace_back("price", std::to_string(data.last_price));
+        fields.emplace_back("change_pct", std::to_string(change));
+        fields.emplace_back("high", std::to_string(data.high));
+        fields.emplace_back("low", std::to_string(data.low));
+        fields.emplace_back("amount", std::to_string(data.amount));
+        fields.emplace_back("volume", Logger::amountToWan(data.amount));
+        fields.emplace_back("large_net", Logger::amountToWan(data.large_net));
+        fields.emplace_back("book1_amount_yuan", std::to_string(book1_amount_yuan));
+        fields.emplace_back("change_rate_1min", std::to_string(change_rate_1min));
+        fields.emplace_back("amount_2min", Logger::amountToWan(amount_2min));
+        fields.emplace_back("timestamp", std::to_string(timestamp_ms));
+
+        if (state.last_static_refresh_ms <= 0 || (timestamp_ms - state.last_static_refresh_ms) >= QUOTE_STATIC_REFRESH_MS) {
+            fields.emplace_back("pre_close", std::to_string(data.close));
+            fields.emplace_back("last_close", std::to_string(data.close));
+            fields.emplace_back("name", stock_mapper_.getStockDisplayName(data.symbol));
+            long long market_cap = static_cast<long long>(calculateMarketCap(data));
+            fields.emplace_back("market_cap", std::to_string(market_cap));
+            state.last_static_refresh_ms = timestamp_ms;
+        }
+
+        if (!redis_client_->appendHsetMulti(key, fields)) {
+            return;
+        }
+
+        if (state.last_expire_refresh_ms <= 0 || (timestamp_ms - state.last_expire_refresh_ms) >= QUOTE_EXPIRE_REFRESH_MS) {
+            if (!redis_client_->appendExpire(key, 60 * 60 * 24)) {
+                return;
+            }
+            state.last_expire_refresh_ms = timestamp_ms;
+        }
+        state.last_write_ts_ms = timestamp_ms;
+        state.last_price = data.last_price;
+        state.last_amount = data.amount;
+        state.last_book1_amount = book1_amount_yuan;
         
         // 可选：记录存储成功的日志
         static int stored_count = 0;
@@ -4208,6 +4539,8 @@ public:
        
         auto last_cleanup = std::chrono::steady_clock::now();
         auto last_report = std::chrono::steady_clock::now();
+        constexpr long long CLEANUP_STALE_WINDOW_MS = 30LL * 60 * 1000;
+        constexpr long long CLEANUP_INTERVAL_SECONDS = 60;
          // 预分配向量，减少重复分配
         std::vector<PendingMessage> messages;
         std::vector<StockData> all_records;
@@ -4268,9 +4601,12 @@ public:
                     consumer_->rejectMessage(message.delivery_tag, true);
                     // 手动释放消息数据
                     message.data.clear();
-                    message.data.shrink_to_fit();
                 }
                 
+            }
+
+            if (phase_dispatcher_ && !phase_dispatcher_->flushRedisWrites() && logger_) {
+                logger_->warn("Quote Redis pipeline flush failed");
             }
             
             if (!all_records.empty()) {
@@ -4302,20 +4638,19 @@ public:
                     failed_messages += valid_messages.size();
                 }
                 last_timestamp = all_records.back().timestamp;
-                std::string last_time_str = TimeUtils::formatTimestamp(last_timestamp);
-                std::string time_part = last_time_str.substr(11, 8);
-                if (!auction_report_emitted_092003 && "09:24:00" > time_part  && time_part >= "09:20:03")
+                const int last_hms = TimeUtils::extractTimeOfDayHms(last_timestamp);
+                if (!auction_report_emitted_092003 && last_hms >= 92003 && last_hms < 92400)
                 {
                     auction_analyzer_->generateEnhancedAuctionReport("试盘结束总结", last_timestamp);
                     store_auction_snapshot_to_redis("0920", last_timestamp);
                     auction_report_emitted_092003 = true;
-                }else if (!auction_report_emitted_092410 && "09:25:00" > time_part && time_part >= "09:24:10")
+                }else if (!auction_report_emitted_092410 && last_hms >= 92410 && last_hms < 92500)
                 {
                     auction_analyzer_->generateEnhancedAuctionReport("竞价接近结束总结", last_timestamp);
                     store_auction_snapshot_to_redis("0924", last_timestamp);
                     auction_report_emitted_092410 = true;
                 }
-                else if (!auction_report_emitted_092510 && "09:30:00" > time_part  && time_part >= "09:25:10")
+                else if (!auction_report_emitted_092510 && last_hms >= 92510 && last_hms < 93000)
                 {
 
                     auction_analyzer_->generateEnhancedAuctionReport("竞价结束总结", last_timestamp);
@@ -4338,6 +4673,14 @@ public:
                 }
             }
             auto now = std::chrono::steady_clock::now();
+            if (last_timestamp > 0 &&
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup).count() >= CLEANUP_INTERVAL_SECONDS) {
+                tick_engine_->cleanupState(last_timestamp, CLEANUP_STALE_WINDOW_MS);
+                auction_analyzer_->cleanAuctOldData(last_timestamp, CLEANUP_STALE_WINDOW_MS);
+                volatility_detector_->cleanupState(last_timestamp, CLEANUP_STALE_WINDOW_MS);
+                phase_dispatcher_->cleanupState(last_timestamp, CLEANUP_STALE_WINDOW_MS);
+                last_cleanup = now;
+            }
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= config_.report_time) {
                 long long current_delay = getServerDelay();
                 // auction_analyzer_->getKaipan();

@@ -78,14 +78,17 @@ def _hot_plate_sort_key(fact: HotPlateFact) -> tuple[float, float, float, float,
 
 
 def _resolve_theme_names(snapshot: StockStateSnapshot) -> tuple[str, ...]:
-    names: list[str] = []
-    for raw_name in (snapshot.plate, *snapshot.real_plate_names):
+    for raw_name in (snapshot.plate,):
         for token in split_plate_tokens(raw_name):
             name = str(token or "").strip()
-            if not name or is_generic_plate(name) or name in names:
-                continue
-            names.append(name)
-    return tuple(names)
+            if name and not is_generic_plate(name):
+                return (name,)
+    for raw_name in snapshot.real_plate_names:
+        for token in split_plate_tokens(raw_name):
+            name = str(token or "").strip()
+            if name and not is_generic_plate(name):
+                return (name,)
+    return ()
 
 
 @dataclass

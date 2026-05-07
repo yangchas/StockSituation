@@ -76,6 +76,21 @@ class LiveRuntimeController:
                 rebuilt_context=False,
             )
 
+        # Premarket/postmarket should stay quiet outside startup audits and
+        # key checkpoints; keep the last cached context instead of
+        # continuously rebuilding runtime state.
+        if (
+            request.phase in (RunPhase.PREMARKET, RunPhase.POSTMARKET)
+            and not lifecycle_audit_ran
+            and not scheduled_event_executed
+            and not should_render_cycle
+        ):
+            return LiveRuntimeResult(
+                intraday_context=intraday_context,
+                primed_runtime_state=None,
+                rebuilt_context=False,
+            )
+
         context_request = IntradayContextRequest(
             phase=request.phase,
             trade_date=request.trade_date,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
-from engine_next.connectors import KaipanConnector
+from engine_next.connectors import KaipanConnector, WencaiConnector
 from engine_next.domain.enums import FetchIntent, RunPhase
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
@@ -14,7 +15,10 @@ from engine_next.runtime.plate_mapping_registry import (
     choose_primary_plate,
     decode_theme_list,
     encode_theme_list,
+    is_generic_plate,
     merge_theme_lists,
+    normalize_plate_name,
+    prioritize_core_themes,
 )
 from engine_next.source_policies.intraday_network_policy import allow_intraday_request
 
@@ -44,11 +48,13 @@ class IntradayDataHub:
         *,
         redis_client: Any | None = None,
         kaipan_connector: KaipanConnector | None = None,
+        wencai_connector: WencaiConnector | None = None,
         tdengine_auction_fetcher: Callable[[str], Sequence[dict[str, Any]]] | None = None,
         wencai_auction_fetcher: Callable[[str], Sequence[dict[str, Any]]] | None = None,
     ) -> None:
         self._redis = redis_client
         self._kaipan = kaipan_connector
+        self._wencai = wencai_connector
         self._tdengine_auction_fetcher = tdengine_auction_fetcher
         self._wencai_auction_fetcher = wencai_auction_fetcher
 
@@ -65,6 +71,12 @@ class IntradayDataHub:
         if self._kaipan is None:
             self._kaipan = KaipanConnector()
         return self._kaipan
+
+    @property
+    def wencai(self) -> WencaiConnector:
+        if self._wencai is None:
+            self._wencai = WencaiConnector()
+        return self._wencai
 
     def _read_json_string_key(self, key: str) -> Any | None:
         raw = self.redis.get(key)
@@ -130,6 +142,17 @@ class IntradayDataHub:
             self.redis.hset(key, field, encode_theme_list(merged))
         return merged
 
+    def _should_refine_yest_limit_symbol(self, symbol: str, pool_plate: str) -> bool:
+        normalized_pool_plate = str(pool_plate or "").strip()
+        current_plate = str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "").strip()
+        if not normalized_pool_plate or is_generic_plate(normalized_pool_plate):
+            return True
+        if not current_plate or is_generic_plate(current_plate):
+            return True
+        if normalize_plate_name(current_plate) != normalize_plate_name(normalized_pool_plate):
+            return True
+        return False
+
     def _decode_archived_anchor_rows(self, payload: Any) -> tuple[list[dict[str, Any]], bool]:
         if not isinstance(payload, dict):
             return [], False
@@ -147,6 +170,7 @@ class IntradayDataHub:
                 rows.append(
                     {
                         "symbol": normalized_symbol,
+                        "name": str(raw.get("name", raw.get("stock_name", "")) or ""),
                         "change_pct": float(raw.get("change_pct", 0.0) or 0.0),
                         "amount": amount,
                         "bid_amount": bid_amount,
@@ -160,6 +184,7 @@ class IntradayDataHub:
             rows.append(
                 {
                     "symbol": normalized_symbol,
+                    "name": "",
                     "change_pct": float(raw or 0.0),
                     "amount": 0.0,
                     "bid_amount": 0.0,
@@ -176,6 +201,7 @@ class IntradayDataHub:
             if not symbol:
                 continue
             payload[symbol] = {
+                "name": str(row.get("name", row.get("stock_name", "")) or ""),
                 "change_pct": float(row.get("change_pct", 0.0) or 0.0),
                 "amount": float(row.get("amount", 0.0) or 0.0),
                 "bid_amount": float(row.get("bid_amount", 0.0) or 0.0),
@@ -208,6 +234,7 @@ class IntradayDataHub:
                 rows.append(
                     {
                         "symbol": symbol,
+                        "name": str(row.get("name", row.get("stock_name", "")) or ""),
                         "change_pct": change_pct,
                         "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                         "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
@@ -260,6 +287,7 @@ class IntradayDataHub:
                     rows.append(
                         {
                             "symbol": symbol,
+                            "name": str(row.get("name", row.get("stock_name", "")) or ""),
                             "change_pct": float(row.get("change_pct", 0.0) or 0.0),
                             "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                             "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
@@ -354,35 +382,63 @@ class IntradayDataHub:
         rows = self.kaipan.to_tdengine_rows("hot_plates", raw, trade_date)
         redis_key = f"cache:hot_plates:{trade_date}"
         meta_key = f"cache:hot_plates_meta:{trade_date}"
-        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        updated_at_ts = int(datetime.now().timestamp())
-        try:
-            if hasattr(self.redis, "delete"):
-                self.redis.delete(redis_key)
-        except Exception:
-            pass
-        for row in rows:
-            plate_name = str(row.get("plate_name") or "")
-            if not plate_name:
-                continue
-            self._write_hash_json(redis_key, plate_name, row)
+        now_dt = datetime.now()
+        attempt_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        attempt_at_ts = int(now_dt.timestamp())
+        previous_cache = self._read_hash_payload(redis_key)
+        previous_meta = self._read_json_string_key(meta_key)
+        previous_updated_at = ""
+        previous_updated_at_ts = 0
+        if isinstance(previous_meta, dict):
+            previous_updated_at = str(previous_meta.get("updated_at") or "")
+            try:
+                previous_updated_at_ts = int(float(previous_meta.get("updated_at_ts", 0) or 0))
+            except (TypeError, ValueError):
+                previous_updated_at_ts = 0
+        cache_preserved = bool(previous_cache) and not rows
+        cache_row_count = len(rows) if rows else len(previous_cache)
+        if rows:
+            try:
+                if hasattr(self.redis, "delete"):
+                    self.redis.delete(redis_key)
+            except Exception:
+                pass
+            for row in rows:
+                plate_name = str(row.get("plate_name") or "")
+                if not plate_name:
+                    continue
+                self._write_hash_json(redis_key, plate_name, row)
+        updated_at = attempt_at
+        updated_at_ts = attempt_at_ts
+        if cache_preserved and previous_updated_at_ts > 0:
+            updated_at = previous_updated_at or attempt_at
+            updated_at_ts = previous_updated_at_ts
         meta_payload = {
             "trade_date": trade_date,
             "phase": phase.value,
             "source": "kaipan",
             "today_mode": bool(today_mode),
-            "row_count": len(rows),
+            "row_count": cache_row_count,
+            "fetched_row_count": len(rows),
+            "cache_row_count": cache_row_count,
+            "success": bool(rows),
+            "cache_preserved": cache_preserved,
             "updated_at": updated_at,
             "updated_at_ts": updated_at_ts,
+            "last_attempt_at": attempt_at,
+            "last_attempt_at_ts": attempt_at_ts,
         }
         self.redis.set(meta_key, json.dumps(meta_payload, ensure_ascii=False))
+        notes = ["Today mode uses empty-date Kaipan semantics; history mode uses explicit trade_date."]
+        if cache_preserved:
+            notes.append("Empty Kaipan hot-plate response preserved the previous Redis cache.")
         return IntradayFetchResult(
             dataset="hot_plates",
             trade_date=trade_date,
             rows=rows,
             source="kaipan",
             redis_keys_written=(redis_key, meta_key),
-            notes=("Today mode uses empty-date Kaipan semantics; history mode uses explicit trade_date.",),
+            notes=tuple(notes),
         )
 
     def fetch_yest_limit_pool(self, trade_date: str, phase: RunPhase, *, max_ban: int = 5) -> IntradayFetchResult:
@@ -399,6 +455,29 @@ class IntradayDataHub:
         raw = self.kaipan.fetch_yesterday_bans_pool(trade_date, max_ban=max_ban)
         rows = self.kaipan.to_tdengine_rows("yest_limit_pool", raw, trade_date)
         redis_key = f"cache:yest_limit_pool:{trade_date}"
+        meta_key = f"cache:yest_limit_pool_meta:{trade_date}"
+        now_dt = datetime.now()
+        attempt_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        attempt_at_ts = int(now_dt.timestamp())
+        previous_cache = self._read_hash_payload(redis_key)
+        previous_meta = self._read_json_string_key(meta_key)
+        previous_updated_at = ""
+        previous_updated_at_ts = 0
+        if isinstance(previous_meta, dict):
+            previous_updated_at = str(previous_meta.get("updated_at") or "")
+            try:
+                previous_updated_at_ts = int(float(previous_meta.get("updated_at_ts", 0) or 0))
+            except (TypeError, ValueError):
+                previous_updated_at_ts = 0
+        cache_preserved = bool(previous_cache) and not rows
+        cache_row_count = len(rows) if rows else len(previous_cache)
+        if rows:
+            try:
+                if hasattr(self.redis, "delete"):
+                    self.redis.delete(redis_key)
+            except Exception:
+                pass
+        refine_symbols: list[str] = []
         for row in rows:
             symbol = _normalize_symbol(row.get("symbol"))
             if not symbol:
@@ -406,21 +485,124 @@ class IntradayDataHub:
             self._write_hash_json(redis_key, symbol, row)
             pool_plate = str(row.get("plate") or "").strip()
             if not pool_plate:
+                refine_symbols.append(symbol)
                 continue
-            merged_themes = self._merge_theme_hash_field(PLATE_MAPPING_S2P_KEY, symbol, (pool_plate,))
+            existing_themes = decode_theme_list(self.redis.hget(PLATE_MAPPING_S2P_KEY, symbol))
+            merged_themes = prioritize_core_themes((pool_plate,), existing_themes, max_count=2)
+            if merged_themes:
+                self.redis.hset(PLATE_MAPPING_S2P_KEY, symbol, encode_theme_list(merged_themes))
             primary_plate = choose_primary_plate(merged_themes, fallback=pool_plate)
-            if primary_plate and not str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "").strip():
+            current_plate = str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "").strip()
+            if primary_plate and (
+                not current_plate
+                or is_generic_plate(current_plate)
+                or normalize_plate_name(current_plate) != normalize_plate_name(primary_plate)
+            ):
                 self._write_hash_plain(RUNTIME_PRIMARY_PLATE_KEY, symbol, primary_plate)
+            if self._should_refine_yest_limit_symbol(symbol, pool_plate):
+                refine_symbols.append(symbol)
+        unique_refine_symbols = tuple(dict.fromkeys(refine_symbols))
+        updated_at = attempt_at
+        updated_at_ts = attempt_at_ts
+        if cache_preserved and previous_updated_at_ts > 0:
+            updated_at = previous_updated_at or attempt_at
+            updated_at_ts = previous_updated_at_ts
+        meta_payload = {
+            "trade_date": trade_date,
+            "phase": phase.value,
+            "source": "kaipan",
+            "row_count": cache_row_count,
+            "fetched_row_count": len(rows),
+            "cache_row_count": cache_row_count,
+            "success": bool(rows),
+            "cache_preserved": cache_preserved,
+            "updated_at": updated_at,
+            "updated_at_ts": updated_at_ts,
+            "last_attempt_at": attempt_at,
+            "last_attempt_at_ts": attempt_at_ts,
+        }
+        self.redis.set(meta_key, json.dumps(meta_payload, ensure_ascii=False))
+        redis_keys_written: list[str] = [redis_key, meta_key, PLATE_MAPPING_S2P_KEY, RUNTIME_PRIMARY_PLATE_KEY]
+        notes = ["Yesterday limit pool is lightweight enough for startup repair and ladder context rebuild."]
+        if cache_preserved:
+            notes.append("Empty yesterday-limit response preserved the previous Redis cache.")
+        if unique_refine_symbols and phase in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.POSTMARKET):
+            enrich_result = self.enrich_stock_plate(
+                trade_date,
+                phase,
+                unique_refine_symbols,
+                max_symbols=None,
+            )
+            if enrich_result.source == "kaipan" and enrich_result.rows:
+                redis_keys_written.extend(enrich_result.redis_keys_written)
+                notes.append(
+                    f"Detailed Kaipan ban-reason enrichment refreshed {len(unique_refine_symbols)} yesterday-limit symbols."
+                )
         return IntradayFetchResult(
             dataset="yest_limit_pool",
             trade_date=trade_date,
             rows=rows,
             source="kaipan",
-            redis_keys_written=(redis_key, PLATE_MAPPING_S2P_KEY, RUNTIME_PRIMARY_PLATE_KEY),
-            notes=("Yesterday limit pool is lightweight enough for startup repair and ladder context rebuild.",),
+            redis_keys_written=tuple(dict.fromkeys(redis_keys_written)),
+            notes=tuple(notes),
         )
 
-    def enrich_stock_plate(self, trade_date: str, phase: RunPhase, symbols: Iterable[str]) -> IntradayFetchResult:
+    def fetch_limit_truth(self, trade_date: str, phase: RunPhase, *, max_stocks: int = 500) -> IntradayFetchResult:
+        decision = allow_intraday_request(FetchIntent.LIMIT_TRUTH_BUILD, phase)
+        if not decision.allowed:
+            return IntradayFetchResult(
+                dataset="limit_truth",
+                trade_date=trade_date,
+                rows=[],
+                source="blocked",
+                notes=(decision.notes,),
+            )
+
+        dataframe = asyncio.run(self.wencai.fetch_limitup_with_lb_days(max_stocks=max_stocks))
+        rows = self.wencai.to_tdengine_rows("limit_truth", dataframe, trade_date)
+        redis_key = f"cache:limit_truth:{trade_date}"
+        meta_key = f"cache:limit_truth_meta:{trade_date}"
+        updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        updated_at_ts = int(datetime.now().timestamp())
+        try:
+            if hasattr(self.redis, "delete"):
+                self.redis.delete(redis_key)
+        except Exception:
+            pass
+        for row in rows:
+            symbol = _normalize_symbol(row.get("symbol"))
+            if not symbol:
+                continue
+            payload = dict(row)
+            payload["symbol"] = symbol
+            self._write_hash_json(redis_key, symbol, payload)
+        meta_payload = {
+            "trade_date": trade_date,
+            "phase": phase.value,
+            "source": "wencai",
+            "row_count": len(rows),
+            "updated_at": updated_at,
+            "updated_at_ts": updated_at_ts,
+            "truth_scope": "final_limit_up_only",
+        }
+        self.redis.set(meta_key, json.dumps(meta_payload, ensure_ascii=False))
+        return IntradayFetchResult(
+            dataset="limit_truth",
+            trade_date=trade_date,
+            rows=rows,
+            source="wencai",
+            redis_keys_written=(redis_key, meta_key),
+            notes=("Today limit truth keeps only final Wencai limit-up rows and should not be mixed with intraday touched-limit traces.",),
+        )
+
+    def enrich_stock_plate(
+        self,
+        trade_date: str,
+        phase: RunPhase,
+        symbols: Iterable[str],
+        *,
+        max_symbols: int | None = 30,
+    ) -> IntradayFetchResult:
         decision = allow_intraday_request(FetchIntent.STOCK_PLATE_ENRICHMENT, phase)
         if not decision.allowed:
             return IntradayFetchResult(
@@ -432,7 +614,10 @@ class IntradayDataHub:
             )
 
         rows: list[dict[str, Any]] = []
-        for raw_symbol in list(symbols)[:30]:
+        selected_symbols = list(symbols)
+        if max_symbols is not None:
+            selected_symbols = selected_symbols[:max_symbols]
+        for raw_symbol in selected_symbols:
             symbol = _normalize_symbol(raw_symbol)
             if not symbol:
                 continue

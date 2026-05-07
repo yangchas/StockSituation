@@ -251,6 +251,11 @@ class StartupDatasetStatus:
     action: StartupAction
     missing_count: int = 0
     total_count: int = 0
+    actionable_missing_count: int = 0
+    structural_gap_count: int = 0
+    cache_gap_count: int = 0
+    dead_symbol_count: int = 0
+    current_trade_ready_count: int = 0
     freshness_date: str = ""
     severity: str = "info"
     notes: tuple[str, ...] = ()

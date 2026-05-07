@@ -13,6 +13,44 @@ class GapFillPlan:
 
 
 @dataclass(frozen=True)
+class DatasetGapEntry:
+    dataset: str
+    symbol: str
+    ready: bool
+    gap_type: str = "ready"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class DatasetGapMatrix:
+    target_date: str
+    entries: tuple[DatasetGapEntry, ...]
+
+    def pending_entries(self, *datasets: str) -> tuple[DatasetGapEntry, ...]:
+        dataset_filter = {str(dataset) for dataset in datasets if str(dataset)}
+        return tuple(
+            entry
+            for entry in self.entries
+            if not entry.ready and (not dataset_filter or entry.dataset in dataset_filter)
+        )
+
+    def symbols_for(self, *datasets: str) -> tuple[str, ...]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for entry in self.pending_entries(*datasets):
+            if entry.symbol in seen:
+                continue
+            seen.add(entry.symbol)
+            ordered.append(entry.symbol)
+        return tuple(ordered)
+
+    def pending_count(self, dataset: str | None = None) -> int:
+        if dataset is None:
+            return sum(1 for entry in self.entries if not entry.ready)
+        return sum(1 for entry in self.entries if not entry.ready and entry.dataset == dataset)
+
+
+@dataclass(frozen=True)
 class ResumeCheckpointState:
     task_type: str
     date_tag: str

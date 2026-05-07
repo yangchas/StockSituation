@@ -11,8 +11,12 @@ from engine_next.domain.enums import RunPhase
 from engine_next.domain.models import IntradayContext, IntradayMarketSummary, StockStateSnapshot
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
+    build_plate_candidates_from_reason,
+    choose_primary_plate,
     decode_theme_list,
     is_generic_plate,
+    merge_theme_lists,
+    prioritize_core_themes,
     split_plate_tokens,
 )
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
@@ -111,6 +115,8 @@ class IntradayContextBuilder:
         self._string_hash_cache: dict[str, dict[str, str]] = {}
         self._string_key_cache: dict[str, dict[str, Any]] = {}
         self._primed_runtime_state: PrimedIntradayRuntimeState | None = None
+        self._f10_service: Any | None = None
+        self._f10_name_cache: dict[str, str] = {}
 
     @property
     def hub(self) -> IntradayDataHub:
@@ -123,6 +129,110 @@ class IntradayContextBuilder:
     @property
     def tick_tracker(self) -> TickWindowTracker:
         return self._tick_tracker
+
+    @staticmethod
+    def _resolve_snapshot_name(
+        *,
+        quote: dict[str, Any],
+        cache: dict[str, Any],
+        auction: dict[str, Any],
+        yest: dict[str, Any],
+    ) -> str:
+        for raw in (
+            quote.get("name"),
+            cache.get("name"),
+            cache.get("stock_name"),
+            auction.get("name"),
+            auction.get("stock_name"),
+            yest.get("name"),
+        ):
+            text = str(raw or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _load_fallback_stock_names(self, symbols: Iterable[str]) -> dict[str, str]:
+        normalized_symbols = tuple(
+            dict.fromkeys(_normalize_symbol(symbol) for symbol in symbols if _normalize_symbol(symbol))
+        )
+        if not normalized_symbols:
+            return {}
+        pending = tuple(symbol for symbol in normalized_symbols if symbol not in self._f10_name_cache)
+        if pending:
+            try:
+                if self._f10_service is None:
+                    from web.services.f10_service import F10DataService
+
+                    self._f10_service = F10DataService()
+                if hasattr(self._f10_service, "batch_get_stock_names"):
+                    payload = self._f10_service.batch_get_stock_names(list(pending))
+                    for symbol in pending:
+                        self._f10_name_cache[symbol] = str((payload or {}).get(symbol) or "").strip()
+                    payload = None
+                else:
+                    payload = self._f10_service.batch_get_f10(list(pending))
+            except Exception:
+                payload = {}
+            if payload is not None:
+                for symbol in pending:
+                    item = payload.get(symbol) if isinstance(payload, dict) else None
+                    basic = item.get("basic") if isinstance(item, dict) else None
+                    name = str((basic or {}).get("stock_name") or "").strip()
+                    self._f10_name_cache[symbol] = name
+        return {
+            symbol: self._f10_name_cache.get(symbol, "")
+            for symbol in normalized_symbols
+            if str(self._f10_name_cache.get(symbol, "") or "").strip()
+        }
+
+    def _resolve_snapshot_plate(
+        self,
+        *,
+        runtime_plate: str,
+        yest_plate: str,
+        themes: Iterable[str] = (),
+        reason: str = "",
+        hot_plate_map: dict[str, Any] | None = None,
+    ) -> str:
+        def _usable_tokens(*values: str) -> tuple[str, ...]:
+            tokens: list[str] = []
+            for value in values:
+                for token in split_plate_tokens(value):
+                    cleaned = str(token or "").strip()
+                    if not cleaned or len(cleaned) > 12 or cleaned in tokens:
+                        continue
+                    tokens.append(cleaned)
+            return tuple(tokens)
+
+        candidate_entries: list[tuple[str, int]] = []
+
+        def _extend(values: tuple[str, ...], priority: int) -> None:
+            for value in values:
+                if any(existing == value for existing, _ in candidate_entries):
+                    continue
+                candidate_entries.append((value, priority))
+
+        _extend(_usable_tokens(yest_plate), 3)
+        _extend(_usable_tokens(runtime_plate), 2)
+        for theme in themes:
+            _extend(_usable_tokens(str(theme or "")), 1)
+
+        theme_candidates = tuple(name for name, _ in candidate_entries)
+        fallback = str(yest_plate or runtime_plate or next(iter(theme_candidates), "")).strip()
+        preferred = [entry for entry in candidate_entries if not is_generic_plate(entry[0])]
+        if hot_plate_map and preferred:
+            ranked = sorted(
+                preferred,
+                key=lambda item: (
+                    -self._match_hot_plate_signal((item[0],), hot_plate_map),
+                    -item[1],
+                    item[0],
+                ),
+            )
+            best_name, _ = ranked[0]
+            if self._match_hot_plate_signal((best_name,), hot_plate_map) > 0:
+                return best_name
+        return choose_primary_plate(theme_candidates, fallback=fallback)
 
     @staticmethod
     def _parse_timestamp_ms(value: Any) -> int:
@@ -218,7 +328,11 @@ class IntradayContextBuilder:
         yesterday_hot_plate_map = self._load_json_hash(f"cache:hot_plates:{request.previous_trade_date}")
         effective_hot_plate_map = hot_plate_map
         effective_hot_plate_trade_date = request.trade_date
-        if request.phase == RunPhase.PREMARKET and not effective_hot_plate_map and yesterday_hot_plate_map:
+        if (
+            request.phase in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY)
+            and not effective_hot_plate_map
+            and yesterday_hot_plate_map
+        ):
             effective_hot_plate_map = yesterday_hot_plate_map
             effective_hot_plate_trade_date = request.previous_trade_date
         hot_plate_meta = self._load_hot_plate_meta(effective_hot_plate_trade_date)
@@ -304,6 +418,7 @@ class IntradayContextBuilder:
                 f"hot_plates_today={len(hot_plate_map)}",
                 f"hot_plates_yesterday={len(yesterday_hot_plate_map)}",
                 f"hot_plates_effective={len(effective_hot_plate_map)}",
+                f"hot_plate_effective_trade_date={effective_hot_plate_trade_date}",
                 f"hot_plate_meta_ts={int(float(hot_plate_meta.get('updated_at_ts', 0) or 0))}",
             ),
         )
@@ -318,6 +433,16 @@ class IntradayContextBuilder:
         quote_map = {row["symbol"]: row for row in primed.quote_rows if row.get("symbol")}
         cache_map = {row["symbol"]: row for row in primed.cache_rows if row.get("symbol")}
         auction_map = {row["symbol"]: row for row in primed.auction_rows if row.get("symbol")}
+        fallback_name_map = self._load_fallback_stock_names(
+            symbol
+            for symbol in primed.symbols
+            if not self._resolve_snapshot_name(
+                quote=quote_map.get(symbol, {}),
+                cache=cache_map.get(symbol, {}),
+                auction=auction_map.get(symbol, {}),
+                yest=primed.yest_limit_map.get(symbol, {}),
+            )
+        )
 
         snapshots = []
         for symbol in primed.symbols:
@@ -335,7 +460,13 @@ class IntradayContextBuilder:
             auction_pct = float(auction.get("change_pct", 0.0) or 0.0)
             peak_price = float(cache.get("peak_price", 0.0) or 0.0)
             resistance_gap = (peak_price - price) / price if peak_price > price > 0 else 0.0
-            plate = str(primed.stock_plate_map.get(symbol) or yest.get("plate") or (theme_names[0] if theme_names else ""))
+            plate = self._resolve_snapshot_plate(
+                runtime_plate=str(primed.stock_plate_map.get(symbol) or ""),
+                yest_plate=str(yest.get("plate") or ""),
+                themes=theme_names,
+                reason=str(primed.stock_reason_map.get(symbol) or ""),
+                hot_plate_map=primed.effective_hot_plate_map,
+            )
             market_cap_yi = self._to_yi(cache.get("real_market_cap"))
             amount_day_yi = self._to_yi(rust_row.get("amount", quote.get("amount")))
             speed_1m = float(rust_row.get("speed_1m", 0.0) or 0.0)
@@ -369,7 +500,13 @@ class IntradayContextBuilder:
             snapshots.append(
                 StockStateSnapshot(
                     symbol=symbol,
-                    name=str(quote.get("name", yest.get("name", "")) or ""),
+                    name=self._resolve_snapshot_name(
+                        quote=quote,
+                        cache=cache,
+                        auction=auction,
+                        yest=yest,
+                    )
+                    or str(fallback_name_map.get(symbol) or ""),
                     plate=plate,
                     lb_days=int(yest.get("lb_days", 0) or 0),
                     open_pct=auction_pct,
@@ -399,7 +536,11 @@ class IntradayContextBuilder:
                     real_plate_names=self._merge_plate_names(
                         plate,
                         primed.stock_reason_map.get(symbol, ""),
-                        theme_names,
+                        (
+                            str(primed.stock_plate_map.get(symbol) or ""),
+                            str(yest.get("plate") or ""),
+                            *theme_names,
+                        ),
                     ),
                 )
             )
@@ -686,15 +827,14 @@ class IntradayContextBuilder:
         return days
 
     def _merge_plate_names(self, plate: str, reason: str, themes: Iterable[str] = ()) -> tuple[str, ...]:
-        names = []
+        reason_candidates = build_plate_candidates_from_reason(reason=reason) if reason else []
+        if reason_candidates:
+            names = prioritize_core_themes((plate, *reason_candidates), themes, max_count=2)
+        else:
+            names = merge_theme_lists((), (plate, *themes))
         if plate:
-            names.append(plate)
-        for theme in themes:
-            text = str(theme or "").strip()
-            if text and text not in names:
-                names.append(text)
-        if reason and reason not in names:
-            names.append(str(reason))
+            normalized_plate = str(plate).strip()
+            names = [normalized_plate] + [name for name in names if name != normalized_plate]
         return tuple(names)
 
     def _attach_theme_ranks(self, snapshots: list[StockStateSnapshot]) -> list[StockStateSnapshot]:

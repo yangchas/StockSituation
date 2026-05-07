@@ -4,11 +4,12 @@ from dataclasses import dataclass
 import json
 import logging
 import queue
+import shutil
 import sys
 import threading
 import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from typing import Any, Iterable, Sequence
@@ -94,19 +95,26 @@ def _render_pipeline_progress(
     if total <= 0:
         return
     percent = max(0.0, min(100.0, (done / total) * 100.0))
-    filled = min(20, int(percent) // 5)
-    bar = f"{'#' * filled}{'-' * (20 - filled)}"
-    suffix = (
-        f" | net={network_done}/{network_total}"
-        f" | calc={analytics_done}/{analytics_total}"
+    line = (
+        f"[进度] {percent:4.1f}% {done}/{total}"
+        f" | 联网{network_done}/{network_total}"
+        f" | 重算{analytics_done}/{analytics_total}"
     )
     if extra:
-        suffix = f"{suffix} | {extra}"
-    sys.stdout.write(f"\r[settlement] [{bar}] {done}/{total} ({percent:.1f}%){suffix}   ")
-    sys.stdout.flush()
-    if done >= total:
-        sys.stdout.write("\n")
+        line = f"{line} | {extra}"
+    if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+        terminal_width = shutil.get_terminal_size((120, 20)).columns
+        safe_width = max(40, terminal_width - 4)
+        if len(line) > safe_width:
+            line = line[: max(0, safe_width - 3)] + "..."
+        sys.stdout.write(f"\r\033[2K{line}")
         sys.stdout.flush()
+        if done >= total:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
 
 
 class WatermarkAuditService:
@@ -881,6 +889,15 @@ class IntegratedSyncExecutor:
         network_total = len(network_set)
         analytics_total = len(analytics_set)
         analytics_worker_count = max(1, int(analytics_workers or self.max_batch_workers or 1))
+        network_worker_count = min(max(1, int(self.max_batch_workers or 1)), network_total) if network_total else 0
+        analytics_queue_limit = min(
+            total,
+            max(8, analytics_worker_count * 2, network_worker_count or 1),
+        )
+        persistence_queue_limit = min(
+            total,
+            max(4, network_worker_count or 1),
+        )
         checkpoint_state = self._load_checkpoint_state(target_date)
         completed_checkpoint_ids = set(checkpoint_state.completed_task_ids)
 
@@ -895,15 +912,16 @@ class IntegratedSyncExecutor:
         analytics_elapsed_total = 0.0
         analytics_timed_count = 0
         deferred_local_analytics: list[str] = []
-        analytics_queue: queue.Queue[NetworkTaskResult | None] = queue.Queue()
-        persistence_queue: queue.Queue[DeferredKlinePersistence | None] = queue.Queue()
+        analytics_queue: queue.Queue[NetworkTaskResult | None] = queue.Queue(maxsize=analytics_queue_limit)
+        persistence_queue: queue.Queue[DeferredKlinePersistence | None] = queue.Queue(maxsize=persistence_queue_limit)
         progress_lock = threading.Lock()
         peak_queue_depth = 0
         analytics_completed_symbols: set[str] = set()
         persistence_required_symbols: set[str] = set()
         persistence_completed_symbols: set[str] = set()
         finalized_symbols: set[str] = set()
-        last_progress_signature: tuple[int, int, int, int, str] | None = None
+        last_progress_signature: tuple[int, int, int] | None = None
+        last_progress_emit_at = 0.0
         checkpoint_reused = 0
         checkpoint_invalidated = 0
         checkpoint_stored = 0
@@ -933,13 +951,27 @@ class IntegratedSyncExecutor:
                     else:
                         self._clear_checkpoint_task(task_id, target_date)
 
-        def _render_progress_if_changed() -> None:
-            nonlocal last_progress_signature
+        def _render_progress_if_changed(force: bool = False) -> None:
+            nonlocal last_progress_signature, last_progress_emit_at
             extra = _progress_extra()
-            signature = (completed, network_done, analytics_done, total, extra)
-            if signature == last_progress_signature:
+            percent_bucket = int((completed / max(total, 1)) * 20)
+            signature = (
+                percent_bucket,
+                int(completed >= total),
+                int(network_done >= network_total) if network_total > 0 else 1,
+                int(analytics_done >= analytics_total) if analytics_total > 0 else 1,
+            )
+            now_monotonic = time.monotonic()
+            if force and signature == last_progress_signature and completed >= total:
+                return
+            if (
+                not force
+                and signature == last_progress_signature
+                and (now_monotonic - last_progress_emit_at) < HEARTBEAT_INTERVAL_SECONDS
+            ):
                 return
             last_progress_signature = signature
+            last_progress_emit_at = now_monotonic
             _render_pipeline_progress(
                 completed,
                 total,
@@ -951,7 +983,7 @@ class IntegratedSyncExecutor:
             )
 
         print(
-            f"[settlement] checkpoint | stored={len(completed_checkpoint_ids)} | reused=0 | invalidated=0 | committed=0"
+            f"[settlement] 断点续跑 | 已存={len(completed_checkpoint_ids)} | 复用=0 | 失效=0 | 新提交=0"
         )
 
         def _complete_symbol(symbol: str, analytics_result: IntegratedSyncResult | None = None) -> None:
@@ -975,12 +1007,7 @@ class IntegratedSyncExecutor:
                 avg_net_ms = max(1, round((network_elapsed_total / network_timed_count) * 1000)) if network_elapsed_total > 0 else 0
             if analytics_timed_count:
                 avg_calc_ms = max(1, round((analytics_elapsed_total / analytics_timed_count) * 1000)) if analytics_elapsed_total > 0 else 0
-            return (
-                f"q={analytics_queue.qsize()}"
-                f" | q_peak={peak_queue_depth}"
-                f" | avg_net_ms={avg_net_ms}"
-                f" | avg_calc_ms={avg_calc_ms}"
-            )
+            return f"队{analytics_queue.qsize()}/{analytics_queue_limit} | 峰{peak_queue_depth} | {avg_net_ms}/{avg_calc_ms}ms"
 
         def _enqueue_analytics(network_result: NetworkTaskResult) -> None:
             nonlocal peak_queue_depth
@@ -1067,6 +1094,47 @@ class IntegratedSyncExecutor:
                     _render_progress_if_changed()
                 analytics_queue.task_done()
 
+        def _run_network_task_timed(task: IntegratedSyncTask) -> tuple[NetworkTaskResult, DeferredKlinePersistence | None, float]:
+            network_started = time.monotonic()
+            network_result, deferred_kline_persist = self._run_network_task(task, watermark_snapshot)
+            return network_result, deferred_kline_persist, time.monotonic() - network_started
+
+        def _handle_network_completion(
+            network_result: NetworkTaskResult,
+            deferred_kline_persist: DeferredKlinePersistence | None,
+            network_elapsed: float,
+        ) -> None:
+            nonlocal network_done, network_elapsed_total, network_timed_count, last_progress_signature
+            symbol = network_result.task.symbol
+            with progress_lock:
+                network_results_by_symbol[symbol] = network_result
+                network_done += 1
+                network_elapsed_total += network_elapsed
+                network_timed_count += 1
+                if deferred_kline_persist is not None:
+                    persistence_required_symbols.add(symbol)
+                if symbol not in analytics_set:
+                    _complete_symbol(symbol)
+                extra = _progress_extra()
+                elapsed = int(time.monotonic() - started_at)
+                if completed == 0 and elapsed >= STALL_WARNING_SECONDS:
+                    last_progress_signature = None
+                    _render_pipeline_progress(
+                        completed,
+                        total,
+                        network_done=network_done,
+                        network_total=network_total,
+                        analytics_done=analytics_done,
+                        analytics_total=analytics_total,
+                        extra=f"{extra} | 首个结果等待={elapsed}s",
+                    )
+                else:
+                    _render_progress_if_changed()
+            if symbol in analytics_set:
+                _enqueue_analytics(network_result)
+            if deferred_kline_persist is not None:
+                persistence_queue.put(deferred_kline_persist)
+
         _render_pipeline_progress(
             0,
             total,
@@ -1095,6 +1163,8 @@ class IntegratedSyncExecutor:
         persistence_thread.start()
 
         try:
+            pending_network_futures = set()
+            reused_network_symbols: set[str] = set()
             for symbol in ordered_targets:
                 task_id = f"{target_date}:{symbol}"
                 if task_id in completed_checkpoint_ids:
@@ -1125,6 +1195,7 @@ class IntegratedSyncExecutor:
                             results_by_symbol[symbol] = checkpoint_result
                             if symbol in network_set:
                                 network_done += 1
+                                reused_network_symbols.add(symbol)
                             if symbol in analytics_set:
                                 analytics_done += 1
                                 analytics_completed_symbols.add(symbol)
@@ -1138,46 +1209,52 @@ class IntegratedSyncExecutor:
                         deferred_local_analytics.append(symbol)
                     continue
 
-                task = self._build_task(
-                    symbol=symbol,
-                    target_date=target_date,
-                    watermark_snapshot=watermark_snapshot,
-                    analytics_set=analytics_set,
-                )
-                network_started = time.monotonic()
-                network_result, deferred_kline_persist = self._run_network_task(task, watermark_snapshot)
-                network_elapsed = time.monotonic() - network_started
-                with progress_lock:
-                    network_results_by_symbol[symbol] = network_result
-                    network_done += 1
-                    network_elapsed_total += network_elapsed
-                    network_timed_count += 1
-                    if deferred_kline_persist is not None:
-                        persistence_required_symbols.add(symbol)
-                    if symbol not in analytics_set:
-                        _complete_symbol(symbol)
-                    extra = _progress_extra()
-                    elapsed = int(time.monotonic() - started_at)
-                    if completed == 0 and elapsed >= STALL_WARNING_SECONDS:
-                        last_progress_signature = None
-                        _render_pipeline_progress(
-                            completed,
-                            total,
-                            network_done=network_done,
-                            network_total=network_total,
-                            analytics_done=analytics_done,
-                            analytics_total=analytics_total,
-                            extra=f"{extra} | waiting_first_result={elapsed}s",
-                        )
-                    else:
-                        _render_progress_if_changed()
-                if symbol in analytics_set:
-                    _enqueue_analytics(network_result)
-                if deferred_kline_persist is not None:
-                    persistence_queue.put(deferred_kline_persist)
-
             for symbol in deferred_local_analytics:
                 _enqueue_analytics(_build_local_only_network_result(symbol))
+
+            if network_worker_count:
+                with ThreadPoolExecutor(
+                    max_workers=network_worker_count,
+                    thread_name_prefix="integrated-sync-network",
+                ) as network_executor:
+                    for symbol in ordered_targets:
+                        if (
+                            symbol in network_set
+                            and symbol not in network_results_by_symbol
+                            and symbol not in reused_network_symbols
+                        ):
+                            task = self._build_task(
+                                symbol=symbol,
+                                target_date=target_date,
+                                watermark_snapshot=watermark_snapshot,
+                                analytics_set=analytics_set,
+                            )
+                            pending_network_futures.add(network_executor.submit(_run_network_task_timed, task))
+
+                    while pending_network_futures:
+                        done, pending_network_futures = wait(
+                            pending_network_futures,
+                            timeout=1.0,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            with progress_lock:
+                                elapsed = int(time.monotonic() - started_at)
+                                if completed == 0 and elapsed >= STALL_WARNING_SECONDS:
+                                    last_progress_signature = None
+                                    _render_pipeline_progress(
+                                        completed,
+                                        total,
+                                        network_done=network_done,
+                                        network_total=network_total,
+                                        analytics_done=analytics_done,
+                                        analytics_total=analytics_total,
+                                        extra=f"{_progress_extra()} | 首个结果等待={elapsed}s",
+                                    )
+                            continue
+                        for future in done:
+                            network_result, deferred_kline_persist, network_elapsed = future.result()
+                            _handle_network_completion(network_result, deferred_kline_persist, network_elapsed)
 
             analytics_queue.join()
             persistence_queue.join()
@@ -1190,9 +1267,9 @@ class IntegratedSyncExecutor:
             persistence_thread.join(timeout=1)
 
         with progress_lock:
-            _render_progress_if_changed()
+            _render_progress_if_changed(force=True)
         print(
-            f"[settlement] checkpoint | stored={len(completed_checkpoint_ids)} | reused={checkpoint_reused} | invalidated={checkpoint_invalidated} | committed={checkpoint_stored}"
+            f"[settlement] 断点续跑 | 已存={len(completed_checkpoint_ids)} | 复用={checkpoint_reused} | 失效={checkpoint_invalidated} | 新提交={checkpoint_stored}"
         )
 
         return [results_by_symbol[symbol] for symbol in ordered_targets if symbol in results_by_symbol]
@@ -1394,7 +1471,7 @@ class IntegratedSyncExecutor:
                 executor.submit(self.sync_symbol, symbol, target_date, watermark_snapshot, stage): symbol
                 for symbol in normalized_symbols
             }
-            results: list[IntegratedSyncResult] = []
+            results_by_symbol: dict[str, IntegratedSyncResult] = {}
             completed = 0
             total = len(normalized_symbols)
             stop_heartbeat = threading.Event()
@@ -1440,8 +1517,9 @@ class IntegratedSyncExecutor:
                     )
                 if completed == 1 or completed % 2 == 0 or completed == total:
                     _render_stage_progress(stage, completed, total)
-                results.append(future.result())
+                results_by_symbol[symbol] = future.result()
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=1)
+        results = [results_by_symbol[symbol] for symbol in normalized_symbols if symbol in results_by_symbol]
         logger.debug("integrated sync batch done | stage=%s | results=%s | workers=%s", stage, len(results), max_workers)
         return results

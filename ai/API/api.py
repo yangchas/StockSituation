@@ -328,6 +328,11 @@ class UnifiedMarketDataFetcher:
         if candidates:
             return candidates[0]
 
+        # 问财常见列名：连续涨停天数[YYYYMMDD]
+        candidates = [c for c in df.columns if isinstance(c, str) and "连续涨停天数" in c]
+        if candidates:
+            return candidates[0]
+
         # 模糊匹配：包含“连板”且包含“天”
         candidates = [c for c in df.columns if isinstance(c, str) and ("连板" in c and "天" in c)]
         if candidates:
@@ -387,6 +392,20 @@ class UnifiedMarketDataFetcher:
             df["lb_days"] = pd.to_numeric(df[lb_col], errors="coerce").astype("Int64")
         else:
             df["lb_days"] = pd.Series([pd.NA] * len(df), dtype="Int64")
+
+        # 问财首板行经常不给连续涨停天数，这里用“几天几板/首板涨停”兜底补成 1。
+        days_boards_col = next(
+            (
+                c
+                for c in df.columns
+                if isinstance(c, str) and ("几天几板" in c or c == "几天几板")
+            ),
+            None,
+        )
+        if days_boards_col:
+            first_board_mask = df["lb_days"].isna() & df[days_boards_col].astype(str).str.contains("首板", na=False)
+            if first_board_mask.any():
+                df.loc[first_board_mask, "lb_days"] = 1
 
         # 去重：按 code6
         df = df.drop_duplicates(subset=["code6"], keep="first")

@@ -30,12 +30,20 @@ class StartupBootstrapRequest:
     kline_watermarks: dict[str, str] | None = None
     factor_watermarks: dict[str, str] | None = None
     redis_factor_cache_ready: dict[str, bool] | None = None
+    current_trade_factor_cache_ready: dict[str, bool] | None = None
+    current_trade_chip_cache_ready: dict[str, bool] | None = None
     yest_limit_pool_ready: bool = False
     hot_plates_ready: bool = False
+    hot_plates_live_fresh: bool = True
     stock_plate_mapping_ready: bool = False
     auction_anchor_ready: bool = False
     redis_chip_ready_count: int = 0
     redis_dde_ready_count: int = 0
+    live_target_session: bool = True
+    previous_settlement_payload: dict[str, object] | None = None
+    cached_listing_dates: dict[str, str] | None = None
+    cached_kline_row_counts: dict[str, int] | None = None
+    cached_structural_factor_gap: dict[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -148,17 +156,32 @@ class StartupBootstrapController:
                 kline_watermarks=request.kline_watermarks or watermark_snapshot.kline_latest_dates,
                 factor_watermarks=request.factor_watermarks or watermark_snapshot.factor_latest_dates,
                 redis_factor_cache_ready=request.redis_factor_cache_ready or runtime_readiness["redis_factor_cache_ready"],
+                current_trade_factor_cache_ready=request.current_trade_factor_cache_ready or runtime_readiness["current_trade_factor_cache_ready"],
+                current_trade_chip_cache_ready=request.current_trade_chip_cache_ready or runtime_readiness["current_trade_chip_cache_ready"],
                 yest_limit_pool_ready=request.yest_limit_pool_ready or bool(runtime_readiness["yest_limit_pool_ready"]),
                 hot_plates_ready=request.hot_plates_ready or bool(runtime_readiness["hot_plates_ready"]),
+                hot_plates_today_ready=bool(runtime_readiness.get("hot_plates_today_ready", False)),
+                hot_plates_effective_ready=bool(runtime_readiness.get("hot_plates_effective_ready", runtime_readiness["hot_plates_ready"])),
+                hot_plates_effective_trade_date=str(runtime_readiness.get("hot_plates_effective_trade_date") or ""),
+                hot_plates_live_fresh=request.hot_plates_live_fresh or bool(runtime_readiness.get("hot_plates_live_fresh", runtime_readiness["hot_plates_ready"])),
                 stock_plate_mapping_ready=request.stock_plate_mapping_ready or bool(runtime_readiness["stock_plate_mapping_ready"]),
                 auction_anchor_ready=request.auction_anchor_ready or bool(runtime_readiness["auction_anchor_ready"]),
                 redis_chip_ready_count=max(request.redis_chip_ready_count, int(runtime_readiness["redis_chip_ready_count"])),
                 redis_dde_ready_count=max(request.redis_dde_ready_count, int(runtime_readiness["redis_dde_ready_count"])),
+                live_target_session=bool(runtime_readiness.get("live_target_session", request.live_target_session)),
+                previous_settlement_payload=request.previous_settlement_payload or runtime_readiness.get("previous_settlement_payload"),
+                cached_listing_dates=request.cached_listing_dates or runtime_readiness.get("cached_listing_dates") or None,
+                cached_kline_row_counts=request.cached_kline_row_counts or runtime_readiness.get("cached_kline_row_counts") or None,
+                cached_structural_factor_gap=request.cached_structural_factor_gap or runtime_readiness.get("cached_structural_factor_gap") or None,
                 watermark_snapshot=watermark_snapshot,
                 environment=request.environment,
             )
+            startup_plan = self._startup_coordinator.build_plan(startup_request)
             logger.debug("startup repair phase start")
-            startup_bundle = self._startup_coordinator.execute_allowed_repairs(startup_request)
+            startup_bundle = self._startup_coordinator.execute_allowed_repairs(
+                startup_request,
+                plan=startup_plan,
+            )
             logger.debug(
                 "startup repair phase done | phase=%s | readiness=%s",
                 startup_bundle.plan.phase.value,

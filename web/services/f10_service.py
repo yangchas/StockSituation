@@ -60,6 +60,10 @@ class F10DataService:
 
     ENCODINGS = ("gbk", "gb18030", "utf-8-sig", "utf-8")
     INDEX_COLUMNS = ("股票代码",)
+    NAME_COLUMNS = (
+        "股票代码",
+        "股票简称",
+    )
     DATA_COLUMNS = (
         "股票代码",
         "股票简称",
@@ -105,7 +109,9 @@ class F10DataService:
             self._encoding: Optional[str] = None
             self._full_data_lock = threading.Lock()
             self.data_loaded = False
+            self.name_map_loaded = False
             self.f10_data: Optional[pd.DataFrame] = None
+            self.name_by_code: Dict[str, str] = {}
             self.index_by_code: Dict[str, int] = {}
             self.memory_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
             self.memory_cache_limit = 1024
@@ -206,6 +212,27 @@ class F10DataService:
                 logger.info("F10完整数据加载完成: %s 行", len(df))
             except Exception as exc:
                 logger.error("加载 F10 完整数据失败: %s", exc)
+
+    def _load_name_map_if_needed(self) -> None:
+        if self.name_map_loaded:
+            return
+        try:
+            df = self._read_csv(usecols=list(self.NAME_COLUMNS))
+            df.columns = [str(col).strip() for col in df.columns]
+            code_col = self.NAME_COLUMNS[0]
+            name_col = self.NAME_COLUMNS[1]
+            name_map: Dict[str, str] = {}
+            for _, row in df.iterrows():
+                code = self._normalize_stock_code(row.get(code_col))
+                if not code:
+                    continue
+                name = str(row.get(name_col, "") or "").strip()
+                if name:
+                    name_map[code] = name
+            self.name_by_code = name_map
+            self.name_map_loaded = True
+        except Exception as exc:
+            logger.error("加载 F10 名称映射失败: %s", exc)
 
     @staticmethod
     def _safe_float(value: Any) -> Optional[float]:
@@ -339,6 +366,32 @@ class F10DataService:
                 results[code] = item
         return results
 
+    def get_stock_name(self, stock_code: str) -> str:
+        normalized_code = self._normalize_stock_code(stock_code)
+        if not normalized_code:
+            return ""
+        if normalized_code in self.name_by_code:
+            return str(self.name_by_code.get(normalized_code) or "").strip()
+        self._load_name_map_if_needed()
+        return str(self.name_by_code.get(normalized_code) or "").strip()
+
+    def batch_get_stock_names(self, stock_codes: List[str]) -> Dict[str, str]:
+        normalized_codes = [
+            normalized
+            for code in stock_codes
+            for normalized in (self._normalize_stock_code(code),)
+            if normalized
+        ]
+        if not normalized_codes:
+            return {}
+        self._load_name_map_if_needed()
+        return {
+            code: name
+            for code in normalized_codes
+            for name in (str(self.name_by_code.get(code) or "").strip(),)
+            if name
+        }
+
     def search_stocks(self, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
         self._load_full_data_if_needed()
         if self.f10_data is None:
@@ -380,8 +433,10 @@ class F10DataService:
     def get_cache_stats(self) -> Dict[str, Any]:
         return {
             "memory_cache_size": len(self.memory_cache),
+            "name_map_size": len(self.name_by_code),
             "index_size": len(self.index_by_code),
             "data_loaded": self.data_loaded,
+            "name_map_loaded": self.name_map_loaded,
             "csv_file_path": self.csv_file_path,
             "encoding": self._encoding,
         }
@@ -391,6 +446,7 @@ class F10DataService:
             normalized_code = self._normalize_stock_code(stock_code)
             cache_key = f"f10_{normalized_code}"
             self.memory_cache.pop(cache_key, None)
+            self.name_by_code.pop(normalized_code, None)
             try:
                 self.redis_storage.redis.delete(cache_key)
             except Exception:
@@ -398,3 +454,5 @@ class F10DataService:
             return
 
         self.memory_cache.clear()
+        self.name_by_code.clear()
+        self.name_map_loaded = False

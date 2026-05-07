@@ -58,13 +58,14 @@ class PostmarketRuntimeController:
         logger.info("scheduled event execute | name=postmarket_settlement_1740")
         hot_plate_result = self._intraday_hub.fetch_hot_plates(trade_date, RunPhase.POSTMARKET, today_mode=True)
         yest_limit_result = self._intraday_hub.fetch_yest_limit_pool(previous_trade_date, RunPhase.POSTMARKET)
-        market_runtime_summary_result = self._market_runtime_summary_service.build_and_write(
+        market_runtime_summary_result = self._market_runtime_summary_service.get_or_build(
             trade_date,
             offline_context_date=offline_context_date,
+            force_rebuild=True,
         )
         return PostmarketEventResult(
             executed=True,
-            notes=("17:40 settlement event refreshed postmarket hot plates, yesterday limit pool, and market runtime summary.",),
+            notes=("17:40 light refresh completed for postmarket hot plates, yesterday limit pool, and market runtime summary.",),
             yest_limit_result=yest_limit_result,
             hot_plate_result=hot_plate_result,
             market_runtime_summary_result=market_runtime_summary_result,
