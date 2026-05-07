@@ -24,6 +24,17 @@ class AuctionPlateBucketStat:
     expectation: str
     sample_symbols: tuple[str, ...]
     generic: bool = False
+    limit_up_count: int = 0
+    strong_lock_count: int = 0
+    turn_strong_count: int = 0
+    rebound_count: int = 0
+    highest_lb_days: int = 0
+    avg_open_pct: float = 0.0
+    avg_current_pct: float = 0.0
+    red_count: int = 0
+    green_count: int = 0
+    primary_reason_hits: int = 0
+    secondary_reason_hits: int = 0
 
 
 def build_auction_plate_bucket_stats(
@@ -61,6 +72,17 @@ def build_auction_plate_bucket_stats(
                     "yest_limit_count": 0,
                     "leader_count": 0,
                     "samples": [],
+                    "limit_up_count": 0,
+                    "strong_lock_count": 0,
+                    "turn_strong_count": 0,
+                    "rebound_count": 0,
+                    "highest_lb_days": 0,
+                    "open_pct_sum": 0.0,
+                    "current_pct_sum": 0.0,
+                    "red_count": 0,
+                    "green_count": 0,
+                    "primary_reason_hits": 0,
+                    "secondary_reason_hits": 0,
                 },
             )
             bucket["score"] = float(bucket["score"]) + _score_snapshot(snapshot, weight, hot_plate_map.get(plate_name, {}))
@@ -76,6 +98,25 @@ def build_auction_plate_bucket_stats(
                 bucket["yest_limit_count"] = int(bucket["yest_limit_count"]) + 1
             if snapshot.leader_rank_in_theme <= 3:
                 bucket["leader_count"] = int(bucket["leader_count"]) + 1
+            if snapshot.touched_limit_today or snapshot.is_locked or snapshot.current_pct >= 0.098:
+                bucket["limit_up_count"] = int(bucket["limit_up_count"]) + 1
+            if snapshot.is_locked or snapshot.current_pct >= 0.098:
+                bucket["strong_lock_count"] = int(bucket["strong_lock_count"]) + 1
+            if _is_turn_strong(snapshot):
+                bucket["turn_strong_count"] = int(bucket["turn_strong_count"]) + 1
+            if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
+                bucket["rebound_count"] = int(bucket["rebound_count"]) + 1
+            bucket["highest_lb_days"] = max(int(bucket["highest_lb_days"]), int(snapshot.lb_days))
+            bucket["open_pct_sum"] = float(bucket["open_pct_sum"]) + float(snapshot.open_pct or 0.0)
+            bucket["current_pct_sum"] = float(bucket["current_pct_sum"]) + float(snapshot.current_pct or 0.0)
+            if snapshot.current_pct > 0:
+                bucket["red_count"] = int(bucket["red_count"]) + 1
+            elif snapshot.current_pct < 0:
+                bucket["green_count"] = int(bucket["green_count"]) + 1
+            if weight >= 0.95:
+                bucket["primary_reason_hits"] = int(bucket["primary_reason_hits"]) + 1
+            elif weight >= 0.5:
+                bucket["secondary_reason_hits"] = int(bucket["secondary_reason_hits"]) + 1
             sample_list = bucket["samples"]
             if isinstance(sample_list, list) and snapshot.symbol not in sample_list and len(sample_list) < 4:
                 sample_list.append(snapshot.symbol)
@@ -93,6 +134,17 @@ def build_auction_plate_bucket_stats(
         auction_symbol_count = len(payload["auction_symbols"]) if isinstance(payload["auction_symbols"], set) else 0
         yest_limit_count = int(payload["yest_limit_count"])
         leader_count = int(payload["leader_count"])
+        limit_up_count = int(payload["limit_up_count"])
+        strong_lock_count = int(payload["strong_lock_count"])
+        turn_strong_count = int(payload["turn_strong_count"])
+        rebound_count = int(payload["rebound_count"])
+        highest_lb_days = int(payload["highest_lb_days"])
+        avg_open_pct = (float(payload["open_pct_sum"]) / symbol_count) if symbol_count else 0.0
+        avg_current_pct = (float(payload["current_pct_sum"]) / symbol_count) if symbol_count else 0.0
+        red_count = int(payload["red_count"])
+        green_count = int(payload["green_count"])
+        primary_reason_hits = int(payload["primary_reason_hits"])
+        secondary_reason_hits = int(payload["secondary_reason_hits"])
         generic = is_generic_plate(plate_name)
         expectation = _infer_expectation(
             generic=generic,
@@ -104,6 +156,10 @@ def build_auction_plate_bucket_stats(
             auction_symbol_count=auction_symbol_count,
             yest_limit_count=yest_limit_count,
             leader_count=leader_count,
+            limit_up_count=limit_up_count,
+            strong_lock_count=strong_lock_count,
+            turn_strong_count=turn_strong_count,
+            highest_lb_days=highest_lb_days,
         )
         stats.append(
             AuctionPlateBucketStat(
@@ -122,6 +178,17 @@ def build_auction_plate_bucket_stats(
                 expectation=expectation,
                 sample_symbols=tuple(payload["samples"]) if isinstance(payload["samples"], list) else (),
                 generic=generic,
+                limit_up_count=limit_up_count,
+                strong_lock_count=strong_lock_count,
+                turn_strong_count=turn_strong_count,
+                rebound_count=rebound_count,
+                highest_lb_days=highest_lb_days,
+                avg_open_pct=round(avg_open_pct, 4),
+                avg_current_pct=round(avg_current_pct, 4),
+                red_count=red_count,
+                green_count=green_count,
+                primary_reason_hits=primary_reason_hits,
+                secondary_reason_hits=secondary_reason_hits,
             )
         )
 
@@ -186,13 +253,11 @@ def _resolve_theme_weights(snapshot: StockStateSnapshot) -> tuple[tuple[str, flo
         return ()
 
     weights: list[tuple[str, float]] = []
-    for idx, plate_name in enumerate(candidates[:3]):
+    for idx, plate_name in enumerate(candidates[:2]):
         if idx == 0:
             weight = 1.0
-        elif idx == 1:
-            weight = 0.55
         else:
-            weight = 0.3
+            weight = 0.6
         if is_generic_plate(plate_name):
             weight *= 0.18
         weights.append((plate_name, weight))
@@ -211,7 +276,10 @@ def _score_snapshot(
     leader_bonus = 0.8 if snapshot.leader_rank_in_theme <= 3 else 0.0
     yest_limit_bonus = 0.9 if snapshot.is_yest_limit else 0.0
     auction_score = min(snapshot.auction_amount / 80_000_000, 1.5)
-    return weight * (auction_score + leader_bonus + yest_limit_bonus + hot_bonus)
+    limit_bonus = 1.0 if (snapshot.touched_limit_today or snapshot.is_locked or snapshot.current_pct >= 0.098) else 0.0
+    ladder_bonus = min(max(snapshot.lb_days, 0), 5) * 0.22
+    turn_strong_bonus = 0.7 if _is_turn_strong(snapshot) else 0.0
+    return weight * (auction_score + leader_bonus + yest_limit_bonus + hot_bonus + limit_bonus + ladder_bonus + turn_strong_bonus)
 
 
 def _infer_expectation(
@@ -225,20 +293,40 @@ def _infer_expectation(
     auction_symbol_count: int,
     yest_limit_count: int,
     leader_count: int,
+    limit_up_count: int,
+    strong_lock_count: int,
+    turn_strong_count: int,
+    highest_lb_days: int,
 ) -> str:
     if generic:
         return "noise"
-    if hot_strength >= 3000 and hot_capital_behavior >= 1.0 and auction_amount >= 80_000_000 and leader_count >= 1:
+    if (
+        hot_strength >= 3000
+        and hot_capital_behavior >= 1.0
+        and auction_amount >= 80_000_000
+        and (leader_count >= 1 or highest_lb_days >= 2)
+        and (limit_up_count >= 1 or strong_lock_count >= 1)
+    ):
         return "mainline_attack"
+    if yest_limit_count >= 2 and leader_count >= 1 and (turn_strong_count >= 1 or highest_lb_days >= 2):
+        return "ladder_extension"
     if hot_strength >= 1800 and hot_capital_behavior >= 0.4 and auction_symbol_count >= 2:
         return "hot_follow"
     if hot_capital_behavior <= -0.3 and hot_change_pct > 0:
         return "distribution"
-    if yest_limit_count >= 2 and leader_count >= 1:
-        return "ladder_extension"
-    if symbol_count >= 3 and auction_symbol_count >= 2:
+    if symbol_count >= 3 and auction_symbol_count >= 2 and limit_up_count >= 1:
         return "cluster_move"
     return "observe"
+
+
+def _is_turn_strong(snapshot: StockStateSnapshot) -> bool:
+    if snapshot.open_pct <= 0.01 and snapshot.current_pct >= 0.03:
+        return True
+    if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
+        return True
+    if snapshot.current_pct >= 0.098 and snapshot.auction_amount >= 20_000_000:
+        return True
+    return False
 
 
 def _hot_plate_capital_behavior_score(change_pct: float, net_inflow_yi: float) -> float:

@@ -944,16 +944,110 @@ class AuctionRuntimeController:
             f"| 场景={self._phase_text(phase_label)}"
         )
 
+    def _plate_rows_for_decision(self, state: StrategyConsoleState) -> tuple[AuctionPlateBucketStat, ...]:
+        rows = tuple(row for row in state.plate_stats if not row.generic)
+        return rows or state.plate_stats
+
+    def _top_theme_by_capital(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_decision(state)
+        if not rows:
+            return None
+        return max(
+            rows,
+            key=lambda row: (
+                row.hot_net_inflow_yi,
+                row.hot_strength,
+                row.auction_amount,
+                row.hot_change_pct,
+                row.primary_reason_hits,
+                row.weighted_score,
+            ),
+        )
+
+    def _top_theme_by_limitups(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_decision(state)
+        if not rows:
+            return None
+        return max(
+            rows,
+            key=lambda row: (
+                row.limit_up_count,
+                row.highest_lb_days,
+                row.leader_count,
+                row.primary_reason_hits,
+                row.weighted_score,
+                row.auction_amount,
+            ),
+        )
+
+    def _top_theme_by_turn_strong(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_decision(state)
+        if not rows:
+            return None
+        return max(
+            rows,
+            key=lambda row: (
+                row.turn_strong_count,
+                row.strong_lock_count,
+                row.rebound_count,
+                row.avg_current_pct,
+                row.highest_lb_days,
+                row.weighted_score,
+            ),
+        )
+
+    def _theme_red_green_ratio_text(self, row: AuctionPlateBucketStat) -> str:
+        total = row.red_count + row.green_count
+        if total <= 0:
+            return "--"
+        return f"{row.red_count}:{row.green_count}"
+
+    def _theme_trade_posture_text(self, row: AuctionPlateBucketStat) -> str:
+        if row.hot_capital_behavior <= -0.3 and row.hot_change_pct > 0:
+            return "兑现回避"
+        if row.limit_up_count >= 2 and row.highest_lb_days >= 2 and row.turn_strong_count >= 1:
+            return "主线攻击"
+        if row.limit_up_count >= 2 and (row.strong_lock_count >= 1 or row.highest_lb_days >= 2):
+            return "主线延续"
+        if row.limit_up_count >= 2 and row.turn_strong_count <= 0:
+            return "兑现分歧"
+        if row.hot_net_inflow_yi > 0 and row.limit_up_count <= 1:
+            return "资金试错"
+        if row.limit_up_count >= 1 and row.symbol_count >= 3:
+            return "首板扩散"
+        return "观察题材"
+
     def _render_mainline_board(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
-        top = state.plate_stats[0] if state.plate_stats else None
-        second = next((row for row in state.plate_stats[1:] if not row.generic), None)
+        capital_row = self._top_theme_by_capital(state)
+        limitup_row = self._top_theme_by_limitups(state)
+        turn_row = self._top_theme_by_turn_strong(state)
+        top = limitup_row or capital_row or turn_row or (state.plate_stats[0] if state.plate_stats else None)
         main_name = summary.mainline_sector or summary.top_plate_name or (top.plate_name if top else "-")
         main_expect = self._infer_market_mainline_label(summary, main_name)
-        secondary = summary.top_plate_name if summary.top_plate_name and summary.top_plate_name != main_name else "-"
-        scope_lead = top.plate_name if top else "-"
-        scope_expect = self._expectation_text(self.EXPECTATION_LABELS.get(top.expectation, top.expectation)) if top else "-"
-        scope_secondary = second.plate_name if second else "-"
+        secondary_candidates = (
+            summary.top_plate_name,
+            capital_row.plate_name if capital_row else "",
+            turn_row.plate_name if turn_row else "",
+            next((row.plate_name for row in state.plate_stats if row.plate_name != main_name), ""),
+        )
+        secondary = next((name for name in secondary_candidates if name and name != main_name), "-")
+        scope_lead = limitup_row.plate_name if limitup_row else (top.plate_name if top else "-")
+        scope_expect = (
+            self._expectation_text(
+                self.EXPECTATION_LABELS.get(limitup_row.expectation, limitup_row.expectation)
+            )
+            if limitup_row
+            else "-"
+        )
+        scope_secondary = next(
+            (
+                row.plate_name
+                for row in (capital_row, turn_row)
+                if row is not None and row.plate_name != scope_lead
+            ),
+            secondary,
+        )
         top_turnover = ", ".join(self._snapshot_name_by_symbol_compact(state, symbol) for symbol in summary.top_turnover_symbols[:3]) or "-"
         volume_pred = self._fmt_amount_yi(summary.market_predicted_full_day_amount)
         switch_badge = "⇄" if summary.mainline_switch else "→"
@@ -966,14 +1060,24 @@ class AuctionRuntimeController:
                 f"  ★ 题材主攻/次强 | -- / -- ({hot_plate_note})",
                 "  ◇ 是否切换/迁移 | -- / --",
                 "  ￥ 板块涨幅/净流入 | -- / --",
+                "  ◎ 资金/涨停/转强 | -- / -- / --",
                 f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
             )
+        capital_name = capital_row.plate_name if capital_row else "-"
+        turn_name = turn_row.plate_name if turn_row else "-"
+        flow_change_text = f"{capital_row.hot_change_pct:.2f}%" if capital_row else f"{summary.top_sector_pct:.2f}%"
+        flow_inflow_text = (
+            self._fmt_net_inflow_yi(capital_row.hot_net_inflow_yi)
+            if capital_row
+            else f"{summary.mainline_net_inflow_yi:.2f}亿"
+        )
         return (
             "【主线脉络】摘要 | 内容",
             f"  {switch_badge} 主线/副线 | {main_name}:{self._mainline_label_text(main_expect)} / {secondary}",
             f"  ★ 题材主攻/次强 | {scope_lead}:{scope_expect} / {scope_secondary}",
             f"  ◇ 是否切换/迁移 | {'是' if summary.mainline_switch else '否'} / {self._migration_text(summary.top_plate_migration_type or '-')}",
-            f"  ￥ 板块涨幅/净流入 | {summary.top_sector_pct:.2f}% / {summary.mainline_net_inflow_yi:.2f}亿",
+            f"  ￥ 板块涨幅/净流入 | {flow_change_text} / {flow_inflow_text}",
+            f"  ◎ 资金/涨停/转强 | {capital_name} / {scope_lead} / {turn_name}",
             f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
         )
 
@@ -1055,19 +1159,27 @@ class AuctionRuntimeController:
             ranked_rows = list(state.plate_stats[:4])
         if not ranked_rows:
             return ("【题材区】暂无题材样本",)
-        rows = ["【题材区】定位 | 题材 | 竞价额 | 昨板 | 龙头数 | 前排 | 观察"]
+        rows = ["【题材区】定位 | 题材 | 热度 | 净额 | 竞价额 | 涨停/高标 | 转强/强封 | 红绿 | 前排 | 观察"]
         for row in ranked_rows:
             leader, assist, follower = self._theme_internal_names(state, row.plate_name)
             front = " ; ".join(name for name in (leader, assist, follower) if name and name != "-") or "-"
+            heat_text = f"#{row.hot_rank}/{row.hot_strength:.0f}" if row.hot_rank < 999 else "--"
+            limit_text = f"{row.limit_up_count}/{row.highest_lb_days}板"
+            turn_text = f"{row.turn_strong_count}/{row.strong_lock_count}"
+            ratio_text = self._theme_red_green_ratio_text(row)
+            breadth_text = f"{ratio_text}/{self._fmt_pct(row.avg_current_pct)}" if ratio_text != "--" else "--"
             rows.append(
                 "  "
                 f"{self._plate_role_text(row)}"
                 f" | {row.plate_name}"
+                f" | {heat_text}"
+                f" | {self._fmt_net_inflow_yi(row.hot_net_inflow_yi)}"
                 f" | {self._fmt_amount_yi_precise(row.auction_amount)}"
-                f" | {row.yest_limit_count}"
-                f" | {row.leader_count}"
+                f" | {limit_text}"
+                f" | {turn_text}"
+                f" | {breadth_text}"
                 f" | {front}"
-                f" | {self._theme_layer_comment(state, row)}"
+                f" | {self._theme_trade_posture_text(row)}"
             )
         return tuple(rows)
 
@@ -1113,6 +1225,14 @@ class AuctionRuntimeController:
     def _render_auction_plan(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
         hot_plate_mode = self._hot_plate_render_mode(state)
+        capital_row = self._top_theme_by_capital(state)
+        limitup_row = self._top_theme_by_limitups(state)
+        turn_row = self._top_theme_by_turn_strong(state)
+        anchor_text = (
+            f"{capital_row.plate_name if capital_row else '-'} / "
+            f"{limitup_row.plate_name if limitup_row else '-'} / "
+            f"{turn_row.plate_name if turn_row else '-'}"
+        )
         if hot_plate_mode == "fallback":
             plan = "当日热板缺失，先看昨日热板延续与高标承接，不判主攻切换。"
             style = "观察盘"
@@ -1122,18 +1242,37 @@ class AuctionRuntimeController:
         elif summary.headshot_rate >= 0.12:
             plan = "更像昨日兑现盘，只盯核心龙头是否超预期，不接后排扩散。"
             style = "兑现盘"
+        elif (
+            capital_row is not None
+            and limitup_row is not None
+            and turn_row is not None
+            and capital_row.plate_name == limitup_row.plate_name == turn_row.plate_name
+            and limitup_row.limit_up_count >= 2
+            and turn_row.turn_strong_count >= 1
+        ):
+            plan = f"资金、涨停、转强同向指向{capital_row.plate_name}，只做前排回封、连板承接和最强换手。"
+            style = "主攻盘"
+        elif (
+            limitup_row is not None
+            and turn_row is not None
+            and limitup_row.plate_name == turn_row.plate_name
+            and limitup_row.limit_up_count >= 2
+        ):
+            plan = f"{limitup_row.plate_name}已有成队和转强确认，优先看高标反馈与一进二承接。"
+            style = "延续盘"
+        elif capital_row is not None and capital_row.hot_net_inflow_yi > 0 and (limitup_row is None or limitup_row.limit_up_count <= 1):
+            plan = f"资金先打到{capital_row.plate_name}，但涨停成队不足，先看前排换手确认，不抢后排。"
+            style = "试错盘"
         elif summary.mainline_switch and summary.emerging_plate_count >= summary.persistent_plate_count:
             plan = "更像今日新机会盘，先盯新题材前排与一进二承接，等开盘确认再动手。"
             style = "新机会"
-        elif summary.persistent_plate_count > summary.emerging_plate_count:
-            plan = "更像老主线延续盘，只做核心回流，不做杂毛补涨。"
-            style = "延续盘"
         else:
             plan = "更像题材切换试错盘，先看竞价最强桶能否带动高位承接。"
             style = "试错盘"
         return (
             "【竞价预案】维度 | 内容",
             f"  盘面归类 | {style}",
+            f"  主攻锚点 | 资金/涨停/转强 = {anchor_text}",
             f"  操作预案 | {plan}",
         )
 
@@ -2763,25 +2902,26 @@ class AuctionRuntimeController:
         return "先等确认"
 
     def _theme_trade_profile(self, row: AuctionPlateBucketStat) -> tuple[str, str, str]:
-        if row.expectation == "distribution":
+        expectation = self.EXPECTATION_LABELS.get(row.expectation, row.expectation)
+        if expectation == "distribution":
             return ("兑现观察", "先不出手", "冲高兑现为主")
         if row.generic:
             return ("大题材泛化", "只看辨识度", "量大但太散")
-        if row.expectation == "attack":
+        if expectation == "attack":
             if row.auction_amount >= 150_000_000 and row.leader_count >= 2:
                 return ("今日主攻", "只做最前排", "竞价额极强")
             return ("今日机会", "只做前排", "强度先手")
-        if row.expectation == "follow":
+        if expectation == "follow":
             if row.hot_change_pct > 0 and row.auction_symbol_count >= 3:
                 return ("回流修复", "可看分歧转强", "回流确认")
             return ("回流修复", "看前排分歧", "弱转强观察")
-        if row.expectation == "ladder":
+        if expectation == "ladder":
             if row.hot_change_pct <= 0 and row.yest_limit_count >= 2:
                 return ("昨日兑现", "不追后排", "高位先兑现")
             if row.leader_count >= 2 and row.auction_amount >= 80_000_000:
                 return ("主线延续", "可做中位晋级", "中位卡位")
             return ("主线延续", "偏向中高位", "看高位活口")
-        if row.expectation == "cluster":
+        if expectation == "cluster":
             if row.symbol_count >= 4 and row.auction_symbol_count >= 3:
                 return ("新发酵", "可找首板前排", "首板扩散")
             return ("首板发酵", "可找前排", "前排试错")
@@ -3609,6 +3749,7 @@ class AuctionRuntimeController:
         mapping = {
             "attack": "主攻",
             "follow": "跟随",
+            "distribution": "兑现",
             "ladder": "梯队",
             "cluster": "抱团",
             "observe": "观察",
