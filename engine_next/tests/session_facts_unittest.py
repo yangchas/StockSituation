@@ -455,6 +455,7 @@ class SessionFactsTests(unittest.TestCase):
         redis_client.hset("q2:300001", "pc", "10000")
         redis_client.hset("q2:300001", "amt", "123456789")
         redis_client.hset("q2:300001", "vol", "1000")
+        redis_client.hset("q2:300001", "ph", "1")
         redis_client.hset("q2:300001", "am", "20000000")
         redis_client.hset("q2:300001", "br", "5000000")
         redis_client.hset("q2:300001", "ar", "0")
@@ -480,6 +481,26 @@ class SessionFactsTests(unittest.TestCase):
         self.assertAlmostEqual(row["change_rate_1min"], 0.0125)
         self.assertEqual(row["amount_2m"], 18_000_000.0)
         self.assertEqual(row["amount_2min"], 18_000_000.0)
+
+    def test_intraday_hub_does_not_treat_q2_auction_rest_bid_as_intraday_bid(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.hset("q2:300001", "px", "12000")
+        redis_client.hset("q2:300001", "pc", "10000")
+        redis_client.hset("q2:300001", "ph", "2")
+        redis_client.hset("q2:300001", "am", "20000000")
+        redis_client.hset("q2:300001", "br", "5000000")
+        redis_client.hset("q2:300001", "ar", "3000000")
+        hub = IntradayDataHub(redis_client=redis_client)
+
+        result = hub.fetch_redis_quotes(("300001",))
+
+        self.assertEqual(len(result.rows), 1)
+        row = result.rows[0]
+        self.assertEqual(row["phase"], 2)
+        self.assertEqual(row["auction_amount_yuan"], 0.0)
+        self.assertEqual(row["bid_amount_yuan"], 0.0)
+        self.assertEqual(row["ask_amount_yuan"], 0.0)
+        self.assertEqual(row["bid_amount"], 0.0)
 
     def test_intraday_context_uses_quote_speed_when_rust_missing(self) -> None:
         builder = self._build_builder()

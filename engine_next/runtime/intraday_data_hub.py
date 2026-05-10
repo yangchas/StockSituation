@@ -155,8 +155,10 @@ class IntradayDataHub:
     def _standardize_q2_quote(symbol: str, quote: dict[str, Any]) -> dict[str, Any]:
         price = _milli_to_price(quote.get("px"))
         pre_close = _milli_to_price(quote.get("pc"))
-        auction_amount = _safe_float(quote.get("am", 0.0))
-        bid_amount = _safe_float(quote.get("br", 0.0))
+        phase = _safe_int(quote.get("ph", 0))
+        is_auction = phase == 1
+        auction_amount = _safe_float(quote.get("am", 0.0)) if is_auction else 0.0
+        bid_amount = _safe_float(quote.get("br", 0.0)) if is_auction else 0.0
         speed_1m = _safe_int(quote.get("spd1m", 0)) / 10000.0
         return {
             "symbol": symbol,
@@ -170,10 +172,12 @@ class IntradayDataHub:
             "bid_amount": bid_amount,
             "auction_amount_yuan": auction_amount,
             "bid_amount_yuan": bid_amount,
-            "ask_amount_yuan": _safe_float(quote.get("ar", 0.0)),
+            "ask_amount_yuan": _safe_float(quote.get("ar", 0.0)) if is_auction else 0.0,
             "instant_amount_yuan": _safe_float(quote.get("ia", 0.0)),
             "instant_volume": _safe_float(quote.get("iv", 0.0)),
             "large_net_yuan": _safe_float(quote.get("ln", 0.0)),
+            "phase": phase,
+            "limit_state": _safe_int(quote.get("ls", 0)),
             "change_rate_1min": speed_1m,
             "speed_1m": speed_1m,
             "speed_1m_bp": _safe_int(quote.get("spd1m", 0)),
@@ -734,13 +738,16 @@ class IntradayDataHub:
         )
         rows: list[dict[str, Any]] = []
         legacy_keys = [f"stock:quote:{symbol}" for symbol in normalized_symbols]
-        q2_keys = [f"q2:{symbol}" for symbol in normalized_symbols]
         legacy_quotes = self._batch_hgetall(legacy_keys)
-        q2_quotes = self._batch_hgetall(q2_keys)
-        for symbol, legacy_quote, q2_quote in zip(normalized_symbols, legacy_quotes, q2_quotes):
+        missing_symbols: list[str] = []
+        for symbol, legacy_quote in zip(normalized_symbols, legacy_quotes):
             if legacy_quote:
                 rows.append(self._standardize_legacy_quote(symbol, legacy_quote))
-            elif q2_quote:
+            else:
+                missing_symbols.append(symbol)
+        q2_keys = [f"q2:{symbol}" for symbol in missing_symbols]
+        for symbol, q2_quote in zip(missing_symbols, self._batch_hgetall(q2_keys)):
+            if q2_quote:
                 rows.append(self._standardize_q2_quote(symbol, q2_quote))
         return IntradayFetchResult(
             dataset="redis_quotes",
