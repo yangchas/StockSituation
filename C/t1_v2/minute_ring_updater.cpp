@@ -1,0 +1,79 @@
+#include "minute_ring_updater.h"
+
+#include <ctime>
+
+namespace t1_v2 {
+
+void MinuteRingUpdater::apply_tick(MinuteRingState& ring, const RawTick& tick) const {
+    const int minute_index = minute_index_of(tick.ts_ms);
+    if (minute_index < 0) {
+        return;
+    }
+    if (ring.latest_minute >= 0 && minute_index < ring.latest_minute - MinuteRingState::KEEP) {
+        return;
+    }
+    MinuteSlot& slot = ensure_slot(ring, minute_index);
+    slot.minute_index = minute_index;
+    slot.px_milli = tick.px_milli;
+    if (tick.amt_yuan >= slot.amt_yuan) {
+        slot.amt_yuan = tick.amt_yuan;
+    }
+    slot.vol_units = tick.vol_units;
+    if (ring.latest_minute < 0 || minute_index > ring.latest_minute) {
+        ring.latest_minute = minute_index;
+    }
+}
+
+const MinuteSlot* MinuteRingUpdater::get_slot(const MinuteRingState& ring, int minute_index) const {
+    if (minute_index < 0) {
+        return nullptr;
+    }
+    const int index = minute_index % MinuteRingState::KEEP;
+    const MinuteSlot& slot = ring.slots[index];
+    if (slot.minute_index == minute_index) {
+        return &slot;
+    }
+    return nullptr;
+}
+
+const MinuteSlot* MinuteRingUpdater::find_rolling_amount_reference(
+    const MinuteRingState& ring,
+    int latest_minute,
+    int window_minutes
+) const {
+    if (latest_minute < 0 || window_minutes <= 0) {
+        return nullptr;
+    }
+    for (int offset = window_minutes; offset >= 1; --offset) {
+        if (const MinuteSlot* slot = get_slot(ring, latest_minute - offset)) {
+            return slot;
+        }
+    }
+    return nullptr;
+}
+
+int MinuteRingUpdater::minute_index_of(int64_t ts_ms) const {
+    if (ts_ms <= 0) {
+        return -1;
+    }
+    const std::time_t seconds = static_cast<std::time_t>(ts_ms / 1000);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    localtime_s(&local_tm, &seconds);
+#else
+    localtime_r(&seconds, &local_tm);
+#endif
+    return local_tm.tm_hour * 60 + local_tm.tm_min;
+}
+
+MinuteSlot& MinuteRingUpdater::ensure_slot(MinuteRingState& ring, int minute_index) const {
+    const int index = minute_index % MinuteRingState::KEEP;
+    MinuteSlot& slot = ring.slots[index];
+    if (slot.minute_index != minute_index) {
+        slot = MinuteSlot{};
+        slot.minute_index = minute_index;
+    }
+    return slot;
+}
+
+}  // namespace t1_v2
