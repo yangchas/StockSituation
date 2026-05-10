@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
@@ -49,6 +50,20 @@ def _milli_to_price(value: Any) -> float:
     return _safe_float(value) / 1000.0
 
 
+def _is_q2_equity_quote(symbol: str, quote: dict[str, Any]) -> bool:
+    market = str(quote.get("mk") or quote.get("market") or "").strip().lower()
+    if market == "sz":
+        return symbol.startswith(("000", "001", "002", "003", "300", "301"))
+    if market == "kc":
+        return symbol.startswith(("688", "689"))
+    if market == "sh":
+        return symbol.startswith(("600", "601", "603", "605", "688", "689"))
+    price = _milli_to_price(quote.get("px"))
+    if symbol.startswith(("000", "001", "002", "003", "300", "301")) and price >= 1000.0:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class IntradayFetchResult:
     dataset: str
@@ -76,6 +91,7 @@ class IntradayDataHub:
         self._wencai = wencai_connector
         self._tdengine_auction_fetcher = tdengine_auction_fetcher
         self._wencai_auction_fetcher = wencai_auction_fetcher
+        self._redis_q2_prefix = os.getenv("REDIS_Q2_PREFIX", "q2:")
 
     @property
     def redis(self) -> Any:
@@ -162,6 +178,7 @@ class IntradayDataHub:
         speed_1m = _safe_int(quote.get("spd1m", 0)) / 10000.0
         return {
             "symbol": symbol,
+            "market": str(quote.get("mk", "") or ""),
             "name": quote.get("name", ""),
             "price": price,
             "pre_close": pre_close,
@@ -184,6 +201,8 @@ class IntradayDataHub:
             "amount_2m": _safe_float(quote.get("amt2m", 0.0)),
             "amount_2min": _safe_float(quote.get("amt2m", 0.0)),
             "amount_5m": _safe_float(quote.get("amt5m", 0.0)),
+            "vector_3m": _safe_int(quote.get("vec3m", 0)) / 10000.0,
+            "vector_5m": _safe_int(quote.get("vec5m", 0)) / 10000.0,
             "source": "redis_q2",
         }
 
@@ -196,6 +215,43 @@ class IntradayDataHub:
         except Exception:
             return []
         return [row for row in payload if isinstance(row, dict)]
+
+    def _read_auction_summary(self, key: str) -> dict[str, Any]:
+        raw = self.redis.hget(key, "summary")
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _standardize_auction_snapshot_row(row: dict[str, Any], *, tag: str, summary: dict[str, Any]) -> dict[str, Any]:
+        symbol = _normalize_symbol(row.get("symbol") or row.get("code"))
+        return {
+            "symbol": symbol,
+            "name": str(row.get("name", row.get("stock_name", "")) or ""),
+            "tag": tag,
+            "timestamp": _safe_int(summary.get("ts", 0)),
+            "price": _safe_float(row.get("price", row.get("open_price", 0.0))),
+            "change_pct": _safe_float(row.get("change_pct", row.get("open_pct", 0.0))),
+            "amount": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
+            "auction_amount_yuan": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
+            "bid_amount": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
+            "bid_amount_yuan": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
+            "snapshot_total_stocks": _safe_int(summary.get("total_stocks", 0)),
+            "snapshot_high_open_count": _safe_int(summary.get("high_open_count", 0)),
+            "snapshot_low_open_count": _safe_int(summary.get("low_open_count", 0)),
+            "snapshot_flat_open_count": _safe_int(summary.get("flat_open_count", 0)),
+            "snapshot_limit_up_count": _safe_int(summary.get("limit_up_count", 0)),
+            "snapshot_limit_down_count": _safe_int(summary.get("limit_down_count", 0)),
+            "snapshot_total_auction_amount_yuan": _safe_float(summary.get("total_auction_amount_yuan", 0.0)),
+            "snapshot_total_limit_up_bid_amount_yuan": _safe_float(
+                summary.get("total_limit_up_bid_amount_yuan", 0.0)
+            ),
+            "source": f"redis_{tag}",
+        }
 
     def _read_hash_payload(self, key: str) -> dict[str, Any]:
         raw = self.redis.hgetall(key) or {}
@@ -437,6 +493,74 @@ class IntradayDataHub:
             rows=[],
             source="empty",
             notes=("No auction anchor source returned usable rows.",),
+        )
+
+    def load_auction_snapshots(
+        self,
+        trade_date: str,
+        *,
+        tags: Sequence[str] = ("0920", "0924", "0925"),
+    ) -> IntradayFetchResult:
+        """Read Redis auction snapshots and attach lightweight cross-time deltas.
+
+        This is local Redis only: no network fallback, no TDengine query, and no
+        strategy decision. EAX/auction strategy can consume these normalized rows
+        without reparsing large JSON blobs repeatedly.
+        """
+
+        date_tag = trade_date.replace("-", "")
+        normalized_tags = tuple(dict.fromkeys(str(tag).strip() for tag in tags if str(tag).strip()))
+        rows: list[dict[str, Any]] = []
+        by_tag_symbol: dict[str, dict[str, dict[str, Any]]] = {}
+        keys_read: list[str] = []
+
+        for snapshot_tag in normalized_tags:
+            key = f"market:auction:{date_tag}:{snapshot_tag}"
+            summary = self._read_auction_summary(key)
+            raw_rows = self._read_auction_hash_rows(key)
+            if not raw_rows:
+                continue
+            keys_read.append(key)
+            tag_map: dict[str, dict[str, Any]] = {}
+            for raw_row in raw_rows:
+                row = self._standardize_auction_snapshot_row(raw_row, tag=snapshot_tag, summary=summary)
+                symbol = str(row.get("symbol") or "")
+                if not symbol:
+                    continue
+                tag_map[symbol] = row
+                rows.append(row)
+            by_tag_symbol[snapshot_tag] = tag_map
+
+        previous_by_tag = {
+            "0924": "0920",
+            "0925": "0924",
+            "latest": "0925",
+        }
+        for row in rows:
+            previous_tag = previous_by_tag.get(str(row.get("tag") or ""))
+            previous = by_tag_symbol.get(previous_tag or "", {}).get(str(row.get("symbol") or ""))
+            if not previous:
+                continue
+            prev_amount = _safe_float(previous.get("amount", 0.0))
+            amount = _safe_float(row.get("amount", 0.0))
+            row["previous_tag"] = previous_tag
+            row["price_delta"] = _safe_float(row.get("price", 0.0)) - _safe_float(previous.get("price", 0.0))
+            row["change_pct_delta"] = _safe_float(row.get("change_pct", 0.0)) - _safe_float(
+                previous.get("change_pct", 0.0)
+            )
+            row["amount_delta"] = amount - prev_amount
+            row["bid_amount_delta"] = _safe_float(row.get("bid_amount", 0.0)) - _safe_float(
+                previous.get("bid_amount", 0.0)
+            )
+            row["amount_ratio"] = (amount / prev_amount) if prev_amount > 0 else 0.0
+
+        return IntradayFetchResult(
+            dataset="auction_snapshots",
+            trade_date=trade_date,
+            rows=rows,
+            source="redis_snapshots" if rows else "empty",
+            redis_keys_written=tuple(keys_read),
+            notes=("Loaded Redis auction snapshots with 0920/0924/0925 marginal deltas.",),
         )
 
     def fetch_hot_plates(self, trade_date: str, phase: RunPhase, *, today_mode: bool) -> IntradayFetchResult:
@@ -745,9 +869,9 @@ class IntradayDataHub:
                 rows.append(self._standardize_legacy_quote(symbol, legacy_quote))
             else:
                 missing_symbols.append(symbol)
-        q2_keys = [f"q2:{symbol}" for symbol in missing_symbols]
+        q2_keys = [f"{self._redis_q2_prefix}{symbol}" for symbol in missing_symbols]
         for symbol, q2_quote in zip(missing_symbols, self._batch_hgetall(q2_keys)):
-            if q2_quote:
+            if q2_quote and _is_q2_equity_quote(symbol, q2_quote):
                 rows.append(self._standardize_q2_quote(symbol, q2_quote))
         return IntradayFetchResult(
             dataset="redis_quotes",

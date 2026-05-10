@@ -260,7 +260,7 @@ def _build_ladder_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[Ladder
         bucket.snapshots.append(snapshot)
         if snapshot.open_pct > 0:
             bucket.red_open_count += 1
-        if snapshot.is_locked or snapshot.current_pct >= 0.098:
+        if snapshot.is_locked or snapshot.touched_limit_today:
             bucket.promoted_count += 1
 
     groups = transitions or fallback_groups

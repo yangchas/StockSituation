@@ -28,9 +28,13 @@ void QuoteCalculator::apply_base_tick(QuoteState& state, const RawTick& tick, Ma
         ? tick.limit_down_milli
         : calc_limit_price_milli(tick, false);
 
-    if (limit_up_milli > 0 && near_price(tick.px_milli, limit_up_milli)) {
+    if (limit_up_milli > 0 &&
+        near_price(tick.px_milli, limit_up_milli) &&
+        has_limit_seal_order(tick, limit_up_milli, true, phase)) {
         state.limit_state = LimitState::Up;
-    } else if (limit_down_milli > 0 && near_price(tick.px_milli, limit_down_milli)) {
+    } else if (limit_down_milli > 0 &&
+               near_price(tick.px_milli, limit_down_milli) &&
+               has_limit_seal_order(tick, limit_down_milli, false, phase)) {
         state.limit_state = LimitState::Down;
     } else {
         state.limit_state = LimitState::Normal;
@@ -74,13 +78,35 @@ int64_t QuoteCalculator::calc_amount_delta_yuan(const QuoteState& state, int loo
 }
 
 int QuoteCalculator::calc_limit_price_milli(const RawTick& tick, bool upper) {
-    if (tick.pc_milli <= 0) {
+    if (tick.pc_milli <= 0 || tick.no_price_limit) {
         return 0;
     }
-    const bool pct20 = is_20pct_symbol(tick.symbol);
-    const int ratio_x10 = upper ? (pct20 ? 12 : 11) : (pct20 ? 8 : 9);
-    const int target_cent = static_cast<int>((static_cast<int64_t>(tick.pc_milli) * ratio_x10 + 50) / 100);
+    const int band_bp = limit_band_bp(tick);
+    if (band_bp <= 0) {
+        return 0;
+    }
+    const int ratio_bp = upper ? (10000 + band_bp) : (10000 - band_bp);
+    const int target_cent = static_cast<int>((static_cast<int64_t>(tick.pc_milli) * ratio_bp + 50000) / 100000);
     return target_cent * 10;
+}
+
+int QuoteCalculator::limit_band_bp(const RawTick& tick) {
+    if (tick.no_price_limit || tick.limit_band_bp < 0) {
+        return 0;
+    }
+    if (tick.limit_band_bp > 0) {
+        return tick.limit_band_bp;
+    }
+    if (tick.is_st) {
+        return 500;
+    }
+    if (is_30pct_market(tick.market)) {
+        return 3000;
+    }
+    if (is_20pct_symbol(tick.symbol)) {
+        return 2000;
+    }
+    return 1000;
 }
 
 bool QuoteCalculator::is_20pct_symbol(const char* symbol) {
@@ -91,11 +117,37 @@ bool QuoteCalculator::is_20pct_symbol(const char* symbol) {
            (symbol[0] == '6' && symbol[1] == '8');
 }
 
+bool QuoteCalculator::is_30pct_market(const char* market) {
+    if (!market || market[0] == '\0') {
+        return false;
+    }
+    return (market[0] == 'b' && market[1] == 'j') ||
+           (market[0] == 'b' && market[1] == 's') ||
+           (market[0] == 'n' && market[1] == 'q');
+}
+
 bool QuoteCalculator::near_price(int lhs_milli, int rhs_milli) {
     if (lhs_milli <= 0 || rhs_milli <= 0) {
         return false;
     }
     return std::abs(lhs_milli - rhs_milli) <= 10;
+}
+
+bool QuoteCalculator::has_limit_seal_order(
+    const RawTick& tick,
+    int limit_price_milli,
+    bool upper,
+    MarketPhase phase
+) {
+    if (limit_price_milli <= 0) {
+        return false;
+    }
+    // During auction, level 1 is the matched part. The unmatched limit queue is
+    // carried by level 2; during continuous trading the visible seal is level 1.
+    const int level = phase == MarketPhase::Auction ? 1 : 0;
+    const int price = upper ? tick.bp_milli[level] : tick.ap_milli[level];
+    const int64_t volume = upper ? tick.bv[level] : tick.av[level];
+    return volume > 0 && near_price(price, limit_price_milli);
 }
 
 }  // namespace t1_v2

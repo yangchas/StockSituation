@@ -22,8 +22,9 @@ write Redis, then ack source messages after downstream success.
 /tmp/t1_v2_all_live --replay --start "2026-04-29 09:25:00" --end "2026-04-29 09:25:03"
 ```
 
-Replay does not write Redis by default. Add `--replay-write-redis` only when
-that is intentional.
+Replay reads `stock_tick_v2` by default and writes Redis by default so Python
+can consume the same `q2:/a2:/market:auction:` path as live mode. It does not
+write TDengine during replay unless `--replay-write-tdengine` is explicitly set.
 
 Use a test Redis namespace for write verification so production q2/a2 and
 legacy auction anchor keys are not touched:

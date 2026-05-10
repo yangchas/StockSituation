@@ -11,6 +11,7 @@ namespace t1_v2 {
 
 struct QuoteState {
     char symbol[7] = {0};
+    char market[8] = {0};
 
     int64_t ts_ms = 0;
     MarketPhase phase = MarketPhase::Premarket;

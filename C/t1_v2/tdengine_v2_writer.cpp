@@ -69,7 +69,7 @@ std::string TDengineV2Writer::build_stock_tick_insert_sql(const TickBatch& batch
     sql << "INSERT INTO ";
     bool wrote = false;
     for (const RawTick& tick : batch.ticks) {
-        if (tick.symbol[0] == '\0' || tick.ts_ms <= 0) {
+        if (tick.symbol[0] == '\0' || tick.ts_ms <= 0 || !is_equity_market_symbol(tick.market, tick.symbol)) {
             continue;
         }
         const std::string symbol(tick.symbol);
@@ -112,7 +112,7 @@ std::string TDengineV2Writer::build_auction_summary_insert_sql(
     int64_t total_rest_ask = 0;
 
     store.for_each_active([&](const QuoteState& state) {
-        if (state.symbol[0] == '\0' || state.auction.ts_ms <= 0) {
+        if (state.symbol[0] == '\0' || state.auction.ts_ms <= 0 || !is_equity_market_symbol(state.market, state.symbol)) {
             return;
         }
         ++total;
@@ -151,9 +151,9 @@ std::string TDengineV2Writer::build_auction_snapshot_insert_sql(
     const SnapshotTriggerState& trigger,
     int64_t logical_ts_ms
 ) const {
-    const std::string tag = auction_tag_from_trigger(trigger);
+    const std::string auction_tag = auction_tag_from_trigger(trigger);
     const std::string trade_date = trade_date_yyyymmdd(logical_ts_ms);
-    if (tag.empty() || trade_date.empty() || logical_ts_ms <= 0) {
+    if (auction_tag.empty() || trade_date.empty() || logical_ts_ms <= 0) {
         return "";
     }
 
@@ -161,13 +161,13 @@ std::string TDengineV2Writer::build_auction_snapshot_insert_sql(
     sql << "INSERT INTO ";
     bool wrote = false;
     store.for_each_active([&](const QuoteState& state) {
-        if (!is_valid_symbol(state.symbol) || state.auction.ts_ms <= 0) {
+        if (!is_valid_symbol(state.symbol) || state.auction.ts_ms <= 0 || !is_equity_market_symbol(state.market, state.symbol)) {
             return;
         }
         const std::string symbol(state.symbol);
-        sql << "a2_" << trade_date << "_" << tag << "_" << symbol
+        sql << "a2_" << trade_date << "_" << auction_tag << "_" << symbol
             << " USING auction_snapshot_v2 TAGS ('" << symbol << "','"
-            << trade_date << "','" << tag << "') VALUES ("
+            << trade_date << "','" << auction_tag << "') VALUES ("
             << logical_ts_ms << ","
             << state.px_milli << ","
             << change_bp(state) << ","
@@ -262,6 +262,24 @@ bool TDengineV2Writer::is_valid_symbol(const char* symbol) {
         ++count;
     }
     return count == 6;
+}
+
+bool TDengineV2Writer::is_equity_market_symbol(const char* market, const char* symbol) {
+    if (!is_valid_symbol(symbol)) {
+        return false;
+    }
+    const std::string market_text(market ? market : "");
+    if (market_text == "sz") {
+        return (symbol[0] == '0' || symbol[0] == '3') &&
+               !(symbol[0] == '3' && symbol[1] == '9');
+    }
+    if (market_text == "sh" || market_text == "kc") {
+        return symbol[0] == '6';
+    }
+    if (market_text == "bj" || market_text == "bs" || market_text == "nq") {
+        return symbol[0] == '8' || symbol[0] == '4';
+    }
+    return market_text.empty();
 }
 
 }  // namespace t1_v2

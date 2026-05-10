@@ -1,6 +1,7 @@
 #include "td_replay_row_converter.h"
 
 #include <algorithm>
+#include <cctype>
 #include <utility>
 
 namespace t1_v2 {
@@ -55,7 +56,10 @@ bool TdReplayRowConverter::convert(
         }
         switch (plan.targets[i]) {
             case TdReplayTargetField::Ts: record.tss = as_i64(cell); break;
-            case TdReplayTargetField::Symbol: record.symbol = normalize_symbol(cell.string_value); break;
+            case TdReplayTargetField::Symbol:
+                record.symbol = normalize_symbol(cell.string_value);
+                record.market = normalize_market(cell.string_value);
+                break;
             case TdReplayTargetField::Lp: record.lp = as_double(cell); break;
             case TdReplayTargetField::Open: record.o = as_double(cell); break;
             case TdReplayTargetField::High: record.h = as_double(cell); break;
@@ -86,6 +90,11 @@ bool TdReplayRowConverter::convert(
             case TdReplayTargetField::InstVolume: record.inst_vol = as_i64(cell); break;
             case TdReplayTargetField::InstAmount: record.inst_amt = as_i64(cell); break;
             case TdReplayTargetField::LargeNet: record.large_net = as_i64(cell); break;
+            case TdReplayTargetField::LimitUp: record.limit_up = as_double(cell); break;
+            case TdReplayTargetField::LimitDown: record.limit_down = as_double(cell); break;
+            case TdReplayTargetField::LimitBandBp: record.limit_band_bp = static_cast<int16_t>(as_i64(cell)); break;
+            case TdReplayTargetField::NoPriceLimit: record.no_price_limit = as_i64(cell) != 0; break;
+            case TdReplayTargetField::IsSt: record.is_st = as_i64(cell) != 0; break;
             case TdReplayTargetField::Ignore: break;
         }
     }
@@ -127,6 +136,11 @@ TdReplayTargetField TdReplayRowConverter::target_for_name(const std::string& nam
     if (name == "inst_vol") return TdReplayTargetField::InstVolume;
     if (name == "inst_amt") return TdReplayTargetField::InstAmount;
     if (name == "large_net") return TdReplayTargetField::LargeNet;
+    if (name == "limit_up" || name == "limit_up_price") return TdReplayTargetField::LimitUp;
+    if (name == "limit_down" || name == "limit_down_price") return TdReplayTargetField::LimitDown;
+    if (name == "limit_band_bp" || name == "limit_ratio_bp") return TdReplayTargetField::LimitBandBp;
+    if (name == "no_price_limit") return TdReplayTargetField::NoPriceLimit;
+    if (name == "is_st" || name == "st_flag") return TdReplayTargetField::IsSt;
     return TdReplayTargetField::Ignore;
 }
 
@@ -151,14 +165,58 @@ double TdReplayRowConverter::as_double(const TdReplayCell& cell) {
 }
 
 std::string TdReplayRowConverter::normalize_symbol(const std::string& raw) {
-    if (raw.size() <= 6) {
-        return raw;
+    std::string text = raw;
+    const std::size_t colon = text.find(':');
+    if (colon != std::string::npos) {
+        text = text.substr(colon + 1);
     }
-    return raw.substr(0, 6);
+    const std::size_t dot = text.find('.');
+    if (dot != std::string::npos) {
+        text = text.substr(0, dot);
+    }
+    if (text.size() <= 6) {
+        return text;
+    }
+    return text.substr(text.size() - 6);
+}
+
+std::string TdReplayRowConverter::normalize_market(const std::string& raw) {
+    const std::size_t colon = raw.find(':');
+    if (colon != std::string::npos && colon > 0) {
+        std::string market = raw.substr(0, colon);
+        std::transform(market.begin(), market.end(), market.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return market;
+    }
+    const std::size_t dot = raw.find('.');
+    if (dot != std::string::npos && dot + 1 < raw.size()) {
+        std::string market = raw.substr(dot + 1);
+        std::transform(market.begin(), market.end(), market.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return market;
+    }
+    return "";
 }
 
 void TdReplayRowConverter::apply_exchange_defaults(SourceTickRecord& record) {
-    if (record.symbol.empty() || !record.exchange.empty()) {
+    if (record.symbol.empty()) {
+        return;
+    }
+    if (!record.market.empty()) {
+        if (record.exchange.empty()) {
+            if (record.market == "sz") {
+                record.exchange = "SZ";
+            } else if (record.market == "bj" || record.market == "bs" || record.market == "nq") {
+                record.exchange = "BJ";
+            } else {
+                record.exchange = "SH";
+            }
+        }
+        return;
+    }
+    if (!record.exchange.empty()) {
         return;
     }
     if (record.symbol[0] == '6') {
@@ -167,6 +225,9 @@ void TdReplayRowConverter::apply_exchange_defaults(SourceTickRecord& record) {
     } else if (record.symbol[0] == '0' || record.symbol[0] == '3') {
         record.exchange = "SZ";
         record.market = "sz";
+    } else if (record.symbol[0] == '8' || record.symbol[0] == '4') {
+        record.exchange = "BJ";
+        record.market = "bj";
     } else {
         record.exchange = "Unknown";
         record.market = "Unknown";

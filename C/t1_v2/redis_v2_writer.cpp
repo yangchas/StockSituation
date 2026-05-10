@@ -21,7 +21,7 @@ void RedisV2Writer::shutdown() {
 }
 
 bool RedisV2Writer::should_write_q2(const QuoteState& state, int64_t logical_ts_ms) const {
-    if (!initialized_ || state.symbol[0] == '\0' || state.dirty_mask == DIRTY_NONE) {
+    if (!initialized_ || state.symbol[0] == '\0' || state.dirty_mask == DIRTY_NONE || !is_equity_alias_state(state)) {
         return false;
     }
 
@@ -50,7 +50,7 @@ std::string RedisV2Writer::active_symbol_key(int64_t logical_ts_ms) const {
 
 RedisFieldList RedisV2Writer::build_q2_fields(const QuoteState& state) const {
     RedisFieldList fields;
-    fields.reserve(23);
+    fields.reserve(24);
     fields.emplace_back("px", to_string_i32(state.px_milli));
     fields.emplace_back("pc", to_string_i32(state.pc_milli));
     fields.emplace_back("amt", to_string_i64(state.amt_yuan));
@@ -74,6 +74,7 @@ RedisFieldList RedisV2Writer::build_q2_fields(const QuoteState& state) const {
     fields.emplace_back("am", to_string_i64(state.auction.match_amt_yuan));
     fields.emplace_back("br", to_string_i64(state.auction.rest_bid_amt_yuan));
     fields.emplace_back("ar", to_string_i64(state.auction.rest_ask_amt_yuan));
+    fields.emplace_back("mk", std::string(state.market));
     return fields;
 }
 
@@ -349,6 +350,28 @@ int RedisV2Writer::change_bp(const QuoteState& state) {
         return 0;
     }
     return static_cast<int>(((static_cast<int64_t>(state.px_milli) - state.pc_milli) * 10000) / state.pc_milli);
+}
+
+bool RedisV2Writer::is_equity_alias_state(const QuoteState& state) {
+    const std::string market(state.market);
+    const char* symbol = state.symbol;
+    if (!symbol || symbol[0] == '\0') {
+        return false;
+    }
+    if (market == "sz") {
+        return (symbol[0] == '0' || symbol[0] == '3') &&
+               !(symbol[0] == '3' && symbol[1] == '9');
+    }
+    if (market == "kc") {
+        return symbol[0] == '6' && symbol[1] == '8';
+    }
+    if (market == "sh") {
+        return symbol[0] == '6';
+    }
+    if (market == "bj" || market == "bs" || market == "nq") {
+        return symbol[0] == '8' || symbol[0] == '4';
+    }
+    return market.empty();
 }
 
 std::string RedisV2Writer::change_pct_string(const QuoteState& state) {

@@ -4,6 +4,18 @@
 #include <ctime>
 
 namespace t1_v2 {
+namespace {
+
+constexpr int64_t kBoardLotShares = 100;
+
+int64_t order_book_amount_yuan(int price_milli, int64_t lot_volume) {
+    if (price_milli <= 0 || lot_volume <= 0) {
+        return 0;
+    }
+    return (static_cast<int64_t>(price_milli) * lot_volume * kBoardLotShares) / 1000;
+}
+
+}  // namespace
 
 bool AuctionCalculator::apply_tick(QuoteState& state, const RawTick& tick, MarketPhase phase) const {
     if (phase != MarketPhase::Auction) {
@@ -54,22 +66,25 @@ int64_t AuctionCalculator::calc_match_amt_yuan(const RawTick& tick, MarketPhase 
     }
 
     const int hms = hms_from_timestamp_ms(tick.ts_ms);
+    if (hms >= 92500 && tick.amt_yuan > 0) {
+        return tick.amt_yuan;
+    }
     if (hms >= 92500 && tick.vol_units > 0) {
-        return (static_cast<int64_t>(tick.px_milli) * tick.vol_units) / 1000;
+        return order_book_amount_yuan(tick.px_milli, tick.vol_units);
     }
 
-    const int64_t bid1_amt = (static_cast<int64_t>(tick.bp_milli[0]) * tick.bv[0]) / 1000;
-    const int64_t ask1_amt = (static_cast<int64_t>(tick.ap_milli[0]) * tick.av[0]) / 1000;
+    const int64_t bid1_amt = order_book_amount_yuan(tick.bp_milli[0], tick.bv[0]);
+    const int64_t ask1_amt = order_book_amount_yuan(tick.ap_milli[0], tick.av[0]);
     return std::max<int64_t>(0, std::min(bid1_amt, ask1_amt));
 }
 
 int64_t AuctionCalculator::calc_rest_bid_amt_yuan(const RawTick& tick) const {
-    const int64_t bid2_amt = (static_cast<int64_t>(tick.bp_milli[1]) * tick.bv[1]) / 1000;
+    const int64_t bid2_amt = order_book_amount_yuan(tick.bp_milli[1], tick.bv[1]);
     return std::max<int64_t>(0, bid2_amt);
 }
 
 int64_t AuctionCalculator::calc_rest_ask_amt_yuan(const RawTick& tick) const {
-    const int64_t ask2_amt = (static_cast<int64_t>(tick.ap_milli[1]) * tick.av[1]) / 1000;
+    const int64_t ask2_amt = order_book_amount_yuan(tick.ap_milli[1], tick.av[1]);
     return std::max<int64_t>(0, ask2_amt);
 }
 

@@ -36,7 +36,7 @@ EngineProcessStats EngineCore::on_batch(const TickBatch& batch) {
 
     quote_store_->begin_batch();
     for (const RawTick& tick : batch.ticks) {
-        QuoteState& state = quote_store_->get_or_create(tick.symbol);
+        QuoteState& state = quote_store_->get_or_create(tick);
         const int previous_px = state.px_milli;
         const int64_t previous_amt = state.amt_yuan;
         const int64_t previous_vol = state.vol_units;

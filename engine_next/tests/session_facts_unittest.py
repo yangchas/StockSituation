@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import sys
 import types
+from unittest.mock import patch
 
 sys.modules.setdefault("talib", types.ModuleType("talib"))
 holidays_stub = types.ModuleType("holidays")
@@ -21,7 +22,7 @@ from engine_next.runtime.controllers.auction_runtime_controller import (
     AuctionThemeCollisionStat,
     StrategyConsoleState,
 )
-from engine_next.runtime.intraday_data_hub import IntradayDataHub
+from engine_next.runtime.intraday_data_hub import IntradayDataHub, IntradayFetchResult
 from engine_next.runtime.intraday_context_builder import IntradayContextBuilder, PrimedIntradayRuntimeState
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
@@ -43,6 +44,8 @@ from engine_next.runtime.session_facts import (
 )
 from engine_next.strategy_skill_layer.auction_plate_buckets import (
     AuctionPlateBucketStat,
+    AuctionSnapshotDeltaStat,
+    build_auction_snapshot_delta_stats,
     build_auction_plate_bucket_stats,
 )
 from engine_next.contracts.offline_sync_contracts import WatermarkSnapshot
@@ -482,6 +485,96 @@ class SessionFactsTests(unittest.TestCase):
         self.assertEqual(row["amount_2m"], 18_000_000.0)
         self.assertEqual(row["amount_2min"], 18_000_000.0)
 
+    def test_intraday_hub_rejects_q2_index_pollution_for_equity_symbol(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.hset("q2:000001", "px", "4179952")
+        redis_client.hset("q2:000001", "pc", "4180092")
+        redis_client.hset("q2:000001", "mk", "sh")
+        hub = IntradayDataHub(redis_client=redis_client)
+
+        result = hub.fetch_redis_quotes(("000001",))
+
+        self.assertEqual(result.rows, [])
+
+    def test_intraday_hub_reads_configured_q2_prefix(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.hset("test:q2:300001", "px", "12000")
+        redis_client.hset("test:q2:300001", "pc", "10000")
+        redis_client.hset("test:q2:300001", "mk", "sz")
+        redis_client.hset("test:q2:300001", "vec3m", "250")
+        redis_client.hset("test:q2:300001", "vec5m", "-120")
+        with patch.dict("os.environ", {"REDIS_Q2_PREFIX": "test:q2:"}):
+            hub = IntradayDataHub(redis_client=redis_client)
+
+        result = hub.fetch_redis_quotes(("300001",))
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertEqual(result.rows[0]["source"], "redis_q2")
+        self.assertEqual(result.rows[0]["market"], "sz")
+        self.assertAlmostEqual(result.rows[0]["vector_3m"], 0.025)
+        self.assertAlmostEqual(result.rows[0]["vector_5m"], -0.012)
+
+    def test_intraday_context_builder_disables_rust_by_default(self) -> None:
+        builder = IntradayContextBuilder(intraday_hub=_FakeHub())
+
+        self.assertIsNone(builder._rust_bridge)
+        self.assertIsNone(builder._rust_feed)
+
+    def test_intraday_hub_loads_auction_snapshots_with_deltas(self) -> None:
+        redis_client = _FakeRedis()
+        snapshots = {
+            "0920": (1000, 10.0, 0.0, 1_000_000, 100_000),
+            "0924": (2000, 10.5, 5.0, 2_500_000, 300_000),
+            "0925": (3000, 10.8, 8.0, 4_000_000, 500_000),
+        }
+        for tag, (ts, price, change_pct, amount, bid_amount) in snapshots.items():
+            key = f"market:auction:20260508:{tag}"
+            redis_client.hset(
+                key,
+                "summary",
+                json.dumps(
+                    {
+                        "ts": ts,
+                        "total_stocks": 1,
+                        "high_open_count": 1,
+                        "low_open_count": 0,
+                        "flat_open_count": 0,
+                        "limit_up_count": 0,
+                        "limit_down_count": 0,
+                        "total_auction_amount_yuan": amount,
+                        "total_limit_up_bid_amount_yuan": 0,
+                    }
+                ),
+            )
+            redis_client.hset(
+                key,
+                "top_amount",
+                json.dumps(
+                    [
+                        {
+                            "symbol": "300001",
+                            "price": price,
+                            "change_pct": change_pct,
+                            "auction_amount_yuan": amount,
+                            "bid_amount_yuan": bid_amount,
+                        }
+                    ]
+                ),
+            )
+        hub = IntradayDataHub(redis_client=redis_client)
+
+        result = hub.load_auction_snapshots("2026-05-08")
+
+        self.assertEqual(result.source, "redis_snapshots")
+        self.assertEqual(len(result.rows), 3)
+        row_0925 = next(row for row in result.rows if row["tag"] == "0925")
+        self.assertEqual(row_0925["previous_tag"], "0924")
+        self.assertEqual(row_0925["amount_delta"], 1_500_000)
+        self.assertEqual(row_0925["bid_amount_delta"], 200_000)
+        self.assertAlmostEqual(row_0925["change_pct_delta"], 3.0)
+        self.assertAlmostEqual(row_0925["amount_ratio"], 1.6)
+        self.assertEqual(row_0925["snapshot_total_stocks"], 1)
+
     def test_intraday_hub_does_not_treat_q2_auction_rest_bid_as_intraday_bid(self) -> None:
         redis_client = _FakeRedis()
         redis_client.hset("q2:300001", "px", "12000")
@@ -613,6 +706,153 @@ class SessionFactsTests(unittest.TestCase):
         self.assertEqual(controller._capital_behavior_text(0.5), "偏强流入")
         self.assertEqual(controller._capital_behavior_text(-0.4), "主力流出")
         self.assertEqual(controller._capital_behavior_text(0.0), "分歧震荡")
+
+    def test_auction_delta_collision_renders_change_delta_as_points(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        snapshot = StockStateSnapshot(symbol="000001", name="Ping An", plate="finance")
+        state = StrategyConsoleState(
+            context=IntradayContext(
+                phase=RunPhase.AUCTION,
+                trade_date="2026-05-08",
+                offline_context_date="2026-05-07",
+                stock_snapshots=(snapshot,),
+                market_summary=IntradayMarketSummary(top_turnover_symbols=()),
+                hot_plate_map={},
+                yesterday_hot_plate_map={},
+                yest_limit_map={},
+                auction_map={},
+            ),
+            candidate_scope=("000001",),
+            candidate_scope_set=frozenset({"000001"}),
+            actual_source="auction",
+            plate_stats=(),
+            bundle=None,
+            candidates=(),
+            missing_inputs=(),
+            snapshot_map={"000001": snapshot},
+            stock_name_map={"000001": "Ping An"},
+            plate_symbol_map={"finance": ("000001",)},
+            decision_map={},
+            auction_delta_stats=(
+                AuctionSnapshotDeltaStat(
+                    plate_name="finance",
+                    symbol_count=1,
+                    amount_0925=100_000_000,
+                    amount_delta_24_25=40_000_000,
+                    amount_ratio_avg=1.5,
+                    bid_amount_delta_24_25=-10_000_000,
+                    change_pct_delta_avg=-7.1,
+                    positive_delta_count=0,
+                    sample_symbols=("000001",),
+                    signal="test",
+                ),
+            ),
+        )
+
+        joined = "\n".join(controller._render_auction_delta_collision(state))
+
+        self.assertIn("-7.1pct", joined)
+        self.assertNotIn("-710", joined)
+
+    def test_eax_expectation_gap_renders_existing_collision_scores(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        snapshot = StockStateSnapshot(symbol="000001", name="算力前排", plate="算力")
+        bucket = AuctionPlateBucketStat(
+            plate_name="算力",
+            weighted_score=80.0,
+            symbol_count=2,
+            auction_symbol_count=2,
+            auction_amount=100_000_000,
+            yest_limit_count=1,
+            leader_count=1,
+            hot_rank=1,
+            hot_change_pct=1.2,
+            hot_strength=3200.0,
+            hot_net_inflow_yi=10.0,
+            hot_capital_behavior=1.2,
+            expectation="mainline_attack",
+            sample_symbols=("000001",),
+            limit_up_count=1,
+            turn_strong_count=1,
+            avg_current_pct=0.04,
+            red_count=2,
+            primary_reason_hits=1,
+        )
+        collision = AuctionThemeCollisionStat(
+            plate_name="算力",
+            row=bucket,
+            capital_rank=1,
+            limitup_rank=1,
+            turn_rank=1,
+            hot_rank=1,
+            yesterday_hot_rank=1,
+            continuation_rank=1,
+            collision_score=8.0,
+            expectation_score=3.0,
+            expectation_delta=2.0,
+            expectation_label="超预期",
+            signal="共振主攻",
+            e_score=7.0,
+            a_score=8.0,
+            x_score=2.0,
+            eax_label="符合/强化",
+            eax_action="前排换手确认",
+        )
+        state = StrategyConsoleState(
+            context=IntradayContext(
+                phase=RunPhase.AUCTION,
+                trade_date="2026-05-08",
+                offline_context_date="2026-05-07",
+                stock_snapshots=(snapshot,),
+                market_summary=IntradayMarketSummary(top_turnover_symbols=("000001",)),
+                hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 3200.0}},
+                yesterday_hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 2800.0}},
+                yest_limit_map={"000001": {"symbol": "000001"}},
+                auction_map={"000001": {"symbol": "000001"}},
+            ),
+            candidate_scope=("000001",),
+            candidate_scope_set=frozenset({"000001"}),
+            actual_source="redis_0925",
+            plate_stats=(bucket,),
+            bundle=None,
+            candidates=(),
+            missing_inputs=(),
+            snapshot_map={"000001": snapshot},
+            stock_name_map={"000001": "算力前排"},
+            plate_symbol_map={"算力": ("000001",)},
+            decision_map={},
+            collision_rows=(collision,),
+        )
+
+        joined = "\n".join(controller._render_eax_expectation_gap(state))
+
+        self.assertIn("【EAX预期差】题材 | E/A/X", joined)
+        self.assertIn("算力 | 7.0/8.0/2.0 | 符合/强化 | 前排换手确认", joined)
+
+    def test_auction_snapshot_loader_uses_short_controller_cache(self) -> None:
+        class CountingHub:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def load_auction_snapshots(self, trade_date: str) -> IntradayFetchResult:
+                self.calls += 1
+                return IntradayFetchResult(
+                    dataset="auction_snapshots",
+                    trade_date=trade_date,
+                    rows=[{"symbol": "000001", "tag": "0925"}],
+                    source="fake",
+                )
+
+        hub = CountingHub()
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        controller._intraday_hub = hub
+        controller._auction_snapshot_cache = {}
+
+        first = controller._load_auction_snapshots_cached("2026-05-08")
+        second = controller._load_auction_snapshots_cached("2026-05-08")
+
+        self.assertIs(first, second)
+        self.assertEqual(hub.calls, 1)
 
     def test_theme_facts_bind_each_snapshot_to_single_primary_theme(self) -> None:
         snapshots = (
@@ -1615,6 +1855,54 @@ class SessionFactsTests(unittest.TestCase):
         self.assertEqual(2, row.primary_reason_hits)
         self.assertEqual("mainline_attack", row.expectation)
 
+    def test_build_auction_snapshot_delta_stats_groups_by_theme(self) -> None:
+        snapshots = (
+            StockStateSnapshot(
+                symbol="000001",
+                name="\u7b97\u529b\u524d\u6392",
+                plate="\u7b97\u529b",
+                real_plate_names=("\u7b97\u529b", "\u5149\u7ea4"),
+            ),
+            StockStateSnapshot(
+                symbol="000002",
+                name="\u7b97\u529b\u52a9\u653b",
+                plate="\u7b97\u529b",
+                real_plate_names=("\u7b97\u529b",),
+            ),
+        )
+        rows = (
+            {
+                "symbol": "000001",
+                "tag": "0925",
+                "previous_tag": "0924",
+                "amount": 120_000_000,
+                "amount_delta": 80_000_000,
+                "bid_amount_delta": 12_000_000,
+                "change_pct_delta": 2.5,
+                "amount_ratio": 2.0,
+            },
+            {
+                "symbol": "000002",
+                "tag": "0925",
+                "previous_tag": "0924",
+                "amount": 60_000_000,
+                "amount_delta": 30_000_000,
+                "bid_amount_delta": 1_000_000,
+                "change_pct_delta": 0.5,
+                "amount_ratio": 1.2,
+            },
+        )
+
+        stats = build_auction_snapshot_delta_stats(rows, snapshots, top_n=3)
+        row = next(item for item in stats if item.plate_name == "\u7b97\u529b")
+
+        self.assertEqual(row.symbol_count, 2)
+        self.assertEqual(row.amount_0925, 180_000_000)
+        self.assertEqual(row.amount_delta_24_25, 110_000_000)
+        self.assertEqual(row.positive_delta_count, 2)
+        self.assertAlmostEqual(row.amount_ratio_avg, 1.6)
+        self.assertEqual(row.signal, "\u589e\u91cf\u8f6c\u5f3a")
+
     def test_auction_rendering_surfaces_capital_limitup_and_turnstrong_anchors(self) -> None:
         controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
         leader = StockStateSnapshot(
@@ -2018,6 +2306,8 @@ class SessionFactsTests(unittest.TestCase):
             amount_2m=60_000_000,
             speed_1m=0.02,
             is_yest_limit=True,
+            touched_limit_today=True,
+            is_locked=True,
             leader_rank_in_theme=1,
         )
         weak = StockStateSnapshot(
@@ -2094,7 +2384,7 @@ class SessionFactsTests(unittest.TestCase):
     def test_recap_plan_review_includes_opening_feedback(self) -> None:
         controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
         controller._intraday_hub = _FakeHub()
-        strong = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10)
+        strong = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10, touched_limit_today=True, is_locked=True)
         weak = StockStateSnapshot(symbol="000002", name="走弱股", plate="芯片", open_pct=0.06, current_pct=-0.01)
         rebound = StockStateSnapshot(symbol="000003", name="反包股", plate="智元机器人", open_pct=-0.03, current_pct=0.06)
         state = StrategyConsoleState(
@@ -2151,7 +2441,7 @@ class SessionFactsTests(unittest.TestCase):
     def test_opening_validation_checkpoint_persists_and_recap_prefers_frozen_payload(self) -> None:
         controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
         controller._intraday_hub = _FakeHub()
-        strong_live = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10)
+        strong_live = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10, touched_limit_today=True, is_locked=True)
         weak_live = StockStateSnapshot(symbol="000002", name="走弱股", plate="芯片", open_pct=0.06, current_pct=-0.01)
         rebound_live = StockStateSnapshot(symbol="000003", name="反包股", plate="智元机器人", open_pct=-0.03, current_pct=0.06)
         live_context = IntradayContext(
@@ -2252,7 +2542,7 @@ class SessionFactsTests(unittest.TestCase):
                 ensure_ascii=False,
             ),
         )
-        strong_close = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10)
+        strong_close = StockStateSnapshot(symbol="000001", name="强势股", plate="算力", open_pct=0.04, current_pct=0.10, touched_limit_today=True, is_locked=True)
         state = StrategyConsoleState(
             context=IntradayContext(
                 phase=RunPhase.POSTMARKET,

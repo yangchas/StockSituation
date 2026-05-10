@@ -107,8 +107,8 @@ class IntradayContextBuilder:
         tick_tracker: TickWindowTracker | None = None,
     ) -> None:
         self._hub = intraday_hub or IntradayDataHub()
-        self._rust_bridge = rust_bridge or RustSnapshotBridge()
-        self._rust_feed = rust_feed or RustRuntimeFeed(self._rust_bridge)
+        self._rust_bridge = rust_bridge
+        self._rust_feed = rust_feed or (RustRuntimeFeed(rust_bridge) if rust_bridge is not None else None)
         self._tick_tracker = tick_tracker or TickWindowTracker()
         self._scoped_cache_token: tuple[str, int | None] | None = None
         self._json_hash_cache: dict[str, dict[str, dict]] = {}
@@ -123,7 +123,7 @@ class IntradayContextBuilder:
         return self._hub
 
     @property
-    def rust_bridge(self) -> RustSnapshotBridge:
+    def rust_bridge(self) -> RustSnapshotBridge | None:
         return self._rust_bridge
 
     @property
@@ -350,12 +350,16 @@ class IntradayContextBuilder:
         stock_theme_map = self._load_list_hash(PLATE_MAPPING_S2P_KEY)
         stock_reason_map = self._load_string_hash("market:stock_reason")
         market_runtime_state = self._load_market_runtime_state(request.trade_date)
-        rust_ingested = self._rust_feed.ingest_quotes(
-            quotes_result.rows,
-            stock_plate_map=stock_plate_map,
-        )
-        rust_snapshot_map = self.rust_bridge.get_normalized_snapshot()
-        rust_market_extremes = self.rust_bridge.get_market_extremes()
+        rust_ingested = 0
+        rust_snapshot_map: dict[str, dict[str, float]] = {}
+        rust_market_extremes: dict[str, Any] = {}
+        if self._rust_feed is not None and self._rust_bridge is not None:
+            rust_ingested = self._rust_feed.ingest_quotes(
+                quotes_result.rows,
+                stock_plate_map=stock_plate_map,
+            )
+            rust_snapshot_map = self._rust_bridge.get_normalized_snapshot()
+            rust_market_extremes = self._rust_bridge.get_market_extremes()
         quote_health = self._summarize_quote_freshness(
             phase=request.phase,
             symbols=symbols,
@@ -422,6 +426,7 @@ class IntradayContextBuilder:
                 f"cache_views={len(cache_result.rows)}",
                 f"rust_snapshot={len(rust_snapshot_map)}",
                 f"rust_ingested={rust_ingested}",
+                f"rust_runtime={'enabled' if self._rust_feed is not None else 'disabled'}",
                 f"tick_metrics={len(tick_metric_map)}",
                 f"auction={len(auction_rows)}",
                 f"yest_limit={len(yest_limit_map)}",
@@ -464,9 +469,11 @@ class IntradayContextBuilder:
             yest = primed.yest_limit_map.get(symbol, {})
             theme_names = primed.stock_theme_map.get(symbol, ())
 
-            price = float(rust_row.get("price", quote.get("price", 0.0)) or 0.0)
+            price = float(quote.get("price", rust_row.get("price", 0.0)) or 0.0)
             pre_close = float(quote.get("pre_close", 0.0) or 0.0)
             current_pct = ((price / pre_close) - 1.0) if price > 0 and pre_close > 0 else float(cache.get("pct_chg", 0.0) or 0.0)
+            limit_state = int(quote.get("limit_state", 0) or 0)
+            is_limit_up_now = limit_state == 1
             auction_pct = float(auction.get("change_pct", 0.0) or 0.0)
             peak_price = float(cache.get("peak_price", 0.0) or 0.0)
             resistance_gap = (peak_price - price) / price if peak_price > price > 0 else 0.0
@@ -478,28 +485,28 @@ class IntradayContextBuilder:
                 hot_plate_map=primed.effective_hot_plate_map,
             )
             market_cap_yi = self._to_yi(cache.get("real_market_cap"))
-            amount_day_yi = self._to_yi(rust_row.get("amount", quote.get("amount")))
-            speed_1m = float(rust_row.get("speed_1m", 0.0) or 0.0)
+            amount_day_yi = self._to_yi(quote.get("amount", rust_row.get("amount")))
+            speed_1m = float(quote.get("speed_1m", quote.get("change_rate_1min", 0.0)) or 0.0)
             if speed_1m == 0.0 and tick_metrics is not None:
                 speed_1m = float(tick_metrics.speed_1m)
             if speed_1m == 0.0:
-                speed_1m = float(quote.get("speed_1m", quote.get("change_rate_1min", 0.0)) or 0.0)
+                speed_1m = float(rust_row.get("speed_1m", 0.0) or 0.0)
             if speed_1m == 0.0:
                 speed_1m = float(cache.get("speed_1m", 0.0) or 0.0)
-            amount_2m = float(rust_row.get("amount_2m", 0.0) or 0.0)
+            amount_2m = float(quote.get("amount_2m", quote.get("amount_2min", 0.0)) or 0.0)
             if amount_2m <= 0.0 and tick_metrics is not None:
                 amount_2m = float(tick_metrics.amount_2m)
             if amount_2m <= 0.0:
-                amount_2m = float(quote.get("amount_2m", quote.get("amount_2min", 0.0)) or 0.0)
+                amount_2m = float(rust_row.get("amount_2m", 0.0) or 0.0)
             if amount_2m <= 0.0:
                 amount_2m = float(cache.get("amount_2m", 0.0) or 0.0)
-            amount_5m = float(rust_row.get("amount_5m", 0.0) or 0.0)
-            vector_3m = float(rust_row.get("vector_3m", 0.0) or 0.0)
-            vector_5m = float(rust_row.get("vector_5m", 0.0) or 0.0)
+            amount_5m = float(quote.get("amount_5m", rust_row.get("amount_5m", 0.0)) or 0.0)
+            vector_3m = float(quote.get("vector_3m", rust_row.get("vector_3m", 0.0)) or 0.0)
+            vector_5m = float(quote.get("vector_5m", rust_row.get("vector_5m", 0.0)) or 0.0)
             bid_amount = float(
-                rust_row.get(
+                quote.get(
                     "bid_amount",
-                    quote.get("bid_amount", quote.get("book1_amount_yuan", 0.0)),
+                    rust_row.get("bid_amount", quote.get("book1_amount_yuan", 0.0)),
                 )
                 or 0.0
             )
@@ -545,6 +552,8 @@ class IntradayContextBuilder:
                     t2_lb_days=int(cache.get("t2_lb_days", 0) or 0),
                     t2_pct=float(cache.get("t2_pct", 0.0) or 0.0),
                     is_yest_limit=bool(yest),
+                    touched_limit_today=is_limit_up_now,
+                    is_locked=is_limit_up_now,
                     real_plate_names=self._merge_plate_names(
                         plate,
                         primed.stock_reason_map.get(symbol, ""),
@@ -958,7 +967,7 @@ class IntradayContextBuilder:
                 continue
             if snapshot.open_pct > 0:
                 red_open_cnt += 1
-            if snapshot.current_pct >= 0.098:
+            if snapshot.is_locked or snapshot.touched_limit_today:
                 promotion_cnt += 1
             if snapshot.open_pct > 0.05 and snapshot.current_pct < 0:
                 headshot_cnt += 1
@@ -1002,8 +1011,23 @@ class IntradayContextBuilder:
                 else ("low" if market_predicted_full_day_amount < market_avg_5d_vol * 0.9 else "flat")
             )
 
+        top_turnover_symbols = tuple(rust_market_extremes.get("top_turnover_symbols", ()))
+        if not top_turnover_symbols:
+            top_turnover_symbols = tuple(
+                snapshot.symbol
+                for snapshot in nlargest(
+                    20,
+                    snapshots,
+                    key=lambda item: (
+                        float(item.amount_day_yi or 0.0),
+                        float(item.auction_amount or 0.0),
+                    ),
+                )
+                if snapshot.symbol
+            )
+
         return IntradayMarketSummary(
-            top_turnover_symbols=tuple(rust_market_extremes.get("top_turnover_symbols", ())),
+            top_turnover_symbols=top_turnover_symbols,
             top_plate_name=top_plate_name,
             top_plate_strength=top_plate_strength,
             top_plate_migration_type=top_plate_migration_type,

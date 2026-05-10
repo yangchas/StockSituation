@@ -40,7 +40,7 @@ struct TdengineConfig {
     std::string user = "root";
     std::string password = "taosdata";
     std::string database = "market_data1";
-    std::string replay_table = "stock_data";
+    std::string replay_table = "stock_tick_v2";
 };
 
 struct ReplayConfig {
@@ -50,7 +50,7 @@ struct ReplayConfig {
     bool loop = false;
     int tick_interval_ms = 3000;
     int batch_size = 5000;
-    bool write_redis = false;
+    bool write_redis = true;
     bool write_tdengine = false;
 };
 

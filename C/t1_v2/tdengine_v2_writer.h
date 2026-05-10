@@ -46,6 +46,7 @@ private:
     static std::string auction_tag_from_trigger(const SnapshotTriggerState& trigger);
     static int change_bp(const QuoteState& state);
     static bool is_valid_symbol(const char* symbol);
+    static bool is_equity_market_symbol(const char* market, const char* symbol);
 
 private:
     ConfigV2 config_;

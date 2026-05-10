@@ -1,7 +1,9 @@
 #include "td_replay_tick_source.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,6 +20,7 @@ TdReplayTickSource::TdReplayTickSource(const ConfigV2& config)
 bool TdReplayTickSource::start() {
     last_error_.clear();
     seq_no_ = 0;
+    slice_no_ = 0;
     if (!scheduler_.start()) {
         last_error_ = "invalid TDengine replay time range";
         started_ = false;
@@ -91,6 +94,8 @@ TickSourceResult TdReplayTickSource::query_next_slice() {
         result.status = TickSourceStatus::EndOfStream;
         return result;
     }
+    throttle_before_next_slice();
+    ++slice_no_;
 
     const std::string sql = query_builder_.build_slice_query(slice.start_ms);
     TAOS_RES* res = taos_query(conn_, sql.c_str());
@@ -152,6 +157,20 @@ TickSourceResult TdReplayTickSource::query_next_slice() {
 #endif
 }
 
+void TdReplayTickSource::throttle_before_next_slice() {
+    if (slice_no_ == 0) {
+        return;
+    }
+    if (config_.replay.speed <= 0 || config_.replay.tick_interval_ms <= 0) {
+        return;
+    }
+    const int delay_ms = config_.replay.tick_interval_ms / config_.replay.speed;
+    if (delay_ms <= 0) {
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+}
+
 TickSourceResult TdReplayTickSource::emit_pending_batch() {
     TickSourceResult result;
     if (pending_records_.empty()) {
@@ -182,7 +201,7 @@ TickSourceResult TdReplayTickSource::emit_pending_batch() {
             ? pending_raw_input_count_ - pending_total_accepted_count_
             : 0;
         result.source_stats.input_count = static_cast<uint32_t>(take) + rejected;
-        result.source_stats.rejected_count = rejected;
+        result.source_stats.rejected_count += rejected;
         pending_raw_input_count_ = 0;
         pending_total_accepted_count_ = 0;
     }

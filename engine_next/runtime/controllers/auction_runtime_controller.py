@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -30,6 +31,8 @@ from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryResul
 from engine_next.runtime.session_facts import build_session_facts
 from engine_next.strategy_skill_layer.auction_plate_buckets import (
     AuctionPlateBucketStat,
+    AuctionSnapshotDeltaStat,
+    build_auction_snapshot_delta_stats,
     build_auction_plate_bucket_stats,
 )
 from engine_next.strategy_skill_layer.context_pipeline import (
@@ -74,6 +77,7 @@ class StrategyConsoleState:
     stale_snapshot_only: bool = False
     frozen_postmarket_snapshot: bool = False
     collision_rows: tuple["AuctionThemeCollisionStat", ...] = ()
+    auction_delta_stats: tuple[AuctionSnapshotDeltaStat, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -91,12 +95,18 @@ class AuctionThemeCollisionStat:
     expectation_delta: float
     expectation_label: str
     signal: str
+    e_score: float = 0.0
+    a_score: float = 0.0
+    x_score: float = 0.0
+    eax_label: str = ""
+    eax_action: str = ""
 
 
 class AuctionRuntimeController:
     """Owns auction/opening/intraday strategy-console rendering."""
 
     AUCTION_TOP_AMOUNT_LIMIT = 1000
+    AUCTION_SNAPSHOT_CACHE_TTL_SECONDS = 1.0
     OPENING_VALIDATION_TTL_SECONDS = 3 * 24 * 60 * 60
     OPENING_VALIDATION_TRUE_STRONG = "真强给机"
     OPENING_VALIDATION_GAP_WEAK = "高开转虚"
@@ -154,6 +164,7 @@ class AuctionRuntimeController:
         )
         self._postmarket_limit_truth_cache: dict[str, tuple[dict[str, object], ...]] = {}
         self._postmarket_limit_truth_enriched_dates: set[str] = set()
+        self._auction_snapshot_cache: dict[str, tuple[float, IntradayFetchResult]] = {}
 
     @staticmethod
     def _opening_validation_redis_key(trade_date: str) -> str:
@@ -624,6 +635,8 @@ class AuctionRuntimeController:
             lines.extend(self._render_auction_thermo(state))
             lines.extend(self._render_auction_structure(state))
             lines.extend(self._render_auction_collision(state))
+            lines.extend(self._render_auction_delta_collision(state))
+            lines.extend(self._render_eax_expectation_gap(state))
             lines.extend(self._render_yest_limit_feedback(state))
             lines.extend(self._render_yest_limit_breakdown(state))
             lines.extend(self._render_auction_plan(state))
@@ -745,7 +758,22 @@ class AuctionRuntimeController:
             intraday_context,
             top_n=max(len(snapshot_map), 5),
         )
-        collision_rows = self._build_theme_collision_rows(full_plate_stats, context=intraday_context)
+        auction_delta_stats: tuple[AuctionSnapshotDeltaStat, ...] = ()
+        if phase_label in {"auction", "auction_preview", "opening"}:
+            try:
+                auction_snapshot_result = self._load_auction_snapshots_cached(intraday_context.trade_date)
+                auction_delta_stats = build_auction_snapshot_delta_stats(
+                    auction_snapshot_result.rows,
+                    snapshot_map.values(),
+                    top_n=5,
+                )
+            except Exception:
+                logger.exception("auction snapshot delta build failed | trade_date=%s", intraday_context.trade_date)
+        collision_rows = self._build_theme_collision_rows(
+            full_plate_stats,
+            context=intraday_context,
+            auction_delta_stats=auction_delta_stats,
+        )
         bundle = None
         candidates: tuple[AuctionLadderDecision, ...] = ()
         decision_map: dict[str, AuctionLadderDecision] = {}
@@ -771,7 +799,31 @@ class AuctionRuntimeController:
             stale_snapshot_only=(stale_snapshot_only or frozen_postmarket_snapshot),
             frozen_postmarket_snapshot=frozen_postmarket_snapshot,
             collision_rows=collision_rows,
+            auction_delta_stats=auction_delta_stats,
         )
+
+    def _load_auction_snapshots_cached(self, trade_date: str) -> IntradayFetchResult:
+        load_auction_snapshots = getattr(self._intraday_hub, "load_auction_snapshots", None)
+        if not callable(load_auction_snapshots):
+            return IntradayFetchResult(
+                dataset="auction_snapshots",
+                trade_date=trade_date,
+                rows=[],
+                source="missing_hub_method",
+            )
+
+        now = time.monotonic()
+        cache = getattr(self, "_auction_snapshot_cache", None)
+        if cache is None:
+            cache = {}
+            self._auction_snapshot_cache = cache
+        cached = cache.get(trade_date)
+        if cached and now - cached[0] <= self.AUCTION_SNAPSHOT_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        result = load_auction_snapshots(trade_date)
+        cache[trade_date] = (now, result)
+        return result
 
     def _resolve_recap_trade_dates(
         self,
@@ -1013,12 +1065,14 @@ class AuctionRuntimeController:
         rows: Iterable[AuctionPlateBucketStat],
         *,
         context: IntradayContext | None = None,
+        auction_delta_stats: Iterable[AuctionSnapshotDeltaStat] = (),
     ) -> tuple[AuctionThemeCollisionStat, ...]:
         rows = tuple(row for row in rows if row.plate_name)
         if not rows:
             return ()
         yesterday_hot_rank_map = self._yesterday_hot_rank_map(context)
         plate_migration_map = getattr(getattr(context, "session_facts", None), "plate_migration_map", {}) if context is not None else {}
+        delta_map = {item.plate_name: item for item in auction_delta_stats}
         capital_ranks = self._rank_bucket_rows(
             rows,
             key=lambda row: (
@@ -1101,6 +1155,32 @@ class AuctionRuntimeController:
                 yesterday_hot_rank=yesterday_hot_rank,
                 expectation_score=expectation_score,
             )
+            delta_stat = delta_map.get(row.plate_name)
+            e_score = self._theme_eax_e_score(
+                row,
+                expectation_score=expectation_score,
+                yesterday_hot_rank=yesterday_hot_rank,
+                migration=plate_migration_map.get(row.plate_name),
+            )
+            a_score = self._theme_eax_a_score(
+                row,
+                capital_rank=capital_rank,
+                limitup_rank=limitup_rank,
+                turn_rank=turn_rank,
+                hot_rank=hot_rank,
+                total=total,
+                delta_stat=delta_stat,
+            )
+            x_score = self._theme_eax_x_score(
+                row,
+                capital_rank=capital_rank,
+                limitup_rank=limitup_rank,
+                turn_rank=turn_rank,
+                expectation_score=expectation_score,
+                delta_stat=delta_stat,
+                context=context,
+            )
+            eax_label, eax_action = self._classify_eax_action(e_score, a_score, x_score)
             built.append(
                 AuctionThemeCollisionStat(
                     plate_name=row.plate_name,
@@ -1122,6 +1202,11 @@ class AuctionRuntimeController:
                         turn_rank=turn_rank,
                         hot_rank=hot_rank,
                     ),
+                    e_score=e_score,
+                    a_score=a_score,
+                    x_score=x_score,
+                    eax_label=eax_label,
+                    eax_action=eax_action,
                 )
             )
         built.sort(
@@ -1249,6 +1334,141 @@ class AuctionRuntimeController:
         if actual_good and (row.turn_strong_count >= 1 or row.limit_up_count >= 1):
             return ("新强试错", 0.9)
         return ("无明显预期差", 0.0)
+
+    @staticmethod
+    def _theme_eax_e_score(
+        row: AuctionPlateBucketStat,
+        *,
+        expectation_score: float,
+        yesterday_hot_rank: int,
+        migration: object | None,
+    ) -> float:
+        score = max(expectation_score, 0.0) * 1.55
+        if yesterday_hot_rank <= 3:
+            score += 1.2
+        elif yesterday_hot_rank <= 6:
+            score += 0.55
+        score += min(row.yest_limit_count, 4) * 0.35
+        score += min(max(row.highest_lb_days - 1, 0), 4) * 0.25
+        if row.hot_strength >= 3000:
+            score += 0.75
+        elif row.hot_strength >= 1800:
+            score += 0.35
+        if migration is not None:
+            present_yesterday = bool(getattr(migration, "present_yesterday", False))
+            present_today = bool(getattr(migration, "present_today", False))
+            strength_delta = float(getattr(migration, "strength_delta", 0.0) or 0.0)
+            net_delta = float(getattr(migration, "net_inflow_yi_delta", 0.0) or 0.0)
+            if present_yesterday and not present_today:
+                score -= 0.7
+            elif present_yesterday and present_today and (strength_delta > 0 or net_delta > 0):
+                score += 0.45
+            elif present_yesterday and present_today and (strength_delta < 0 or net_delta < 0):
+                score -= 0.35
+        return round(min(max(score, 0.0), 10.0), 1)
+
+    @staticmethod
+    def _theme_eax_a_score(
+        row: AuctionPlateBucketStat,
+        *,
+        capital_rank: int,
+        limitup_rank: int,
+        turn_rank: int,
+        hot_rank: int,
+        total: int,
+        delta_stat: AuctionSnapshotDeltaStat | None,
+    ) -> float:
+        def rank_points(rank: int, weight: float) -> float:
+            if total <= 0 or rank <= 0:
+                return 0.0
+            if rank == 1:
+                return weight
+            if rank == 2:
+                return weight * 0.72
+            if rank == 3:
+                return weight * 0.45
+            return max(weight * 0.18 * (total - rank + 1) / max(total, 1), 0.0)
+
+        score = (
+            rank_points(capital_rank, 2.0)
+            + rank_points(limitup_rank, 2.2)
+            + rank_points(turn_rank, 1.8)
+            + (rank_points(hot_rank, 1.4) if row.hot_rank < 999 or row.hot_strength > 0 else 0.0)
+        )
+        score += min(row.auction_amount / 100_000_000, 2.0)
+        total_breadth = row.red_count + row.green_count
+        if total_breadth > 0:
+            red_ratio = row.red_count / total_breadth
+            if red_ratio >= 0.7:
+                score += 0.7
+            elif red_ratio <= 0.35:
+                score -= 0.45
+        if row.avg_current_pct >= 0.04:
+            score += 0.55
+        elif row.avg_current_pct < 0:
+            score -= 0.55
+        if delta_stat is not None:
+            if delta_stat.amount_delta_24_25 > 0:
+                score += min(delta_stat.amount_delta_24_25 / 80_000_000, 1.2)
+            if delta_stat.bid_amount_delta_24_25 > 0:
+                score += min(delta_stat.bid_amount_delta_24_25 / 30_000_000, 0.7)
+            if delta_stat.change_pct_delta_avg > 0:
+                score += min(delta_stat.change_pct_delta_avg / 2.0, 0.6)
+            elif delta_stat.change_pct_delta_avg < -1.0:
+                score -= min(abs(delta_stat.change_pct_delta_avg) / 3.0, 1.0)
+        return round(min(max(score, 0.0), 10.0), 1)
+
+    @staticmethod
+    def _theme_eax_x_score(
+        row: AuctionPlateBucketStat,
+        *,
+        capital_rank: int,
+        limitup_rank: int,
+        turn_rank: int,
+        expectation_score: float,
+        delta_stat: AuctionSnapshotDeltaStat | None,
+        context: IntradayContext | None,
+    ) -> float:
+        score = 0.0
+        summary = getattr(context, "market_summary", None)
+        headshot_rate = float(getattr(summary, "headshot_rate", 0.0) or 0.0) if summary is not None else 0.0
+        promotion_rate = float(getattr(summary, "promotion_rate", 0.0) or 0.0) if summary is not None else 0.0
+        if headshot_rate >= 0.12:
+            score += 2.0
+        elif headshot_rate >= 0.08:
+            score += 1.0
+        if 0 < promotion_rate <= 0.15:
+            score += 1.2
+        if row.avg_open_pct >= 0.07 and row.limit_up_count <= 0:
+            score += 1.1
+        if row.hot_capital_behavior <= -0.3 and row.hot_change_pct > 0:
+            score += 1.3
+        if expectation_score >= 2.6 and (limitup_rank > 3 or turn_rank > 3):
+            score += 1.2
+        if capital_rank <= 2 and limitup_rank > 3:
+            score += 0.8
+        if delta_stat is not None:
+            if delta_stat.amount_delta_24_25 >= 50_000_000 and delta_stat.change_pct_delta_avg <= -1.0:
+                score += 2.4
+            if delta_stat.bid_amount_delta_24_25 < 0 and delta_stat.amount_delta_24_25 > 0:
+                score += 1.0
+            if delta_stat.amount_ratio_avg >= 1.8 and delta_stat.change_pct_delta_avg <= 0:
+                score += 0.8
+        return round(min(max(score, 0.0), 10.0), 1)
+
+    @staticmethod
+    def _classify_eax_action(e_score: float, a_score: float, x_score: float) -> tuple[str, str]:
+        if x_score >= 6.0:
+            return ("强但风险高", "只等开盘确认")
+        if e_score >= 6.0 and a_score <= 4.0:
+            return ("低于预期", "回避/等修复")
+        if e_score <= 4.0 and a_score >= 6.0 and x_score < 5.0:
+            return ("超预期", "小仓试错")
+        if e_score >= 6.0 and a_score >= 6.0 and x_score < 5.0:
+            return ("符合/强化", "前排换手确认")
+        if a_score >= 5.0 and x_score < 4.0:
+            return ("局部转强", "观察前排")
+        return ("无明显差", "只观察")
 
     @staticmethod
     def _rank_bucket_rows(
@@ -1557,6 +1777,55 @@ class AuctionRuntimeController:
             )
         return tuple(rows)
 
+    def _render_auction_delta_collision(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        if not state.auction_delta_stats:
+            return ("【竞价边际】暂无 0924→0925 对比样本",)
+        rows = ["【竞价边际】题材 | 0925额 | 0924→0925增额 | 额比 | 涨跌变化 | 封单变化 | 结论 | 代表"]
+        for item in state.auction_delta_stats[:4]:
+            representative = self._snapshot_name_by_symbol(state, item.sample_symbols[0]) if item.sample_symbols else "-"
+            rows.append(
+                "  "
+                f"{item.plate_name}"
+                f" | {self._fmt_amount_yi_precise(item.amount_0925)}"
+                f" | {self._fmt_amount_yi_precise(item.amount_delta_24_25)}"
+                f" | {item.amount_ratio_avg:.2f}x"
+                f" | {item.change_pct_delta_avg:+.1f}pct"
+                f" | {self._fmt_amount_yi_precise(item.bid_amount_delta_24_25)}"
+                f" | {item.signal}"
+                f" | {representative}"
+            )
+        return tuple(rows)
+
+    def _render_eax_expectation_gap(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        if not self._expectation_ready(state):
+            return (
+                "【EAX预期差】题材 | E/A/X | 预期差 | 动作 | 代表",
+                "  - | --/--/-- | -- | 等竞价锚点、昨日涨停池、今日热板同时就绪 | -",
+            )
+        rows = self._theme_collision_rows(state)
+        if not rows:
+            return ("【EAX预期差】暂无题材样本",)
+        rendered = ["【EAX预期差】题材 | E/A/X | 预期差 | 动作 | 证据 | 代表"]
+        for item in rows[:4]:
+            row = item.row
+            leader, assist, _ = self._theme_internal_names(state, row.plate_name)
+            representative = " ; ".join(name for name in (leader, assist) if name and name != "-") or "-"
+            evidence = (
+                f"资{item.capital_rank}/板{item.limitup_rank}/强{item.turn_rank}"
+                f"/昨热{self._collision_rank_text(row, item.yesterday_hot_rank, hot=True)}"
+                f"/红绿{self._theme_red_green_ratio_text(row)}"
+            )
+            rendered.append(
+                "  "
+                f"{row.plate_name}"
+                f" | {item.e_score:.1f}/{item.a_score:.1f}/{item.x_score:.1f}"
+                f" | {item.eax_label}"
+                f" | {item.eax_action}"
+                f" | {evidence}"
+                f" | {representative}"
+            )
+        return tuple(rendered)
+
     def _render_auction_attack_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
             return ("【竞价攻击图】暂无题材样本",)
@@ -1801,7 +2070,7 @@ class AuctionRuntimeController:
             if snapshot is None:
                 continue
             matched += 1
-            if snapshot.is_locked or snapshot.current_pct >= 0.098:
+            if self._is_limit_up_snapshot(snapshot):
                 promoted_count += 1
             auction_row = auction_map.get(symbol)
             if auction_row is None:
@@ -1934,7 +2203,7 @@ class AuctionRuntimeController:
             snapshot
             for symbol in yest_limit_map.keys()
             for snapshot in (state.snapshot_map.get(symbol),)
-            if snapshot is not None and (snapshot.is_locked or snapshot.current_pct >= 0.098)
+            if snapshot is not None and self._is_limit_up_snapshot(snapshot)
         ]
         promoted.sort(key=lambda item: (-item.lb_days, -item.current_pct, -item.auction_amount))
         first_board = [
@@ -1975,7 +2244,7 @@ class AuctionRuntimeController:
         else:
             strong = self._pick_auction_outcome_names(
                 state,
-                predicate=lambda snapshot: snapshot.open_pct >= 0.02 and snapshot.current_pct >= 0.098,
+                predicate=lambda snapshot: snapshot.open_pct >= 0.02 and self._is_limit_up_snapshot(snapshot),
                 limit=2,
             )
             weak = self._pick_auction_outcome_names(
@@ -2283,7 +2552,7 @@ class AuctionRuntimeController:
 
         plate_rows: dict[str, list[StockStateSnapshot]] = defaultdict(list)
         for snapshot in state.snapshot_map.values():
-            if not (snapshot.touched_limit_today or snapshot.is_locked or snapshot.current_pct >= 0.098):
+            if not self._is_limit_up_snapshot(snapshot):
                 continue
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             if not plate or plate == "-":
@@ -2547,7 +2816,7 @@ class AuctionRuntimeController:
     def _render_auction_outcome(self, state: StrategyConsoleState) -> tuple[str, ...]:
         strong = self._pick_auction_outcome_names(
             state,
-            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and snapshot.current_pct >= 0.098,
+            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and self._is_limit_up_snapshot(snapshot),
         )
         weak = self._pick_auction_outcome_names(
             state,
@@ -2596,7 +2865,7 @@ class AuctionRuntimeController:
             )
         strong = self._pick_auction_outcome_names(
             eval_state,
-            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and snapshot.current_pct >= 0.098,
+            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and self._is_limit_up_snapshot(snapshot),
         )
         weak = self._pick_auction_outcome_names(
             eval_state,
@@ -2704,7 +2973,7 @@ class AuctionRuntimeController:
     def _auction_outcome_summary(self, state: StrategyConsoleState) -> str:
         strong = self._pick_auction_outcome_names(
             state,
-            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and snapshot.current_pct >= 0.098,
+            predicate=lambda snapshot: snapshot.open_pct >= 0.02 and self._is_limit_up_snapshot(snapshot),
             limit=2,
         )
         weak = self._pick_auction_outcome_names(
@@ -2783,7 +3052,7 @@ class AuctionRuntimeController:
             if snapshot.current_pct > 0:
                 return "昨收分歧"
             return "昨收回落"
-        if snapshot.is_locked or snapshot.current_pct >= 0.098:
+        if self._is_limit_up_snapshot(snapshot):
             return "封板"
         if snapshot.open_pct >= 0.08 and snapshot.current_pct < snapshot.open_pct - 0.02:
             return "炸板"
@@ -2806,7 +3075,7 @@ class AuctionRuntimeController:
             tags.append("[买一最强]")
         if snapshot.leader_rank_in_theme <= 1:
             tags.append("[题材先锋]")
-        if snapshot.current_pct >= 0.098:
+        if self._is_limit_up_snapshot(snapshot):
             tags.append("[昨收封板]" if historical_only else "[封板]")
         elif snapshot.current_pct < snapshot.open_pct - 0.03:
             tags.append("[分歧回落]")
@@ -2991,7 +3260,7 @@ class AuctionRuntimeController:
         rows = ["【梯队映射】梯队 | 数量 | 红开率 | 晋级率 | 极值特征 | 层级定性 | 代表"]
         for key, snapshots in ordered[:4]:
             red_open_text, red_count = red_open_stats(snapshots)
-            promoted_count = sum(1 for snapshot in snapshots if snapshot.is_locked or snapshot.current_pct >= 0.098)
+            promoted_count = sum(1 for snapshot in snapshots if self._is_limit_up_snapshot(snapshot))
             rep = min(
                 snapshots,
                 key=lambda snapshot: (
@@ -3614,7 +3883,7 @@ class AuctionRuntimeController:
     def _yest_limit_bucket_strength(self, snapshots: list[StockStateSnapshot]) -> str:
         if not snapshots:
             return "无样本"
-        strong = sum(1 for snapshot in snapshots if snapshot.is_locked or snapshot.current_pct >= 0.098)
+        strong = sum(1 for snapshot in snapshots if self._is_limit_up_snapshot(snapshot))
         red = sum(1 for snapshot in snapshots if snapshot.open_pct > 0)
         weak = sum(1 for snapshot in snapshots if snapshot.current_pct < 0)
         if strong >= max(1, len(snapshots) // 2):
@@ -3628,7 +3897,7 @@ class AuctionRuntimeController:
     def _yest_limit_bucket_action(self, bucket: str, snapshots: list[StockStateSnapshot]) -> str:
         if not snapshots:
             return "无交易结论"
-        strong = sum(1 for snapshot in snapshots if snapshot.is_locked or snapshot.current_pct >= 0.098)
+        strong = sum(1 for snapshot in snapshots if self._is_limit_up_snapshot(snapshot))
         weak = sum(1 for snapshot in snapshots if snapshot.current_pct < 0)
         if bucket == "high":
             if weak >= max(1, len(snapshots) // 2):
@@ -4366,6 +4635,10 @@ class AuctionRuntimeController:
     def _ladder_sort_value(self, key: str) -> int:
         digits = "".join(ch for ch in key if ch.isdigit())
         return int(digits or 0)
+
+    @staticmethod
+    def _is_limit_up_snapshot(snapshot: StockStateSnapshot) -> bool:
+        return bool(snapshot.is_locked or snapshot.touched_limit_today)
 
     def _fmt_pct(self, value: float) -> str:
         if isinstance(value, float) and math.isnan(value):

@@ -37,6 +37,21 @@ class AuctionPlateBucketStat:
     secondary_reason_hits: int = 0
 
 
+@dataclass(frozen=True)
+class AuctionSnapshotDeltaStat:
+    plate_name: str
+    symbol_count: int
+    amount_0925: float
+    amount_delta_24_25: float
+    amount_ratio_avg: float
+    bid_amount_delta_24_25: float
+    change_pct_delta_avg: float
+    positive_delta_count: int
+    sample_symbols: tuple[str, ...]
+    signal: str
+    generic: bool = False
+
+
 def build_auction_plate_bucket_stats(
     context: IntradayContext,
     *,
@@ -98,9 +113,9 @@ def build_auction_plate_bucket_stats(
                 bucket["yest_limit_count"] = int(bucket["yest_limit_count"]) + 1
             if snapshot.leader_rank_in_theme <= 3:
                 bucket["leader_count"] = int(bucket["leader_count"]) + 1
-            if snapshot.touched_limit_today or snapshot.is_locked or snapshot.current_pct >= 0.098:
+            if _is_limit_up_snapshot(snapshot):
                 bucket["limit_up_count"] = int(bucket["limit_up_count"]) + 1
-            if snapshot.is_locked or snapshot.current_pct >= 0.098:
+            if _is_limit_up_snapshot(snapshot):
                 bucket["strong_lock_count"] = int(bucket["strong_lock_count"]) + 1
             if _is_turn_strong(snapshot):
                 bucket["turn_strong_count"] = int(bucket["turn_strong_count"]) + 1
@@ -206,6 +221,100 @@ def build_auction_plate_bucket_stats(
     return tuple(stats[:top_n])
 
 
+def build_auction_snapshot_delta_stats(
+    snapshot_rows: Iterable[dict[str, Any]],
+    snapshots: Iterable[StockStateSnapshot],
+    *,
+    top_n: int = 5,
+) -> tuple[AuctionSnapshotDeltaStat, ...]:
+    """Aggregate 09:24 -> 09:25 auction marginal changes by theme."""
+
+    snapshot_map = {snapshot.symbol: snapshot for snapshot in snapshots}
+    bucket_payload: dict[str, dict[str, object]] = {}
+    for row in snapshot_rows:
+        if str(row.get("tag") or "") != "0925" or str(row.get("previous_tag") or "") != "0924":
+            continue
+        symbol = str(row.get("symbol") or "")
+        snapshot = snapshot_map.get(symbol)
+        if snapshot is None:
+            continue
+        theme_weights = _resolve_theme_weights(snapshot)
+        if not theme_weights:
+            continue
+        amount = _safe_float(row.get("amount", row.get("auction_amount_yuan", 0.0)))
+        amount_delta = _safe_float(row.get("amount_delta", 0.0))
+        bid_delta = _safe_float(row.get("bid_amount_delta", 0.0))
+        change_delta = _safe_float(row.get("change_pct_delta", 0.0))
+        amount_ratio = _safe_float(row.get("amount_ratio", 0.0))
+        for plate_name, weight in theme_weights:
+            bucket = bucket_payload.setdefault(
+                plate_name,
+                {
+                    "symbols": set(),
+                    "amount": 0.0,
+                    "amount_delta": 0.0,
+                    "bid_delta": 0.0,
+                    "change_delta": 0.0,
+                    "ratio_sum": 0.0,
+                    "ratio_count": 0,
+                    "positive_delta_count": 0,
+                    "samples": [],
+                },
+            )
+            cast_symbols = bucket["symbols"]
+            if isinstance(cast_symbols, set):
+                cast_symbols.add(symbol)
+            bucket["amount"] = float(bucket["amount"]) + amount * weight
+            bucket["amount_delta"] = float(bucket["amount_delta"]) + amount_delta * weight
+            bucket["bid_delta"] = float(bucket["bid_delta"]) + bid_delta * weight
+            bucket["change_delta"] = float(bucket["change_delta"]) + change_delta * weight
+            if amount_ratio > 0:
+                bucket["ratio_sum"] = float(bucket["ratio_sum"]) + amount_ratio
+                bucket["ratio_count"] = int(bucket["ratio_count"]) + 1
+            if amount_delta > 0:
+                bucket["positive_delta_count"] = int(bucket["positive_delta_count"]) + 1
+            sample_list = bucket["samples"]
+            if isinstance(sample_list, list) and symbol not in sample_list and len(sample_list) < 4:
+                sample_list.append(symbol)
+
+    stats: list[AuctionSnapshotDeltaStat] = []
+    for plate_name, payload in bucket_payload.items():
+        symbol_count = len(payload["symbols"]) if isinstance(payload["symbols"], set) else 0
+        if symbol_count <= 0:
+            continue
+        amount_delta = float(payload["amount_delta"])
+        bid_delta = float(payload["bid_delta"])
+        change_delta_avg = float(payload["change_delta"]) / symbol_count
+        ratio_count = int(payload["ratio_count"])
+        ratio_avg = float(payload["ratio_sum"]) / ratio_count if ratio_count else 0.0
+        stats.append(
+            AuctionSnapshotDeltaStat(
+                plate_name=plate_name,
+                symbol_count=symbol_count,
+                amount_0925=round(float(payload["amount"]), 2),
+                amount_delta_24_25=round(amount_delta, 2),
+                amount_ratio_avg=round(ratio_avg, 4),
+                bid_amount_delta_24_25=round(bid_delta, 2),
+                change_pct_delta_avg=round(change_delta_avg, 4),
+                positive_delta_count=int(payload["positive_delta_count"]),
+                sample_symbols=tuple(payload["samples"]) if isinstance(payload["samples"], list) else (),
+                signal=_infer_snapshot_delta_signal(amount_delta, bid_delta, change_delta_avg, ratio_avg),
+                generic=is_generic_plate(plate_name),
+            )
+        )
+
+    stats.sort(
+        key=lambda item: (
+            item.generic,
+            -abs(item.amount_delta_24_25),
+            -item.amount_0925,
+            -item.positive_delta_count,
+            -item.amount_ratio_avg,
+        )
+    )
+    return tuple(stats[:top_n])
+
+
 def render_plate_bucket_summary(stats: Iterable[AuctionPlateBucketStat]) -> tuple[str, ...]:
     rows = list(stats)
     if not rows:
@@ -276,7 +385,7 @@ def _score_snapshot(
     leader_bonus = 0.8 if snapshot.leader_rank_in_theme <= 3 else 0.0
     yest_limit_bonus = 0.9 if snapshot.is_yest_limit else 0.0
     auction_score = min(snapshot.auction_amount / 80_000_000, 1.5)
-    limit_bonus = 1.0 if (snapshot.touched_limit_today or snapshot.is_locked or snapshot.current_pct >= 0.098) else 0.0
+    limit_bonus = 1.0 if _is_limit_up_snapshot(snapshot) else 0.0
     ladder_bonus = min(max(snapshot.lb_days, 0), 5) * 0.22
     turn_strong_bonus = 0.7 if _is_turn_strong(snapshot) else 0.0
     return weight * (auction_score + leader_bonus + yest_limit_bonus + hot_bonus + limit_bonus + ladder_bonus + turn_strong_bonus)
@@ -324,9 +433,13 @@ def _is_turn_strong(snapshot: StockStateSnapshot) -> bool:
         return True
     if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
         return True
-    if snapshot.current_pct >= 0.098 and snapshot.auction_amount >= 20_000_000:
+    if _is_limit_up_snapshot(snapshot) and snapshot.auction_amount >= 20_000_000:
         return True
     return False
+
+
+def _is_limit_up_snapshot(snapshot: StockStateSnapshot) -> bool:
+    return bool(snapshot.is_locked or snapshot.touched_limit_today)
 
 
 def _hot_plate_capital_behavior_score(change_pct: float, net_inflow_yi: float) -> float:
@@ -361,3 +474,29 @@ def _hot_strength(payload: Any) -> float:
     if strength > 0.0:
         return strength
     return _hot_field(payload, "hot")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_snapshot_delta_signal(
+    amount_delta: float,
+    bid_delta: float,
+    change_delta_avg: float,
+    amount_ratio_avg: float,
+) -> str:
+    if amount_delta >= 50_000_000 and change_delta_avg >= 1.0:
+        return "增量转强"
+    if amount_delta >= 50_000_000 and change_delta_avg <= -2.0:
+        return "放量回落"
+    if bid_delta >= 10_000_000 and amount_delta >= 0:
+        return "封单增强"
+    if amount_delta <= -20_000_000:
+        return "竞价降温"
+    if amount_ratio_avg >= 1.5 and amount_delta > 0:
+        return "温和放量"
+    return "平稳"

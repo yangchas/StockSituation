@@ -61,6 +61,11 @@ enum class TdReplayTargetField : uint8_t {
     InstVolume,
     InstAmount,
     LargeNet,
+    LimitUp,
+    LimitDown,
+    LimitBandBp,
+    NoPriceLimit,
+    IsSt,
 };
 
 struct TdReplayRowPlan {
@@ -77,6 +82,7 @@ private:
     static int64_t as_i64(const TdReplayCell& cell);
     static double as_double(const TdReplayCell& cell);
     static std::string normalize_symbol(const std::string& raw);
+    static std::string normalize_market(const std::string& raw);
     static void apply_exchange_defaults(SourceTickRecord& record);
 };
 

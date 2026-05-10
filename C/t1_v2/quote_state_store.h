@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "quote_state.h"
+#include "raw_tick.h"
 
 namespace t1_v2 {
 
@@ -13,7 +14,7 @@ class QuoteStateStore {
 public:
     explicit QuoteStateStore(std::size_t reserve_symbols = 6000);
 
-    QuoteState& get_or_create(const char symbol[7]);
+    QuoteState& get_or_create(const RawTick& tick);
     void for_each_active(const std::function<void(QuoteState&)>& fn);
     void for_each_active(const std::function<void(const QuoteState&)>& fn) const;
     std::size_t size() const { return states_.size(); }

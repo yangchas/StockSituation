@@ -59,12 +59,20 @@ void set_symbol(RawTick& tick, const char* symbol) {
     std::memcpy(tick.symbol, symbol, sizeof(tick.symbol) - 1);
 }
 
+void set_market(RawTick& tick, const char* market) {
+    std::memset(tick.market, 0, sizeof(tick.market));
+    if (market) {
+        std::memcpy(tick.market, market, std::min<std::size_t>(std::strlen(market), sizeof(tick.market) - 1));
+    }
+}
+
 // This builds a normalized RawTick, not a wire/protobuf StockData record.
 // Source adapters must separately prove float/int64 feed fields are converted
 // into these fixed-point units without unit drift.
-RawTick make_tick(const char* symbol, int64_t ts_ms, int px_milli, int64_t amt_yuan) {
+RawTick make_tick(const char* symbol, int64_t ts_ms, int px_milli, int64_t amt_yuan, const char* market = "") {
     RawTick tick;
     set_symbol(tick, symbol);
+    set_market(tick, market);
     tick.ts_ms = ts_ms;
     tick.px_milli = px_milli;
     tick.pc_milli = 10000;
@@ -263,6 +271,11 @@ bool run_self_test() {
         trigger.update(make_local_ts_ms(2026, 4, 29, 9, 25, 2), MarketPhase::Auction);
     if (!expect(!repeat_a25.emit_a25, "a25 emitted only once")) return false;
 
+    ConfigV2 default_replay_config;
+    if (!expect(default_replay_config.tdengine.replay_table == "stock_tick_v2", "default replay table is v2 ticks")) return false;
+    if (!expect(default_replay_config.replay.write_redis, "replay writes redis by default")) return false;
+    if (!expect(!default_replay_config.replay.write_tdengine, "replay suppresses tdengine by default")) return false;
+
     ConfigV2 replay_config;
     replay_config.tdengine.replay_table = "stock_data";
     replay_config.replay.start_time = "2026-04-29 09:20:00";
@@ -292,6 +305,7 @@ bool run_self_test() {
     SourceTickRecord source;
     source.tss = make_local_ts_ms(2026, 4, 29, 9, 24, 5);
     source.symbol = "000070";
+    source.market = "sz";
     source.lp = 12.345;
     source.o = 12.010;
     source.h = 12.700;
@@ -310,11 +324,15 @@ bool run_self_test() {
     source.inst_vol = 1000;
     source.inst_amt = 12345;
     source.large_net = -12345;
+    source.limit_up = 12.340;
+    source.limit_down = 10.100;
+    source.limit_band_bp = 500;
+    source.is_st = true;
 
     const std::vector<std::string> replay_fields{
         "ts", "symbol", "lp", "o", "h", "l", "lc", "a", "v",
         "ap1", "ap2", "bp1", "bp2", "av1", "av2", "bv1", "bv2",
-        "inst_vol", "inst_amt", "large_net"
+        "inst_vol", "inst_amt", "large_net", "limit_up", "limit_down", "limit_band_bp", "is_st"
     };
     const TdReplayRowPlan replay_plan = TdReplayRowConverter::build_plan(replay_fields);
     const std::vector<TdReplayCell> replay_cells{
@@ -325,12 +343,15 @@ bool run_self_test() {
         TdReplayCell::f64(source.bp[0]), TdReplayCell::f64(source.bp[1]),
         TdReplayCell::i64(source.av[0]), TdReplayCell::i64(source.av[1]),
         TdReplayCell::i64(source.bv[0]), TdReplayCell::i64(source.bv[1]),
-        TdReplayCell::i64(source.inst_vol), TdReplayCell::i64(source.inst_amt), TdReplayCell::i64(source.large_net)
+        TdReplayCell::i64(source.inst_vol), TdReplayCell::i64(source.inst_amt), TdReplayCell::i64(source.large_net),
+        TdReplayCell::f64(source.limit_up), TdReplayCell::f64(source.limit_down),
+        TdReplayCell::i64(source.limit_band_bp), TdReplayCell::i64(1)
     };
     SourceTickRecord replay_record;
     if (!expect(TdReplayRowConverter::convert(replay_plan, replay_cells, replay_record), "td replay row converts")) return false;
     if (!expect(replay_record.symbol == "000070" && replay_record.market == "sz", "td replay symbol normalized")) return false;
     if (!expect(replay_record.inst_amt == source.inst_amt && replay_record.large_net == source.large_net, "td replay derived fields")) return false;
+    if (!expect(replay_record.limit_band_bp == 500 && replay_record.is_st, "td replay limit metadata")) return false;
 #if defined(T1_V2_ENABLE_TDENGINE)
     if (!expect(TdengineRowAdapter::enabled(), "tdengine adapter enabled")) return false;
 #else
@@ -340,16 +361,31 @@ bool run_self_test() {
     RawTick converted;
     if (!expect(RawTickConverter::from_source_record(source, converted), "source record converts")) return false;
     if (!expect(std::string(converted.symbol) == "000070", "source symbol")) return false;
+    if (!expect(std::string(converted.market) == "sz", "source market")) return false;
     if (!expect(converted.px_milli == 12345, "source price milli")) return false;
     if (!expect(converted.pc_milli == 11220, "source previous close milli")) return false;
     if (!expect(converted.amt_yuan == 123456789, "source amount yuan")) return false;
     if (!expect(converted.vol_units == 9876543, "source volume shares")) return false;
     if (!expect(converted.ap_milli[1] == 12350 && converted.bv[1] == 11000, "source book levels")) return false;
     if (!expect(converted.inst_amt_yuan == 12345 && converted.large_net_yuan == -12345, "source derived fields")) return false;
+    if (!expect(converted.limit_up_milli == 12340 && converted.limit_down_milli == 10100, "source limit prices")) return false;
+    if (!expect(converted.limit_band_bp == 500 && converted.is_st, "source limit metadata")) return false;
+    SourceTickRecord sh_index_source = source;
+    sh_index_source.symbol = "000001";
+    sh_index_source.market = "sh";
+    sh_index_source.lp = 4179.952;
+    RawTick rejected_index_tick;
+    if (!expect(!RawTickConverter::from_source_record(sh_index_source, rejected_index_tick), "sh index rejected from stock tick path")) return false;
+    SourceTickRecord sz_index_source = source;
+    sz_index_source.symbol = "000170";
+    sz_index_source.market = "sz";
+    sz_index_source.lp = 6349.69;
+    RawTick rejected_sz_index_tick;
+    if (!expect(!RawTickConverter::from_source_record(sz_index_source, rejected_sz_index_tick), "sz index-like price rejected from stock tick path")) return false;
 
     SourceTickRecord bad_source = source;
     bad_source.symbol = "BAD";
-    std::vector<SourceTickRecord> source_records{source, bad_source};
+    std::vector<SourceTickRecord> source_records{source, bad_source, sh_index_source, sz_index_source};
     TickBatch source_batch;
     const SourceTickBatchBuildStats build_stats = SourceTickBatchBuilder::build(
         source_records,
@@ -358,8 +394,8 @@ bool run_self_test() {
         7,
         source_batch
     );
-    if (!expect(build_stats.input_count == 2, "source batch input count")) return false;
-    if (!expect(build_stats.accepted_count == 1 && build_stats.rejected_count == 1, "source batch filtering")) return false;
+    if (!expect(build_stats.input_count == 4, "source batch input count")) return false;
+    if (!expect(build_stats.accepted_count == 1 && build_stats.rejected_count == 3, "source batch filtering")) return false;
     if (!expect(source_batch.mode == RuntimeMode::Replay, "source batch mode")) return false;
     if (!expect(source_batch.logical_ts_ms == source.tss, "source batch logical ts fallback")) return false;
     if (!expect(source_batch.ticks.size() == 1 && std::string(source_batch.ticks[0].symbol) == "000070", "source batch tick")) return false;
@@ -471,26 +507,94 @@ bool run_self_test() {
     if (!expect(found != nullptr, "quote state exists")) return false;
     const QuoteState& state = *found;
     if (!expect(state.auction.a20_px_milli == 10000, "a20 captured")) return false;
-    if (!expect(state.auction.match_amt_yuan == 8160, "auction matched amount uses l1 min")) return false;
-    if (!expect(state.auction.rest_bid_amt_yuan == 30600, "auction rest bid uses l2")) return false;
-    if (!expect(state.auction.rest_ask_amt_yuan == 20400, "auction rest ask uses l2")) return false;
+    if (!expect(state.auction.match_amt_yuan == 816000, "auction matched amount uses l1 min lots")) return false;
+    if (!expect(state.auction.rest_bid_amt_yuan == 3060000, "auction rest bid uses l2 lots")) return false;
+    if (!expect(state.auction.rest_ask_amt_yuan == 2040000, "auction rest ask uses l2 lots")) return false;
     if (!expect(state.inst_amt_yuan == 30000000, "auction inst amount diff")) return false;
     if (!expect(state.large_net_yuan == 0, "auction large net stays zero")) return false;
     if (!expect(state.spd1m_bp == 99, "speed_1m minute bucket")) return false;
     if (!expect(state.amt2m_yuan == 60000000, "amount_2m cumulative difference")) return false;
     if (!expect(state.amt5m_yuan == 60000000, "amount_5m fallback inside window")) return false;
 
+    EngineCore auction25_engine(config);
+    if (!expect(auction25_engine.initialize(), "auction25 engine initialize")) return false;
+    const int64_t ts_0925 = make_local_ts_ms(2026, 4, 29, 9, 25, 0);
+    TickBatch auction25_batch;
+    auction25_batch.logical_ts_ms = ts_0925;
+    auction25_batch.ticks.push_back(make_tick("688820", ts_0925, 115000, 71536200, "kc"));
+    auction25_engine.on_batch(auction25_batch);
+    bool has_auction25_amount = false;
+    auction25_engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "688820") {
+            has_auction25_amount = quote.auction.match_amt_yuan == 71536200;
+        }
+    });
+    if (!expect(has_auction25_amount, "0925 auction matched amount uses cumulative amount")) return false;
+
     TickBatch limit_batch;
     limit_batch.logical_ts_ms = ts_0922;
     limit_batch.ticks.push_back(make_tick("300001", ts_0922, 12000, 50000000));
+    RawTick no_buy_seal_limit = make_tick("300002", ts_0922, 12000, 50000000);
+    no_buy_seal_limit.bv[1] = 0;
+    limit_batch.ticks.push_back(no_buy_seal_limit);
+    limit_batch.ticks.push_back(make_tick("000003", ts_0922, 9000, 50000000));
+    RawTick no_sell_seal_limit = make_tick("000004", ts_0922, 9000, 50000000);
+    no_sell_seal_limit.av[1] = 0;
+    limit_batch.ticks.push_back(no_sell_seal_limit);
+    RawTick st_limit = make_tick("600005", ts_0922, 10500, 50000000, "sh");
+    st_limit.is_st = true;
+    limit_batch.ticks.push_back(st_limit);
+    RawTick bj_limit = make_tick("830001", ts_0922, 13000, 50000000, "bj");
+    limit_batch.ticks.push_back(bj_limit);
+    RawTick no_limit_day = make_tick("000006", ts_0922, 11000, 50000000, "sz");
+    no_limit_day.no_price_limit = true;
+    limit_batch.ticks.push_back(no_limit_day);
     engine.on_batch(limit_batch);
     bool has_computed_limit_up = false;
+    bool no_buy_seal_is_normal = false;
+    bool has_computed_limit_down = false;
+    bool no_sell_seal_is_normal = false;
+    bool st_limit_up = false;
+    bool bj_limit_up = false;
+    bool no_limit_is_normal = false;
     engine.quote_store().for_each_active([&](const QuoteState& quote) {
         if (std::string(quote.symbol) == "300001") {
             has_computed_limit_up = quote.limit_state == LimitState::Up;
+        } else if (std::string(quote.symbol) == "300002") {
+            no_buy_seal_is_normal = quote.limit_state == LimitState::Normal;
+        } else if (std::string(quote.symbol) == "000003") {
+            has_computed_limit_down = quote.limit_state == LimitState::Down;
+        } else if (std::string(quote.symbol) == "000004") {
+            no_sell_seal_is_normal = quote.limit_state == LimitState::Normal;
+        } else if (std::string(quote.symbol) == "600005") {
+            st_limit_up = quote.limit_state == LimitState::Up;
+        } else if (std::string(quote.symbol) == "830001") {
+            bj_limit_up = quote.limit_state == LimitState::Up;
+        } else if (std::string(quote.symbol) == "000006") {
+            no_limit_is_normal = quote.limit_state == LimitState::Normal;
         }
     });
-    if (!expect(has_computed_limit_up, "limit state computed from prev close and symbol board")) return false;
+    if (!expect(has_computed_limit_up, "limit up requires price and buy seal")) return false;
+    if (!expect(no_buy_seal_is_normal, "limit up rejected without buy seal")) return false;
+    if (!expect(has_computed_limit_down, "limit down requires price and sell seal")) return false;
+    if (!expect(no_sell_seal_is_normal, "limit down rejected without sell seal")) return false;
+    if (!expect(st_limit_up, "ST explicit metadata uses 5pct limit band")) return false;
+    if (!expect(bj_limit_up, "BJ market uses 30pct limit band")) return false;
+    if (!expect(no_limit_is_normal, "no price-limit day never marks limit")) return false;
+
+    EngineCore stock_market_engine(config);
+    if (!expect(stock_market_engine.initialize(), "stock market engine initialize")) return false;
+    TickBatch stock_market_batch;
+    stock_market_batch.logical_ts_ms = ts_0922;
+    stock_market_batch.ticks.push_back(make_tick("000001", ts_0922, 11300, 200000000, "sz"));
+    stock_market_engine.on_batch(stock_market_batch);
+    bool has_sz_stock = false;
+    stock_market_engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "000001" && std::string(quote.market) == "sz" && quote.px_milli == 11300) {
+            has_sz_stock = true;
+        }
+    });
+    if (!expect(stock_market_engine.quote_store().size() == 1 && has_sz_stock, "sz stock remains in stock path")) return false;
 
     const int64_t ts_0930 = make_local_ts_ms(2026, 4, 29, 9, 30, 5);
     const int64_t ts_0931 = make_local_ts_ms(2026, 4, 29, 9, 31, 5);
@@ -519,7 +623,7 @@ bool run_self_test() {
     if (!expect(!q2_commands.empty(), "q2 command generated")) return false;
     RedisArgvCommand first_redis_argv;
     if (!expect(RedisCommandFormatter::format(q2_commands.front(), first_redis_argv), "redis command formats")) return false;
-    if (!expect(first_redis_argv.argv.size() == 48, "q2 hset argv count")) return false;
+    if (!expect(first_redis_argv.argv.size() == 50, "q2 hset argv count")) return false;
     bool has_active_symbol_index = false;
     for (const RedisCommand& command : q2_commands) {
         if (command.type == RedisCommandType::SAdd && command.key.find("q2:active:") == 0) {
@@ -531,6 +635,14 @@ bool run_self_test() {
     if (!expect(has_active_symbol_index, "q2 active symbol index generated")) return false;
     const RedisCommandFormatStats redis_stats = RedisCommandFormatter::estimate(q2_commands);
     if (!expect(redis_stats.ok && redis_stats.command_count == q2_commands.size(), "redis command estimate")) return false;
+    const auto stock_market_q2_commands = redis_writer.build_q2_commands(stock_market_engine.quote_store(), ts_0922);
+    bool has_stock_alias_key = false;
+    for (const RedisCommand& command : stock_market_q2_commands) {
+        if (command.key == "q2:000001") {
+            has_stock_alias_key = true;
+        }
+    }
+    if (!expect(has_stock_alias_key, "sz stock writes q2 alias")) return false;
     const RuntimeBatchStats runtime_stats = RuntimeBatchStatsBuilder::build(
         7,
         ts_0922,
@@ -539,7 +651,7 @@ bool run_self_test() {
         stats3,
         redis_stats
     );
-    if (!expect(runtime_stats.source_rejected == 1 && runtime_stats.redis_fields > 0, "runtime batch stats")) return false;
+    if (!expect(runtime_stats.source_rejected == 3 && runtime_stats.redis_fields > 0, "runtime batch stats")) return false;
     if (!expect(runtime_stats.wall_ts_ms == ts_0922 + 30, "runtime wall timestamp stats")) return false;
     SnapshotTriggerState legacy_trigger;
     legacy_trigger.emit_a20 = true;
@@ -599,7 +711,7 @@ bool run_self_test() {
         }
     }
     if (!expect(has_runtime_command, "runtime pipeline m2 command")) return false;
-    if (!expect(pipeline_result.runtime_stats.source_rejected == 1, "runtime pipeline stats")) return false;
+    if (!expect(pipeline_result.runtime_stats.source_rejected == 3, "runtime pipeline stats")) return false;
     if (!expect(count_dirty_quotes(pipeline.engine().quote_store()) > 0, "runtime pipeline dirty before commit")) return false;
     NullRedisCommandExecutor null_redis_executor;
     NullTDengineCommandExecutor null_td_executor_for_runtime;
@@ -746,6 +858,14 @@ bool run_self_test() {
     if (!expect(td_writer.initialize(), "td writer initialize")) return false;
     const std::string tick_sql = td_writer.build_stock_tick_insert_sql(batch3);
     if (!expect(tick_sql.find("stock_tick_v2") != std::string::npos, "stock tick sql")) return false;
+    TickBatch td_filter_batch;
+    td_filter_batch.logical_ts_ms = ts_0922;
+    td_filter_batch.ticks.push_back(make_tick("000001", ts_0922, 4179952, 1000000000, "sh"));
+    td_filter_batch.ticks.push_back(make_tick("000001", ts_0922, 11300, 200000000, "sz"));
+    const std::string market_tick_sql = td_writer.build_stock_tick_insert_sql(td_filter_batch);
+    if (!expect(market_tick_sql.find("t2_s_000001") != std::string::npos &&
+                market_tick_sql.find("4179952") == std::string::npos,
+                "td stock tick skips sh index and keeps sz stock")) return false;
     const auto schema_statements = td_writer.build_schema_statements();
     if (!expect(schema_statements.size() == 3, "td schema statements")) return false;
     NullTDengineCommandExecutor td_executor;

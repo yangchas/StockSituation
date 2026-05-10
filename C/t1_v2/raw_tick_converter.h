@@ -33,6 +33,12 @@ struct SourceTickRecord {
     int64_t inst_vol = 0;
     int64_t inst_amt = 0;
     int64_t large_net = 0;
+
+    double limit_up = 0.0;
+    double limit_down = 0.0;
+    int16_t limit_band_bp = 0;
+    bool no_price_limit = false;
+    bool is_st = false;
 };
 
 class RawTickConverter {
@@ -42,6 +48,7 @@ public:
     static int price_to_milli(double price);
     static int64_t amount_to_yuan(double amount);
     static bool copy_symbol(const std::string& symbol, char (&out)[7]);
+    static bool copy_market(const std::string& market, char (&out)[8]);
 };
 
 }  // namespace t1_v2

@@ -29,11 +29,13 @@ private:
     void disconnect();
     TickSourceResult query_next_slice();
     TickSourceResult emit_pending_batch();
+    void throttle_before_next_slice();
 
     ConfigV2 config_;
     ReplaySliceScheduler scheduler_;
     TdReplayQueryBuilder query_builder_;
     uint32_t seq_no_ = 0;
+    uint32_t slice_no_ = 0;
     bool started_ = false;
     std::string last_error_;
     std::vector<SourceTickRecord> pending_records_;
