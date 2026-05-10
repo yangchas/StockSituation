@@ -480,6 +480,18 @@ bool run_self_test() {
     if (!expect(state.amt2m_yuan == 60000000, "amount_2m cumulative difference")) return false;
     if (!expect(state.amt5m_yuan == 60000000, "amount_5m fallback inside window")) return false;
 
+    TickBatch limit_batch;
+    limit_batch.logical_ts_ms = ts_0922;
+    limit_batch.ticks.push_back(make_tick("300001", ts_0922, 12000, 50000000));
+    engine.on_batch(limit_batch);
+    bool has_computed_limit_up = false;
+    engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "300001") {
+            has_computed_limit_up = quote.limit_state == LimitState::Up;
+        }
+    });
+    if (!expect(has_computed_limit_up, "limit state computed from prev close and symbol board")) return false;
+
     const int64_t ts_0930 = make_local_ts_ms(2026, 4, 29, 9, 30, 5);
     const int64_t ts_0931 = make_local_ts_ms(2026, 4, 29, 9, 31, 5);
     TickBatch trade_batch1;
