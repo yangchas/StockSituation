@@ -39,7 +39,7 @@ public:
         const QuoteStateStore& store,
         const SnapshotTriggerState& trigger,
         int64_t logical_ts_ms
-    ) const;
+    );
 
 private:
     static std::string trade_date_yyyymmdd(int64_t ts_ms);
@@ -50,6 +50,7 @@ private:
 private:
     ConfigV2 config_;
     bool initialized_ = false;
+    bool schema_emitted_ = false;
 };
 
 }  // namespace t1_v2

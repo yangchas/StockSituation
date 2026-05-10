@@ -750,6 +750,23 @@ bool run_self_test() {
     if (!expect(schema_statements.size() == 3, "td schema statements")) return false;
     NullTDengineCommandExecutor td_executor;
     if (!expect(td_executor.execute(schema_statements).statement_count == 3, "null td executor")) return false;
+    const auto first_batch_td = td_writer.build_batch_statements(
+        batch3,
+        engine.quote_store(),
+        stats3.snapshot_trigger,
+        ts_0922
+    );
+    if (!expect(first_batch_td.size() >= 4, "first td batch prepends schema")) return false;
+    if (!expect(first_batch_td.front().find("CREATE STABLE IF NOT EXISTS stock_tick_v2") != std::string::npos,
+                "first td batch starts with stock schema")) return false;
+    const auto second_batch_td = td_writer.build_batch_statements(
+        batch3,
+        engine.quote_store(),
+        stats3.snapshot_trigger,
+        ts_0922
+    );
+    if (!expect(!second_batch_td.empty() && second_batch_td.front().find("CREATE ") == std::string::npos,
+                "second td batch skips schema")) return false;
 #if defined(T1_V2_ENABLE_TDENGINE)
     TaosTDengineCommandExecutor taos_executor(config);
     const TDengineExecutionResult empty_td_result = taos_executor.execute({});

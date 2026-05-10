@@ -1,6 +1,7 @@
 #include "tdengine_v2_writer.h"
 
 #include <ctime>
+#include <iterator>
 #include <sstream>
 
 namespace t1_v2 {
@@ -8,12 +9,14 @@ namespace t1_v2 {
 TDengineV2Writer::TDengineV2Writer(const ConfigV2& config) : config_(config) {}
 
 bool TDengineV2Writer::initialize() {
+    schema_emitted_ = false;
     initialized_ = true;
     return true;
 }
 
 void TDengineV2Writer::shutdown() {
     initialized_ = false;
+    schema_emitted_ = false;
 }
 
 bool TDengineV2Writer::should_write_stock_ticks(const TickBatch& batch) const {
@@ -191,7 +194,7 @@ std::vector<std::string> TDengineV2Writer::build_batch_statements(
     const QuoteStateStore& store,
     const SnapshotTriggerState& trigger,
     int64_t logical_ts_ms
-) const {
+) {
     std::vector<std::string> statements;
     if (std::string sql = build_stock_tick_insert_sql(batch); !sql.empty()) {
         statements.emplace_back(std::move(sql));
@@ -201,6 +204,12 @@ std::vector<std::string> TDengineV2Writer::build_batch_statements(
     }
     if (std::string sql = build_auction_summary_insert_sql(store, trigger, logical_ts_ms); !sql.empty()) {
         statements.emplace_back(std::move(sql));
+    }
+    if (!statements.empty() && !schema_emitted_) {
+        std::vector<std::string> schema = build_schema_statements();
+        schema.insert(schema.end(), std::make_move_iterator(statements.begin()), std::make_move_iterator(statements.end()));
+        statements = std::move(schema);
+        schema_emitted_ = true;
     }
     return statements;
 }
