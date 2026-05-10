@@ -1,0 +1,38 @@
+# t1_v2
+
+`t1_v2` is the isolated high-performance replacement path for `C/t1.cpp`.
+
+## Production
+
+```bash
+cd /root/work/C/t1_v2
+./make.sh
+/tmp/t1_v2_all_live
+```
+
+Default build opens all production features: zlib, protobuf, TDengine, Redis,
+and RabbitMQ.
+
+Default run is live mode: consume RabbitMQ, compute v2 metrics, write TDengine,
+write Redis, then ack source messages after downstream success.
+
+## Replay
+
+```bash
+/tmp/t1_v2_all_live --replay --start "2026-04-29 09:25:00" --end "2026-04-29 09:25:03"
+```
+
+Replay does not write Redis by default. Add `--replay-write-redis` only when
+that is intentional.
+
+## Self-Test
+
+`self-test` is an internal semantic check. It does not replace live validation;
+it only verifies conversions, minute buckets, auction math, Redis command
+formatting, and runtime ack/reject rules.
+
+Run it manually before publishing a binary:
+
+```bash
+./make.sh --self-test
+```
