@@ -50,3 +50,16 @@ Run it manually before publishing a binary:
 ```bash
 ./make.sh --self-test
 ```
+
+## Live Health Check
+
+Read-only health check during the live session:
+
+```bash
+cd /root/work/C/t1_v2
+bash live_health_check.sh
+```
+
+It checks the `t1_v2` process, Redis responsiveness, today's auction keys,
+sample `q2` fields, and Python auction snapshot loading. It does not mutate
+Redis or TDengine.
