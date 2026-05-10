@@ -27,6 +27,8 @@ struct RedisConfig {
     std::string q2_prefix = "q2:";
     std::string a2_prefix = "a2:";
     std::string m2_prefix = "m2:";
+    std::string legacy_auction_prefix = "market:auction:";
+    std::string legacy_anchor_prefix = "market:auction:anchor:";
     int quote_ttl_seconds = 86400;
     int auction_ttl_seconds = 172800;
     int auction_top_n = 200;

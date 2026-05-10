@@ -18,7 +18,7 @@ SnapshotTriggerState SnapshotTrigger::update(int64_t logical_ts_ms, MarketPhase 
         emitted_a24_ = true;
         state.emit_a24 = true;
     }
-    if (!emitted_a25_ && hms >= 92510 && hms < 93000) {
+    if (!emitted_a25_ && hms >= 92500 && hms < 93000) {
         emitted_a25_ = true;
         state.emit_a25 = true;
     }

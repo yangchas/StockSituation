@@ -25,6 +25,19 @@ write Redis, then ack source messages after downstream success.
 Replay does not write Redis by default. Add `--replay-write-redis` only when
 that is intentional.
 
+Use a test Redis namespace for write verification so production q2/a2 and
+legacy auction anchor keys are not touched:
+
+```bash
+REDIS_Q2_PREFIX=test:q2: \
+REDIS_A2_PREFIX=test:a2: \
+REDIS_M2_PREFIX=test:m2: \
+REDIS_LEGACY_AUCTION_PREFIX=test:market:auction: \
+REDIS_LEGACY_ANCHOR_PREFIX=test:market:auction:anchor: \
+/tmp/t1_v2_all_live --replay --replay-write-redis \
+  --start "2026-04-29 09:25:00" --end "2026-04-29 09:25:03"
+```
+
 ## Self-Test
 
 `self-test` is an internal semantic check. It does not replace live validation;

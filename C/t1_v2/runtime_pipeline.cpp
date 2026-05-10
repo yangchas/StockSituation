@@ -61,7 +61,9 @@ RuntimePipelineResult RuntimePipeline::process_batch(
         );
     }
     result.redis_format_stats = RedisCommandFormatter::estimate(result.redis_commands);
-    if (!config_.processing.dry_run) {
+    const bool write_tdengine = !config_.processing.dry_run &&
+        (batch.mode != RuntimeMode::Replay || config_.replay.write_tdengine);
+    if (write_tdengine) {
         result.tdengine_statements = tdengine_writer_.build_batch_statements(
             batch,
             engine_.quote_store(),

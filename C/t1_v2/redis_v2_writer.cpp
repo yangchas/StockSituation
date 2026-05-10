@@ -210,7 +210,7 @@ std::vector<RedisCommand> RedisV2Writer::build_a2_commands(
     commands.emplace_back(std::move(expire));
 
     const std::string date = trade_date_yyyymmdd(logical_ts_ms);
-    const std::string legacy_key = "market:auction:" + date + ":" + tag;
+    const std::string legacy_key = config_.redis.legacy_auction_prefix + date + ":" + tag;
     RedisCommand legacy_hset;
     legacy_hset.type = RedisCommandType::HSetMulti;
     legacy_hset.key = legacy_key;
@@ -227,7 +227,7 @@ std::vector<RedisCommand> RedisV2Writer::build_a2_commands(
     commands.emplace_back(std::move(legacy_expire));
 
     if (tag == "0920" || tag == "0924" || tag == "0925") {
-        const std::string latest_key = "market:auction:" + date + ":latest";
+        const std::string latest_key = config_.redis.legacy_auction_prefix + date + ":latest";
         RedisCommand latest_hset;
         latest_hset.type = RedisCommandType::HSetMulti;
         latest_hset.key = latest_key;
@@ -242,7 +242,7 @@ std::vector<RedisCommand> RedisV2Writer::build_a2_commands(
         commands.emplace_back(std::move(latest_expire));
     }
     if (tag == "0925") {
-        const std::string anchor_key = "market:auction:anchor:" + date;
+        const std::string anchor_key = config_.redis.legacy_anchor_prefix + date;
         RedisCommand anchor_set;
         anchor_set.type = RedisCommandType::SetString;
         anchor_set.key = anchor_key;

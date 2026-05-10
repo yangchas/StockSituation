@@ -24,6 +24,7 @@
 #include "runtime_loop.h"
 #include "runtime_pipeline.h"
 #include "source_tick_batch_builder.h"
+#include "snapshot_trigger.h"
 #include "tdengine_command_executor.h"
 #include "td_replay_query.h"
 #include "td_replay_row_converter.h"
@@ -249,6 +250,18 @@ bool run_self_test() {
 #else
     if (!expect(!gzip_decompress.ok && gzip_decompress.unsupported, "gzip unsupported without zlib")) return false;
 #endif
+
+    ConfigV2 trigger_config;
+    SnapshotTrigger trigger(trigger_config);
+    const SnapshotTriggerState before_a25 =
+        trigger.update(make_local_ts_ms(2026, 4, 29, 9, 24, 59), MarketPhase::Auction);
+    if (!expect(!before_a25.emit_a25, "a25 not emitted before 09:25:00")) return false;
+    const SnapshotTriggerState at_a25 =
+        trigger.update(make_local_ts_ms(2026, 4, 29, 9, 25, 0), MarketPhase::Auction);
+    if (!expect(at_a25.emit_a25, "a25 emitted at first 09:25 tick")) return false;
+    const SnapshotTriggerState repeat_a25 =
+        trigger.update(make_local_ts_ms(2026, 4, 29, 9, 25, 2), MarketPhase::Auction);
+    if (!expect(!repeat_a25.emit_a25, "a25 emitted only once")) return false;
 
     ConfigV2 replay_config;
     replay_config.tdengine.replay_table = "stock_data";
@@ -642,6 +655,7 @@ bool run_self_test() {
     RuntimePipelineResult no_redis_result = no_redis_replay_pipeline.process_batch(replay_batch, build_stats);
     if (!expect(no_redis_result.engine_stats.tick_count == 1, "no-redis replay still processes ticks")) return false;
     if (!expect(no_redis_result.redis_commands.empty(), "no-redis replay suppresses redis commands")) return false;
+    if (!expect(no_redis_result.tdengine_statements.empty(), "replay suppresses td statements by default")) return false;
     const RuntimeExecutionResult no_redis_execution = coordinator.execute_and_commit(
         no_redis_replay_pipeline,
         no_redis_result
@@ -649,6 +663,16 @@ bool run_self_test() {
     if (!expect(no_redis_execution.ok, "no-redis replay execution ok")) return false;
     if (!expect(no_redis_execution.redis_committed_quotes == 0, "no-redis replay does not fake commit")) return false;
     no_redis_replay_pipeline.shutdown();
+
+    ConfigV2 redis_only_replay_config = config;
+    redis_only_replay_config.replay.write_redis = true;
+    redis_only_replay_config.replay.write_tdengine = false;
+    RuntimePipeline redis_only_replay_pipeline(redis_only_replay_config);
+    if (!expect(redis_only_replay_pipeline.initialize(), "redis-only replay pipeline initialize")) return false;
+    RuntimePipelineResult redis_only_replay_result = redis_only_replay_pipeline.process_batch(replay_batch, build_stats);
+    if (!expect(!redis_only_replay_result.redis_commands.empty(), "redis-only replay emits redis commands")) return false;
+    if (!expect(redis_only_replay_result.tdengine_statements.empty(), "redis-only replay suppresses td statements")) return false;
+    redis_only_replay_pipeline.shutdown();
 
     ConfigV2 dry_run_config = config;
     dry_run_config.processing.dry_run = true;

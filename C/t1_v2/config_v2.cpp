@@ -35,6 +35,16 @@ void ConfigManagerV2::reload_from_environment() {
     config_.redis.host = read_env_string("REDIS_HOST", config_.redis.host);
     config_.redis.port = read_env_int("REDIS_PORT", config_.redis.port);
     config_.redis.db = read_env_int("REDIS_DB", config_.redis.db);
+    config_.redis.q2_prefix = read_env_string("REDIS_Q2_PREFIX", config_.redis.q2_prefix);
+    config_.redis.a2_prefix = read_env_string("REDIS_A2_PREFIX", config_.redis.a2_prefix);
+    config_.redis.m2_prefix = read_env_string("REDIS_M2_PREFIX", config_.redis.m2_prefix);
+    config_.redis.legacy_auction_prefix =
+        read_env_string("REDIS_LEGACY_AUCTION_PREFIX", config_.redis.legacy_auction_prefix);
+    config_.redis.legacy_anchor_prefix =
+        read_env_string("REDIS_LEGACY_ANCHOR_PREFIX", config_.redis.legacy_anchor_prefix);
+    config_.redis.quote_ttl_seconds = read_env_int("REDIS_QUOTE_TTL_SECONDS", config_.redis.quote_ttl_seconds);
+    config_.redis.auction_ttl_seconds = read_env_int("REDIS_AUCTION_TTL_SECONDS", config_.redis.auction_ttl_seconds);
+    config_.redis.auction_top_n = read_env_int("REDIS_AUCTION_TOP_N", config_.redis.auction_top_n);
 
     config_.tdengine.host = read_env_string("TDENGINE_HOST", config_.tdengine.host);
     config_.tdengine.port = read_env_int("TDENGINE_PORT", config_.tdengine.port);
