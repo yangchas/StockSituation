@@ -16,6 +16,7 @@ from engine_next.runtime.plate_mapping_registry import (
     decode_theme_list,
     encode_theme_list,
     is_generic_plate,
+    merge_theme_payload_prioritized,
     merge_theme_lists,
     normalize_plate_name,
     prioritize_core_themes,
@@ -28,6 +29,24 @@ def _normalize_symbol(value: Any) -> str:
     if "." in text:
         text = text.split(".")[0]
     return text[-6:]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _milli_to_price(value: Any) -> float:
+    return _safe_float(value) / 1000.0
 
 
 @dataclass(frozen=True)
@@ -115,6 +134,55 @@ class IntradayDataHub:
                 pass
         return [self.redis.hget(key, field) for field in fields]
 
+    @staticmethod
+    def _standardize_legacy_quote(symbol: str, quote: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "name": quote.get("name", ""),
+            "price": _safe_float(quote.get("price", 0.0)),
+            "pre_close": _safe_float(quote.get("pre_close", 0.0)),
+            "amount": _safe_float(quote.get("amount", 0.0)),
+            "volume": _safe_float(quote.get("volume", 0.0)),
+            "time": str(quote.get("time", "") or ""),
+            "timestamp": _safe_int(quote.get("timestamp", quote.get("ts", 0))),
+            "bid_amount": _safe_float(quote.get("bid_amount", quote.get("bid_amt", 0.0))),
+            "auction_amount_yuan": _safe_float(quote.get("auction_amount_yuan", quote.get("amount", 0.0))),
+            "bid_amount_yuan": _safe_float(quote.get("bid_amount_yuan", quote.get("bid_amount", quote.get("bid_amt", 0.0)))),
+            "source": "redis_quote",
+        }
+
+    @staticmethod
+    def _standardize_q2_quote(symbol: str, quote: dict[str, Any]) -> dict[str, Any]:
+        price = _milli_to_price(quote.get("px"))
+        pre_close = _milli_to_price(quote.get("pc"))
+        auction_amount = _safe_float(quote.get("am", 0.0))
+        bid_amount = _safe_float(quote.get("br", 0.0))
+        speed_1m = _safe_int(quote.get("spd1m", 0)) / 10000.0
+        return {
+            "symbol": symbol,
+            "name": quote.get("name", ""),
+            "price": price,
+            "pre_close": pre_close,
+            "amount": _safe_float(quote.get("amt", 0.0)),
+            "volume": _safe_float(quote.get("vol", 0.0)),
+            "time": str(quote.get("time", "") or ""),
+            "timestamp": _safe_int(quote.get("ts", 0)),
+            "bid_amount": bid_amount,
+            "auction_amount_yuan": auction_amount,
+            "bid_amount_yuan": bid_amount,
+            "ask_amount_yuan": _safe_float(quote.get("ar", 0.0)),
+            "instant_amount_yuan": _safe_float(quote.get("ia", 0.0)),
+            "instant_volume": _safe_float(quote.get("iv", 0.0)),
+            "large_net_yuan": _safe_float(quote.get("ln", 0.0)),
+            "change_rate_1min": speed_1m,
+            "speed_1m": speed_1m,
+            "speed_1m_bp": _safe_int(quote.get("spd1m", 0)),
+            "amount_2m": _safe_float(quote.get("amt2m", 0.0)),
+            "amount_2min": _safe_float(quote.get("amt2m", 0.0)),
+            "amount_5m": _safe_float(quote.get("amt5m", 0.0)),
+            "source": "redis_q2",
+        }
+
     def _read_auction_hash_rows(self, key: str) -> list[dict[str, Any]]:
         raw = self.redis.hget(key, "top_amount")
         if not raw:
@@ -137,9 +205,9 @@ class IntradayDataHub:
 
     def _merge_theme_hash_field(self, key: str, field: str, values: Iterable[str]) -> list[str]:
         existing_raw = self.redis.hget(key, field)
-        merged = merge_theme_lists(decode_theme_list(existing_raw), values)
+        merged, payload = merge_theme_payload_prioritized(existing_raw, values)
         if merged:
-            self.redis.hset(key, field, encode_theme_list(merged))
+            self.redis.hset(key, field, payload)
         return merged
 
     def _should_refine_yest_limit_symbol(self, symbol: str, pool_plate: str) -> bool:
@@ -478,6 +546,7 @@ class IntradayDataHub:
             except Exception:
                 pass
         refine_symbols: list[str] = []
+        pool_plate_map: dict[str, str] = {}
         for row in rows:
             symbol = _normalize_symbol(row.get("symbol"))
             if not symbol:
@@ -487,6 +556,7 @@ class IntradayDataHub:
             if not pool_plate:
                 refine_symbols.append(symbol)
                 continue
+            pool_plate_map[symbol] = pool_plate
             existing_themes = decode_theme_list(self.redis.hget(PLATE_MAPPING_S2P_KEY, symbol))
             merged_themes = prioritize_core_themes((pool_plate,), existing_themes, max_count=2)
             if merged_themes:
@@ -501,6 +571,8 @@ class IntradayDataHub:
                 self._write_hash_plain(RUNTIME_PRIMARY_PLATE_KEY, symbol, primary_plate)
             if self._should_refine_yest_limit_symbol(symbol, pool_plate):
                 refine_symbols.append(symbol)
+        if pool_plate_map:
+            refine_symbols.extend(pool_plate_map.keys())
         unique_refine_symbols = tuple(dict.fromkeys(refine_symbols))
         updated_at = attempt_at
         updated_at_ts = attempt_at_ts
@@ -532,6 +604,7 @@ class IntradayDataHub:
                 phase,
                 unique_refine_symbols,
                 max_symbols=None,
+                pool_plate_map=pool_plate_map,
             )
             if enrich_result.source == "kaipan" and enrich_result.rows:
                 redis_keys_written.extend(enrich_result.redis_keys_written)
@@ -602,6 +675,7 @@ class IntradayDataHub:
         symbols: Iterable[str],
         *,
         max_symbols: int | None = 30,
+        pool_plate_map: dict[str, str] | None = None,
     ) -> IntradayFetchResult:
         decision = allow_intraday_request(FetchIntent.STOCK_PLATE_ENRICHMENT, phase)
         if not decision.allowed:
@@ -629,6 +703,7 @@ class IntradayDataHub:
                 trade_date,
                 existing_themes=decode_theme_list(self.redis.hget(PLATE_MAPPING_S2P_KEY, symbol)),
                 fallback_plate=str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or ""),
+                pool_plate=str((pool_plate_map or {}).get(symbol) or ""),
             )
             theme_payload = writebacks.get(PLATE_MAPPING_S2P_KEY, {})
             plate_payload = writebacks.get(RUNTIME_PRIMARY_PLATE_KEY, {})
@@ -658,24 +733,15 @@ class IntradayDataHub:
             dict.fromkeys(_normalize_symbol(raw_symbol) for raw_symbol in symbols if _normalize_symbol(raw_symbol))
         )
         rows: list[dict[str, Any]] = []
-        keys = [f"stock:quote:{symbol}" for symbol in normalized_symbols]
-        for symbol, quote in zip(normalized_symbols, self._batch_hgetall(keys)):
-            if not quote:
-                continue
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "name": quote.get("name", ""),
-                    "price": float(quote.get("price", 0.0) or 0.0),
-                    "pre_close": float(quote.get("pre_close", 0.0) or 0.0),
-                    "amount": float(quote.get("amount", 0.0) or 0.0),
-                    "volume": float(quote.get("volume", 0.0) or 0.0),
-                    "time": str(quote.get("time", "") or ""),
-                    "timestamp": int(quote.get("timestamp", quote.get("ts", 0)) or 0),
-                    "bid_amount": float(quote.get("bid_amount", quote.get("bid_amt", 0.0)) or 0.0),
-                    "source": "redis_quote",
-                }
-            )
+        legacy_keys = [f"stock:quote:{symbol}" for symbol in normalized_symbols]
+        q2_keys = [f"q2:{symbol}" for symbol in normalized_symbols]
+        legacy_quotes = self._batch_hgetall(legacy_keys)
+        q2_quotes = self._batch_hgetall(q2_keys)
+        for symbol, legacy_quote, q2_quote in zip(normalized_symbols, legacy_quotes, q2_quotes):
+            if legacy_quote:
+                rows.append(self._standardize_legacy_quote(symbol, legacy_quote))
+            elif q2_quote:
+                rows.append(self._standardize_q2_quote(symbol, q2_quote))
         return IntradayFetchResult(
             dataset="redis_quotes",
             trade_date="",

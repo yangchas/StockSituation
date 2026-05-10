@@ -588,7 +588,9 @@ public:
        
         if (enable_file_ && log_file_.is_open() && level >= file_level_) {
             log_file_ << log_msg << std::endl;
-            log_file_.flush();
+            if (level >= 2) {
+                log_file_.flush();
+            }
         }
     }
    
@@ -1994,6 +1996,8 @@ private:
     int port_;
     int db_;
     int pending_pipeline_replies_ = 0;
+    static constexpr long long CONNECT_TIMEOUT_MS = 1000;
+    static constexpr long long IO_TIMEOUT_MS = 1500;
    
 public:
     RedisClient(const std::string& host, int port, int db)
@@ -2005,11 +2009,23 @@ public:
    
     bool connect() {
         if (context_) return true;
-       
-        context_ = redisConnect(host_.c_str(), port_);
+
+        struct timeval connect_timeout;
+        connect_timeout.tv_sec = static_cast<long>(CONNECT_TIMEOUT_MS / 1000);
+        connect_timeout.tv_usec = static_cast<long>((CONNECT_TIMEOUT_MS % 1000) * 1000);
+
+        context_ = redisConnectWithTimeout(host_.c_str(), port_, connect_timeout);
         if (!context_ || context_->err) {
             if (context_) redisFree(context_);
             context_ = nullptr;
+            return false;
+        }
+
+        struct timeval io_timeout;
+        io_timeout.tv_sec = static_cast<long>(IO_TIMEOUT_MS / 1000);
+        io_timeout.tv_usec = static_cast<long>((IO_TIMEOUT_MS % 1000) * 1000);
+        if (redisSetTimeout(context_, io_timeout) != REDIS_OK) {
+            disconnect();
             return false;
         }
        
@@ -4171,7 +4187,9 @@ private:
     std::unique_ptr<RedisClient> redis_client_;
     const Config& config_;
     StockNameMapper& stock_mapper_;
-    std::unordered_map<std::string, QuoteRedisState> quote_redis_state_;
+    std::unordered_map<std::string, QuoteRedisState> quote_redis_committed_state_;
+    std::unordered_map<std::string, QuoteRedisState> quote_redis_pending_state_;
+    bool quote_redis_pipeline_failed_ = false;
 
     static constexpr long long QUOTE_WRITE_INTERVAL_MS = 300;
     static constexpr long long QUOTE_EXPIRE_REFRESH_MS = 60 * 1000;
@@ -4185,9 +4203,38 @@ public:
         }
 
     bool flushRedisWrites() {
-        if (!redis_client_) return true;
-        if (!redis_client_->isConnected()) return true;
-        return redis_client_->executePipeline();
+        const bool had_pending = !quote_redis_pending_state_.empty();
+        if (quote_redis_pipeline_failed_) {
+            quote_redis_pipeline_failed_ = false;
+            quote_redis_pending_state_.clear();
+            if (redis_client_ && redis_client_->isConnected()) {
+                redis_client_->disconnect();
+            }
+            return false;
+        }
+        if (!had_pending) {
+            return true;
+        }
+        if (!redis_client_) {
+            quote_redis_pending_state_.clear();
+            return false;
+        }
+        if (!redis_client_->isConnected()) {
+            quote_redis_pending_state_.clear();
+            return false;
+        }
+
+        const bool success = redis_client_->executePipeline();
+        if (success) {
+            for (const auto& entry : quote_redis_pending_state_) {
+                quote_redis_committed_state_[entry.first] = entry.second;
+            }
+        } else if (redis_client_->isConnected()) {
+            redis_client_->disconnect();
+        }
+        quote_redis_pending_state_.clear();
+        quote_redis_pipeline_failed_ = false;
+        return success;
     }
 
     void cleanupState(long long reference_timestamp_ms, long long stale_window_ms) {
@@ -4195,14 +4242,18 @@ public:
             return;
         }
         const long long cutoff_time = reference_timestamp_ms - stale_window_ms;
-        auto it = quote_redis_state_.begin();
-        while (it != quote_redis_state_.end()) {
-            if (it->second.last_write_ts_ms > 0 && it->second.last_write_ts_ms < cutoff_time) {
-                it = quote_redis_state_.erase(it);
-            } else {
-                ++it;
+        auto cleanup_map = [cutoff_time](std::unordered_map<std::string, QuoteRedisState>& states) {
+            auto it = states.begin();
+            while (it != states.end()) {
+                if (it->second.last_write_ts_ms > 0 && it->second.last_write_ts_ms < cutoff_time) {
+                    it = states.erase(it);
+                } else {
+                    ++it;
+                }
             }
-        }
+        };
+        cleanup_map(quote_redis_committed_state_);
+        cleanup_map(quote_redis_pending_state_);
     }
    
     void dispatch(StockData& data) {
@@ -4229,6 +4280,24 @@ public:
         }
     }
 private:
+    void markQuoteRedisPipelineFailed() {
+        quote_redis_pipeline_failed_ = true;
+        quote_redis_pending_state_.clear();
+    }
+
+    const QuoteRedisState& getEffectiveQuoteState(const std::string& symbol) const {
+        auto pending_it = quote_redis_pending_state_.find(symbol);
+        if (pending_it != quote_redis_pending_state_.end()) {
+            return pending_it->second;
+        }
+        auto committed_it = quote_redis_committed_state_.find(symbol);
+        if (committed_it != quote_redis_committed_state_.end()) {
+            return committed_it->second;
+        }
+        static const QuoteRedisState empty_state;
+        return empty_state;
+    }
+
     bool shouldWriteQuoteRedis(
         const StockData& data,
         const QuoteRedisState& state,
@@ -4246,7 +4315,11 @@ private:
     }
 
     void storeStockDataToRedis(const StockData& data, double change, double change_rate_1min, double amount_2min, bool is_auction) {
+        if (quote_redis_pipeline_failed_) {
+            return;
+        }
         if (!redis_client_->connect()) {
+            markQuoteRedisPipelineFailed();
             return;
         }
         
@@ -4258,10 +4331,11 @@ private:
         const double ask1_amount_yuan = data.ask_prices[0] * data.ask_volumes[0] * 100.0;
         const double book1_amount_yuan = bid1_amount_yuan + ask1_amount_yuan;
         long long timestamp_ms = static_cast<long long>(data.timestamp);
-        auto& state = quote_redis_state_[data.symbol];
-        if (!shouldWriteQuoteRedis(data, state, is_auction, book1_amount_yuan, timestamp_ms)) {
+        const QuoteRedisState& effective_state = getEffectiveQuoteState(data.symbol);
+        if (!shouldWriteQuoteRedis(data, effective_state, is_auction, book1_amount_yuan, timestamp_ms)) {
             return;
         }
+        QuoteRedisState next_state = effective_state;
 
         std::vector<std::pair<std::string, std::string>> fields;
         fields.reserve(15);
@@ -4277,36 +4351,33 @@ private:
         fields.emplace_back("amount_2min", Logger::amountToWan(amount_2min));
         fields.emplace_back("timestamp", std::to_string(timestamp_ms));
 
-        if (state.last_static_refresh_ms <= 0 || (timestamp_ms - state.last_static_refresh_ms) >= QUOTE_STATIC_REFRESH_MS) {
+        if (next_state.last_static_refresh_ms <= 0 || (timestamp_ms - next_state.last_static_refresh_ms) >= QUOTE_STATIC_REFRESH_MS) {
             fields.emplace_back("pre_close", std::to_string(data.close));
             fields.emplace_back("last_close", std::to_string(data.close));
             fields.emplace_back("name", stock_mapper_.getStockDisplayName(data.symbol));
             long long market_cap = static_cast<long long>(calculateMarketCap(data));
             fields.emplace_back("market_cap", std::to_string(market_cap));
-            state.last_static_refresh_ms = timestamp_ms;
+            next_state.last_static_refresh_ms = timestamp_ms;
         }
 
         if (!redis_client_->appendHsetMulti(key, fields)) {
+            markQuoteRedisPipelineFailed();
             return;
         }
 
-        if (state.last_expire_refresh_ms <= 0 || (timestamp_ms - state.last_expire_refresh_ms) >= QUOTE_EXPIRE_REFRESH_MS) {
+        if (next_state.last_expire_refresh_ms <= 0 || (timestamp_ms - next_state.last_expire_refresh_ms) >= QUOTE_EXPIRE_REFRESH_MS) {
             if (!redis_client_->appendExpire(key, 60 * 60 * 24)) {
+                markQuoteRedisPipelineFailed();
                 return;
             }
-            state.last_expire_refresh_ms = timestamp_ms;
+            next_state.last_expire_refresh_ms = timestamp_ms;
         }
-        state.last_write_ts_ms = timestamp_ms;
-        state.last_price = data.last_price;
-        state.last_amount = data.amount;
-        state.last_book1_amount = book1_amount_yuan;
+        next_state.last_write_ts_ms = timestamp_ms;
+        next_state.last_price = data.last_price;
+        next_state.last_amount = data.amount;
+        next_state.last_book1_amount = book1_amount_yuan;
         
-        // 可选：记录存储成功的日志
-        static int stored_count = 0;
-        stored_count++;
-        if (stored_count % 1000 == 0 && global_logger) {
-            global_logger->info("Stored " + std::to_string(stored_count) + " stock records to Redis");
-        }
+        quote_redis_pending_state_[data.symbol] = next_state;
     }
     
     // 计算市值（模拟实现）
@@ -4325,11 +4396,36 @@ private:
     std::atomic<bool> running_{false};
     bool consumer_started_ = false;
     std::string consumer_tag_;
+    long long next_connect_retry_ms_ = 0;
+    long long last_connect_error_log_ms_ = 0;
+    static constexpr long long CONNECT_RETRY_BACKOFF_MS = 5000;
+    static constexpr long long CONNECT_ERROR_LOG_INTERVAL_MS = 5000;
    
     void checkAmqpError(amqp_rpc_reply_t reply, const std::string& context) {
         if (reply.reply_type != AMQP_RESPONSE_NORMAL) {
             throw std::runtime_error(context + " failed");
         }
+    }
+
+    static long long monotonicNowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    void armConnectBackoff() {
+        next_connect_retry_ms_ = monotonicNowMs() + CONNECT_RETRY_BACKOFF_MS;
+        consumer_started_ = false;
+    }
+
+    void logConnectFailure(const std::string& message) {
+        const long long now_ms = monotonicNowMs();
+        if (last_connect_error_log_ms_ > 0 &&
+            (now_ms - last_connect_error_log_ms_) < CONNECT_ERROR_LOG_INTERVAL_MS) {
+            return;
+        }
+        std::cerr << message << std::endl;
+        last_connect_error_log_ms_ = now_ms;
     }
    
     bool declareQueue() {
@@ -4378,26 +4474,39 @@ public:
     }
    
     bool connect() override {
+        const long long now_ms = monotonicNowMs();
         if (conn_) {
-            return true;
+            if (consumer_started_ || startConsumer()) {
+                next_connect_retry_ms_ = 0;
+                return true;
+            }
+            logConnectFailure("Failed to start RabbitMQ consumer");
+            disconnect();
+            armConnectBackoff();
+            return false;
         }
+        if (next_connect_retry_ms_ > now_ms) {
+            return false;
+        }
+        try {
         conn_ = amqp_new_connection();
         if (!conn_) {
-            std::cerr << "Failed to create RabbitMQ connection" << std::endl;
+            logConnectFailure("RabbitMQ connect failed: create connection");
+            armConnectBackoff();
             return false;
         }
         amqp_socket_t* socket = amqp_tcp_socket_new(conn_);
         if (!socket) {
-            std::cerr << "Failed to create RabbitMQ socket" << std::endl;
-            amqp_destroy_connection(conn_);
-            conn_ = nullptr;
+            logConnectFailure("RabbitMQ connect failed: create socket");
+            disconnect();
+            armConnectBackoff();
             return false;
         }
         int status = amqp_socket_open(socket, config_.rabbitmq_host.c_str(), config_.rabbitmq_port);
          if (status != AMQP_STATUS_OK) {
-            std::cerr << "Failed to open RabbitMQ socket: " << amqp_error_string2(status) << std::endl;
-            amqp_destroy_connection(conn_);
-            conn_ = nullptr;
+            logConnectFailure(std::string("RabbitMQ connect failed: open socket: ") + amqp_error_string2(status));
+            disconnect();
+            armConnectBackoff();
             return false;
         }
         amqp_rpc_reply_t login_reply = amqp_login(conn_, config_.rabbitmq_vhost.c_str(),
@@ -4409,23 +4518,42 @@ public:
         checkAmqpError(channel_reply, "Open channel");
         // 声明并检查队列
         if (!declareQueue()) {
+            logConnectFailure("RabbitMQ connect failed: declare queue");
+            disconnect();
+            armConnectBackoff();
             return false;
         }
-        startConsumer();
+        if (!startConsumer()) {
+            logConnectFailure("RabbitMQ connect failed: start consumer");
+            disconnect();
+            armConnectBackoff();
+            return false;
+        }
+        next_connect_retry_ms_ = 0;
+        last_connect_error_log_ms_ = 0;
         return true;
+        } catch (const std::exception& e) {
+            logConnectFailure(std::string("RabbitMQ connect failed: ") + e.what());
+            disconnect();
+            armConnectBackoff();
+            return false;
+        }
     }
    
     void disconnect() override {
+        const bool should_close = consumer_started_;
+        consumer_started_ = false;
         if (conn_) {
-            amqp_connection_close(conn_, AMQP_REPLY_SUCCESS);
+            if (should_close) {
+                amqp_connection_close(conn_, AMQP_REPLY_SUCCESS);
+            }
             amqp_destroy_connection(conn_);
             conn_ = nullptr;
         }
     }
    
      bool consumeMessages(std::vector<PendingMessage>& messages, int count) override {
-        if (!conn_ && !connect()) {
-            std::cerr << "Failed to connect to RabbitMQ" << std::endl;
+        if ((!conn_ || !consumer_started_) && !connect()) {
             return false;
         }
         
@@ -4449,6 +4577,22 @@ public:
             amqp_maybe_release_buffers_on_channel(conn_, 1);
             return true;
         }
+
+        if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION &&
+            ret.library_error == AMQP_STATUS_TIMEOUT) {
+            return false;
+        }
+
+        std::string error_message = "RabbitMQ consume failed";
+        if (ret.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
+            error_message += ": ";
+            error_message += amqp_error_string2(ret.library_error);
+        } else {
+            error_message += " | reply_type=" + std::to_string(ret.reply_type);
+        }
+        logConnectFailure(error_message);
+        disconnect();
+        armConnectBackoff();
         
         return false;
     }
@@ -4497,7 +4641,26 @@ private:
     std::atomic<long long> max_server_timestamp_{0};
     std::atomic<long long> total_delay_{0};
     std::atomic<int> delay_count_{0};
-   
+    enum class LoopStage {
+        Idle = 0,
+        RateLimit,
+        Consume,
+        Process,
+        RedisFlush,
+        TdWrite,
+        Ack,
+        Reject,
+        Housekeeping
+    };
+    std::atomic<int> current_stage_{static_cast<int>(LoopStage::Idle)};
+    std::atomic<long long> current_stage_since_ms_{0};
+    std::atomic<long long> last_consume_success_ms_{0};
+    std::atomic<long long> last_process_success_ms_{0};
+    std::atomic<long long> last_redis_flush_success_ms_{0};
+    std::atomic<long long> last_td_write_success_ms_{0};
+    std::atomic<long long> last_ack_success_ms_{0};
+    static constexpr long long SLOW_STAGE_WARN_MS = 1500;
+
 public:
     EnhancedSingleThreadedProcessor(std::unique_ptr<IDataWriter> writer,
                                   std::unique_ptr<IMessageProcessor> processor,
@@ -4531,7 +4694,8 @@ public:
         }
        
         logger_->info("Starting enhanced single-threaded processor...");
-       
+        enterStage(LoopStage::Idle);
+
         int total_messages = 0;
         int total_records = 0;
         int failed_messages = 0;
@@ -4555,23 +4719,32 @@ public:
         long long last_timestamp = 0;
         while (running_) {
             if (config_.enable_rate_limiting) {
+                enterStage(LoopStage::RateLimit);
                 std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing_delay_ms));
             }
+            enterStage(LoopStage::Idle);
             // 清空向量但保留容量
             messages.clear();
             all_records.clear();
             valid_messages.clear();
 
+            enterStage(LoopStage::Consume);
+            const long long consume_start_ms = monotonicNowMs();
             bool has_messages = consumer_->consumeMessages(messages, config_.messages_per_batch);
+            logSlowStage(LoopStage::Consume, consume_start_ms, "messages=" + std::to_string(messages.size()));
            
             if (!has_messages) {
                 empty_cycles++;
-                std::this_thread::sleep_for(std::chrono::seconds(10));
+                enterStage(LoopStage::Idle);
+                std::this_thread::sleep_for(std::chrono::milliseconds(computeIdleBackoffMs(empty_cycles)));
                 continue;
             }
-           
+
             empty_cycles = 0;
-           
+            markStageSuccess(LoopStage::Consume);
+            enterStage(LoopStage::Process);
+            const long long process_start_ms = monotonicNowMs();
+
             for (auto& message : messages) {
                 std::vector<StockData> records;
                 if (message_processor_->processMessage(message.data, records)) {
@@ -4604,15 +4777,40 @@ public:
                 }
                 
             }
+            logSlowStage(LoopStage::Process, process_start_ms, "valid_messages=" + std::to_string(valid_messages.size()) + ", records=" + std::to_string(all_records.size()));
+            markStageSuccess(LoopStage::Process);
 
-            if (phase_dispatcher_ && !phase_dispatcher_->flushRedisWrites() && logger_) {
-                logger_->warn("Quote Redis pipeline flush failed");
+            bool redis_flush_failed = false;
+            if (phase_dispatcher_) {
+                enterStage(LoopStage::RedisFlush);
+                const long long redis_flush_start_ms = monotonicNowMs();
+                if (!phase_dispatcher_->flushRedisWrites()) {
+                    redis_flush_failed = true;
+                    if (logger_) {
+                        logger_->warn("Quote Redis pipeline flush failed | " + buildStageSnapshot());
+                    }
+                } else {
+                    markStageSuccess(LoopStage::RedisFlush);
+                }
+                logSlowStage(LoopStage::RedisFlush, redis_flush_start_ms);
+            }
+
+            if (redis_flush_failed) {
+                enterStage(LoopStage::Reject);
+                for (auto& message : valid_messages) {
+                    consumer_->rejectMessage(message.delivery_tag, true);
+                }
+                failed_messages += static_cast<int>(valid_messages.size());
+                valid_messages.clear();
+                all_records.clear();
             }
             
             if (!all_records.empty()) {
                 bool write_success = false;
                 int retry_count = 0;
-               
+                enterStage(LoopStage::TdWrite);
+                const long long td_write_start_ms = monotonicNowMs();
+
                 while (retry_count < config_.max_retry_count && !write_success) {
                     if (config_.data_source == "tdengine_replay") {
                         write_success = true;
@@ -4624,14 +4822,19 @@ public:
                         std::this_thread::sleep_for(std::chrono::milliseconds(config_.retry_delay_ms));
                     }
                 }
-               
+                logSlowStage(LoopStage::TdWrite, td_write_start_ms, "records=" + std::to_string(all_records.size()) + ", retries=" + std::to_string(retry_count));
+
                 if (write_success) {
+                    markStageSuccess(LoopStage::TdWrite);
+                    enterStage(LoopStage::Ack);
                     for (auto& message : valid_messages) {
                         consumer_->ackMessage(message.delivery_tag);
                     }
+                    markStageSuccess(LoopStage::Ack);
                     total_messages += valid_messages.size();
                     total_records += all_records.size();
                 } else {
+                    enterStage(LoopStage::Reject);
                     for (auto& message : valid_messages) {
                         consumer_->rejectMessage(message.delivery_tag, true);
                     }
@@ -4672,6 +4875,7 @@ public:
                     auction_report_emitted_092510 = true;
                 }
             }
+            enterStage(LoopStage::Housekeeping);
             auto now = std::chrono::steady_clock::now();
             if (last_timestamp > 0 &&
                 std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup).count() >= CLEANUP_INTERVAL_SECONDS) {
@@ -4690,7 +4894,8 @@ public:
                              std::to_string(total_messages/config_.report_time) + " msg/s, " +
                             //  "延迟: " + (int(current_delay*0.001)>60*60*12?"historical":std::to_string(int(current_delay*0.001))) + "s");
                              "延迟: " + std::to_string(int(current_delay*0.001)) + "s"+
-                            "服务器时间："+ TimeUtils::formatTimestamp(max_server_timestamp_.load()).substr(11));
+                            "服务器时间："+ TimeUtils::formatTimestamp(max_server_timestamp_.load()).substr(11) +
+                            " | " + buildStageSnapshot());
                 last_report = now;
                 total_messages = 0;
                 total_records = 0;
@@ -4713,8 +4918,104 @@ public:
         running_ = false;
         consumer_->stop();
     }
-   
+
 private:
+    static long long monotonicNowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    static const char* loopStageName(LoopStage stage) {
+        switch (stage) {
+            case LoopStage::Idle: return "idle";
+            case LoopStage::RateLimit: return "rate_limit";
+            case LoopStage::Consume: return "consume";
+            case LoopStage::Process: return "process";
+            case LoopStage::RedisFlush: return "redis_flush";
+            case LoopStage::TdWrite: return "td_write";
+            case LoopStage::Ack: return "ack";
+            case LoopStage::Reject: return "reject";
+            case LoopStage::Housekeeping: return "housekeeping";
+            default: return "unknown";
+        }
+    }
+
+    void enterStage(LoopStage stage) {
+        current_stage_.store(static_cast<int>(stage));
+        current_stage_since_ms_.store(monotonicNowMs());
+    }
+
+    void markStageSuccess(LoopStage stage) {
+        const long long now_ms = monotonicNowMs();
+        switch (stage) {
+            case LoopStage::Consume:
+                last_consume_success_ms_.store(now_ms);
+                break;
+            case LoopStage::Process:
+                last_process_success_ms_.store(now_ms);
+                break;
+            case LoopStage::RedisFlush:
+                last_redis_flush_success_ms_.store(now_ms);
+                break;
+            case LoopStage::TdWrite:
+                last_td_write_success_ms_.store(now_ms);
+                break;
+            case LoopStage::Ack:
+                last_ack_success_ms_.store(now_ms);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void logSlowStage(LoopStage stage, long long start_ms, const std::string& detail = "") {
+        if (!logger_) {
+            return;
+        }
+        const long long elapsed_ms = monotonicNowMs() - start_ms;
+        if (elapsed_ms < SLOW_STAGE_WARN_MS) {
+            return;
+        }
+        std::string message = "slow stage | stage=" + std::string(loopStageName(stage)) +
+                              " | cost_ms=" + std::to_string(elapsed_ms);
+        if (!detail.empty()) {
+            message += " | " + detail;
+        }
+        logger_->warn(message);
+    }
+
+    static int computeIdleBackoffMs(int empty_cycles) {
+        if (empty_cycles <= 0) {
+            return 100;
+        }
+        if (empty_cycles == 1) {
+            return 100;
+        }
+        if (empty_cycles == 2) {
+            return 300;
+        }
+        return 1000;
+    }
+
+    std::string buildStageSnapshot() const {
+        const auto stage = static_cast<LoopStage>(current_stage_.load());
+        const long long now_ms = monotonicNowMs();
+        const long long stage_since_ms = current_stage_since_ms_.load();
+        const auto age_or_dash = [now_ms](long long ts_ms) -> std::string {
+            return ts_ms > 0 ? std::to_string(now_ms - ts_ms) : std::string("-");
+        };
+
+        std::string snapshot = "stage=" + std::string(loopStageName(stage));
+        snapshot += " | stage_age_ms=" + age_or_dash(stage_since_ms);
+        snapshot += " | last_consume_ms=" + age_or_dash(last_consume_success_ms_.load());
+        snapshot += " | last_process_ms=" + age_or_dash(last_process_success_ms_.load());
+        snapshot += " | last_redis_ms=" + age_or_dash(last_redis_flush_success_ms_.load());
+        snapshot += " | last_td_ms=" + age_or_dash(last_td_write_success_ms_.load());
+        snapshot += " | last_ack_ms=" + age_or_dash(last_ack_success_ms_.load());
+        return snapshot;
+    }
+
 
      void updateServerTimestamp(long long timestamp) {
         long long current_max = max_server_timestamp_.load();

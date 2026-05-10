@@ -16,14 +16,21 @@ from engine_next.domain.enums import RunPhase
 from engine_next.domain.models import IntradayContext, IntradayMarketSummary, PlateMigrationFact, StockStateSnapshot
 from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult
 from engine_next.app_main import EngineApp
-from engine_next.runtime.controllers.auction_runtime_controller import AuctionRuntimeController, StrategyConsoleState
+from engine_next.runtime.controllers.auction_runtime_controller import (
+    AuctionRuntimeController,
+    AuctionThemeCollisionStat,
+    StrategyConsoleState,
+)
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
-from engine_next.runtime.intraday_context_builder import IntradayContextBuilder
+from engine_next.runtime.intraday_context_builder import IntradayContextBuilder, PrimedIntradayRuntimeState
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
     RUNTIME_PRIMARY_PLATE_KEY,
     build_plate_candidates_from_reason,
     build_runtime_writebacks_from_reasons,
+    choose_pool_primary_plate,
+    is_generic_plate,
+    merge_theme_payload_prioritized,
     merge_theme_lists,
     split_plate_tokens,
 )
@@ -276,6 +283,19 @@ class SessionFactsTests(unittest.TestCase):
         )
         self.assertEqual(resolved, "\u4e00\u5b63\u62a5\u589e\u957f")
 
+    def test_snapshot_plate_keeps_runtime_primary_when_yest_pool_primary_matches(self) -> None:
+        builder = self._build_builder()
+        resolved = builder._resolve_snapshot_plate(
+            runtime_plate="\u5149\u7ea4",
+            yest_plate="\u5149\u7ea4\u6982\u5ff5\u3001\u901a\u4fe1",
+            themes=("\u5149\u7ea4", "\u7b97\u529b"),
+            reason="",
+            hot_plate_map={
+                "\u7b97\u529b": {"strength": 3200, "change_pct": 2.1, "net_inflow_yi": 18.0},
+            },
+        )
+        self.assertEqual(resolved, "\u5149\u7ea4")
+
     def test_merge_plate_names_keeps_resolved_primary_plate_first(self) -> None:
         builder = self._build_builder()
         merged = builder._merge_plate_names(
@@ -324,6 +344,53 @@ class SessionFactsTests(unittest.TestCase):
             ["\u4e00\u5b63\u62a5\u589e\u957f", "\u65e0\u4eba\u9a7e\u9a76"],
         )
 
+    def test_runtime_writebacks_prioritize_yest_limit_pool_primary_and_keep_reason_secondary(self) -> None:
+        writebacks = build_runtime_writebacks_from_reasons(
+            symbol="000070",
+            reason_rows=(
+                {
+                    "reason": "\u5149\u7ea4\u6982\u5ff5+\u7b97\u529b",
+                    "group_str": "\u5149\u7ea4\u6982\u5ff5+\u7b97\u529b",
+                    "gnsm": "",
+                },
+            ),
+            existing_themes=("\u901a\u4fe1",),
+            fallback_plate="\u901a\u4fe1",
+            pool_plate="\u5149\u7ea4\u6982\u5ff5\u3001\u901a\u4fe1",
+        )
+        self.assertEqual(writebacks[RUNTIME_PRIMARY_PLATE_KEY]["000070"], "\u5149\u7ea4")
+        self.assertEqual(
+            writebacks[PLATE_MAPPING_S2P_KEY]["000070"][:2],
+            ["\u5149\u7ea4", "\u7b97\u529b"],
+        )
+
+    def test_runtime_writebacks_keep_robot_primary_when_pool_groups_it_as_main_cluster(self) -> None:
+        writebacks = build_runtime_writebacks_from_reasons(
+            symbol="603278",
+            reason_rows=(
+                {
+                    "reason": "\u673a\u5668\u4eba\u6982\u5ff5+\u5546\u4e1a\u822a\u5929",
+                    "group_str": "\u673a\u5668\u4eba\u6982\u5ff5+\u5546\u4e1a\u822a\u5929",
+                    "gnsm": "",
+                },
+            ),
+            existing_themes=("\u5de5\u4e1a4.0",),
+            fallback_plate="\u673a\u5668\u4eba",
+            pool_plate="\u673a\u5668\u4eba\u6982\u5ff5\u3001\u5de5\u4e1a4.0",
+        )
+        self.assertEqual(writebacks[RUNTIME_PRIMARY_PLATE_KEY]["603278"], "\u673a\u5668\u4eba")
+        self.assertEqual(
+            writebacks[PLATE_MAPPING_S2P_KEY]["603278"][:2],
+            ["\u673a\u5668\u4eba", "\u5546\u4e1a\u822a\u5929"],
+        )
+
+    def test_robot_remains_generic_globally_but_can_be_pool_primary(self) -> None:
+        self.assertTrue(is_generic_plate("\u673a\u5668\u4eba"))
+        self.assertEqual(
+            choose_pool_primary_plate(("\u673a\u5668\u4eba", "\u5de5\u4e1a4.0"), ()),
+            "\u673a\u5668\u4eba",
+        )
+
     def test_runtime_writebacks_ignore_free_text_reason_and_region_only_candidates(self) -> None:
         writebacks = build_runtime_writebacks_from_reasons(
             symbol="001234",
@@ -353,6 +420,109 @@ class SessionFactsTests(unittest.TestCase):
     def test_merge_theme_lists_drops_ascii_brand_like_noise(self) -> None:
         merged = merge_theme_lists((), ["Quiksilver", "Kappa", "AI", "\u7b97\u529b"])
         self.assertEqual(merged, ["AI", "\u7b97\u529b"])
+
+    def test_merge_theme_payload_prioritized_keeps_new_front_order_and_old_tail(self) -> None:
+        merged, _ = merge_theme_payload_prioritized(
+            json.dumps(["\u5149\u7ea4", "\u901a\u4fe1"], ensure_ascii=False),
+            ["\u5149\u7ea4", "\u7b97\u529b", "\u901a\u4fe1"],
+        )
+        self.assertEqual(merged[:3], ["\u5149\u7ea4", "\u7b97\u529b", "\u901a\u4fe1"])
+
+    def test_intraday_hub_theme_writeback_keeps_correct_front_two(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.hset(
+            PLATE_MAPPING_S2P_KEY,
+            "000070",
+            json.dumps(["\u5149\u7ea4", "\u901a\u4fe1"], ensure_ascii=False),
+        )
+        hub = IntradayDataHub(redis_client=redis_client)
+
+        merged = hub._merge_theme_hash_field(
+            PLATE_MAPPING_S2P_KEY,
+            "000070",
+            ["\u5149\u7ea4", "\u7b97\u529b", "\u901a\u4fe1"],
+        )
+
+        self.assertEqual(merged[:3], ["\u5149\u7ea4", "\u7b97\u529b", "\u901a\u4fe1"])
+        self.assertEqual(
+            json.loads(redis_client.hget(PLATE_MAPPING_S2P_KEY, "000070") or "[]")[:3],
+            ["\u5149\u7ea4", "\u7b97\u529b", "\u901a\u4fe1"],
+        )
+
+    def test_intraday_hub_reads_q2_quote_units(self) -> None:
+        redis_client = _FakeRedis()
+        redis_client.hset("q2:300001", "px", "12000")
+        redis_client.hset("q2:300001", "pc", "10000")
+        redis_client.hset("q2:300001", "amt", "123456789")
+        redis_client.hset("q2:300001", "vol", "1000")
+        redis_client.hset("q2:300001", "am", "20000000")
+        redis_client.hset("q2:300001", "br", "5000000")
+        redis_client.hset("q2:300001", "ar", "0")
+        redis_client.hset("q2:300001", "ia", "300000")
+        redis_client.hset("q2:300001", "iv", "25")
+        redis_client.hset("q2:300001", "ln", "0")
+        redis_client.hset("q2:300001", "spd1m", "125")
+        redis_client.hset("q2:300001", "amt2m", "18000000")
+        redis_client.hset("q2:300001", "amt5m", "28000000")
+        hub = IntradayDataHub(redis_client=redis_client)
+
+        result = hub.fetch_redis_quotes(("300001",))
+
+        self.assertEqual(len(result.rows), 1)
+        row = result.rows[0]
+        self.assertEqual(row["source"], "redis_q2")
+        self.assertEqual(row["price"], 12.0)
+        self.assertEqual(row["pre_close"], 10.0)
+        self.assertEqual(row["auction_amount_yuan"], 20_000_000.0)
+        self.assertEqual(row["bid_amount_yuan"], 5_000_000.0)
+        self.assertEqual(row["speed_1m_bp"], 125)
+        self.assertAlmostEqual(row["speed_1m"], 0.0125)
+        self.assertAlmostEqual(row["change_rate_1min"], 0.0125)
+        self.assertEqual(row["amount_2m"], 18_000_000.0)
+        self.assertEqual(row["amount_2min"], 18_000_000.0)
+
+    def test_intraday_context_uses_quote_speed_when_rust_missing(self) -> None:
+        builder = self._build_builder()
+        primed = PrimedIntradayRuntimeState(
+            phase=RunPhase.AUCTION,
+            trade_date="2026-04-29",
+            previous_trade_date="2026-04-28",
+            offline_context_date="2026-04-28",
+            symbols=("300001",),
+            quote_rows=(
+                {
+                    "symbol": "300001",
+                    "name": "\u6d4b\u8bd5\u80a1",
+                    "price": 12.0,
+                    "pre_close": 10.0,
+                    "amount": 123_000_000.0,
+                    "speed_1m": 0.0125,
+                    "amount_2m": 18_000_000.0,
+                },
+            ),
+            cache_rows=(),
+            auction_rows=(),
+            yest_limit_map={},
+            hot_plate_map={},
+            yesterday_hot_plate_map={},
+            effective_hot_plate_map={},
+            stock_plate_map={},
+            stock_theme_map={},
+            stock_reason_map={},
+            market_runtime_state={},
+            rust_ingested=0,
+            rust_snapshot_map={},
+            rust_market_extremes={},
+            tick_metric_map={},
+            latest_quote_timestamp_ms=1777425900000,
+        )
+
+        context = builder.build_from_primed(primed)
+
+        self.assertEqual(len(context.stock_snapshots), 1)
+        snapshot = context.stock_snapshots[0]
+        self.assertAlmostEqual(snapshot.speed_1m, 0.0125)
+        self.assertEqual(snapshot.amount_2m, 18_000_000.0)
 
     def test_build_plate_candidates_from_reason_prefers_reason_head_over_verbose_gnsm(self) -> None:
         candidates = build_plate_candidates_from_reason(
@@ -1552,15 +1722,268 @@ class SessionFactsTests(unittest.TestCase):
         )
 
         mainline_joined = "\n".join(controller._render_mainline_board(state))
+        collision_joined = "\n".join(controller._render_auction_collision(state))
         theme_joined = "\n".join(controller._render_theme_zone(state))
         plan_joined = "\n".join(controller._render_auction_plan(state))
 
         self.assertIn("资金/涨停/转强 | 算力 / 算力 / 算力", mainline_joined)
+        self.assertIn("数据对撞 | 算力(", mainline_joined)
         self.assertIn("涨停/高标", theme_joined)
         self.assertIn("3/3板", theme_joined)
         self.assertIn("2/2", theme_joined)
+        self.assertIn("1/1/1/1", collision_joined)
+        self.assertIn("2/3/2", collision_joined)
         self.assertIn("主攻锚点 | 资金/涨停/转强 = 算力 / 算力 / 算力", plan_joined)
         self.assertIn("盘面归类 | 主攻盘", plan_joined)
+
+    def test_auction_collision_and_plan_degrade_when_yest_limit_pool_is_missing(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        leader = StockStateSnapshot(
+            symbol="000001",
+            name="算力龙头",
+            plate="算力",
+            open_pct=0.04,
+            current_pct=0.10,
+            auction_amount=80_000_000,
+            leader_rank_in_theme=1,
+        )
+        state = StrategyConsoleState(
+            context=IntradayContext(
+                phase=RunPhase.AUCTION,
+                trade_date="2026-04-29",
+                offline_context_date="2026-04-28",
+                stock_snapshots=(leader,),
+                market_summary=IntradayMarketSummary(
+                    top_turnover_symbols=("000001",),
+                    top_plate_name="算力",
+                    mainline_sector="算力",
+                ),
+                hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 3200.0, "net_inflow_yi": 12.0}},
+                yesterday_hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 2000.0}},
+                yest_limit_map={},
+                auction_map={"000001": {"symbol": "000001"}},
+            ),
+            candidate_scope=("000001",),
+            candidate_scope_set=frozenset({"000001"}),
+            actual_source="redis_0925",
+            plate_stats=(
+                AuctionPlateBucketStat(
+                    plate_name="算力",
+                    weighted_score=88.0,
+                    symbol_count=1,
+                    auction_symbol_count=1,
+                    auction_amount=80_000_000,
+                    yest_limit_count=0,
+                    leader_count=1,
+                    hot_rank=1,
+                    hot_change_pct=1.2,
+                    hot_strength=3200.0,
+                    hot_net_inflow_yi=12.0,
+                    hot_capital_behavior=1.2,
+                    expectation="attack",
+                    sample_symbols=("000001",),
+                    limit_up_count=1,
+                    strong_lock_count=1,
+                    turn_strong_count=1,
+                    highest_lb_days=2,
+                    avg_current_pct=0.10,
+                    red_count=1,
+                    primary_reason_hits=1,
+                ),
+            ),
+            bundle=None,
+            candidates=(),
+            missing_inputs=("yest_limit_pool",),
+            snapshot_map={"000001": leader},
+            stock_name_map={"000001": "算力龙头"},
+            plate_symbol_map={"算力": ("000001",)},
+            decision_map={},
+        )
+
+        collision_joined = "\n".join(controller._render_auction_collision(state))
+        plan_joined = "\n".join(controller._render_auction_plan(state))
+        mainline_joined = "\n".join(controller._render_mainline_board(state))
+
+        self.assertIn("昨日涨停池未就绪，先不判题材预期差", collision_joined)
+        self.assertIn("昨日涨停池未就绪，先看竞价额前排和高标承接", plan_joined)
+        self.assertIn("数据对撞 | --", mainline_joined)
+
+    def test_mainline_and_plan_use_full_market_plate_rows_instead_of_local_candidate_scope(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        local = StockStateSnapshot(symbol="000001", name="芯片观察", plate="芯片", open_pct=0.02, current_pct=0.03, auction_amount=30_000_000)
+        strong = StockStateSnapshot(symbol="000002", name="算力龙头", plate="算力", open_pct=0.05, current_pct=0.10, auction_amount=90_000_000, leader_rank_in_theme=1)
+        state = StrategyConsoleState(
+            context=IntradayContext(
+                phase=RunPhase.AUCTION,
+                trade_date="2026-04-29",
+                offline_context_date="2026-04-28",
+                stock_snapshots=(local, strong),
+                market_summary=IntradayMarketSummary(top_turnover_symbols=("000002",)),
+                hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 3200.0, "net_inflow_yi": 12.0}},
+                yesterday_hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 2500.0}},
+                yest_limit_map={"000002": {"symbol": "000002"}},
+                auction_map={"000002": {"symbol": "000002"}},
+            ),
+            candidate_scope=("000001",),
+            candidate_scope_set=frozenset({"000001"}),
+            actual_source="redis_0925",
+            plate_stats=(
+                AuctionPlateBucketStat(
+                    plate_name="芯片",
+                    weighted_score=55.0,
+                    symbol_count=1,
+                    auction_symbol_count=1,
+                    auction_amount=30_000_000,
+                    yest_limit_count=0,
+                    leader_count=1,
+                    hot_rank=3,
+                    hot_change_pct=0.6,
+                    hot_strength=1600.0,
+                    hot_net_inflow_yi=2.0,
+                    hot_capital_behavior=0.6,
+                    expectation="observe",
+                    sample_symbols=("000001",),
+                    limit_up_count=0,
+                    turn_strong_count=0,
+                    avg_current_pct=0.03,
+                    red_count=1,
+                    primary_reason_hits=1,
+                ),
+            ),
+            bundle=None,
+            candidates=(),
+            missing_inputs=(),
+            snapshot_map={"000001": local, "000002": strong},
+            stock_name_map={"000001": "芯片观察", "000002": "算力龙头"},
+            plate_symbol_map={"芯片": ("000001",), "算力": ("000002",)},
+            decision_map={},
+            full_plate_stats=(
+                AuctionPlateBucketStat(
+                    plate_name="算力",
+                    weighted_score=90.0,
+                    symbol_count=1,
+                    auction_symbol_count=1,
+                    auction_amount=90_000_000,
+                    yest_limit_count=1,
+                    leader_count=1,
+                    hot_rank=1,
+                    hot_change_pct=1.5,
+                    hot_strength=3200.0,
+                    hot_net_inflow_yi=12.0,
+                    hot_capital_behavior=1.2,
+                    expectation="attack",
+                    sample_symbols=("000002",),
+                    limit_up_count=1,
+                    strong_lock_count=1,
+                    turn_strong_count=1,
+                    highest_lb_days=2,
+                    avg_current_pct=0.10,
+                    red_count=1,
+                    primary_reason_hits=1,
+                ),
+                AuctionPlateBucketStat(
+                    plate_name="芯片",
+                    weighted_score=55.0,
+                    symbol_count=1,
+                    auction_symbol_count=1,
+                    auction_amount=30_000_000,
+                    yest_limit_count=0,
+                    leader_count=1,
+                    hot_rank=3,
+                    hot_change_pct=0.6,
+                    hot_strength=1600.0,
+                    hot_net_inflow_yi=2.0,
+                    hot_capital_behavior=0.6,
+                    expectation="observe",
+                    sample_symbols=("000001",),
+                    limit_up_count=0,
+                    turn_strong_count=0,
+                    avg_current_pct=0.03,
+                    red_count=1,
+                    primary_reason_hits=1,
+                ),
+            ),
+        )
+
+        mainline_joined = "\n".join(controller._render_mainline_board(state))
+        plan_joined = "\n".join(controller._render_auction_plan(state))
+
+        self.assertIn("题材主攻/次强 | 算力", mainline_joined)
+        self.assertIn("资金/涨停/转强 | 算力 / 算力 / 算力", mainline_joined)
+        self.assertIn("主攻锚点 | 资金/涨停/转强 = 算力 / 算力 / 算力", plan_joined)
+
+    def test_focus_ordered_decisions_keeps_non_priority_avoid_items_visible(self) -> None:
+        controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
+        leader = StockStateSnapshot(symbol="000001", name="算力龙头", plate="算力", real_plate_names=("算力",))
+        risk = StockStateSnapshot(symbol="000002", name="芯片风险", plate="芯片", real_plate_names=("芯片",))
+        collision_row = AuctionThemeCollisionStat(
+            plate_name="算力",
+            row=AuctionPlateBucketStat(
+                plate_name="算力",
+                weighted_score=88.0,
+                symbol_count=1,
+                auction_symbol_count=1,
+                auction_amount=80_000_000,
+                yest_limit_count=1,
+                leader_count=1,
+                hot_rank=1,
+                hot_change_pct=1.2,
+                hot_strength=3000.0,
+                hot_net_inflow_yi=10.0,
+                hot_capital_behavior=1.1,
+                expectation="attack",
+                sample_symbols=("000001",),
+                limit_up_count=1,
+                turn_strong_count=1,
+                primary_reason_hits=1,
+            ),
+            capital_rank=1,
+            limitup_rank=1,
+            turn_rank=1,
+            hot_rank=1,
+            yesterday_hot_rank=1,
+            continuation_rank=1,
+            collision_score=10.0,
+            expectation_score=3.0,
+            expectation_delta=2.0,
+            expectation_label="超预期",
+            signal="共振主攻",
+        )
+        bundle = types.SimpleNamespace(
+            decisions=(
+                types.SimpleNamespace(symbol="000001", action="dragon_early_board"),
+                types.SimpleNamespace(symbol="000002", action="do_not_chase"),
+            )
+        )
+        state = StrategyConsoleState(
+            context=IntradayContext(
+                phase=RunPhase.AUCTION,
+                trade_date="2026-04-29",
+                offline_context_date="2026-04-28",
+                stock_snapshots=(leader, risk),
+                market_summary=IntradayMarketSummary(top_turnover_symbols=()),
+                hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 3000.0}},
+                yesterday_hot_plate_map={"算力": {"plate_name": "算力", "rank": 1, "strength": 2500.0}},
+                yest_limit_map={"000001": {"symbol": "000001"}},
+                auction_map={"000001": {"symbol": "000001"}},
+            ),
+            candidate_scope=("000001", "000002"),
+            candidate_scope_set=frozenset({"000001", "000002"}),
+            actual_source="redis_0925",
+            plate_stats=(),
+            bundle=bundle,
+            candidates=(),
+            missing_inputs=(),
+            snapshot_map={"000001": leader, "000002": risk},
+            stock_name_map={"000001": "算力龙头", "000002": "芯片风险"},
+            plate_symbol_map={},
+            decision_map={},
+            collision_rows=(collision_row,),
+        )
+
+        ordered = controller._focus_ordered_decisions(state, phase_label="auction")
+
+        self.assertEqual([item.symbol for item in ordered], ["000001", "000002"])
 
     def test_opening_validation_renders_feedback_loop(self) -> None:
         controller = AuctionRuntimeController.__new__(AuctionRuntimeController)
@@ -1638,12 +2061,14 @@ class SessionFactsTests(unittest.TestCase):
         )
 
         rendered = "\n".join(controller._render_opening_validation(state))
+        self.assertIn("1/1/1/1", rendered)
 
         self.assertIn("【开盘验证】维度 | 结果", rendered)
         self.assertIn("强开兑现 | 强势股(+4.0%/+10.0%/算力)", rendered)
         self.assertIn("高开转虚 | 走弱股(+6.0%/-1.0%/芯片)", rendered)
         self.assertIn("低开转强 | 反包股(-3.0%/+6.0%/智元机器人)", rendered)
-        self.assertIn("题材验证 | 算力(额0.90亿/竞价样本2/昨板1/代表强势股(+4.0%/+10.0%/算力))", rendered)
+        self.assertIn("题材验证 | 算力(额0.90亿/竞价样本2/昨热1/昨板1/代表强势股(+4.0%/+10.0%/算力))", rendered)
+        self.assertIn("预期差局部超预期", rendered)
 
     def test_recap_plan_review_includes_opening_feedback(self) -> None:
         controller = AuctionRuntimeController.__new__(AuctionRuntimeController)

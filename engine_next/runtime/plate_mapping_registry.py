@@ -135,6 +135,19 @@ EXTRA_GENERIC_PLATE_NAMES = {
     "地产链",
     "金融概念",
 }
+HARD_GENERIC_PLATE_KEYWORDS = (
+    "\u56fd\u4f01",
+    "\u592e\u4f01",
+    "\u4e2d\u5b57\u5934",
+    "\u878d\u8d44\u878d\u5238",
+    "\u8f6c\u878d\u5238",
+    "\u6628\u65e5\u6da8\u505c",
+    "\u6628\u65e5\u66fe\u6da8\u505c",
+    "\u6628\u65e5\u9996\u677f",
+    "\u8bc1\u91d1\u6301\u80a1",
+    "\u6c47\u91d1\u6301\u80a1",
+    "MSCI",
+)
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -189,6 +202,13 @@ def is_valid_plate_candidate(name: str) -> bool:
     if any(keyword in cleaned for keyword in INVALID_PLATE_KEYWORDS):
         return False
     return True
+
+
+def is_hard_generic_plate(name: str) -> bool:
+    cleaned = normalize_plate_name(name)
+    if not cleaned:
+        return True
+    return any(keyword in cleaned for keyword in HARD_GENERIC_PLATE_KEYWORDS)
 
 
 def split_plate_tokens(*values: Any) -> list[str]:
@@ -273,6 +293,12 @@ def merge_theme_payload(existing_raw: Any, new_values: Iterable[str]) -> tuple[l
     return merged, encode_theme_list(merged)
 
 
+def merge_theme_payload_prioritized(existing_raw: Any, new_values: Iterable[str]) -> tuple[list[str], str]:
+    prioritized = merge_theme_lists((), new_values)
+    merged = merge_theme_lists(prioritized, decode_theme_list(existing_raw))
+    return merged, encode_theme_list(merged)
+
+
 def prioritize_core_themes(
     primary_values: Iterable[str],
     secondary_values: Iterable[str] = (),
@@ -297,12 +323,58 @@ def prioritize_core_themes(
     return merged
 
 
+def choose_pool_primary_plate(
+    pool_candidates: Sequence[str],
+    fallback_candidates: Sequence[str] = (),
+    *,
+    fallback: str = "",
+) -> str:
+    merged_pool = merge_theme_lists((), pool_candidates)
+    for name in merged_pool:
+        if name == "\u673a\u5668\u4eba":
+            return name
+        if not is_hard_generic_plate(name):
+            return name
+    return choose_primary_plate((*merged_pool, *fallback_candidates), fallback=fallback)
+
+
+def build_yest_limit_theme_candidates(
+    *,
+    pool_plate: str = "",
+    reason_candidates: Sequence[str] = (),
+    existing_themes: Sequence[str] = (),
+) -> list[str]:
+    pool_candidates = split_plate_tokens(pool_plate)
+    parsed_reason_candidates = merge_theme_lists((), reason_candidates)
+    merged_existing = merge_theme_lists((), existing_themes)
+    if not pool_candidates:
+        if parsed_reason_candidates:
+            return prioritize_core_themes(parsed_reason_candidates, merged_existing, max_count=2)
+        return merged_existing
+
+    primary = choose_pool_primary_plate(
+        pool_candidates,
+        parsed_reason_candidates,
+        fallback=pool_plate or (parsed_reason_candidates[0] if parsed_reason_candidates else ""),
+    )
+    ordered: list[str] = []
+    if primary:
+        ordered.append(primary)
+    for bucket in (parsed_reason_candidates, pool_candidates, merged_existing):
+        for name in bucket:
+            if not name or name in ordered:
+                continue
+            ordered.append(name)
+    return ordered
+
+
 def build_runtime_writebacks_from_reasons(
     *,
     symbol: str,
     reason_rows: Sequence[dict[str, Any]],
     existing_themes: Sequence[str] = (),
     fallback_plate: str = "",
+    pool_plate: str = "",
 ) -> dict[str, dict[str, Any]]:
     normalized_symbol = _normalize_symbol(symbol)
     if not normalized_symbol:
@@ -326,12 +398,22 @@ def build_runtime_writebacks_from_reasons(
                 gnsm=row.get("gnsm") or "",
             ),
         )
-    if reason_candidates:
-        candidates = prioritize_core_themes(reason_candidates, existing_themes, max_count=2)
-    else:
+    candidates = build_yest_limit_theme_candidates(
+        pool_plate=pool_plate,
+        reason_candidates=reason_candidates,
+        existing_themes=existing_themes,
+    )
+    if not candidates:
         candidates = merge_theme_lists(reason_candidates, existing_themes)
 
-    primary_plate = choose_primary_plate(candidates, fallback=fallback_plate)
+    if pool_plate:
+        primary_plate = choose_pool_primary_plate(
+            candidates,
+            reason_candidates,
+            fallback=fallback_plate or pool_plate,
+        )
+    else:
+        primary_plate = choose_primary_plate(candidates, fallback=fallback_plate)
     return {
         PLATE_MAPPING_S2P_KEY: {normalized_symbol: list(candidates)} if candidates else {},
         RUNTIME_PRIMARY_PLATE_KEY: {normalized_symbol: primary_plate} if primary_plate else {},

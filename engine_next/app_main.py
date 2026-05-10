@@ -303,6 +303,15 @@ class EngineApp:
             return ()
         return ()
 
+    def _safe_smembers(self, key: str) -> tuple[str, ...]:
+        try:
+            if hasattr(self.redis, "smembers"):
+                values = self.redis.smembers(key) or []
+                return tuple(str(value) for value in values if str(value))
+        except Exception:
+            return ()
+        return ()
+
     def _safe_hexists(self, key: str, field: str) -> bool:
         try:
             if hasattr(self.redis, "hexists"):
@@ -566,6 +575,12 @@ class EngineApp:
         candidates.extend(self._safe_hkeys("config:plate_mapping:s2p"))
         quote_keys = self._safe_keys("stock:quote:*")
         candidates.extend(key.replace("stock:quote:", "") for key in quote_keys)
+        q2_active_symbols = self._safe_smembers(f"q2:active:{trade_date.replace('-', '')}")
+        if q2_active_symbols:
+            candidates.extend(q2_active_symbols)
+        else:
+            q2_keys = self._safe_keys("q2:*")
+            candidates.extend(key.replace("q2:", "") for key in q2_keys)
         return _dedupe_symbols(candidates)
 
     def _filter_active_runtime_symbols(
@@ -597,6 +612,15 @@ class EngineApp:
             for key in self._safe_keys("stock:quote:*")
             if str(key).startswith("stock:quote:")
         }
+        q2_active_symbols = self._safe_smembers(f"q2:active:{trade_date.replace('-', '')}")
+        if q2_active_symbols:
+            active_quote_symbols.update(q2_active_symbols)
+        else:
+            active_quote_symbols.update(
+                key.replace("q2:", "")
+                for key in self._safe_keys("q2:*")
+                if str(key).startswith("q2:")
+            )
         if not active_quote_symbols:
             return symbols
 

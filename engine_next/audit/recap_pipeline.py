@@ -10,9 +10,12 @@ from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
     RUNTIME_PRIMARY_PLATE_KEY,
     RUNTIME_REASON_KEY,
+    build_yest_limit_theme_candidates,
     choose_primary_plate,
+    choose_pool_primary_plate,
     decode_theme_list,
     encode_theme_list,
+    merge_theme_payload_prioritized,
     merge_theme_lists,
 )
 
@@ -298,6 +301,7 @@ class RecapIngestionService:
         notes: list[str] = []
         updated_plate = dict(stock_plate_writebacks)
         updated_reason = dict(stock_reason_writebacks)
+        pool_plate_map: dict[str, str] = {}
 
         pending_symbols = []
         for row in yesterday_limit_pool:
@@ -305,17 +309,29 @@ class RecapIngestionService:
             if not symbol:
                 continue
             pool_plate = str(row.get("plate") or "").strip()
-            if pool_plate and symbol not in updated_plate:
-                updated_plate[symbol] = pool_plate
             if pool_plate:
+                pool_plate_map[symbol] = pool_plate
                 existing_theme_raw = self.redis.hget(PLATE_MAPPING_S2P_KEY, symbol)
-                merged_themes = merge_theme_lists(decode_theme_list(existing_theme_raw), (pool_plate,))
+                merged_themes = build_yest_limit_theme_candidates(
+                    pool_plate=pool_plate,
+                    reason_candidates=(),
+                    existing_themes=decode_theme_list(existing_theme_raw),
+                )
                 if merged_themes:
+                    resolved_pool_plate = choose_pool_primary_plate(
+                        merged_themes,
+                        (),
+                        fallback=pool_plate,
+                    )
+                    if resolved_pool_plate:
+                        updated_plate[symbol] = resolved_pool_plate
                     try:
                         self.redis.hset(PLATE_MAPPING_S2P_KEY, symbol, encode_theme_list(merged_themes))
                     except Exception as exc:
                         notes.append(f"redis writeback failed for {PLATE_MAPPING_S2P_KEY}:{symbol}: {exc}")
-            if symbol not in updated_plate or symbol not in updated_reason:
+            elif symbol not in updated_plate:
+                updated_plate[symbol] = ""
+            if pool_plate or symbol not in updated_plate or symbol not in updated_reason:
                 pending_symbols.append(symbol)
 
         for symbol in pending_symbols:
@@ -331,13 +347,17 @@ class RecapIngestionService:
                 trade_date,
                 existing_themes=decode_theme_list(self.redis.hget(PLATE_MAPPING_S2P_KEY, symbol)),
                 fallback_plate=str(updated_plate.get(symbol) or ""),
+                pool_plate=pool_plate_map.get(symbol, ""),
             )
             for code, themes in writebacks.get(PLATE_MAPPING_S2P_KEY, {}).items():
-                merged_themes = merge_theme_lists(decode_theme_list(self.redis.hget(PLATE_MAPPING_S2P_KEY, code)), themes)
+                merged_themes, merged_payload = merge_theme_payload_prioritized(
+                    self.redis.hget(PLATE_MAPPING_S2P_KEY, code),
+                    themes,
+                )
                 if not merged_themes:
                     continue
                 try:
-                    self.redis.hset(PLATE_MAPPING_S2P_KEY, code, encode_theme_list(merged_themes))
+                    self.redis.hset(PLATE_MAPPING_S2P_KEY, code, merged_payload)
                 except Exception as exc:
                     notes.append(f"redis writeback failed for {PLATE_MAPPING_S2P_KEY}:{code}: {exc}")
                 if code not in updated_plate:
@@ -345,7 +365,7 @@ class RecapIngestionService:
                     if resolved_plate:
                         updated_plate[code] = resolved_plate
             for code, plate in writebacks.get(RUNTIME_PRIMARY_PLATE_KEY, {}).items():
-                if plate and code not in updated_plate:
+                if plate and updated_plate.get(code) != str(plate):
                     updated_plate[code] = str(plate)
                     try:
                         self.redis.hset(RUNTIME_PRIMARY_PLATE_KEY, code, str(plate))

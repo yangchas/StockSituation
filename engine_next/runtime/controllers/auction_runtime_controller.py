@@ -69,9 +69,28 @@ class StrategyConsoleState:
     stock_name_map: dict[str, str]
     plate_symbol_map: dict[str, tuple[str, ...]]
     decision_map: dict[str, AuctionLadderDecision]
+    full_plate_stats: tuple[AuctionPlateBucketStat, ...] = ()
     historical_only: bool = False
     stale_snapshot_only: bool = False
     frozen_postmarket_snapshot: bool = False
+    collision_rows: tuple["AuctionThemeCollisionStat", ...] = ()
+
+
+@dataclass(frozen=True)
+class AuctionThemeCollisionStat:
+    plate_name: str
+    row: AuctionPlateBucketStat
+    capital_rank: int
+    limitup_rank: int
+    turn_rank: int
+    hot_rank: int
+    yesterday_hot_rank: int
+    continuation_rank: int
+    collision_score: float
+    expectation_score: float
+    expectation_delta: float
+    expectation_label: str
+    signal: str
 
 
 class AuctionRuntimeController:
@@ -604,6 +623,7 @@ class AuctionRuntimeController:
         if phase_label in {"auction", "auction_preview"}:
             lines.extend(self._render_auction_thermo(state))
             lines.extend(self._render_auction_structure(state))
+            lines.extend(self._render_auction_collision(state))
             lines.extend(self._render_yest_limit_feedback(state))
             lines.extend(self._render_yest_limit_breakdown(state))
             lines.extend(self._render_auction_plan(state))
@@ -721,6 +741,11 @@ class AuctionRuntimeController:
             symbols=candidate_scope,
             top_n=5,
         )
+        full_plate_stats = build_auction_plate_bucket_stats(
+            intraday_context,
+            top_n=max(len(snapshot_map), 5),
+        )
+        collision_rows = self._build_theme_collision_rows(full_plate_stats, context=intraday_context)
         bundle = None
         candidates: tuple[AuctionLadderDecision, ...] = ()
         decision_map: dict[str, AuctionLadderDecision] = {}
@@ -741,9 +766,11 @@ class AuctionRuntimeController:
             stock_name_map=stock_name_map,
             plate_symbol_map={plate_name: tuple(symbols) for plate_name, symbols in plate_symbol_index.items()},
             decision_map=decision_map,
+            full_plate_stats=full_plate_stats,
             historical_only=historical_only,
             stale_snapshot_only=(stale_snapshot_only or frozen_postmarket_snapshot),
             frozen_postmarket_snapshot=frozen_postmarket_snapshot,
+            collision_rows=collision_rows,
         )
 
     def _resolve_recap_trade_dates(
@@ -948,8 +975,346 @@ class AuctionRuntimeController:
         rows = tuple(row for row in state.plate_stats if not row.generic)
         return rows or state.plate_stats
 
-    def _top_theme_by_capital(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
-        rows = self._plate_rows_for_decision(state)
+    def _plate_rows_for_market(self, state: StrategyConsoleState) -> tuple[AuctionPlateBucketStat, ...]:
+        rows = tuple(row for row in state.full_plate_stats if not row.generic)
+        if rows:
+            return rows
+        if state.full_plate_stats:
+            return state.full_plate_stats
+        return self._plate_rows_for_decision(state)
+
+    def _theme_collision_rows(self, state: StrategyConsoleState) -> tuple[AuctionThemeCollisionStat, ...]:
+        rows = tuple(item for item in state.collision_rows if not item.row.generic)
+        if rows:
+            return rows
+        return self._build_theme_collision_rows(self._plate_rows_for_market(state), context=state.context)
+
+    def _top_theme_by_collision(self, state: StrategyConsoleState) -> AuctionThemeCollisionStat | None:
+        rows = self._theme_collision_rows(state)
+        return rows[0] if rows else None
+
+    def _expectation_ready(self, state: StrategyConsoleState) -> bool:
+        return (
+            self._hot_plate_render_mode(state) == "today"
+            and self._auction_anchor_ready(state)
+            and self._yest_limit_ready(state)
+        )
+
+    def _collision_brief_text(self, state: StrategyConsoleState) -> str:
+        if not self._expectation_ready(state):
+            return "--"
+        collision_row = self._top_theme_by_collision(state)
+        if collision_row is None:
+            return "-"
+        return f"{collision_row.plate_name}({collision_row.signal}/{collision_row.expectation_label})"
+
+    def _build_theme_collision_rows(
+        self,
+        rows: Iterable[AuctionPlateBucketStat],
+        *,
+        context: IntradayContext | None = None,
+    ) -> tuple[AuctionThemeCollisionStat, ...]:
+        rows = tuple(row for row in rows if row.plate_name)
+        if not rows:
+            return ()
+        yesterday_hot_rank_map = self._yesterday_hot_rank_map(context)
+        plate_migration_map = getattr(getattr(context, "session_facts", None), "plate_migration_map", {}) if context is not None else {}
+        capital_ranks = self._rank_bucket_rows(
+            rows,
+            key=lambda row: (
+                row.hot_net_inflow_yi,
+                row.hot_strength,
+                row.auction_amount,
+                row.hot_change_pct,
+                row.primary_reason_hits,
+                row.weighted_score,
+            ),
+        )
+        limitup_ranks = self._rank_bucket_rows(
+            rows,
+            key=lambda row: (
+                row.limit_up_count,
+                row.highest_lb_days,
+                row.yest_limit_count,
+                row.leader_count,
+                row.primary_reason_hits,
+                row.weighted_score,
+                row.auction_amount,
+            ),
+        )
+        turn_ranks = self._rank_bucket_rows(
+            rows,
+            key=lambda row: (
+                row.turn_strong_count,
+                row.strong_lock_count,
+                row.rebound_count,
+                row.avg_current_pct,
+                row.highest_lb_days,
+                row.weighted_score,
+            ),
+        )
+        hot_ranks = self._rank_bucket_rows_by_hot(rows)
+        continuation_ranks = self._rank_bucket_rows(
+            rows,
+            key=lambda row: (
+                row.yest_limit_count,
+                row.highest_lb_days,
+                row.leader_count,
+                row.primary_reason_hits,
+                row.secondary_reason_hits,
+                row.weighted_score,
+            ),
+        )
+        total = len(rows)
+        built: list[AuctionThemeCollisionStat] = []
+        for row in rows:
+            capital_rank = capital_ranks[row.plate_name]
+            limitup_rank = limitup_ranks[row.plate_name]
+            turn_rank = turn_ranks[row.plate_name]
+            hot_rank = hot_ranks[row.plate_name]
+            yesterday_hot_rank = int(yesterday_hot_rank_map.get(row.plate_name, 999) or 999)
+            continuation_rank = continuation_ranks[row.plate_name]
+            hot_points = 0.0
+            if row.hot_rank < 999 or row.hot_strength > 0 or row.hot_net_inflow_yi != 0:
+                hot_points = self._collision_rank_points(hot_rank, total)
+            collision_score = round(
+                self._collision_rank_points(capital_rank, total) * 1.20
+                + self._collision_rank_points(limitup_rank, total) * 1.35
+                + self._collision_rank_points(turn_rank, total) * 1.15
+                + hot_points * 0.95
+                + self._collision_rank_points(continuation_rank, total) * 1.05
+                + min(row.primary_reason_hits, 3) * 0.30
+                + min(row.secondary_reason_hits, 3) * 0.12,
+                4,
+            )
+            expectation_score = self._expected_theme_score(
+                row,
+                yesterday_hot_rank=yesterday_hot_rank,
+                migration=plate_migration_map.get(row.plate_name),
+            )
+            expectation_label, expectation_delta = self._classify_theme_expectation_gap(
+                row,
+                capital_rank=capital_rank,
+                limitup_rank=limitup_rank,
+                turn_rank=turn_rank,
+                hot_rank=hot_rank,
+                yesterday_hot_rank=yesterday_hot_rank,
+                expectation_score=expectation_score,
+            )
+            built.append(
+                AuctionThemeCollisionStat(
+                    plate_name=row.plate_name,
+                    row=row,
+                    capital_rank=capital_rank,
+                    limitup_rank=limitup_rank,
+                    turn_rank=turn_rank,
+                    hot_rank=hot_rank,
+                    yesterday_hot_rank=yesterday_hot_rank,
+                    continuation_rank=continuation_rank,
+                    collision_score=collision_score,
+                    expectation_score=expectation_score,
+                    expectation_delta=expectation_delta,
+                    expectation_label=expectation_label,
+                    signal=self._classify_theme_collision_signal(
+                        row,
+                        capital_rank=capital_rank,
+                        limitup_rank=limitup_rank,
+                        turn_rank=turn_rank,
+                        hot_rank=hot_rank,
+                    ),
+                )
+            )
+        built.sort(
+            key=lambda item: (
+                item.row.generic,
+                -item.expectation_delta,
+                -item.collision_score,
+                item.limitup_rank,
+                item.turn_rank,
+                item.capital_rank,
+                item.hot_rank,
+                item.plate_name,
+            )
+        )
+        return tuple(built)
+
+    @staticmethod
+    def _yesterday_hot_rank_map(context: IntradayContext | None) -> dict[str, int]:
+        if context is None:
+            return {}
+        rank_map: dict[str, int] = {}
+        facts = getattr(context, "session_facts", None)
+        if facts is not None:
+            for fact in getattr(facts, "hot_plate_yesterday", ()):
+                plate_name = normalize_plate_name(getattr(fact, "plate_name", ""))
+                if not plate_name:
+                    continue
+                try:
+                    rank_map[plate_name] = int(getattr(fact, "rank", 999) or 999)
+                except (TypeError, ValueError):
+                    rank_map[plate_name] = 999
+        if rank_map:
+            return rank_map
+        for plate_name, payload in getattr(context, "yesterday_hot_plate_map", {}).items():
+            normalized = normalize_plate_name(plate_name)
+            if not normalized or not isinstance(payload, dict):
+                continue
+            try:
+                rank_map[normalized] = int(payload.get("rank", 999) or 999)
+            except (TypeError, ValueError):
+                rank_map[normalized] = 999
+        return rank_map
+
+    @staticmethod
+    def _expected_theme_score(
+        row: AuctionPlateBucketStat,
+        *,
+        yesterday_hot_rank: int,
+        migration: object | None,
+    ) -> float:
+        score = 0.0
+        if yesterday_hot_rank <= 3:
+            score += max(4 - yesterday_hot_rank, 0) * 1.1
+        elif yesterday_hot_rank <= 6:
+            score += 0.8
+        score += min(row.yest_limit_count, 4) * 0.55
+        if row.highest_lb_days >= 2:
+            score += min(row.highest_lb_days - 1, 3) * 0.45
+        if migration is not None:
+            present_yesterday = bool(getattr(migration, "present_yesterday", False))
+            present_today = bool(getattr(migration, "present_today", False))
+            strength_delta = float(getattr(migration, "strength_delta", 0.0) or 0.0)
+            net_delta = float(getattr(migration, "net_inflow_yi_delta", 0.0) or 0.0)
+            if present_yesterday and present_today and (strength_delta > 0 or net_delta > 0):
+                score += 0.4
+            elif present_yesterday and present_today and (strength_delta < 0 or net_delta < 0):
+                score -= 0.3
+        return round(score, 4)
+
+    @staticmethod
+    def _classify_theme_expectation_gap(
+        row: AuctionPlateBucketStat,
+        *,
+        capital_rank: int,
+        limitup_rank: int,
+        turn_rank: int,
+        hot_rank: int,
+        yesterday_hot_rank: int,
+        expectation_score: float,
+    ) -> tuple[str, float]:
+        has_hot_truth = row.hot_rank < 999 or row.hot_strength > 0 or row.hot_net_inflow_yi != 0
+        hot_top = has_hot_truth and hot_rank <= 2
+        actual_strong = (
+            limitup_rank <= 2
+            and turn_rank <= 2
+            and (capital_rank <= 2 or hot_top)
+            and row.limit_up_count >= 2
+        )
+        actual_core_strong = (
+            row.leader_count >= 1
+            and (
+                (capital_rank <= 2 and row.auction_amount >= 60_000_000)
+                or (hot_top and row.auction_amount >= 50_000_000)
+                or (turn_rank <= 2 and (row.turn_strong_count >= 1 or row.highest_lb_days >= 2))
+            )
+        )
+        actual_good = (
+            capital_rank <= 2
+            or limitup_rank <= 2
+            or turn_rank <= 2
+            or (hot_top and row.auction_amount >= 50_000_000)
+        )
+        has_expectation = expectation_score >= 1.5 or yesterday_hot_rank <= 6 or row.yest_limit_count >= 1
+        strong_expectation = expectation_score >= 2.6 or yesterday_hot_rank <= 3 or row.yest_limit_count >= 2 or row.highest_lb_days >= 3
+        if strong_expectation:
+            if actual_strong:
+                return ("强更强", 2.4)
+            if actual_core_strong:
+                return ("局部超预期", 1.6)
+            if actual_good and (row.turn_strong_count >= 1 or row.leader_count >= 1):
+                return ("符合预期", 1.2)
+            return ("低于预期", -2.2)
+        if has_expectation:
+            if actual_strong:
+                return ("超预期", 2.0)
+            if actual_core_strong:
+                return ("局部超预期", 1.4)
+            if actual_good:
+                return ("有预期差", 0.8)
+            return ("不及预期", -1.4)
+        if actual_strong:
+            return ("超预期", 1.8)
+        if actual_core_strong:
+            return ("新强试错", 1.0)
+        if actual_good and (row.turn_strong_count >= 1 or row.limit_up_count >= 1):
+            return ("新强试错", 0.9)
+        return ("无明显预期差", 0.0)
+
+    @staticmethod
+    def _rank_bucket_rows(
+        rows: Iterable[AuctionPlateBucketStat],
+        *,
+        key,
+    ) -> dict[str, int]:
+        ordered = sorted(rows, key=key, reverse=True)
+        return {row.plate_name: idx + 1 for idx, row in enumerate(ordered)}
+
+    @staticmethod
+    def _rank_bucket_rows_by_hot(rows: Iterable[AuctionPlateBucketStat]) -> dict[str, int]:
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                row.hot_rank if row.hot_rank < 999 else 9999,
+                -row.hot_strength,
+                -row.hot_net_inflow_yi,
+                -row.hot_change_pct,
+                -row.primary_reason_hits,
+                -row.weighted_score,
+            ),
+        )
+        return {row.plate_name: idx + 1 for idx, row in enumerate(ordered)}
+
+    @staticmethod
+    def _collision_rank_points(rank: int, total: int) -> float:
+        if rank <= 0 or total <= 0:
+            return 0.0
+        return float(max(total - rank + 1, 0))
+
+    @staticmethod
+    def _classify_theme_collision_signal(
+        row: AuctionPlateBucketStat,
+        *,
+        capital_rank: int,
+        limitup_rank: int,
+        turn_rank: int,
+        hot_rank: int,
+    ) -> str:
+        capital_top = capital_rank <= 2
+        limit_top = limitup_rank <= 2
+        turn_top = turn_rank <= 2
+        hot_top = hot_rank <= 2 and (row.hot_rank < 999 or row.hot_strength > 0 or row.hot_net_inflow_yi != 0)
+        if limit_top and turn_top and (capital_top or hot_top) and row.limit_up_count >= 2:
+            return "共振主攻"
+        if row.yest_limit_count >= 2 and limit_top and (turn_top or row.highest_lb_days >= 2):
+            return "连板延续"
+        if capital_top and hot_top and row.limit_up_count <= 1:
+            return "资金试错"
+        if hot_top and limit_top and row.limit_up_count >= 2:
+            return "热板补强"
+        if capital_top and not limit_top:
+            return "有量无板"
+        if limit_top and not capital_top:
+            return "有板待放量"
+        return "观察跟踪"
+
+    @staticmethod
+    def _collision_rank_text(row: AuctionPlateBucketStat, rank: int, *, hot: bool = False) -> str:
+        if hot and row.hot_rank >= 999 and row.hot_strength <= 0 and row.hot_net_inflow_yi == 0:
+            return "-"
+        return str(rank)
+
+    def _top_theme_by_capital(self, state: StrategyConsoleState, *, market_scope: bool = False) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_market(state) if market_scope else self._plate_rows_for_decision(state)
         if not rows:
             return None
         return max(
@@ -964,8 +1329,8 @@ class AuctionRuntimeController:
             ),
         )
 
-    def _top_theme_by_limitups(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
-        rows = self._plate_rows_for_decision(state)
+    def _top_theme_by_limitups(self, state: StrategyConsoleState, *, market_scope: bool = False) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_market(state) if market_scope else self._plate_rows_for_decision(state)
         if not rows:
             return None
         return max(
@@ -980,8 +1345,8 @@ class AuctionRuntimeController:
             ),
         )
 
-    def _top_theme_by_turn_strong(self, state: StrategyConsoleState) -> AuctionPlateBucketStat | None:
-        rows = self._plate_rows_for_decision(state)
+    def _top_theme_by_turn_strong(self, state: StrategyConsoleState, *, market_scope: bool = False) -> AuctionPlateBucketStat | None:
+        rows = self._plate_rows_for_market(state) if market_scope else self._plate_rows_for_decision(state)
         if not rows:
             return None
         return max(
@@ -1019,17 +1384,19 @@ class AuctionRuntimeController:
 
     def _render_mainline_board(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
-        capital_row = self._top_theme_by_capital(state)
-        limitup_row = self._top_theme_by_limitups(state)
-        turn_row = self._top_theme_by_turn_strong(state)
-        top = limitup_row or capital_row or turn_row or (state.plate_stats[0] if state.plate_stats else None)
+        market_rows = self._plate_rows_for_market(state)
+        capital_row = self._top_theme_by_capital(state, market_scope=True)
+        limitup_row = self._top_theme_by_limitups(state, market_scope=True)
+        turn_row = self._top_theme_by_turn_strong(state, market_scope=True)
+        top = limitup_row or capital_row or turn_row or (market_rows[0] if market_rows else None)
         main_name = summary.mainline_sector or summary.top_plate_name or (top.plate_name if top else "-")
         main_expect = self._infer_market_mainline_label(summary, main_name)
         secondary_candidates = (
             summary.top_plate_name,
+            limitup_row.plate_name if limitup_row else "",
             capital_row.plate_name if capital_row else "",
             turn_row.plate_name if turn_row else "",
-            next((row.plate_name for row in state.plate_stats if row.plate_name != main_name), ""),
+            next((row.plate_name for row in market_rows if row.plate_name != main_name), ""),
         )
         secondary = next((name for name in secondary_candidates if name and name != main_name), "-")
         scope_lead = limitup_row.plate_name if limitup_row else (top.plate_name if top else "-")
@@ -1043,7 +1410,11 @@ class AuctionRuntimeController:
         scope_secondary = next(
             (
                 row.plate_name
-                for row in (capital_row, turn_row)
+                for row in (
+                    capital_row,
+                    turn_row,
+                    next((row for row in market_rows if row.plate_name != scope_lead), None),
+                )
                 if row is not None and row.plate_name != scope_lead
             ),
             secondary,
@@ -1061,6 +1432,7 @@ class AuctionRuntimeController:
                 "  ◇ 是否切换/迁移 | -- / --",
                 "  ￥ 板块涨幅/净流入 | -- / --",
                 "  ◎ 资金/涨停/转强 | -- / -- / --",
+                "  ◎ 数据对撞 | --",
                 f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
             )
         capital_name = capital_row.plate_name if capital_row else "-"
@@ -1078,6 +1450,7 @@ class AuctionRuntimeController:
             f"  ◇ 是否切换/迁移 | {'是' if summary.mainline_switch else '否'} / {self._migration_text(summary.top_plate_migration_type or '-')}",
             f"  ￥ 板块涨幅/净流入 | {flow_change_text} / {flow_inflow_text}",
             f"  ◎ 资金/涨停/转强 | {capital_name} / {scope_lead} / {turn_name}",
+            f"  ◎ 数据对撞 | {self._collision_brief_text(state)}",
             f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
         )
 
@@ -1132,6 +1505,57 @@ class AuctionRuntimeController:
             f"  ◇ 热门题材数 | {hot_plate_text}",
             f"  ⇄ 延续/新发酵/兑现 | {migration_text}",
         )
+
+    def _render_auction_collision(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        hot_plate_mode = self._hot_plate_render_mode(state)
+        if hot_plate_mode == "fallback":
+            return (
+                "【数据对撞】定位 | 结果",
+                "  - | 当日热板缺失，先不判题材预期差，只看昨日热板延续与高标反馈",
+            )
+        if hot_plate_mode == "missing":
+            return (
+                "【数据对撞】定位 | 结果",
+                "  - | 热点题材缺失，先不判题材预期差，只看昨日涨停反馈与高标承接",
+            )
+        if not self._auction_anchor_ready(state) and not self._yest_limit_ready(state):
+            return (
+                "【数据对撞】定位 | 结果",
+                "  - | 竞价锚点和昨日涨停池未就绪，先不判题材预期差，等竞价额与昨板反馈补齐",
+            )
+        if not self._auction_anchor_ready(state):
+            return (
+                "【数据对撞】定位 | 结果",
+                "  - | 竞价锚点未就绪，先不判题材预期差，等真实竞价额和前排承接确认",
+            )
+        if not self._yest_limit_ready(state):
+            return (
+                "【数据对撞】定位 | 结果",
+                "  - | 昨日涨停池未就绪，先不判题材预期差，等昨板反馈和连板承接补齐",
+            )
+        collision_rows = self._theme_collision_rows(state)
+        if not collision_rows:
+            return ("【数据对撞】暂无题材样本",)
+        rows = ["【数据对撞】定位 | 题材 | 资金/涨停/转强/热板 | 昨热/昨板/涨停/转强 | 红绿/均涨 | 结果 | 预期差 | 代表"]
+        for item in collision_rows[:4]:
+            row = item.row
+            leader, assist, _ = self._theme_internal_names(state, row.plate_name)
+            hot_rank = self._collision_rank_text(row, item.hot_rank, hot=True)
+            yest_hot_rank = self._collision_rank_text(row, item.yesterday_hot_rank, hot=True)
+            breadth_text = f"{self._theme_red_green_ratio_text(row)}/{self._fmt_pct(row.avg_current_pct)}"
+            front = " ; ".join(name for name in (leader, assist) if name and name != "-") or "-"
+            rows.append(
+                "  "
+                f"{self._plate_role_text(row)}"
+                f" | {row.plate_name}"
+                f" | {item.capital_rank}/{item.limitup_rank}/{item.turn_rank}/{hot_rank}"
+                f" | {yest_hot_rank}/{row.yest_limit_count}/{row.limit_up_count}/{row.turn_strong_count}"
+                f" | {breadth_text}"
+                f" | {item.signal}"
+                f" | {item.expectation_label}"
+                f" | {front}"
+            )
+        return tuple(rows)
 
     def _render_auction_attack_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
@@ -1225,23 +1649,50 @@ class AuctionRuntimeController:
     def _render_auction_plan(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
         hot_plate_mode = self._hot_plate_render_mode(state)
-        capital_row = self._top_theme_by_capital(state)
-        limitup_row = self._top_theme_by_limitups(state)
-        turn_row = self._top_theme_by_turn_strong(state)
+        expectation_ready = self._expectation_ready(state)
+        collision_row = self._top_theme_by_collision(state) if expectation_ready else None
+        capital_row = self._top_theme_by_capital(state, market_scope=True)
+        limitup_row = self._top_theme_by_limitups(state, market_scope=True)
+        turn_row = self._top_theme_by_turn_strong(state, market_scope=True)
         anchor_text = (
             f"{capital_row.plate_name if capital_row else '-'} / "
             f"{limitup_row.plate_name if limitup_row else '-'} / "
             f"{turn_row.plate_name if turn_row else '-'}"
         )
+        collision_text = self._collision_brief_text(state)
         if hot_plate_mode == "fallback":
             plan = "当日热板缺失，先看昨日热板延续与高标承接，不判主攻切换。"
             style = "观察盘"
         elif hot_plate_mode == "missing":
             plan = "热点题材缺失，先看昨日涨停反馈与高标承接，不判主攻切换。"
             style = "观察盘"
+        elif not self._auction_anchor_ready(state) and not self._yest_limit_ready(state):
+            plan = "竞价锚点和昨日涨停池都未补齐，先看高标承接和资金前排，不提前判主攻。"
+            style = "观察盘"
+        elif not self._auction_anchor_ready(state):
+            plan = "竞价锚点未就绪，先看昨日热板延续与高标承接，不提前判主攻。"
+            style = "观察盘"
+        elif not self._yest_limit_ready(state):
+            plan = "昨日涨停池未就绪，先看竞价额前排和高标承接，等昨板反馈补齐再判主攻。"
+            style = "观察盘"
         elif summary.headshot_rate >= 0.12:
             plan = "更像昨日兑现盘，只盯核心龙头是否超预期，不接后排扩散。"
             style = "兑现盘"
+        elif collision_row is not None and collision_row.expectation_label in {"低于预期", "不及预期"}:
+            plan = f"{collision_row.plate_name} 虽然还在前排，但承接与转强弱于预期，先看高标反馈，不急着出手。"
+            style = "观察盘"
+        elif collision_row is not None and collision_row.signal == "共振主攻":
+            plan = f"数据对撞共振指向 {collision_row.plate_name}，且竞价表现{collision_row.expectation_label}，优先看前排回封、连板承接和最强换手。"
+            style = "主攻盘"
+        elif collision_row is not None and collision_row.signal == "连板延续":
+            plan = f"{collision_row.plate_name} 更像连板延续，当前属于{collision_row.expectation_label}，先看高标反馈和一进二承接，不抢后排。"
+            style = "延续盘"
+        elif collision_row is not None and collision_row.signal in {"资金试错", "有量无板"}:
+            plan = f"{collision_row.plate_name} 量能先到但封板成队不足，属于{collision_row.expectation_label}，先等开盘确认，不提前抢跑。"
+            style = "试错盘"
+        elif collision_row is not None and collision_row.signal == "有板待放量":
+            plan = f"{collision_row.plate_name} 有板有梯队，但资金共振还不够，先看分歧后的承接强弱。"
+            style = "观察盘"
         elif (
             capital_row is not None
             and limitup_row is not None
@@ -1272,6 +1723,7 @@ class AuctionRuntimeController:
         return (
             "【竞价预案】维度 | 内容",
             f"  盘面归类 | {style}",
+            f"  数据对撞 | {collision_text}",
             f"  主攻锚点 | 资金/涨停/转强 = {anchor_text}",
             f"  操作预案 | {plan}",
         )
@@ -2163,10 +2615,16 @@ class AuctionRuntimeController:
             if len(validated) >= 3:
                 break
         plate_checks: list[str] = []
-        for row in eval_state.plate_stats[:3]:
+        collision_rows = self._theme_collision_rows(eval_state)[:3] if self._expectation_ready(eval_state) else ()
+        for item in collision_rows:
+            row = item.row
             representative = self._snapshot_name_by_symbol_compact(eval_state, row.sample_symbols[0]) if row.sample_symbols else "-"
+            hot_rank = self._collision_rank_text(row, item.hot_rank, hot=True)
+            yest_hot_rank = self._collision_rank_text(row, item.yesterday_hot_rank, hot=True)
             plate_checks.append(
-                f"{row.plate_name}(额{self._fmt_amount_yi_precise(row.auction_amount)}/竞价样本{row.auction_symbol_count}/昨板{row.yest_limit_count}/代表{representative})"
+                f"{row.plate_name}(额{self._fmt_amount_yi_precise(row.auction_amount)}/竞价样本{row.auction_symbol_count}/昨热{yest_hot_rank}/昨板{row.yest_limit_count}/代表{representative})"
+                f"/对撞{item.signal}/预期差{item.expectation_label}/资金{item.capital_rank}/涨停{item.limitup_rank}/转强{item.turn_rank}/热板{hot_rank}"
+                f"/位次{item.capital_rank}/{item.limitup_rank}/{item.turn_rank}/{hot_rank}"
             )
         return {
             "trade_date": eval_state.context.trade_date,
@@ -2592,15 +3050,16 @@ class AuctionRuntimeController:
     def _render_auction_execution_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if state.bundle is None:
             return ("【竞价预案拆解】候选样本尚未就绪",)
+        ordered_decisions = self._focus_ordered_decisions(state, phase_label="auction")
         attack = [
             decision
-            for decision in state.bundle.decisions
+            for decision in ordered_decisions
             if decision.action in ("dragon_early_board", "early_boarding_candidate")
         ][:3]
-        hold = [decision for decision in state.bundle.decisions if decision.action == "hold_only"][:3]
+        hold = [decision for decision in ordered_decisions if decision.action == "hold_only"][:3]
         avoid = [
             decision
-            for decision in state.bundle.decisions
+            for decision in ordered_decisions
             if decision.action in ("avoid_after_failed_promotion", "do_not_chase")
         ][:3]
         attack_text = " ; ".join(
@@ -2633,7 +3092,7 @@ class AuctionRuntimeController:
             buy_parts.append(self._format_focus_item(decision, snapshot, action=action, plate=plate, evidence=evidence))
 
         ordered_decisions = self._focus_ordered_decisions(state, phase_label=phase_label)
-        preferred_plates = self._focus_priority_plates(state) if phase_label == "postmarket" else ()
+        preferred_plates = self._focus_priority_plates(state) if phase_label in {"auction", "auction_preview", "opening", "postmarket"} else ()
         alt_parts: list[str] = []
         for decision in ordered_decisions:
             if decision.symbol in selected_symbols:
@@ -2730,7 +3189,7 @@ class AuctionRuntimeController:
         if state.bundle is None:
             return ()
         decisions = tuple(state.bundle.decisions)
-        if phase_label != "postmarket":
+        if phase_label not in {"auction", "auction_preview", "opening", "postmarket"}:
             return decisions
         preferred_plates = self._focus_priority_plates(state)
         if not preferred_plates:
@@ -2742,11 +3201,28 @@ class AuctionRuntimeController:
                 matched.append(decision)
             else:
                 remainder.append(decision)
-        return tuple(matched + remainder) if matched else decisions
+        if not matched:
+            return decisions
+        if self._expectation_ready(state) and phase_label in {"auction", "auction_preview", "opening"}:
+            preserved = [
+                decision
+                for decision in remainder
+                if decision.action in {"avoid_after_failed_promotion", "do_not_chase", "hold_only"}
+            ]
+            return tuple(matched + preserved)
+        return tuple(matched + remainder)
 
     def _focus_priority_plates(self, state: StrategyConsoleState) -> tuple[str, ...]:
-        summary = state.context.market_summary
         ordered: list[str] = []
+        positive_labels = {"强更强", "超预期", "局部超预期", "符合预期", "有预期差", "新强试错"}
+        if self._expectation_ready(state):
+            for item in self._theme_collision_rows(state):
+                if item.expectation_label not in positive_labels:
+                    continue
+                name = normalize_plate_name(item.plate_name)
+                if name and name != "-" and name not in ordered:
+                    ordered.append(name)
+        summary = state.context.market_summary
         for raw_name in (
             summary.mainline_sector,
             summary.top_plate_name,

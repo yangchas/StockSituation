@@ -219,6 +219,16 @@ class IntradayContextBuilder:
 
         theme_candidates = tuple(name for name, _ in candidate_entries)
         fallback = str(yest_plate or runtime_plate or next(iter(theme_candidates), "")).strip()
+        runtime_tokens = _usable_tokens(runtime_plate)
+        yest_tokens = _usable_tokens(yest_plate)
+        theme_front = tuple(dict.fromkeys(theme_candidates[:2]))
+        runtime_primary = runtime_tokens[0] if runtime_tokens else ""
+        yest_primary = yest_tokens[0] if yest_tokens else ""
+        if runtime_primary and runtime_primary in theme_front:
+            if yest_primary and yest_primary == runtime_primary:
+                return runtime_primary
+            if yest_primary and yest_primary not in theme_front and is_generic_plate(yest_primary):
+                return runtime_primary
         preferred = [entry for entry in candidate_entries if not is_generic_plate(entry[0])]
         if hot_plate_map and preferred:
             ranked = sorted(
@@ -472,6 +482,8 @@ class IntradayContextBuilder:
             speed_1m = float(rust_row.get("speed_1m", 0.0) or 0.0)
             if speed_1m == 0.0 and tick_metrics is not None:
                 speed_1m = float(tick_metrics.speed_1m)
+            if speed_1m == 0.0:
+                speed_1m = float(quote.get("speed_1m", quote.get("change_rate_1min", 0.0)) or 0.0)
             if speed_1m == 0.0:
                 speed_1m = float(cache.get("speed_1m", 0.0) or 0.0)
             amount_2m = float(rust_row.get("amount_2m", 0.0) or 0.0)

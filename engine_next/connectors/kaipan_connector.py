@@ -422,6 +422,7 @@ class KaipanConnector:
         *,
         existing_themes: Sequence[str] = (),
         fallback_plate: str = "",
+        pool_plate: str = "",
     ) -> dict[str, dict[str, Any]]:
         normalized_rows = self.normalize_ban_reasons(reasons)
         symbol = next((str(row.get("symbol") or "") for row in normalized_rows if row.get("symbol")), "")
@@ -430,4 +431,5 @@ class KaipanConnector:
             reason_rows=normalized_rows,
             existing_themes=existing_themes,
             fallback_plate=fallback_plate,
+            pool_plate=pool_plate,
         )
