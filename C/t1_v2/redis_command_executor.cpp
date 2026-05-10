@@ -25,6 +25,32 @@ HiredisRedisCommandExecutor::~HiredisRedisCommandExecutor() {
     disconnect();
 }
 
+RedisExecutionResult HiredisRedisCommandExecutor::preflight() {
+    RedisExecutionResult result;
+    if (!connect(result)) {
+        return result;
+    }
+    redisReply* reply = static_cast<redisReply*>(redisCommand(context_, "PING"));
+    if (!reply) {
+        result.ok = false;
+        result.error = context_ && context_->errstr ? context_->errstr : "redis ping failed";
+        disconnect();
+        return result;
+    }
+    const bool ok = reply->type == REDIS_REPLY_STATUS && reply->str && std::string(reply->str) == "PONG";
+    if (!ok) {
+        result.ok = false;
+        result.error = reply->str ? reply->str : "redis ping failed";
+    }
+    freeReplyObject(reply);
+    if (!ok) {
+        disconnect();
+        return result;
+    }
+    result.ok = true;
+    return result;
+}
+
 RedisExecutionResult HiredisRedisCommandExecutor::execute(const std::vector<RedisCommand>& commands) {
     RedisExecutionResult result;
     if (commands.empty()) {

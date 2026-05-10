@@ -48,6 +48,8 @@ public:
     RuntimeLoopStats run();
 
 private:
+    bool should_preflight_redis() const;
+    bool should_preflight_tdengine() const;
     bool should_stop_after_empty(RuntimeLoopStats& stats) const;
     bool should_ack_source() const;
     bool has_runtime_bound() const;

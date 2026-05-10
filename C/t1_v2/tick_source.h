@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 #include "source_tick_batch_builder.h"
 #include "tick_batch.h"
@@ -32,6 +33,7 @@ public:
     virtual void stop() = 0;
     virtual TickSourceResult next_batch() = 0;
     virtual RuntimeMode mode() const = 0;
+    virtual std::string error_message() const { return ""; }
     virtual bool ack(const TickSourceResult& result) {
         (void)result;
         return true;

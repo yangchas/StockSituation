@@ -161,6 +161,10 @@ private:
 
 class FailingRedisCommandExecutor final : public IRedisCommandExecutor {
 public:
+    RedisExecutionResult preflight() override {
+        return {};
+    }
+
     RedisExecutionResult execute(const std::vector<RedisCommand>& commands) override {
         RedisExecutionResult result;
         result.command_count = static_cast<int>(commands.size());

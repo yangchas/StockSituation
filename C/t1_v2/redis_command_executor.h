@@ -22,11 +22,16 @@ struct RedisExecutionResult {
 class IRedisCommandExecutor {
 public:
     virtual ~IRedisCommandExecutor() = default;
+    virtual RedisExecutionResult preflight() = 0;
     virtual RedisExecutionResult execute(const std::vector<RedisCommand>& commands) = 0;
 };
 
 class NullRedisCommandExecutor final : public IRedisCommandExecutor {
 public:
+    RedisExecutionResult preflight() override {
+        return {};
+    }
+
     RedisExecutionResult execute(const std::vector<RedisCommand>& commands) override {
         RedisExecutionResult result;
         result.ok = true;
@@ -41,6 +46,7 @@ public:
     explicit HiredisRedisCommandExecutor(const ConfigV2& config);
     ~HiredisRedisCommandExecutor() override;
 
+    RedisExecutionResult preflight() override;
     RedisExecutionResult execute(const std::vector<RedisCommand>& commands) override;
     void disconnect();
     bool is_connected() const { return context_ != nullptr; }

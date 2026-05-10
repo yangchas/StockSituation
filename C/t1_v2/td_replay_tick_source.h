@@ -23,6 +23,7 @@ public:
     void stop() override;
     TickSourceResult next_batch() override;
     RuntimeMode mode() const override { return RuntimeMode::Replay; }
+    std::string error_message() const override { return last_error_; }
 
 private:
     bool connect();

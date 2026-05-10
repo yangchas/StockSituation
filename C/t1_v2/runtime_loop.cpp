@@ -1,6 +1,7 @@
 #include "runtime_loop.h"
 
 #include <chrono>
+#include <iostream>
 #include <thread>
 
 namespace t1_v2 {
@@ -34,11 +35,30 @@ RuntimeLoopStats RuntimeLoop::run() {
         stats.error = "runtime pipeline initialize failed";
         return stats;
     }
+    const RuntimePreflightResult preflight = coordinator_.preflight(
+        should_preflight_redis(),
+        should_preflight_tdengine()
+    );
+    if (!preflight.ok) {
+        pipeline_.shutdown();
+        stats.ok = false;
+        stats.error = preflight.error.empty() ? "runtime preflight failed" : preflight.error;
+        return stats;
+    }
     if (!source_->start()) {
         pipeline_.shutdown();
         stats.ok = false;
-        stats.error = "tick source is not ready";
+        const std::string source_error = source_->error_message();
+        stats.error = source_error.empty() ? "tick source is not ready" : source_error;
         return stats;
+    }
+    if (config_.logging.verbose) {
+        std::cout << "t1_v2 preflight | mode="
+                  << (config_.runtime_mode == RuntimeMode::Replay ? "replay" : "live")
+                  << " | redis=" << (preflight.redis_checked ? "ok" : "skip")
+                  << " | tdengine=" << (preflight.tdengine_checked ? "ok" : "skip")
+                  << " | source=ok"
+                  << std::endl;
     }
 
     while (true) {
@@ -120,6 +140,20 @@ RuntimeLoopStats RuntimeLoop::run() {
     source_->stop();
     pipeline_.shutdown();
     return stats;
+}
+
+bool RuntimeLoop::should_preflight_redis() const {
+    if (config_.processing.dry_run) {
+        return false;
+    }
+    return config_.runtime_mode != RuntimeMode::Replay || config_.replay.write_redis;
+}
+
+bool RuntimeLoop::should_preflight_tdengine() const {
+    if (config_.processing.dry_run) {
+        return false;
+    }
+    return config_.runtime_mode != RuntimeMode::Replay || config_.replay.write_tdengine;
 }
 
 bool RuntimeLoop::should_stop_after_empty(RuntimeLoopStats& stats) const {

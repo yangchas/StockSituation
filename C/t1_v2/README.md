@@ -16,6 +16,21 @@ and RabbitMQ.
 Default run is live mode: consume RabbitMQ, compute v2 metrics, write TDengine,
 write Redis, then ack source messages after downstream success.
 
+Live startup performs a mandatory preflight before entering the main loop:
+
+- Redis `PING`
+- TDengine connection to the configured database
+- RabbitMQ connection plus consumer startup
+
+On success it prints:
+
+```text
+t1_v2 preflight | mode=live | redis=ok | tdengine=ok | source=ok
+```
+
+Any failed connection exits immediately with a non-zero code and an error on
+stderr.
+
 ## Replay
 
 ```bash

@@ -10,6 +10,15 @@ TaosTDengineCommandExecutor::~TaosTDengineCommandExecutor() {
     disconnect();
 }
 
+TDengineExecutionResult TaosTDengineCommandExecutor::preflight() {
+    TDengineExecutionResult result;
+    if (!connect(result)) {
+        return result;
+    }
+    result.ok = true;
+    return result;
+}
+
 TDengineExecutionResult TaosTDengineCommandExecutor::execute(const std::vector<std::string>& statements) {
     TDengineExecutionResult result;
     if (statements.empty()) {

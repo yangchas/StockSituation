@@ -18,6 +18,7 @@ public:
     void stop() override;
     TickSourceResult next_batch() override;
     RuntimeMode mode() const override { return RuntimeMode::Live; }
+    std::string error_message() const override { return last_error_; }
     bool ack(const TickSourceResult& result) override;
     bool reject(const TickSourceResult& result, bool requeue) override;
 

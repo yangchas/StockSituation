@@ -7,6 +7,30 @@ RuntimeExecutionCoordinator::RuntimeExecutionCoordinator(
     ITDengineCommandExecutor& tdengine_executor
 ) : redis_executor_(redis_executor), tdengine_executor_(tdengine_executor) {}
 
+RuntimePreflightResult RuntimeExecutionCoordinator::preflight(bool check_redis, bool check_tdengine) {
+    RuntimePreflightResult result;
+    if (check_redis) {
+        result.redis_checked = true;
+        result.redis = redis_executor_.preflight();
+        if (!result.redis.ok) {
+            result.ok = false;
+            result.error = "redis preflight failed: " + result.redis.error;
+            return result;
+        }
+    }
+    if (check_tdengine) {
+        result.tdengine_checked = true;
+        result.tdengine = tdengine_executor_.preflight();
+        if (!result.tdengine.ok) {
+            result.ok = false;
+            result.error = "tdengine preflight failed: " + result.tdengine.error;
+            return result;
+        }
+    }
+    result.ok = true;
+    return result;
+}
+
 RuntimeExecutionResult RuntimeExecutionCoordinator::execute_and_commit(
     RuntimePipeline& pipeline,
     const RuntimePipelineResult& batch_result

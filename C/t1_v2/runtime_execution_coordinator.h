@@ -15,10 +15,20 @@ struct RuntimeExecutionResult {
     TDengineExecutionResult tdengine;
 };
 
+struct RuntimePreflightResult {
+    bool ok = true;
+    bool redis_checked = false;
+    bool tdengine_checked = false;
+    RedisExecutionResult redis;
+    TDengineExecutionResult tdengine;
+    std::string error;
+};
+
 class RuntimeExecutionCoordinator {
 public:
     RuntimeExecutionCoordinator(IRedisCommandExecutor& redis_executor, ITDengineCommandExecutor& tdengine_executor);
 
+    RuntimePreflightResult preflight(bool check_redis, bool check_tdengine);
     RuntimeExecutionResult execute_and_commit(RuntimePipeline& pipeline, const RuntimePipelineResult& batch_result);
 
 private:

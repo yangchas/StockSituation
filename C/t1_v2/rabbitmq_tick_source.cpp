@@ -39,9 +39,8 @@ bool RabbitMqTickSource::start() {
     started_ = false;
     return false;
 #elif defined(T1_V2_ENABLE_RABBITMQ)
-    // Lazy-connect in next_batch() so a temporary RabbitMQ outage does not kill the process.
-    started_ = true;
-    return true;
+    started_ = connect();
+    return started_;
 #else
     last_error_ = "RabbitMqTickSource requires --with-rabbitmq";
     started_ = false;

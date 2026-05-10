@@ -20,11 +20,16 @@ struct TDengineExecutionResult {
 class ITDengineCommandExecutor {
 public:
     virtual ~ITDengineCommandExecutor() = default;
+    virtual TDengineExecutionResult preflight() = 0;
     virtual TDengineExecutionResult execute(const std::vector<std::string>& statements) = 0;
 };
 
 class NullTDengineCommandExecutor final : public ITDengineCommandExecutor {
 public:
+    TDengineExecutionResult preflight() override {
+        return {};
+    }
+
     TDengineExecutionResult execute(const std::vector<std::string>& statements) override {
         TDengineExecutionResult result;
         result.ok = true;
@@ -39,6 +44,7 @@ public:
     explicit TaosTDengineCommandExecutor(const ConfigV2& config);
     ~TaosTDengineCommandExecutor() override;
 
+    TDengineExecutionResult preflight() override;
     TDengineExecutionResult execute(const std::vector<std::string>& statements) override;
     void disconnect();
     bool is_connected() const { return conn_ != nullptr; }
