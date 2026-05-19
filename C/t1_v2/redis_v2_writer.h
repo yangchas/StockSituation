@@ -51,16 +51,26 @@ public:
         const SnapshotTriggerState& trigger,
         int64_t logical_ts_ms
     ) const;
-    std::vector<RedisCommand> build_runtime_commands(const RuntimeBatchStats& stats, RuntimeMode mode) const;
+    std::vector<RedisCommand> build_runtime_commands(
+        const QuoteStateStore& store,
+        const RuntimeBatchStats& stats,
+        RuntimeMode mode
+    ) const;
 
 private:
     static std::string to_string_i64(int64_t value);
     static std::string to_string_i32(int value);
     static std::string trade_date_yyyymmdd(int64_t ts_ms);
+    static std::string trade_date_iso8601(int64_t ts_ms);
     static std::string auction_tag_from_trigger(const SnapshotTriggerState& trigger);
     static int change_bp(const QuoteState& state);
     static bool is_equity_alias_state(const QuoteState& state);
     static std::string change_pct_string(const QuoteState& state);
+    std::string build_open_2m_summary_json(
+        const QuoteStateStore& store,
+        int64_t logical_ts_ms,
+        std::string* trade_date_iso = nullptr
+    ) const;
     std::string build_a2_meta_json(const std::string& tag, int64_t logical_ts_ms, int row_count) const;
     std::string build_top_json(const std::vector<const QuoteState*>& rows) const;
     std::string build_legacy_summary_json(

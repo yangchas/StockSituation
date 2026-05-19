@@ -9,9 +9,9 @@ def fetch_weekly_reports(time_code):
     """
     base_url = "http://taskcoll.simforge.cn/prod-api/performance/weeklydetl/list"
     headers = {
-        "Authorization": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJsb2dpbl91c2VyX2tleSI6IjIzYmVlNjc3LTk5MTgtNDRmMC1hZWUwLWE4NjQ5NDU5MWVhMiJ9.MIi6TlZ25-E8_fH-RJOqOuZti7UrolnBXBx5Wiq2N7pNgC8-KTbf8XHFJgvdyXBxA76EmcSZFYI9EGJNYILdhA",
+        "Authorization": "Bearer eyJhbGciOiJIUzUxMiJ9.eyJsb2dpbl91c2VyX2tleSI6IjFmMDYyMjU1LWNiYTgtNGQ2ZS1iODgwLTgyMjJmNzMwNGNiMyJ9.OX6jHoDjgzjPKuSFaLsIcSIk84tcJtIDIQzPqa9s-KqfISRXVxetU1mOj_aAKshUqLn-ijAA2fNnwGqw_845bg",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-        "Cookie": "Admin-Token=eyJhbGciOiJIUzUxMiJ9.eyJsb2dpbl91c2VyX2tleSI6IjIzYmVlNjc3LTk5MTgtNDRmMC1hZWUwLWE4NjQ5NDU5MWVhMiJ9.MIi6TlZ25-E8_fH-RJOqOuZti7UrolnBXBx5Wiq2N7pNgC8-KTbf8XHFJgvdyXBxA76EmcSZFYI9EGJNYILdhA; sidebarStatus=0"
+        "Cookie": "Admin-Token=eyJhbGciOiJIUzUxMiJ9.eyJsb2dpbl91c2VyX2tleSI6IjFmMDYyMjU1LWNiYTgtNGQ2ZS1iODgwLTgyMjJmNzMwNGNiMyJ9.OX6jHoDjgzjPKuSFaLsIcSIk84tcJtIDIQzPqa9s-KqfISRXVxetU1mOj_aAKshUqLn-ijAA2fNnwGqw_845bg; sidebarStatus=0"
     }
     
     params = {
@@ -97,7 +97,7 @@ def save_to_csv(data, filename):
 
 def main():
     # 配置要获取的年份
-    target_year = 2025
+    target_year = 2023
     
     print(f"开始获取 {target_year} 年所有周报数据...")
     

@@ -79,6 +79,15 @@ FACTOR_FIELDS = (
     "vol_ratio",
     "rsi_6",
     "concentration",
+    "structure_score_base",
+    "shape_platform_ready",
+    "shape_breakout_ready",
+    "shape_repair_ready",
+    "shape_overheat_risk",
+    "shape_chip_cleanliness",
+    "shape_trend_health",
+    "shape_t2_repair_bias",
+    "theme_core_base",
 )
 
 

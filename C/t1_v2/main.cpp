@@ -47,7 +47,28 @@ int main(int argc, char* argv[]) {
     RuntimeLoop loop(config, std::move(source), redis_executor, tdengine_executor, options);
     const RuntimeLoopStats stats = loop.run();
     if (!stats.ok) {
-        std::cerr << stats.error << std::endl;
+        std::cerr << "t1_v2 fatal"
+                  << " | stage=" << (stats.failure_stage.empty() ? "-" : stats.failure_stage)
+                  << " | error=" << (stats.error.empty() ? "-" : stats.error)
+                  << " | source_error=" << (stats.source_error.empty() ? "-" : stats.source_error)
+                  << " | batches=" << stats.batches
+                  << " | empty=" << stats.empty_polls
+                  << " | source_errs=" << stats.source_errors
+                  << " | ack=" << stats.source_acks
+                  << " | ack_fail=" << stats.source_ack_failures
+                  << " | reject=" << stats.source_rejects
+                  << " | reject_fail=" << stats.source_reject_failures
+                  << " | ticks=" << stats.ticks
+                  << " | redis_cmds=" << stats.redis_commands
+                  << " | td_sql=" << stats.tdengine_statements
+                  << " | redis_committed=" << stats.redis_committed_quotes
+                  << " | last_in=" << stats.last_batch_source_input
+                  << " | last_reject=" << stats.last_batch_source_rejected
+                  << " | last_ticks=" << stats.last_batch_ticks
+                  << " | last_redis=" << stats.last_batch_redis_commands
+                  << " | last_td=" << stats.last_batch_tdengine_statements
+                  << " | last_ts_ms=" << stats.last_batch_logical_ts_ms
+                  << std::endl;
         return 3;
     }
     if (config.logging.verbose) {

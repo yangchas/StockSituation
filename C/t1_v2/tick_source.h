@@ -13,6 +13,7 @@ enum class TickSourceStatus : uint8_t {
     Empty = 1,
     EndOfStream = 2,
     Error = 3,
+    Skipped = 4,
 };
 
 struct TickSourceResult {

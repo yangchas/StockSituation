@@ -11,6 +11,8 @@ EngineCore::~EngineCore() {
 bool EngineCore::initialize() {
     quote_store_ = std::make_unique<QuoteStateStore>();
     snapshot_trigger_ = std::make_unique<SnapshotTrigger>(config_);
+    last_batch_phase_ = MarketPhase::Premarket;
+    has_last_batch_phase_ = false;
     initialized_ = true;
     return true;
 }
@@ -18,6 +20,8 @@ bool EngineCore::initialize() {
 void EngineCore::shutdown() {
     quote_store_.reset();
     snapshot_trigger_.reset();
+    last_batch_phase_ = MarketPhase::Premarket;
+    has_last_batch_phase_ = false;
     initialized_ = false;
 }
 
@@ -35,6 +39,11 @@ EngineProcessStats EngineCore::on_batch(const TickBatch& batch) {
     }
 
     quote_store_->begin_batch();
+    if (!has_last_batch_phase_ || stats.phase != last_batch_phase_) {
+        refresh_phase_for_active_quotes(stats.phase);
+        last_batch_phase_ = stats.phase;
+        has_last_batch_phase_ = true;
+    }
     for (const RawTick& tick : batch.ticks) {
         QuoteState& state = quote_store_->get_or_create(tick);
         const int previous_px = state.px_milli;
@@ -77,6 +86,19 @@ EngineProcessStats EngineCore::on_batch(const TickBatch& batch) {
     }
     stats.new_symbol_count = quote_store_->last_batch_symbol_count();
     return stats;
+}
+
+void EngineCore::refresh_phase_for_active_quotes(MarketPhase phase) {
+    if (!quote_store_) {
+        return;
+    }
+    quote_store_->for_each_active([phase](QuoteState& state) {
+        if (state.phase == phase) {
+            return;
+        }
+        state.phase = phase;
+        state.dirty_mask |= DIRTY_RUNTIME;
+    });
 }
 
 const QuoteStateStore& EngineCore::quote_store() const {

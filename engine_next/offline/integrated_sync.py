@@ -274,8 +274,9 @@ class FactorComputationService:
         payload["ts"] = f"{target_date} 00:00:00"
         payload["symbol"] = symbol
         payload["source"] = "chip_batch_runner"
-        payload.setdefault("profit_ratio", payload.get("change_pct_5d", 0.0))
-        payload.setdefault("concentration", 0.0)
+        payload["profit_ratio"] = float(payload.get("profit_ratio", 0.0) or 0.0)
+        payload["concentration"] = float(payload.get("concentration", 0.0) or 0.0)
+        payload["avg_cost"] = float(payload.get("avg_cost", 0.0) or 0.0)
         return FactorResult(
             symbol=symbol,
             trade_date=target_date,

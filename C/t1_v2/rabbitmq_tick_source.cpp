@@ -88,6 +88,15 @@ TickSourceResult RabbitMqTickSource::next_batch() {
         result.delivery_tag = delivery_tag;
         if (!decoded.ok) {
             last_error_ = decoded.error.empty() ? "RabbitMQ body decode failed" : decoded.error;
+            result.source_stats = decoded.build_stats;
+            if (decoded.build_stats.input_count > 0 &&
+                decoded.build_stats.accepted_count == 0 &&
+                decoded.build_stats.rejected_count == decoded.build_stats.input_count) {
+                result.status = TickSourceStatus::Skipped;
+                result.requeue_on_error = false;
+                result.error_msg = last_error_.c_str();
+                return result;
+            }
             result.status = TickSourceStatus::Error;
             result.requeue_on_error = !redelivered;
             result.error_msg = last_error_.c_str();

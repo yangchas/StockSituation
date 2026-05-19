@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
 
-from engine_next.connectors import KaipanConnector, WencaiConnector
+from engine_next.connectors import KaipanConnector, ThsHotConnector, WencaiConnector
 from engine_next.domain.enums import FetchIntent, RunPhase
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
@@ -37,6 +37,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def normalize_auction_pct_ratio(value: Any) -> float:
+    """Normalize stock auction change values to ratio units.
+
+    Legacy auction feeds have used three scales in Redis:
+    ratio (0.0997), percent points (9.97), and occasionally basis points
+    (997).  Strategy snapshots expect ratio units, while marginal deltas are
+    converted back to percentage points at the delta boundary.
+    """
+
+    raw = _safe_float(value, 0.0)
+    abs_raw = abs(raw)
+    if abs_raw <= 0.35:
+        return raw
+    if abs_raw <= 30.0:
+        return raw / 100.0
+    return raw / 10000.0
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -82,12 +100,14 @@ class IntradayDataHub:
         *,
         redis_client: Any | None = None,
         kaipan_connector: KaipanConnector | None = None,
+        ths_hot_connector: ThsHotConnector | None = None,
         wencai_connector: WencaiConnector | None = None,
         tdengine_auction_fetcher: Callable[[str], Sequence[dict[str, Any]]] | None = None,
         wencai_auction_fetcher: Callable[[str], Sequence[dict[str, Any]]] | None = None,
     ) -> None:
         self._redis = redis_client
         self._kaipan = kaipan_connector
+        self._ths_hot = ths_hot_connector
         self._wencai = wencai_connector
         self._tdengine_auction_fetcher = tdengine_auction_fetcher
         self._wencai_auction_fetcher = wencai_auction_fetcher
@@ -112,6 +132,12 @@ class IntradayDataHub:
         if self._wencai is None:
             self._wencai = WencaiConnector()
         return self._wencai
+
+    @property
+    def ths_hot(self) -> ThsHotConnector:
+        if self._ths_hot is None:
+            self._ths_hot = ThsHotConnector()
+        return self._ths_hot
 
     def _read_json_string_key(self, key: str) -> Any | None:
         raw = self.redis.get(key)
@@ -175,6 +201,9 @@ class IntradayDataHub:
         is_auction = phase == 1
         auction_amount = _safe_float(quote.get("am", 0.0)) if is_auction else 0.0
         bid_amount = _safe_float(quote.get("br", 0.0)) if is_auction else 0.0
+        q2_auction_amount = _safe_float(quote.get("am", 0.0))
+        q2_auction_bid_amount = _safe_float(quote.get("br", 0.0))
+        q2_auction_ask_amount = _safe_float(quote.get("ar", 0.0))
         speed_1m = _safe_int(quote.get("spd1m", 0)) / 10000.0
         return {
             "symbol": symbol,
@@ -190,6 +219,12 @@ class IntradayDataHub:
             "auction_amount_yuan": auction_amount,
             "bid_amount_yuan": bid_amount,
             "ask_amount_yuan": _safe_float(quote.get("ar", 0.0)) if is_auction else 0.0,
+            "q2_a20_milli": _safe_int(quote.get("a20", 0)),
+            "q2_a24_milli": _safe_int(quote.get("a24", 0)),
+            "q2_a25_milli": _safe_int(quote.get("a25", 0)),
+            "q2_auction_amount_yuan": q2_auction_amount,
+            "q2_auction_bid_amount_yuan": q2_auction_bid_amount,
+            "q2_auction_ask_amount_yuan": q2_auction_ask_amount,
             "instant_amount_yuan": _safe_float(quote.get("ia", 0.0)),
             "instant_volume": _safe_float(quote.get("iv", 0.0)),
             "large_net_yuan": _safe_float(quote.get("ln", 0.0)),
@@ -235,7 +270,7 @@ class IntradayDataHub:
             "tag": tag,
             "timestamp": _safe_int(summary.get("ts", 0)),
             "price": _safe_float(row.get("price", row.get("open_price", 0.0))),
-            "change_pct": _safe_float(row.get("change_pct", row.get("open_pct", 0.0))),
+            "change_pct": normalize_auction_pct_ratio(row.get("change_pct", row.get("open_pct", 0.0))),
             "amount": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
             "auction_amount_yuan": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
             "bid_amount": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
@@ -299,7 +334,7 @@ class IntradayDataHub:
                     {
                         "symbol": normalized_symbol,
                         "name": str(raw.get("name", raw.get("stock_name", "")) or ""),
-                        "change_pct": float(raw.get("change_pct", 0.0) or 0.0),
+                        "change_pct": normalize_auction_pct_ratio(raw.get("change_pct", 0.0)),
                         "amount": amount,
                         "bid_amount": bid_amount,
                         "tag": tag,
@@ -313,7 +348,7 @@ class IntradayDataHub:
                 {
                     "symbol": normalized_symbol,
                     "name": "",
-                    "change_pct": float(raw or 0.0),
+                    "change_pct": normalize_auction_pct_ratio(raw),
                     "amount": 0.0,
                     "bid_amount": 0.0,
                     "source": "redis_anchor",
@@ -330,7 +365,7 @@ class IntradayDataHub:
                 continue
             payload[symbol] = {
                 "name": str(row.get("name", row.get("stock_name", "")) or ""),
-                "change_pct": float(row.get("change_pct", 0.0) or 0.0),
+                "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                 "amount": float(row.get("amount", 0.0) or 0.0),
                 "bid_amount": float(row.get("bid_amount", 0.0) or 0.0),
                 "tag": tag,
@@ -351,14 +386,24 @@ class IntradayDataHub:
 
         tag = trade_date.replace("-", "")
         anchor_key = f"market:auction:anchor:{tag}"
+        anchor_payload = self._read_json_string_key(anchor_key)
+        archived_rows, archived_has_extended_fields = self._decode_archived_anchor_rows(anchor_payload)
         hash_rows = self._read_auction_hash_rows(f"market:auction:{tag}:0925")
+        if archived_rows and archived_has_extended_fields and len(archived_rows) >= len(hash_rows):
+            return IntradayFetchResult(
+                dataset="auction_anchor",
+                trade_date=trade_date,
+                rows=archived_rows,
+                source="redis_anchor",
+                notes=("Recovered from full market:auction:anchor archive.",),
+            )
         if hash_rows:
             rows = []
             for row in hash_rows:
                 symbol = _normalize_symbol(row.get("symbol") or row.get("code"))
                 if not symbol:
                     continue
-                change_pct = float(row.get("change_pct", 0.0) or 0.0)
+                change_pct = normalize_auction_pct_ratio(row.get("change_pct", 0.0))
                 rows.append(
                     {
                         "symbol": symbol,
@@ -381,8 +426,6 @@ class IntradayDataHub:
                 notes=("Recovered from market:auction:{date}:0925 and archived to anchor.",),
             )
 
-        anchor_payload = self._read_json_string_key(anchor_key)
-        archived_rows, archived_has_extended_fields = self._decode_archived_anchor_rows(anchor_payload)
         if archived_rows and archived_has_extended_fields:
             return IntradayFetchResult(
                 dataset="auction_anchor",
@@ -416,7 +459,7 @@ class IntradayDataHub:
                         {
                             "symbol": symbol,
                             "name": str(row.get("name", row.get("stock_name", "")) or ""),
-                            "change_pct": float(row.get("change_pct", 0.0) or 0.0),
+                            "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                             "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                             "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
                             "source": f"redis_preview_{latest_tag}",
@@ -438,7 +481,7 @@ class IntradayDataHub:
                 symbol = _normalize_symbol(row.get("code") or row.get("symbol"))
                 if not symbol:
                     continue
-                change_pct = float(row.get("change_pct", 0.0) or 0.0)
+                change_pct = normalize_auction_pct_ratio(row.get("change_pct", 0.0))
                 normalized_td_rows.append(
                     {
                         "symbol": symbol,
@@ -466,7 +509,7 @@ class IntradayDataHub:
                 symbol = _normalize_symbol(row.get("code") or row.get("symbol"))
                 if not symbol:
                     continue
-                change_pct = float(row.get("change_pct", 0.0) or 0.0)
+                change_pct = normalize_auction_pct_ratio(row.get("change_pct", 0.0))
                 normalized_wc_rows.append(
                     {
                         "symbol": symbol,
@@ -545,9 +588,9 @@ class IntradayDataHub:
             amount = _safe_float(row.get("amount", 0.0))
             row["previous_tag"] = previous_tag
             row["price_delta"] = _safe_float(row.get("price", 0.0)) - _safe_float(previous.get("price", 0.0))
-            row["change_pct_delta"] = _safe_float(row.get("change_pct", 0.0)) - _safe_float(
-                previous.get("change_pct", 0.0)
-            )
+            row["change_pct_delta"] = (
+                _safe_float(row.get("change_pct", 0.0)) - _safe_float(previous.get("change_pct", 0.0))
+            ) * 100.0
             row["amount_delta"] = amount - prev_amount
             row["bid_amount_delta"] = _safe_float(row.get("bid_amount", 0.0)) - _safe_float(
                 previous.get("bid_amount", 0.0)
@@ -633,6 +676,102 @@ class IntradayDataHub:
             trade_date=trade_date,
             rows=rows,
             source="kaipan",
+            redis_keys_written=(redis_key, meta_key),
+            notes=tuple(notes),
+        )
+
+    def fetch_hot_rank(self, trade_date: str, phase: RunPhase, *, top_n: int = 100) -> IntradayFetchResult:
+        decision = allow_intraday_request(FetchIntent.HOT_RANK_DISCOVERY, phase)
+        if not decision.allowed:
+            return IntradayFetchResult(
+                dataset="hot_rank",
+                trade_date=trade_date,
+                rows=[],
+                source="blocked",
+                notes=(decision.notes,),
+            )
+
+        redis_key = f"cache:hot_rank:{trade_date}"
+        meta_key = f"cache:hot_rank_meta:{trade_date}"
+        now_dt = datetime.now()
+        attempt_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        attempt_at_ts = int(now_dt.timestamp())
+        previous_cache = self._read_hash_payload(redis_key)
+        previous_meta = self._read_json_string_key(meta_key)
+        previous_updated_at = ""
+        previous_updated_at_ts = 0
+        if isinstance(previous_meta, dict):
+            previous_updated_at = str(previous_meta.get("updated_at") or "")
+            try:
+                previous_updated_at_ts = int(float(previous_meta.get("updated_at_ts", 0) or 0))
+            except (TypeError, ValueError):
+                previous_updated_at_ts = 0
+
+        rows: list[dict[str, Any]] = []
+        try:
+            raw = asyncio.run(self.ths_hot.fetch_hot_rank(top_n=top_n))
+            if self.ths_hot.validate_hot_rank(raw):
+                rows = self.ths_hot.to_tdengine_rows(raw, trade_date)
+        except Exception as exc:
+            notes = (f"THS hot rank fetch failed: {type(exc).__name__}: {exc}",)
+            return IntradayFetchResult(
+                dataset="hot_rank",
+                trade_date=trade_date,
+                rows=[],
+                source="ths_error",
+                notes=notes,
+            )
+
+        cache_preserved = bool(previous_cache) and not rows
+        cache_row_count = len(rows) if rows else len(previous_cache)
+        if rows:
+            try:
+                if hasattr(self.redis, "delete"):
+                    self.redis.delete(redis_key)
+            except Exception:
+                pass
+            for row in rows:
+                symbol = _normalize_symbol(row.get("symbol"))
+                if not symbol:
+                    continue
+                payload = {
+                    "symbol": symbol,
+                    "rank": _safe_int(row.get("rank"), 0),
+                    "heat": _safe_float(row.get("heat", 0.0), 0.0),
+                    "name": str(row.get("name") or ""),
+                    "source": str(row.get("source") or "ths_hot_rank"),
+                    "trade_date": trade_date,
+                }
+                self._write_hash_json(redis_key, symbol, payload)
+
+        updated_at = attempt_at
+        updated_at_ts = attempt_at_ts
+        if cache_preserved and previous_updated_at_ts > 0:
+            updated_at = previous_updated_at or attempt_at
+            updated_at_ts = previous_updated_at_ts
+        meta_payload = {
+            "trade_date": trade_date,
+            "phase": phase.value,
+            "source": "ths_hot_rank",
+            "row_count": cache_row_count,
+            "fetched_row_count": len(rows),
+            "cache_row_count": cache_row_count,
+            "success": bool(rows),
+            "cache_preserved": cache_preserved,
+            "updated_at": updated_at,
+            "updated_at_ts": updated_at_ts,
+            "last_attempt_at": attempt_at,
+            "last_attempt_at_ts": attempt_at_ts,
+        }
+        self.redis.set(meta_key, json.dumps(meta_payload, ensure_ascii=False))
+        notes = ["THS hot rank is low-frequency and cached by trade_date."]
+        if cache_preserved:
+            notes.append("Empty THS hot-rank response preserved the previous Redis cache.")
+        return IntradayFetchResult(
+            dataset="hot_rank",
+            trade_date=trade_date,
+            rows=rows,
+            source="ths_hot_rank",
             redis_keys_written=(redis_key, meta_key),
             notes=tuple(notes),
         )
@@ -881,18 +1020,32 @@ class IntradayDataHub:
             notes=("Redis quote path is the main intraday low-latency market data source.",),
         )
 
-    def load_runtime_cache_views(self, trade_date: str, symbols: Iterable[str]) -> IntradayFetchResult:
+    def load_runtime_cache_views(
+        self,
+        trade_date: str,
+        symbols: Iterable[str],
+        *,
+        hot_rank_trade_date: str | None = None,
+    ) -> IntradayFetchResult:
         normalized_symbols = tuple(
             dict.fromkeys(_normalize_symbol(raw_symbol) for raw_symbol in symbols if _normalize_symbol(raw_symbol))
         )
+        hot_rank_date = str(hot_rank_trade_date or trade_date or "").strip()
         factor_values = self._batch_hmget(f"cache:stock_extra:{trade_date}", normalized_symbols)
         chip_values = self._batch_hmget(f"cache:chip_peaks:{trade_date}", normalized_symbols)
         dde_values = self._batch_hmget(f"cache:dde_ready:{trade_date}", normalized_symbols)
+        hot_rank_values = self._batch_hmget(f"cache:hot_rank:{hot_rank_date}", normalized_symbols)
         rows: list[dict[str, Any]] = []
-        for symbol, factor_raw, chip_raw, dde_raw in zip(normalized_symbols, factor_values, chip_values, dde_values):
+        for symbol, factor_raw, chip_raw, dde_raw, hot_rank_raw in zip(
+            normalized_symbols,
+            factor_values,
+            chip_values,
+            dde_values,
+            hot_rank_values,
+        ):
             merged = {"symbol": symbol}
             found = False
-            for raw in (factor_raw, chip_raw, dde_raw):
+            for raw in (factor_raw, chip_raw, dde_raw, hot_rank_raw):
                 if not raw:
                     continue
                 try:

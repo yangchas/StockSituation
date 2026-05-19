@@ -1,5 +1,7 @@
 #include "rabbitmq_batch_decoder.h"
 
+#include <sstream>
+
 #include "protobuf_tick_decoder.h"
 
 namespace t1_v2 {
@@ -34,7 +36,13 @@ RabbitMqBatchDecodeResult RabbitMqBatchDecoder::decode_body(
     out.wall_ts_ms = view.header.timestamp;
     result.ok = result.build_stats.accepted_count > 0;
     if (!result.ok) {
-        result.error = "no valid source records";
+        std::ostringstream oss;
+        oss << "no valid source records"
+            << " | header_records=" << view.header.record_count
+            << " | decoded=" << decoded.record_count
+            << " | input=" << result.build_stats.input_count
+            << " | rejected=" << result.build_stats.rejected_count;
+        result.error = oss.str();
     }
     return result;
 }

@@ -8,6 +8,7 @@ class FetchIntent(str, Enum):
     AUCTION_COVERAGE_RECOVERY = "auction_coverage_recovery"
     STOCK_PLATE_ENRICHMENT = "stock_plate_enrichment"
     HOT_PLATE_DISCOVERY = "hot_plate_discovery"
+    HOT_RANK_DISCOVERY = "hot_rank_discovery"
     YEST_LIMIT_POOL_BUILD = "yest_limit_pool_build"
     LIMIT_TRUTH_BUILD = "limit_truth_build"
 

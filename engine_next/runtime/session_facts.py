@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from heapq import nsmallest
 from typing import Any, Iterable
 
 from engine_next.domain.models import (
@@ -11,8 +10,9 @@ from engine_next.domain.models import (
     SessionFacts,
     StockStateSnapshot,
     ThemeFact,
+    ThemeTradeFact,
 )
-from engine_next.runtime.plate_mapping_registry import is_generic_plate, split_plate_tokens
+from engine_next.runtime.theme_fact_aggregator import build_theme_fact_outputs
 
 
 def session_facts_to_payload(facts: SessionFacts) -> dict[str, Any]:
@@ -22,6 +22,7 @@ def session_facts_to_payload(facts: SessionFacts) -> dict[str, Any]:
         "hot_plate_yesterday": [fact.__dict__ for fact in facts.hot_plate_yesterday],
         "plate_migration": [fact.__dict__ for fact in facts.plate_migration],
         "theme_facts": [fact.__dict__ for fact in facts.theme_facts],
+        "theme_trade_facts": [fact.__dict__ for fact in facts.theme_trade_facts],
         "ladder_facts": [fact.__dict__ for fact in facts.ladder_facts],
     }
 
@@ -35,6 +36,9 @@ def session_facts_from_payload(payload: dict[str, Any]) -> SessionFacts:
         PlateMigrationFact(**item) for item in payload.get("plate_migration", ()) if isinstance(item, dict)
     )
     theme_facts = tuple(ThemeFact(**item) for item in payload.get("theme_facts", ()) if isinstance(item, dict))
+    theme_trade_facts = tuple(
+        ThemeTradeFact(**item) for item in payload.get("theme_trade_facts", ()) if isinstance(item, dict)
+    )
     ladder_facts = tuple(LadderFact(**item) for item in payload.get("ladder_facts", ()) if isinstance(item, dict))
     return SessionFacts(
         fact_set_id=str(payload.get("fact_set_id") or ""),
@@ -46,6 +50,8 @@ def session_facts_from_payload(payload: dict[str, Any]) -> SessionFacts:
         plate_migration_map={fact.plate_name: fact for fact in plate_migration},
         theme_facts=theme_facts,
         theme_fact_map={fact.plate_name: fact for fact in theme_facts},
+        theme_trade_facts=theme_trade_facts,
+        theme_trade_fact_map={fact.plate_name: fact for fact in theme_trade_facts},
         ladder_facts=ladder_facts,
         ladder_fact_map={fact.key: fact for fact in ladder_facts},
     )
@@ -77,28 +83,6 @@ def _hot_plate_sort_key(fact: HotPlateFact) -> tuple[float, float, float, float,
     )
 
 
-def _resolve_theme_names(snapshot: StockStateSnapshot) -> tuple[str, ...]:
-    for raw_name in (snapshot.plate,):
-        for token in split_plate_tokens(raw_name):
-            name = str(token or "").strip()
-            if name and not is_generic_plate(name):
-                return (name,)
-    for raw_name in snapshot.real_plate_names:
-        for token in split_plate_tokens(raw_name):
-            name = str(token or "").strip()
-            if name and not is_generic_plate(name):
-                return (name,)
-    return ()
-
-
-@dataclass
-class _ThemeAccumulator:
-    symbols: list[StockStateSnapshot]
-    auction_amount: float = 0.0
-    yest_limit_count: int = 0
-    leader_count: int = 0
-
-
 @dataclass
 class _LadderAccumulator:
     snapshots: list[StockStateSnapshot]
@@ -120,7 +104,23 @@ def build_session_facts(
     today_map = {fact.plate_name: fact for fact in today_facts}
     yesterday_map = {fact.plate_name: fact for fact in yesterday_facts}
     migration = _build_plate_migration_facts(today_map, yesterday_map)
-    theme_facts = _build_theme_facts(snapshots)
+    yesterday_hot_rank_by_plate = {fact.plate_name: fact.rank for fact in yesterday_facts}
+    theme_facts, theme_trade_fact_map = build_theme_fact_outputs(
+        snapshots,
+        yesterday_hot_rank_by_plate=yesterday_hot_rank_by_plate,
+    )
+    theme_trade_facts = tuple(
+        sorted(
+            theme_trade_fact_map.values(),
+            key=lambda item: (
+                item.yest_hot_rank,
+                -item.yest_limit_count,
+                -item.leader_count,
+                -item.auction_amount,
+                item.plate_name,
+            ),
+        )
+    )
     ladder_facts = _build_ladder_facts(snapshots)
     return SessionFacts(
         fact_set_id=f"{trade_date}:{phase_name}:h{len(today_facts)}:t{len(theme_facts)}:l{len(ladder_facts)}",
@@ -132,6 +132,8 @@ def build_session_facts(
         plate_migration_map={fact.plate_name: fact for fact in migration},
         theme_facts=theme_facts,
         theme_fact_map={fact.plate_name: fact for fact in theme_facts},
+        theme_trade_facts=theme_trade_facts,
+        theme_trade_fact_map=theme_trade_fact_map,
         ladder_facts=ladder_facts,
         ladder_fact_map={fact.key: fact for fact in ladder_facts},
     )
@@ -193,57 +195,6 @@ def _build_plate_migration_facts(
         )
     )
     return tuple(rows)
-
-
-def _build_theme_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[ThemeFact, ...]:
-    buckets: dict[str, _ThemeAccumulator] = {}
-    for snapshot in snapshots:
-        theme_names = _resolve_theme_names(snapshot)
-        if not theme_names:
-            continue
-        for plate_name in theme_names:
-            bucket = buckets.setdefault(plate_name, _ThemeAccumulator(symbols=[]))
-            bucket.symbols.append(snapshot)
-            bucket.auction_amount += float(snapshot.auction_amount or 0.0)
-            bucket.yest_limit_count += int(bool(snapshot.is_yest_limit))
-            if snapshot.leader_rank_in_theme <= 3:
-                bucket.leader_count += 1
-
-    facts: list[ThemeFact] = []
-    for plate_name, bucket in buckets.items():
-        ranked = nsmallest(
-            3,
-            bucket.symbols,
-            key=lambda snapshot: (
-                -snapshot.lb_days,
-                snapshot.leader_rank_in_theme,
-                -snapshot.auction_amount,
-                -snapshot.current_pct,
-            ),
-        )
-        top3_symbols = tuple(snapshot.symbol for snapshot in ranked)
-        facts.append(
-            ThemeFact(
-                plate_name=plate_name,
-                leader_symbol=top3_symbols[0] if top3_symbols else "",
-                top3_symbols=top3_symbols,
-                symbol_count=len({snapshot.symbol for snapshot in bucket.symbols}),
-                auction_amount=round(bucket.auction_amount, 2),
-                yest_limit_count=bucket.yest_limit_count,
-                leader_count=bucket.leader_count,
-            )
-        )
-    facts.sort(
-        key=lambda item: (
-            -item.yest_limit_count,
-            -item.leader_count,
-            -item.auction_amount,
-            -item.symbol_count,
-            item.plate_name,
-        )
-    )
-    return tuple(facts)
-
 
 def _build_ladder_facts(snapshots: Iterable[StockStateSnapshot]) -> tuple[LadderFact, ...]:
     transitions: dict[str, _LadderAccumulator] = {}

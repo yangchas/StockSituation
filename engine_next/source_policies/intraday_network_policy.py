@@ -51,6 +51,16 @@ INTRADAY_NETWORK_RULES: tuple[IntradayNetworkRule, ...] = (
         reason="Kaipan hot plates support small-batch intraday refresh and should be cached by trade_date in Redis.",
     ),
     IntradayNetworkRule(
+        name="hot_rank_discovery",
+        intent=FetchIntent.HOT_RANK_DISCOVERY,
+        allowed_phases=(RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY, RunPhase.POSTMARKET),
+        preferred_sources=(SourceName.THS,),
+        max_symbols_per_request=200,
+        max_requests_per_minute=1,
+        redis_write_key="cache:hot_rank:{date}",
+        reason="THS hot rank is low-frequency attention data and should be cached by trade_date in Redis.",
+    ),
+    IntradayNetworkRule(
         name="yest_limit_pool_build",
         intent=FetchIntent.YEST_LIMIT_POOL_BUILD,
         allowed_phases=(RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY, RunPhase.POSTMARKET),

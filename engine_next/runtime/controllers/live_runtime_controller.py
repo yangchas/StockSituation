@@ -16,6 +16,18 @@ from engine_next.runtime.intraday_context_builder import (
 logger = logging.getLogger(__name__)
 
 
+def _native_ingested_count(primed_runtime_state: PrimedIntradayRuntimeState | None) -> int:
+    if primed_runtime_state is None:
+        return 0
+    value = getattr(primed_runtime_state, "native_ingested", None)
+    if value is None:
+        value = getattr(primed_runtime_state, "rust_ingested", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass(frozen=True)
 class LiveRuntimeRequest:
     phase: RunPhase
@@ -111,11 +123,11 @@ class LiveRuntimeController:
 
         if lifecycle_audit_ran or scheduled_event_executed:
             logger.info(
-                "runtime prime | phase=%s | symbols=%s | quotes=%s | rust=%s",
+                "runtime prime | phase=%s | symbols=%s | quotes=%s | native=%s",
                 request.phase.value,
                 len(request.symbols),
                 len(primed_runtime_state.quote_rows),
-                primed_runtime_state.rust_ingested,
+                _native_ingested_count(primed_runtime_state),
             )
 
         if should_rebuild_context:

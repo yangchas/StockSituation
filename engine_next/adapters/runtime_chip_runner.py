@@ -6,10 +6,17 @@ from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
-import talib
+try:
+    import talib
+except Exception:  # pragma: no cover - optional dependency
+    talib = None
 
 
 logger = logging.getLogger(__name__)
+
+
+def _clamp(value: float, minimum: float = 0.0, maximum: float = 10.0) -> float:
+    return max(minimum, min(maximum, value))
 
 
 class RuntimeChipRunner:
@@ -58,6 +65,26 @@ class RuntimeChipRunner:
             cache[code6] = 0.0
             return 0.0
 
+    def stock_name_for(self, symbol: str) -> str:
+        code6 = str(symbol or "").split(".")[-1][-6:]
+        if not code6:
+            return ""
+        try:
+            return str(self.f10_service.get_stock_name(code6) or "").strip()
+        except Exception:
+            return ""
+
+    def limit_up_threshold_pct(self, symbol: str) -> float:
+        code6 = str(symbol or "").split(".")[-1][-6:]
+        name = self.stock_name_for(code6).upper()
+        if "ST" in name:
+            return 4.8
+        if code6.startswith(("300", "301", "688", "689")):
+            return 19.8
+        if code6.startswith(("8", "92")):
+            return 29.8
+        return 9.8
+
     def calculate_chip_peak(self, dataframe: Any) -> dict[str, Any]:
         try:
             df = pd.DataFrame(dataframe).copy()
@@ -78,6 +105,7 @@ class RuntimeChipRunner:
 
             bins = 50
             bin_edges = np.linspace(p_min, p_max, bins + 1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
             current_chips = np.zeros(bins)
             for idx, price in enumerate(prices):
                 turn = min(turns[idx], 1.0)
@@ -87,17 +115,40 @@ class RuntimeChipRunner:
 
             peak_idx = int(np.argmax(current_chips))
             peak_price = round((bin_edges[peak_idx] + bin_edges[peak_idx + 1]) / 2, 2)
+            current_price = float(prices[-1])
             total = float(current_chips.sum())
             if total > 0:
                 sorted_chips = np.sort(current_chips)[::-1]
                 cum_chips = np.cumsum(sorted_chips)
                 cutoff_idx = int(np.searchsorted(cum_chips, total * 0.7))
                 concentration = round((cutoff_idx + 1) / bins, 4)
+                avg_cost = round(float(np.dot(bin_centers, current_chips) / total), 2)
+                profit_ratio = round(float(current_chips[bin_centers <= current_price].sum() / total), 4)
+                loss_ratio = round(max(0.0, 1.0 - profit_ratio), 4)
+                chip_percent = round(float(current_chips[peak_idx] / total * 100.0), 2)
+                cum_by_price = np.cumsum(current_chips)
+                lower_idx = int(np.searchsorted(cum_by_price, total * 0.15))
+                upper_idx = int(np.searchsorted(cum_by_price, total * 0.85))
+                lower_cost = round(float(bin_centers[min(lower_idx, bins - 1)]), 2)
+                upper_cost = round(float(bin_centers[min(upper_idx, bins - 1)]), 2)
             else:
                 concentration = 1.0
+                avg_cost = peak_price
+                profit_ratio = 0.0
+                loss_ratio = 0.0
+                chip_percent = 0.0
+                lower_cost = peak_price
+                upper_cost = peak_price
 
             return {
                 "peak_price": peak_price,
+                "peak_weight": chip_percent,
+                "chip_percent": chip_percent,
+                "avg_cost": avg_cost,
+                "profit_ratio": profit_ratio,
+                "loss_ratio": loss_ratio,
+                "upper_cost": upper_cost,
+                "lower_cost": lower_cost,
                 "concentration": concentration,
                 "dense_area_count": int(np.sum(current_chips > total * 0.05)),
             }
@@ -122,7 +173,8 @@ class RuntimeChipRunner:
             close_5d = float(df.iloc[idx_5d]["close"])
             change_5d = round((curr_close - close_5d) / close_5d * 100, 2) if close_5d else 0.0
             avg_turn = round(float(df.tail(5)["turn"].astype(float).mean()), 2)
-            limit_ups = int((df.tail(5)["pct_chg"].astype(float) > 9.8).sum())
+            limit_threshold = self.limit_up_threshold_pct(symbol)
+            limit_ups = int((df.tail(5)["pct_chg"].astype(float) > limit_threshold).sum())
 
             rsi_6 = bias_20 = 0.0
             ma5 = ma10 = ma20 = 0.0
@@ -185,14 +237,72 @@ class RuntimeChipRunner:
                 kdj_j = round(float(j_arr[-1]), 2)
 
             turnover_base = float(df["turn"].iloc[-20:-5].astype(float).mean()) if len(df) >= 20 else 0.0
+            chip_payload = self.calculate_chip_peak(df)
+            profit_ratio = float(chip_payload.get("profit_ratio", 0.0) or 0.0)
+            concentration = float(chip_payload.get("concentration", 0.0) or 0.0)
+            shape_chip_cleanliness = _clamp(
+                5.0
+                + (1.6 if 0.05 <= profit_ratio <= 0.35 else -1.0 if profit_ratio > 0.75 else 0.0)
+                + (1.4 if 0.05 <= concentration <= 0.22 else -1.0 if concentration > 0.38 else 0.0)
+            )
+            shape_t2_repair_bias = _clamp(
+                5.0
+                + (2.2 if t2_lb_days >= 1 and -8.0 <= t2_pct <= -2.0 else 0.0)
+                + (0.8 if bias_20 < 0 else 0.0)
+            )
+            shape_platform_ready = _clamp(
+                4.5
+                + (1.8 if -3.0 <= bias_20 <= 8.0 else -1.0 if bias_20 > 15.0 else 0.0)
+                + (1.2 if 45.0 <= rsi_6 <= 68.0 else -0.8 if rsi_6 >= 82.0 else 0.0)
+                + (0.8 if limit_ups <= 1 else -0.6)
+            )
+            shape_breakout_ready = _clamp(
+                4.2
+                + (1.4 if -1.5 <= change_5d <= 12.0 else -1.0 if change_5d > 20.0 else 0.0)
+                + (1.0 if avg_turn >= 1.0 else -0.5)
+                + (0.8 if 48.0 <= rsi_6 <= 72.0 else -0.8 if rsi_6 >= 85.0 else 0.0)
+            )
+            shape_overheat_risk = _clamp(
+                2.5
+                + (2.4 if bias_20 > 12.0 else 0.0)
+                + (1.8 if profit_ratio > 0.75 else 0.0)
+                + (1.6 if rsi_6 >= 82.0 else 0.0)
+                + (1.0 if change_5d > 18.0 else 0.0)
+            )
+            shape_trend_health = _clamp(
+                4.5
+                + (1.5 if bias_20 > -4.0 else -1.0)
+                + (1.2 if rsi_6 >= 45.0 else -1.0)
+                + (1.0 if avg_turn >= 1.0 else 0.0)
+                + (0.8 if limit_ups <= 2 else -0.6)
+            )
+            structure_score_base = _clamp(
+                0.24 * shape_chip_cleanliness
+                + 0.18 * shape_platform_ready
+                + 0.18 * shape_breakout_ready
+                + 0.18 * shape_trend_health
+                + 0.14 * shape_t2_repair_bias
+                + 0.08 * (10.0 - shape_overheat_risk)
+            )
+            theme_core_base = _clamp(
+                3.5
+                + (1.2 if limit_ups >= 1 else 0.0)
+                + (1.0 if avg_turn >= 1.5 else 0.0)
+                + (0.8 if change_5d > 0 else 0.0)
+                + (0.8 if 8.0 <= self.market_cap_for(symbol) <= 800.0 else 0.0)
+                + (0.7 if bias_20 > -2.0 else 0.0)
+            )
             return {
                 "change_pct_5d": change_5d,
                 "avg_turnover_5d": avg_turn,
                 "limit_up_days_5": limit_ups,
                 "real_market_cap": self.market_cap_for(symbol),
+                "avg_cost": float(chip_payload.get("avg_cost", 0.0) or 0.0),
                 "rsi_6": rsi_6,
                 "bias_20": bias_20,
+                "profit_ratio": profit_ratio,
                 "vol_ratio": round(avg_turn / (turnover_base + 0.1), 2),
+                "concentration": concentration,
                 "ma5": ma5,
                 "ma10": ma10,
                 "ma20": ma20,
@@ -207,6 +317,15 @@ class RuntimeChipRunner:
                 "boll_low": boll_low,
                 "t2_lb_days": t2_lb_days,
                 "t2_pct": t2_pct,
+                "structure_score_base": round(structure_score_base, 2),
+                "shape_platform_ready": round(shape_platform_ready, 2),
+                "shape_breakout_ready": round(shape_breakout_ready, 2),
+                "shape_repair_ready": round(max(shape_t2_repair_bias, shape_trend_health * 0.8), 2),
+                "shape_overheat_risk": round(shape_overheat_risk, 2),
+                "shape_chip_cleanliness": round(shape_chip_cleanliness, 2),
+                "shape_trend_health": round(shape_trend_health, 2),
+                "shape_t2_repair_bias": round(shape_t2_repair_bias, 2),
+                "theme_core_base": round(theme_core_base, 2),
             }
         except Exception as exc:
             logger.error("runtime factor calculation failed | symbol=%s | error=%s", symbol, exc)

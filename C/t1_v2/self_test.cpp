@@ -461,6 +461,45 @@ bool run_self_test() {
     const RabbitMqBatchDecodeResult live_decoded = RabbitMqBatchDecoder::decode_body(live_body, 99, live_decoded_batch);
     if (!expect(live_decoded.ok, "rabbit live body decode")) return false;
     if (!expect(live_decoded_batch.seq_no == 99 && live_decoded_batch.ticks.size() == 1, "rabbit live batch output")) return false;
+
+    dataservice::DataBatch skipped_proto_batch;
+    dataservice::DataRecord* skipped_record = skipped_proto_batch.add_records();
+    skipped_record->set_tss(sh_index_source.tss);
+    skipped_record->set_symbol(sh_index_source.symbol);
+    skipped_record->set_exchange("SH");
+    skipped_record->set_market("sh");
+    skipped_record->set_lp(static_cast<float>(sh_index_source.lp));
+    skipped_record->set_lc(static_cast<float>(sh_index_source.lc));
+    std::string skipped_batch_bytes;
+    if (!expect(skipped_proto_batch.SerializeToString(&skipped_batch_bytes), "skipped protobuf batch serialize")) return false;
+    dataservice::DataRequest skipped_request;
+    skipped_request.set_compression(dataservice::NONE);
+    skipped_request.set_compressed_data(skipped_batch_bytes);
+    std::string skipped_request_bytes;
+    if (!expect(skipped_request.SerializeToString(&skipped_request_bytes), "skipped protobuf request serialize")) return false;
+    const std::string skipped_header =
+        "{\"record_count\":1,\"compression\":\"NONE\",\"original_size\":"
+        + std::to_string(skipped_request_bytes.size())
+        + ",\"compressed_size\":" + std::to_string(skipped_request_bytes.size())
+        + ",\"timestamp\":1777425845000,\"batch_id\":\"skip1\",\"proto_version\":\"v1\"}";
+    std::vector<char> skipped_body;
+    const uint32_t skipped_header_len = static_cast<uint32_t>(skipped_header.size());
+    skipped_body.push_back(static_cast<char>((skipped_header_len >> 24) & 0xFF));
+    skipped_body.push_back(static_cast<char>((skipped_header_len >> 16) & 0xFF));
+    skipped_body.push_back(static_cast<char>((skipped_header_len >> 8) & 0xFF));
+    skipped_body.push_back(static_cast<char>(skipped_header_len & 0xFF));
+    skipped_body.insert(skipped_body.end(), skipped_header.begin(), skipped_header.end());
+    skipped_body.insert(skipped_body.end(), skipped_request_bytes.begin(), skipped_request_bytes.end());
+    TickBatch skipped_decoded_batch;
+    const RabbitMqBatchDecodeResult skipped_decoded =
+        RabbitMqBatchDecoder::decode_body(skipped_body, 100, skipped_decoded_batch);
+    if (!expect(!skipped_decoded.ok, "rabbit skipped body has no accepted ticks")) return false;
+    if (!expect(skipped_decoded.build_stats.input_count == 1 &&
+                skipped_decoded.build_stats.accepted_count == 0 &&
+                skipped_decoded.build_stats.rejected_count == 1,
+                "rabbit skipped body keeps rejection stats")) return false;
+    if (!expect(skipped_decoded.error.find("rejected=1") != std::string::npos,
+                "rabbit skipped body diagnostic")) return false;
 #else
     std::vector<SourceTickRecord> decoded_records;
     const ProtobufDecodeResult proto_decode = ProtobufTickDecoder::decode_data_request_payload(
@@ -519,6 +558,60 @@ bool run_self_test() {
     if (!expect(state.spd1m_bp == 99, "speed_1m minute bucket")) return false;
     if (!expect(state.amt2m_yuan == 60000000, "amount_2m cumulative difference")) return false;
     if (!expect(state.amt5m_yuan == 60000000, "amount_5m fallback inside window")) return false;
+    if (!expect(state.vec3m_bp == 0, "speed_3m remains zero without exact 3m slot")) return false;
+
+    EngineCore phase_refresh_engine(config);
+    if (!expect(phase_refresh_engine.initialize(), "phase refresh engine initialize")) return false;
+    TickBatch phase_batch_auction;
+    phase_batch_auction.logical_ts_ms = ts_0920;
+    phase_batch_auction.ticks.push_back(make_tick("000002", ts_0920, 10000, 100000000));
+    phase_refresh_engine.on_batch(phase_batch_auction);
+    const int64_t ts_0930_phase = make_local_ts_ms(2026, 4, 29, 9, 30, 1);
+    TickBatch phase_batch_intraday;
+    phase_batch_intraday.logical_ts_ms = ts_0930_phase;
+    phase_batch_intraday.ticks.push_back(make_tick("000003", ts_0930_phase, 10100, 110000000));
+    phase_refresh_engine.on_batch(phase_batch_intraday);
+    bool refreshed_phase = false;
+    phase_refresh_engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "000002" &&
+            quote.phase == MarketPhase::Intraday &&
+            (quote.dirty_mask & DIRTY_RUNTIME) != 0) {
+            refreshed_phase = true;
+        }
+    });
+    if (!expect(refreshed_phase, "phase transition refreshes untouched quotes")) return false;
+
+    EngineCore cross_day_engine(config);
+    if (!expect(cross_day_engine.initialize(), "cross day engine initialize")) return false;
+    const int64_t ts_1459 = make_local_ts_ms(2026, 4, 29, 14, 59, 0);
+    const int64_t ts_1500 = make_local_ts_ms(2026, 4, 29, 15, 0, 0);
+    const int64_t ts_0931_next = make_local_ts_ms(2026, 4, 30, 9, 31, 0);
+    const int64_t ts_0934_next = make_local_ts_ms(2026, 4, 30, 9, 34, 0);
+    TickBatch cross_day_batch1;
+    cross_day_batch1.logical_ts_ms = ts_1459;
+    cross_day_batch1.ticks.push_back(make_tick("000004", ts_1459, 10000, 100000000));
+    cross_day_engine.on_batch(cross_day_batch1);
+    TickBatch cross_day_batch2;
+    cross_day_batch2.logical_ts_ms = ts_1500;
+    cross_day_batch2.ticks.push_back(make_tick("000004", ts_1500, 10100, 120000000));
+    cross_day_engine.on_batch(cross_day_batch2);
+    TickBatch cross_day_batch3;
+    cross_day_batch3.logical_ts_ms = ts_0931_next;
+    cross_day_batch3.ticks.push_back(make_tick("000004", ts_0931_next, 11000, 150000000));
+    cross_day_engine.on_batch(cross_day_batch3);
+    TickBatch cross_day_batch4;
+    cross_day_batch4.logical_ts_ms = ts_0934_next;
+    cross_day_batch4.ticks.push_back(make_tick("000004", ts_0934_next, 11300, 180000000));
+    cross_day_engine.on_batch(cross_day_batch4);
+    bool cross_day_ok = false;
+    cross_day_engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "000004" &&
+            quote.vec3m_bp == 272 &&
+            quote.spd1m_bp == 0) {
+            cross_day_ok = true;
+        }
+    });
+    if (!expect(cross_day_ok, "cross day minute ring keeps absolute minute history")) return false;
 
     EngineCore auction25_engine(config);
     if (!expect(auction25_engine.initialize(), "auction25 engine initialize")) return false;
@@ -627,7 +720,10 @@ bool run_self_test() {
     if (!expect(!q2_commands.empty(), "q2 command generated")) return false;
     RedisArgvCommand first_redis_argv;
     if (!expect(RedisCommandFormatter::format(q2_commands.front(), first_redis_argv), "redis command formats")) return false;
-    if (!expect(first_redis_argv.argv.size() == 50, "q2 hset argv count")) return false;
+    if (!expect(
+            first_redis_argv.argv.size() == 2 + q2_commands.front().fields.size() * 2,
+            "q2 hset argv count follows field list"
+        )) return false;
     bool has_active_symbol_index = false;
     for (const RedisCommand& command : q2_commands) {
         if (command.type == RedisCommandType::SAdd && command.key.find("q2:active:") == 0) {
@@ -647,6 +743,34 @@ bool run_self_test() {
         }
     }
     if (!expect(has_stock_alias_key, "sz stock writes q2 alias")) return false;
+
+    QuoteState intraday_without_auction;
+    std::memcpy(intraday_without_auction.symbol, "000007", 6);
+    std::memcpy(intraday_without_auction.market, "sz", 2);
+    intraday_without_auction.phase = MarketPhase::Intraday;
+    intraday_without_auction.px_milli = 10100;
+    intraday_without_auction.pc_milli = 10000;
+    const RedisFieldList intraday_empty_auction_fields = redis_writer.build_q2_fields(intraday_without_auction);
+    bool has_empty_a25_field = false;
+    for (const auto& field : intraday_empty_auction_fields) {
+        if (field.first == "a25" || field.first == "am" || field.first == "br" || field.first == "ar") {
+            has_empty_a25_field = true;
+        }
+    }
+    if (!expect(!has_empty_a25_field, "intraday q2 does not overwrite missing auction anchors")) return false;
+
+    QuoteState intraday_with_auction = intraday_without_auction;
+    intraday_with_auction.auction.a25_px_milli = 10500;
+    intraday_with_auction.auction.match_amt_yuan = 12000000;
+    const RedisFieldList intraday_kept_auction_fields = redis_writer.build_q2_fields(intraday_with_auction);
+    bool has_kept_a25_field = false;
+    for (const auto& field : intraday_kept_auction_fields) {
+        if (field.first == "a25" && field.second == "10500") {
+            has_kept_a25_field = true;
+        }
+    }
+    if (!expect(has_kept_a25_field, "intraday q2 keeps known auction anchors")) return false;
+
     const RuntimeBatchStats runtime_stats = RuntimeBatchStatsBuilder::build(
         7,
         ts_0922,
@@ -667,6 +791,8 @@ bool run_self_test() {
             for (const auto& field : command.fields) {
                 if (field.first == "top_amount" && field.second.find("\"symbol\"") != std::string::npos) {
                     has_legacy_auction_key = true;
+                    if (!expect(field.second.find("\"change_pct\":0.020000") != std::string::npos,
+                                "legacy auction change_pct uses ratio units")) return false;
                 }
             }
         }
@@ -711,7 +837,6 @@ bool run_self_test() {
     for (const RedisCommand& command : pipeline_result.redis_commands) {
         if (command.key.find("m2:runtime:") == 0) {
             has_runtime_command = true;
-            break;
         }
     }
     if (!expect(has_runtime_command, "runtime pipeline m2 command")) return false;
@@ -725,6 +850,26 @@ bool run_self_test() {
     if (!expect(execution_result.redis_committed_quotes > 0, "runtime execution coordinator commit count")) return false;
     if (!expect(count_dirty_quotes(pipeline.engine().quote_store()) == 0, "runtime pipeline dirty after commit")) return false;
     pipeline.shutdown();
+
+    RuntimePipeline intraday_pipeline(config);
+    if (!expect(intraday_pipeline.initialize(), "intraday runtime pipeline initialize")) return false;
+    SourceTickBatchBuildStats intraday_build_stats = build_stats;
+    RuntimePipelineResult intraday_pipeline_result1 = intraday_pipeline.process_batch(trade_batch1, intraday_build_stats);
+    if (!expect(!intraday_pipeline_result1.redis_commands.empty(), "intraday runtime pipeline first batch redis commands")) return false;
+    RuntimePipelineResult intraday_pipeline_result2 = intraday_pipeline.process_batch(trade_batch2, intraday_build_stats);
+    bool has_open_2m_summary_command = false;
+    for (const RedisCommand& command : intraday_pipeline_result2.redis_commands) {
+        if (command.type == RedisCommandType::SetString &&
+            command.key.find("market:open2m:summary:") == 0 &&
+            command.value.find("\"top10_amount\":") != std::string::npos &&
+            command.value.find("\"top20_amount\":") != std::string::npos) {
+            RedisArgvCommand set_argv;
+            if (!expect(RedisCommandFormatter::format(command, set_argv), "open2m summary SET formats")) return false;
+            has_open_2m_summary_command = set_argv.argv.size() == 3;
+        }
+    }
+    if (!expect(has_open_2m_summary_command, "intraday runtime pipeline open2m summary command")) return false;
+    intraday_pipeline.shutdown();
 
     TickSourceResult loop_source_result;
     loop_source_result.status = TickSourceStatus::Ok;

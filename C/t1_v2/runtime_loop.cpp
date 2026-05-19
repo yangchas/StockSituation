@@ -22,16 +22,19 @@ RuntimeLoopStats RuntimeLoop::run() {
     RuntimeLoopStats stats;
     if (!source_) {
         stats.ok = false;
+        stats.failure_stage = "bootstrap.null_source";
         stats.error = "tick source is null";
         return stats;
     }
     if (config_.runtime_mode == RuntimeMode::Live && config_.processing.dry_run && !has_runtime_bound()) {
         stats.ok = false;
+        stats.failure_stage = "bootstrap.invalid_live_dry_run";
         stats.error = "live dry-run requires --max-batches or --max-empty-polls";
         return stats;
     }
     if (!pipeline_.initialize()) {
         stats.ok = false;
+        stats.failure_stage = "bootstrap.pipeline_initialize";
         stats.error = "runtime pipeline initialize failed";
         return stats;
     }
@@ -42,13 +45,16 @@ RuntimeLoopStats RuntimeLoop::run() {
     if (!preflight.ok) {
         pipeline_.shutdown();
         stats.ok = false;
+        stats.failure_stage = "bootstrap.preflight";
         stats.error = preflight.error.empty() ? "runtime preflight failed" : preflight.error;
         return stats;
     }
     if (!source_->start()) {
         pipeline_.shutdown();
         stats.ok = false;
+        stats.failure_stage = "bootstrap.source_start";
         const std::string source_error = source_->error_message();
+        stats.source_error = source_error;
         stats.error = source_error.empty() ? "tick source is not ready" : source_error;
         return stats;
     }
@@ -65,6 +71,25 @@ RuntimeLoopStats RuntimeLoop::run() {
         TickSourceResult source_result = source_->next_batch();
         if (source_result.status == TickSourceStatus::EndOfStream) {
             break;
+        }
+        if (source_result.status == TickSourceStatus::Skipped) {
+            stats.source_input += source_result.source_stats.input_count;
+            stats.source_rejected += source_result.source_stats.rejected_count;
+            if (source_result.requires_ack) {
+                if (!should_ack_source()) {
+                    ++stats.source_ack_skipped;
+                } else if (source_->reject(source_result, false)) {
+                    ++stats.source_rejects;
+                } else {
+                    ++stats.source_reject_failures;
+                    stats.ok = false;
+                    stats.failure_stage = "source.reject_after_skip";
+                    stats.source_error = source_->error_message();
+                    stats.error = "source reject failed";
+                    break;
+                }
+            }
+            continue;
         }
         if (source_result.status == TickSourceStatus::Empty) {
             ++stats.empty_polls;
@@ -86,6 +111,8 @@ RuntimeLoopStats RuntimeLoop::run() {
                 }
             }
             stats.ok = false;
+            stats.failure_stage = "source.batch_error";
+            stats.source_error = source_->error_message();
             stats.error = source_result.error_msg ? source_result.error_msg : "tick source error";
             break;
         }
@@ -94,6 +121,12 @@ RuntimeLoopStats RuntimeLoop::run() {
             source_result.batch,
             source_result.source_stats
         );
+        stats.last_batch_source_input = batch_result.runtime_stats.source_input;
+        stats.last_batch_source_rejected = batch_result.runtime_stats.source_rejected;
+        stats.last_batch_ticks = batch_result.engine_stats.tick_count;
+        stats.last_batch_redis_commands = batch_result.redis_commands.size();
+        stats.last_batch_tdengine_statements = batch_result.tdengine_statements.size();
+        stats.last_batch_logical_ts_ms = batch_result.runtime_stats.logical_ts_ms;
         RuntimeExecutionResult execution_result = coordinator_.execute_and_commit(pipeline_, batch_result);
         if (!execution_result.ok) {
             if (source_result.requires_ack) {
@@ -106,6 +139,8 @@ RuntimeLoopStats RuntimeLoop::run() {
                 }
             }
             stats.ok = false;
+            stats.failure_stage = execution_result.tdengine.ok ? "commit.redis" : "commit.tdengine";
+            stats.source_error = source_->error_message();
             stats.error = execution_result.tdengine.ok ? execution_result.redis.error : execution_result.tdengine.error;
             if (stats.error.empty()) {
                 stats.error = "runtime execution failed";
@@ -120,6 +155,8 @@ RuntimeLoopStats RuntimeLoop::run() {
             } else {
                 ++stats.source_ack_failures;
                 stats.ok = false;
+                stats.failure_stage = "source.ack";
+                stats.source_error = source_->error_message();
                 stats.error = "source ack failed";
                 break;
             }

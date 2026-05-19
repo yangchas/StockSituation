@@ -271,9 +271,8 @@ class TDengineService:
                 # 动态构造 VALUES 部分
                 vals = [f"'{ts_str}'"]
                 for col in all_cols[1:]: # 跳过 ts
-                    # [V40.10 Fix] 字段别名对位：profit_ratio <- change_pct_5d, avg_cost <- peak_price
+                    # 优先使用同名真实字段，避免把语义字段错误映射成占位值
                     alias_map = {
-                        'profit_ratio': 'change_pct_5d',
                         'avg_cost': 'avg_cost',
                         'concentration': 'concentration',
                     }

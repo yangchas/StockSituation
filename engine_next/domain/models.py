@@ -107,11 +107,26 @@ class StockStateSnapshot:
     concentration: float = 0.0
     profit_ratio: float = 0.0
     bias_20: float = 0.0
+    rsi_6: float = 0.0
+    ddje: float = 0.0
+    ddx: float = 0.0
+    ddy: float = 0.0
+    ddz: float = 0.0
+    structure_score_base: float = 0.0
+    shape_platform_ready: float = 0.0
+    shape_breakout_ready: float = 0.0
+    shape_repair_ready: float = 0.0
+    shape_overheat_risk: float = 0.0
+    shape_chip_cleanliness: float = 0.0
+    shape_trend_health: float = 0.0
+    shape_t2_repair_bias: float = 0.0
+    theme_core_base: float = 0.0
     market_cap_yi: float = 0.0
     amount_day_yi: float = 0.0
     plate_persistence_score: float = 0.0
     hot_plate_days: int = 0
     ths_hot_rank: int | None = None
+    ths_hot_heat: float = 0.0
     t2_lb_days: int = 0
     t2_pct: float = 0.0
     yday_broken_board: bool = False
@@ -177,6 +192,27 @@ class ThemeFact:
 
 
 @dataclass(frozen=True)
+class ThemeTradeFact:
+    plate_name: str
+    yest_hot_rank: int = 999
+    yest_limit_count: int = 0
+    yest_high_board_count: int = 0
+    auction_amount: float = 0.0
+    red_open_count: int = 0
+    red_open_rate: float = 0.0
+    avg_open_pct: float = 0.0
+    front_row_count: int = 0
+    front_row_red_count: int = 0
+    leader_count: int = 0
+    amount_2m_sum: float = 0.0
+    amount_5m_sum: float = 0.0
+    front_row_2m_pass_count: int = 0
+    high_open_fail_count: int = 0
+    low_open_repair_count: int = 0
+    expansion_count: int = 0
+
+
+@dataclass(frozen=True)
 class LadderFact:
     key: str
     total_count: int = 0
@@ -196,6 +232,8 @@ class SessionFacts:
     plate_migration_map: Dict[str, PlateMigrationFact] = field(default_factory=dict)
     theme_facts: tuple[ThemeFact, ...] = ()
     theme_fact_map: Dict[str, ThemeFact] = field(default_factory=dict)
+    theme_trade_facts: tuple[ThemeTradeFact, ...] = ()
+    theme_trade_fact_map: Dict[str, ThemeTradeFact] = field(default_factory=dict)
     ladder_facts: tuple[LadderFact, ...] = ()
     ladder_fact_map: Dict[str, LadderFact] = field(default_factory=dict)
 
@@ -210,6 +248,69 @@ class AuctionLadderDecision:
     risk_reward_ratio: float
     profile: StockProfileAssessment
     reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ThemeSelectionContext:
+    plate_name: str
+    e_score: float = 0.0
+    a_score: float = 0.0
+    x_score: float = 0.0
+    market_regime: str = "neutral"
+    theme_trade_label: str = "unknown"
+    trade_conclusion: str = "unknown"
+    fakeout_level: str = "unknown"
+    cohesion_level: str = "unknown"
+    tradable: bool = False
+    bias_action: str = "observe_only"
+    open_confirm_state: str = "unknown"
+    plate_strength_rank_pct: float = 1.0
+    plate_delta_rank_pct: float = 1.0
+    plate_breadth_score: float = 0.0
+    plate_follow_through_score: float = 0.0
+    plate_resistance_score: float = 0.0
+    plate_role: str = "neutral"
+    rotation_bias: str = "neutral"
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StockSelectionContext:
+    symbol: str
+    plate_name: str = ""
+    theme_trade_label: str = "unknown"
+    hot_rank: int = 999
+    hot_heat: float = 0.0
+    is_active_pool: bool = False
+    is_true_leader: bool = False
+    is_front_row: bool = False
+    leader_bucket: str = "unknown"
+    heat_flow_score: float = 0.0
+    turnover_quality_score: float = 0.0
+    activity_score: float = 0.0
+    theme_core_score: float = 0.0
+    kline_pattern: str = "unknown"
+    auction_open_bucket: str = "unknown"
+    open_follow_state: str = "unknown"
+    kline_score: float = 0.0
+    structure_score: float = 0.0
+    chip_score: float = 0.0
+    auction_score: float = 0.0
+    timing_score: float = 0.0
+    open_undertake_score: float = 0.0
+    shape_quality_score: float = 0.0
+    execution_quality_score: float = 0.0
+    theme_tradable: bool = False
+    theme_fakeout_level: str = "unknown"
+    theme_x_score: float = 0.0
+    open_confirm_state: str = "unknown"
+    daily_height_bucket: str = "mid"
+    stock_amount_2m_rank_in_theme_pct: float = 1.0
+    stock_amount_ratio_2m_rank_in_theme_pct: float = 1.0
+    stock_execution_rank_in_theme_pct: float = 1.0
+    stock_shape_rank_in_theme_pct: float = 1.0
+    total_score: float = 0.0
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -322,5 +423,13 @@ class IntradayMarketSummary:
     sentiment_score: float = 0.0
     red_green_ratio: float = 0.0
     avg_bid_amt: float = 0.0
+    auction_top10_amount: float = 0.0
+    auction_top20_amount: float = 0.0
+    auction_top10_vs_prev_ratio: float = 1.0
+    auction_top20_vs_prev_ratio: float = 1.0
+    open_2m_top10_amount: float = 0.0
+    open_2m_top20_amount: float = 0.0
+    open_2m_top10_vs_prev_ratio: float = 1.0
+    open_2m_top20_vs_prev_ratio: float = 1.0
     battle_status: str = ""
     notes: tuple[str, ...] = ()

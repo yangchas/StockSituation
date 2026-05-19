@@ -19,6 +19,8 @@ struct RuntimeLoopOptions {
 struct RuntimeLoopStats {
     bool ok = true;
     std::string error;
+    std::string failure_stage;
+    std::string source_error;
     uint32_t batches = 0;
     uint32_t empty_polls = 0;
     uint32_t source_errors = 0;
@@ -33,6 +35,12 @@ struct RuntimeLoopStats {
     uint64_t redis_commands = 0;
     uint64_t tdengine_statements = 0;
     uint64_t redis_committed_quotes = 0;
+    uint64_t last_batch_source_input = 0;
+    uint64_t last_batch_source_rejected = 0;
+    uint64_t last_batch_ticks = 0;
+    uint64_t last_batch_redis_commands = 0;
+    uint64_t last_batch_tdengine_statements = 0;
+    int64_t last_batch_logical_ts_ms = 0;
 };
 
 class RuntimeLoop {

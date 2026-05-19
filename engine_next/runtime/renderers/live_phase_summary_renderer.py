@@ -5,6 +5,18 @@ from engine_next.domain.models import IntradayContext
 from engine_next.runtime.intraday_context_builder import PrimedIntradayRuntimeState
 
 
+def _native_ingested_count(primed_runtime_state: PrimedIntradayRuntimeState | None) -> int:
+    if primed_runtime_state is None:
+        return 0
+    value = getattr(primed_runtime_state, "native_ingested", None)
+    if value is None:
+        value = getattr(primed_runtime_state, "rust_ingested", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def render_quote_freshness_line(
     primed_runtime_state: PrimedIntradayRuntimeState | None,
     *,
@@ -16,10 +28,12 @@ def render_quote_freshness_line(
     latest = primed_runtime_state.latest_quote_time or "-"
     latest_age = primed_runtime_state.latest_quote_age_seconds
     lag = "-" if latest_age is None else f"{latest_age}s"
+    stale_or_cached = primed_runtime_state.quote_stale_count
     return (
         "quote_freshness "
         f"| fresh={primed_runtime_state.quote_fresh_count}/{symbol_count} "
-        f"| stale={primed_runtime_state.quote_stale_count} "
+        f"| stale={stale_or_cached} "
+        f"| cache_only={stale_or_cached} "
         f"| missing={primed_runtime_state.quote_missing_count} "
         f"| latest={latest} "
         f"| lag={lag} "
@@ -48,7 +62,7 @@ class LivePhaseSummaryRenderer:
 
         market_summary = intraday_context.market_summary
         quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-        rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+        native_count = _native_ingested_count(primed_runtime_state)
         coverage_ratio = (quote_count / symbol_count) if symbol_count else 0.0
         fresh_line = render_quote_freshness_line(
             primed_runtime_state,
@@ -58,7 +72,7 @@ class LivePhaseSummaryRenderer:
         header = (
             f"runtime_readiness={runtime_readiness_label} "
             f"| quotes={quote_count}/{symbol_count} "
-            f"| rust={rust_count}"
+            f"| native={native_count}"
         )
         quote_fresh_ratio = primed_runtime_state.quote_fresh_ratio if primed_runtime_state is not None else 0.0
         coverage = (
@@ -73,7 +87,7 @@ class LivePhaseSummaryRenderer:
                 (
                     f"auction_focus | top_plate={market_summary.top_plate_name or '-'} "
                     f"| hot={market_summary.hot_plate_count} "
-                    f"| avg_bid={market_summary.avg_bid_amt / 1e8:.2f}y "
+                    f"| avg_yest_auc={market_summary.avg_bid_amt / 1e8:.2f}y "
                     f"| auc_amt={market_summary.context_auc_amt / 1e8:.2f}y"
                 ),
                 (

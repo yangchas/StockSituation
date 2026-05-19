@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip>
+#include <limits>
 #include <sstream>
+#include <vector>
 
 #include "runtime_batch_stats.h"
 
@@ -68,12 +71,22 @@ RedisFieldList RedisV2Writer::build_q2_fields(const QuoteState& state) const {
     fields.emplace_back("amt5m", to_string_i64(state.amt5m_yuan));
     fields.emplace_back("vec3m", to_string_i32(state.vec3m_bp));
     fields.emplace_back("vec5m", to_string_i32(state.vec5m_bp));
-    fields.emplace_back("a20", to_string_i32(state.auction.a20_px_milli));
-    fields.emplace_back("a24", to_string_i32(state.auction.a24_px_milli));
-    fields.emplace_back("a25", to_string_i32(state.auction.a25_px_milli));
-    fields.emplace_back("am", to_string_i64(state.auction.match_amt_yuan));
-    fields.emplace_back("br", to_string_i64(state.auction.rest_bid_amt_yuan));
-    fields.emplace_back("ar", to_string_i64(state.auction.rest_ask_amt_yuan));
+    const bool has_auction_state =
+        state.phase == MarketPhase::Auction ||
+        state.auction.a20_px_milli > 0 ||
+        state.auction.a24_px_milli > 0 ||
+        state.auction.a25_px_milli > 0 ||
+        state.auction.match_amt_yuan > 0 ||
+        state.auction.rest_bid_amt_yuan > 0 ||
+        state.auction.rest_ask_amt_yuan > 0;
+    if (has_auction_state) {
+        fields.emplace_back("a20", to_string_i32(state.auction.a20_px_milli));
+        fields.emplace_back("a24", to_string_i32(state.auction.a24_px_milli));
+        fields.emplace_back("a25", to_string_i32(state.auction.a25_px_milli));
+        fields.emplace_back("am", to_string_i64(state.auction.match_amt_yuan));
+        fields.emplace_back("br", to_string_i64(state.auction.rest_bid_amt_yuan));
+        fields.emplace_back("ar", to_string_i64(state.auction.rest_ask_amt_yuan));
+    }
     fields.emplace_back("mk", std::string(state.market));
     return fields;
 }
@@ -247,7 +260,7 @@ std::vector<RedisCommand> RedisV2Writer::build_a2_commands(
         RedisCommand anchor_set;
         anchor_set.type = RedisCommandType::SetString;
         anchor_set.key = anchor_key;
-        anchor_set.value = build_anchor_archive_json(tag, top_amount_rows);
+        anchor_set.value = build_anchor_archive_json(tag, candidates);
         commands.emplace_back(std::move(anchor_set));
 
         RedisCommand anchor_expire;
@@ -260,6 +273,7 @@ std::vector<RedisCommand> RedisV2Writer::build_a2_commands(
 }
 
 std::vector<RedisCommand> RedisV2Writer::build_runtime_commands(
+    const QuoteStateStore& store,
     const RuntimeBatchStats& stats,
     RuntimeMode mode
 ) const {
@@ -302,6 +316,26 @@ std::vector<RedisCommand> RedisV2Writer::build_runtime_commands(
     expire.key = key;
     expire.ttl_seconds = config_.redis.quote_ttl_seconds;
     commands.emplace_back(std::move(expire));
+
+    std::string trade_date_iso;
+    const std::string open_2m_summary_json = build_open_2m_summary_json(
+        store,
+        stats.logical_ts_ms,
+        &trade_date_iso
+    );
+    if (!open_2m_summary_json.empty() && !trade_date_iso.empty()) {
+        RedisCommand open_2m_set;
+        open_2m_set.type = RedisCommandType::SetString;
+        open_2m_set.key = "market:open2m:summary:" + trade_date_iso;
+        open_2m_set.value = open_2m_summary_json;
+        commands.emplace_back(std::move(open_2m_set));
+
+        RedisCommand open_2m_expire;
+        open_2m_expire.type = RedisCommandType::Expire;
+        open_2m_expire.key = "market:open2m:summary:" + trade_date_iso;
+        open_2m_expire.ttl_seconds = config_.redis.quote_ttl_seconds;
+        commands.emplace_back(std::move(open_2m_expire));
+    }
     return commands;
 }
 
@@ -329,6 +363,22 @@ std::string RedisV2Writer::trade_date_yyyymmdd(int64_t ts_ms) {
     return std::string(buffer);
 }
 
+std::string RedisV2Writer::trade_date_iso8601(int64_t ts_ms) {
+    if (ts_ms <= 0) {
+        return "";
+    }
+    const std::time_t seconds = static_cast<std::time_t>(ts_ms / 1000);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    localtime_s(&local_tm, &seconds);
+#else
+    localtime_r(&seconds, &local_tm);
+#endif
+    char buffer[11] = {0};
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &local_tm);
+    return std::string(buffer);
+}
+
 std::string RedisV2Writer::auction_tag_from_trigger(const SnapshotTriggerState& trigger) {
     if (trigger.emit_a25) {
         return "0925";
@@ -350,6 +400,83 @@ int RedisV2Writer::change_bp(const QuoteState& state) {
         return 0;
     }
     return static_cast<int>(((static_cast<int64_t>(state.px_milli) - state.pc_milli) * 10000) / state.pc_milli);
+}
+
+std::string RedisV2Writer::build_open_2m_summary_json(
+    const QuoteStateStore& store,
+    int64_t logical_ts_ms,
+    std::string* trade_date_iso
+) const {
+    if (trade_date_iso != nullptr) {
+        *trade_date_iso = trade_date_iso8601(logical_ts_ms);
+    }
+    if (!initialized_ || logical_ts_ms <= 0) {
+        return "";
+    }
+
+    std::vector<int64_t> top_amounts;
+    top_amounts.reserve(20);
+    store.for_each_active([&](const QuoteState& state) {
+        if (!is_equity_alias_state(state)) {
+            return;
+        }
+        if (state.phase == MarketPhase::Auction) {
+            return;
+        }
+        if (state.ts_ms <= 0 || state.amt2m_yuan <= 0) {
+            return;
+        }
+
+        const int64_t amount = state.amt2m_yuan;
+        if (top_amounts.size() < 20) {
+            top_amounts.emplace_back(amount);
+            if (top_amounts.size() == 20) {
+                std::sort(top_amounts.begin(), top_amounts.end(), std::greater<int64_t>());
+            }
+            return;
+        }
+
+        if (amount <= top_amounts.back()) {
+            return;
+        }
+        top_amounts.back() = amount;
+        for (std::size_t i = top_amounts.size() - 1; i > 0; --i) {
+            if (top_amounts[i] <= top_amounts[i - 1]) {
+                break;
+            }
+            std::swap(top_amounts[i], top_amounts[i - 1]);
+        }
+    });
+
+    if (top_amounts.empty()) {
+        return "";
+    }
+
+    if (top_amounts.size() < 20) {
+        std::sort(top_amounts.begin(), top_amounts.end(), std::greater<int64_t>());
+    }
+
+    int64_t top10_amount = 0;
+    int64_t top20_amount = 0;
+    const std::size_t top10_count = std::min<std::size_t>(10, top_amounts.size());
+    const std::size_t top20_count = top_amounts.size();
+    for (std::size_t i = 0; i < top_amounts.size(); ++i) {
+        top20_amount += top_amounts[i];
+        if (i < top10_count) {
+            top10_amount += top_amounts[i];
+        }
+    }
+
+    std::ostringstream out;
+    out << "{"
+        << "\"trade_date\":\"" << trade_date_iso8601(logical_ts_ms) << "\","
+        << "\"top10_amount\":" << top10_amount << ","
+        << "\"top20_amount\":" << top20_amount << ","
+        << "\"top10_count\":" << top10_count << ","
+        << "\"top20_count\":" << top20_count << ","
+        << "\"updated_at_ts\":" << logical_ts_ms / 1000
+        << "}";
+    return out.str();
 }
 
 bool RedisV2Writer::is_equity_alias_state(const QuoteState& state) {
@@ -376,18 +503,10 @@ bool RedisV2Writer::is_equity_alias_state(const QuoteState& state) {
 
 std::string RedisV2Writer::change_pct_string(const QuoteState& state) {
     const int bp = change_bp(state);
-    const int scaled = bp;
-    const int whole = scaled / 100;
-    int frac = scaled % 100;
-    if (frac < 0) {
-        frac = -frac;
-    }
     std::ostringstream oss;
-    oss << whole << ".";
-    if (frac < 10) {
-        oss << "0";
-    }
-    oss << frac;
+    oss.setf(std::ios::fixed);
+    oss.precision(6);
+    oss << (static_cast<double>(bp) / 10000.0);
     return oss.str();
 }
 

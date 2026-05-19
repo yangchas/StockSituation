@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from heapq import nlargest
 from typing import Any, Iterable
@@ -16,12 +16,9 @@ from engine_next.runtime.plate_mapping_registry import (
     decode_theme_list,
     is_generic_plate,
     merge_theme_lists,
-    prioritize_core_themes,
     split_plate_tokens,
 )
-from engine_next.runtime.intraday_data_hub import IntradayDataHub
-from engine_next.runtime.rust_runtime_feed import RustRuntimeFeed
-from engine_next.runtime.rust_snapshot_bridge import RustSnapshotBridge
+from engine_next.runtime.intraday_data_hub import IntradayDataHub, normalize_auction_pct_ratio
 from engine_next.runtime.session_facts import (
     build_session_facts,
     session_facts_from_payload,
@@ -68,10 +65,11 @@ class PrimedIntradayRuntimeState:
     stock_theme_map: dict[str, tuple[str, ...]]
     stock_reason_map: dict[str, str]
     market_runtime_state: dict[str, Any]
-    rust_ingested: int
-    rust_snapshot_map: dict[str, dict[str, float]]
-    rust_market_extremes: dict[str, Any]
-    tick_metric_map: dict[str, TickWindowMetrics]
+    native_ingested: int = 0
+    rust_ingested: int = 0
+    tick_metric_map: dict[str, TickWindowMetrics] = field(default_factory=dict)
+    rust_snapshot_map: dict[str, Any] = field(default_factory=dict)
+    rust_market_extremes: dict[str, Any] = field(default_factory=dict)
     quote_fresh_count: int = 0
     quote_stale_count: int = 0
     quote_missing_count: int = 0
@@ -88,6 +86,12 @@ class PrimedIntradayRuntimeState:
     auction_signature: str = ""
     notes: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        if int(getattr(self, "native_ingested", 0) or 0) <= 0 and int(getattr(self, "rust_ingested", 0) or 0) > 0:
+            object.__setattr__(self, "native_ingested", int(self.rust_ingested))
+        if int(getattr(self, "rust_ingested", 0) or 0) <= 0 and int(getattr(self, "native_ingested", 0) or 0) > 0:
+            object.__setattr__(self, "rust_ingested", int(self.native_ingested))
+
 
 class IntradayContextBuilder:
     """
@@ -102,29 +106,23 @@ class IntradayContextBuilder:
         self,
         *,
         intraday_hub: IntradayDataHub | None = None,
-        rust_bridge: RustSnapshotBridge | None = None,
-        rust_feed: RustRuntimeFeed | None = None,
         tick_tracker: TickWindowTracker | None = None,
     ) -> None:
         self._hub = intraday_hub or IntradayDataHub()
-        self._rust_bridge = rust_bridge
-        self._rust_feed = rust_feed or (RustRuntimeFeed(rust_bridge) if rust_bridge is not None else None)
         self._tick_tracker = tick_tracker or TickWindowTracker()
         self._scoped_cache_token: tuple[str, int | None] | None = None
         self._json_hash_cache: dict[str, dict[str, dict]] = {}
         self._string_hash_cache: dict[str, dict[str, str]] = {}
         self._string_key_cache: dict[str, dict[str, Any]] = {}
         self._primed_runtime_state: PrimedIntradayRuntimeState | None = None
+        self._rust_bridge = None
+        self._rust_feed = None
         self._f10_service: Any | None = None
         self._f10_name_cache: dict[str, str] = {}
 
     @property
     def hub(self) -> IntradayDataHub:
         return self._hub
-
-    @property
-    def rust_bridge(self) -> RustSnapshotBridge | None:
-        return self._rust_bridge
 
     @property
     def tick_tracker(self) -> TickWindowTracker:
@@ -204,6 +202,7 @@ class IntradayContextBuilder:
                     tokens.append(cleaned)
             return tuple(tokens)
 
+        reason_tokens = tuple(build_plate_candidates_from_reason(reason=reason)) if reason else ()
         candidate_entries: list[tuple[str, int]] = []
 
         def _extend(values: tuple[str, ...], priority: int) -> None:
@@ -212,13 +211,14 @@ class IntradayContextBuilder:
                     continue
                 candidate_entries.append((value, priority))
 
-        _extend(_usable_tokens(yest_plate), 3)
-        _extend(_usable_tokens(runtime_plate), 2)
+        _extend(_usable_tokens(yest_plate), 4)
+        _extend(reason_tokens, 3)
         for theme in themes:
-            _extend(_usable_tokens(str(theme or "")), 1)
+            _extend(_usable_tokens(str(theme or "")), 2)
+        _extend(_usable_tokens(runtime_plate), 1)
 
         theme_candidates = tuple(name for name, _ in candidate_entries)
-        fallback = str(yest_plate or runtime_plate or next(iter(theme_candidates), "")).strip()
+        fallback = str(yest_plate or reason_tokens[0] if reason_tokens else runtime_plate or next(iter(theme_candidates), "")).strip()
         runtime_tokens = _usable_tokens(runtime_plate)
         yest_tokens = _usable_tokens(yest_plate)
         theme_front = tuple(dict.fromkeys(theme_candidates[:2]))
@@ -240,8 +240,22 @@ class IntradayContextBuilder:
                 ),
             )
             best_name, _ = ranked[0]
-            if self._match_hot_plate_signal((best_name,), hot_plate_map) > 0:
+            if self._match_hot_plate_signal((best_name,), hot_plate_map) > 0 and not (
+                yest_primary and not is_generic_plate(yest_primary)
+            ):
                 return best_name
+        if preferred:
+            ranked = sorted(
+                preferred,
+                key=lambda item: (
+                    -item[1],
+                    item[0] != yest_primary,
+                    item[0] != (reason_tokens[0] if reason_tokens else ""),
+                    item[0] == runtime_primary,
+                    item[0],
+                ),
+            )
+            return ranked[0][0]
         return choose_primary_plate(theme_candidates, fallback=fallback)
 
     @staticmethod
@@ -330,8 +344,14 @@ class IntradayContextBuilder:
         offline_context_date = request.offline_context_date or request.previous_trade_date
         symbols = tuple(dict.fromkeys(_normalize_symbol(symbol) for symbol in request.symbols if _normalize_symbol(symbol)))
 
+        if request.now is not None and request.now.strftime("%Y-%m-%d") == request.trade_date:
+            self._ensure_hot_rank_cache(request.trade_date, request.phase)
         quotes_result = self.hub.fetch_redis_quotes(symbols)
-        cache_result = self.hub.load_runtime_cache_views(offline_context_date, symbols)
+        cache_result = self.hub.load_runtime_cache_views(
+            offline_context_date,
+            symbols,
+            hot_rank_trade_date=request.trade_date,
+        )
         auction_rows = self._load_auction_rows(request, symbols)
         yest_limit_map = self._load_json_hash(f"cache:yest_limit_pool:{request.previous_trade_date}")
         hot_plate_map = self._load_json_hash(f"cache:hot_plates:{request.trade_date}")
@@ -350,16 +370,6 @@ class IntradayContextBuilder:
         stock_theme_map = self._load_list_hash(PLATE_MAPPING_S2P_KEY)
         stock_reason_map = self._load_string_hash("market:stock_reason")
         market_runtime_state = self._load_market_runtime_state(request.trade_date)
-        rust_ingested = 0
-        rust_snapshot_map: dict[str, dict[str, float]] = {}
-        rust_market_extremes: dict[str, Any] = {}
-        if self._rust_feed is not None and self._rust_bridge is not None:
-            rust_ingested = self._rust_feed.ingest_quotes(
-                quotes_result.rows,
-                stock_plate_map=stock_plate_map,
-            )
-            rust_snapshot_map = self._rust_bridge.get_normalized_snapshot()
-            rust_market_extremes = self._rust_bridge.get_market_extremes()
         quote_health = self._summarize_quote_freshness(
             phase=request.phase,
             symbols=symbols,
@@ -392,9 +402,7 @@ class IntradayContextBuilder:
             stock_theme_map=stock_theme_map,
             stock_reason_map=stock_reason_map,
             market_runtime_state=market_runtime_state,
-            rust_ingested=rust_ingested,
-            rust_snapshot_map=rust_snapshot_map,
-            rust_market_extremes=rust_market_extremes,
+            native_ingested=len(quotes_result.rows),
             tick_metric_map=tick_metric_map,
             quote_fresh_count=int(quote_health["fresh_count"]),
             quote_stale_count=int(quote_health["stale_count"]),
@@ -424,9 +432,8 @@ class IntradayContextBuilder:
                     f" latest={quote_health['latest_time'] or '-'}"
                 ),
                 f"cache_views={len(cache_result.rows)}",
-                f"rust_snapshot={len(rust_snapshot_map)}",
-                f"rust_ingested={rust_ingested}",
-                f"rust_runtime={'enabled' if self._rust_feed is not None else 'disabled'}",
+                f"native_ingested={len(quotes_result.rows)}",
+                "native_runtime=t1_v2_q2",
                 f"tick_metrics={len(tick_metric_map)}",
                 f"auction={len(auction_rows)}",
                 f"yest_limit={len(yest_limit_map)}",
@@ -463,18 +470,25 @@ class IntradayContextBuilder:
         for symbol in primed.symbols:
             quote = quote_map.get(symbol, {})
             cache = cache_map.get(symbol, {})
-            rust_row = primed.rust_snapshot_map.get(symbol, {})
             tick_metrics = primed.tick_metric_map.get(symbol)
             auction = auction_map.get(symbol, {})
             yest = primed.yest_limit_map.get(symbol, {})
             theme_names = primed.stock_theme_map.get(symbol, ())
 
-            price = float(quote.get("price", rust_row.get("price", 0.0)) or 0.0)
+            price = float(quote.get("price", 0.0) or 0.0)
             pre_close = float(quote.get("pre_close", 0.0) or 0.0)
             current_pct = ((price / pre_close) - 1.0) if price > 0 and pre_close > 0 else float(cache.get("pct_chg", 0.0) or 0.0)
             limit_state = int(quote.get("limit_state", 0) or 0)
             is_limit_up_now = limit_state == 1
-            auction_pct = float(auction.get("change_pct", 0.0) or 0.0)
+            auction_pct = normalize_auction_pct_ratio(auction.get("change_pct", 0.0))
+            auction_from_q2 = False
+            q2_a25_milli = float(quote.get("q2_a25_milli", 0.0) or 0.0)
+            if not auction and q2_a25_milli > 0 and pre_close > 0:
+                auction_pct = normalize_auction_pct_ratio((q2_a25_milli / (pre_close * 1000.0)) - 1.0)
+                auction_from_q2 = True
+            if not auction_from_q2 and price > 0 and pre_close > 0 and abs(current_pct) <= 0.35:
+                if abs(auction_pct) > 0.35 or abs(auction_pct - current_pct) > 0.15:
+                    auction_pct = current_pct
             peak_price = float(cache.get("peak_price", 0.0) or 0.0)
             resistance_gap = (peak_price - price) / price if peak_price > price > 0 else 0.0
             plate = self._resolve_snapshot_plate(
@@ -485,31 +499,21 @@ class IntradayContextBuilder:
                 hot_plate_map=primed.effective_hot_plate_map,
             )
             market_cap_yi = self._to_yi(cache.get("real_market_cap"))
-            amount_day_yi = self._to_yi(quote.get("amount", rust_row.get("amount")))
+            amount_day_yi = self._to_yi(quote.get("amount"))
             speed_1m = float(quote.get("speed_1m", quote.get("change_rate_1min", 0.0)) or 0.0)
             if speed_1m == 0.0 and tick_metrics is not None:
                 speed_1m = float(tick_metrics.speed_1m)
-            if speed_1m == 0.0:
-                speed_1m = float(rust_row.get("speed_1m", 0.0) or 0.0)
             if speed_1m == 0.0:
                 speed_1m = float(cache.get("speed_1m", 0.0) or 0.0)
             amount_2m = float(quote.get("amount_2m", quote.get("amount_2min", 0.0)) or 0.0)
             if amount_2m <= 0.0 and tick_metrics is not None:
                 amount_2m = float(tick_metrics.amount_2m)
             if amount_2m <= 0.0:
-                amount_2m = float(rust_row.get("amount_2m", 0.0) or 0.0)
-            if amount_2m <= 0.0:
                 amount_2m = float(cache.get("amount_2m", 0.0) or 0.0)
-            amount_5m = float(quote.get("amount_5m", rust_row.get("amount_5m", 0.0)) or 0.0)
-            vector_3m = float(quote.get("vector_3m", rust_row.get("vector_3m", 0.0)) or 0.0)
-            vector_5m = float(quote.get("vector_5m", rust_row.get("vector_5m", 0.0)) or 0.0)
-            bid_amount = float(
-                quote.get(
-                    "bid_amount",
-                    rust_row.get("bid_amount", quote.get("book1_amount_yuan", 0.0)),
-                )
-                or 0.0
-            )
+            amount_5m = float(quote.get("amount_5m", 0.0) or 0.0)
+            vector_3m = float(quote.get("vector_3m", 0.0) or 0.0)
+            vector_5m = float(quote.get("vector_5m", 0.0) or 0.0)
+            bid_amount = float(quote.get("bid_amount", quote.get("book1_amount_yuan", 0.0)) or 0.0)
             volume_intensity = 1.0
             if bid_amount > 0 and pre_close > 0:
                 volume_intensity = max(1.0, round(bid_amount / 10_000_000, 2))
@@ -531,7 +535,9 @@ class IntradayContextBuilder:
                     open_pct=auction_pct,
                     current_pct=current_pct,
                     change_pct=current_pct,
-                    auction_amount=float(auction.get("amount", 0.0) or 0.0),
+                    auction_amount=float(
+                        auction.get("amount", quote.get("q2_auction_amount_yuan", 0.0)) or 0.0
+                    ),
                     volume_intensity=volume_intensity,
                     vol_ratio=float(cache.get("vol_ratio", 0.0) or 0.0),
                     speed_1m=speed_1m,
@@ -544,11 +550,26 @@ class IntradayContextBuilder:
                     concentration=float(cache.get("concentration", 0.0) or 0.0),
                     profit_ratio=float(cache.get("profit_ratio", 0.0) or 0.0),
                     bias_20=float(cache.get("bias_20", 0.0) or 0.0),
+                    rsi_6=float(cache.get("rsi_6", 0.0) or 0.0),
+                    ddje=float(cache.get("ddje", 0.0) or 0.0),
+                    ddx=float(cache.get("ddx", 0.0) or 0.0),
+                    ddy=float(cache.get("ddy", 0.0) or 0.0),
+                    ddz=float(cache.get("ddz", 0.0) or 0.0),
+                    structure_score_base=float(cache.get("structure_score_base", 0.0) or 0.0),
+                    shape_platform_ready=float(cache.get("shape_platform_ready", 0.0) or 0.0),
+                    shape_breakout_ready=float(cache.get("shape_breakout_ready", 0.0) or 0.0),
+                    shape_repair_ready=float(cache.get("shape_repair_ready", 0.0) or 0.0),
+                    shape_overheat_risk=float(cache.get("shape_overheat_risk", 0.0) or 0.0),
+                    shape_chip_cleanliness=float(cache.get("shape_chip_cleanliness", 0.0) or 0.0),
+                    shape_trend_health=float(cache.get("shape_trend_health", 0.0) or 0.0),
+                    shape_t2_repair_bias=float(cache.get("shape_t2_repair_bias", 0.0) or 0.0),
+                    theme_core_base=float(cache.get("theme_core_base", 0.0) or 0.0),
                     market_cap_yi=market_cap_yi,
                     amount_day_yi=amount_day_yi,
                     plate_persistence_score=self._plate_persistence_score(plate, primed.effective_hot_plate_map, primed.yesterday_hot_plate_map),
                     hot_plate_days=self._hot_plate_days(plate, primed.effective_hot_plate_map, primed.yesterday_hot_plate_map),
                     ths_hot_rank=self._to_optional_int(cache.get("rank")),
+                    ths_hot_heat=float(cache.get("heat", 0.0) or 0.0),
                     t2_lb_days=int(cache.get("t2_lb_days", 0) or 0),
                     t2_pct=float(cache.get("t2_pct", 0.0) or 0.0),
                     is_yest_limit=bool(yest),
@@ -603,9 +624,9 @@ class IntradayContextBuilder:
             auction_map=auction_map,
             yest_limit_map=primed.yest_limit_map,
             session_facts=session_facts,
-            rust_market_extremes=primed.rust_market_extremes,
             cache_rows=tuple(cache_map.values()),
             market_runtime_state=primed.market_runtime_state,
+            previous_market_runtime_state=self._load_market_runtime_state(primed.previous_trade_date),
         )
         return IntradayContext(
             phase=primed.phase,
@@ -637,7 +658,7 @@ class IntradayContextBuilder:
                     (
                         {
                             "symbol": _normalize_symbol(symbol),
-                            "change_pct": float(change_pct.get("change_pct", 0.0) or 0.0),
+                            "change_pct": normalize_auction_pct_ratio(change_pct.get("change_pct", 0.0)),
                             "amount": float(change_pct.get("amount", 0.0) or 0.0),
                             "bid_amount": float(change_pct.get("bid_amount", 0.0) or 0.0),
                             "source": str(change_pct.get("source") or "redis_anchor"),
@@ -645,7 +666,7 @@ class IntradayContextBuilder:
                         if isinstance(change_pct, dict)
                         else {
                             "symbol": _normalize_symbol(symbol),
-                            "change_pct": float(change_pct),
+                            "change_pct": normalize_auction_pct_ratio(change_pct),
                             "amount": 0.0,
                             "bid_amount": 0.0,
                             "source": "redis_anchor",
@@ -725,6 +746,30 @@ class IntradayContextBuilder:
     def _load_hot_plate_meta(self, trade_date: str) -> dict[str, Any]:
         payload = self._load_json_string(f"cache:hot_plates_meta:{trade_date}")
         return payload if isinstance(payload, dict) else {}
+
+    def _load_hot_rank_meta(self, trade_date: str) -> dict[str, Any]:
+        payload = self._load_json_string(f"cache:hot_rank_meta:{trade_date}")
+        return payload if isinstance(payload, dict) else {}
+
+    def _ensure_hot_rank_cache(self, trade_date: str, phase: RunPhase) -> None:
+        if phase not in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY):
+            return
+        redis_key = f"cache:hot_rank:{trade_date}"
+        meta = self._load_hot_rank_meta(trade_date)
+        stale_limit_seconds = 30 * 60 if phase in (RunPhase.AUCTION, RunPhase.INTRADAY) else 4 * 60 * 60
+        try:
+            updated_at_ts = int(float(meta.get("updated_at_ts", 0) or 0))
+        except (TypeError, ValueError):
+            updated_at_ts = 0
+        age_seconds = max(int(datetime.now().timestamp()) - updated_at_ts, 0) if updated_at_ts > 0 else None
+        has_cache = bool(self.hub.redis.hlen(redis_key) or 0)
+        is_fresh = bool(has_cache and age_seconds is not None and age_seconds <= stale_limit_seconds)
+        if is_fresh:
+            return
+        try:
+            self.hub.fetch_hot_rank(trade_date, phase, top_n=200)
+        except Exception:
+            return
 
     def _prepare_scope_cache(self, trade_date: str, minute_index: int | None) -> None:
         token = (trade_date, minute_index)
@@ -849,14 +894,23 @@ class IntradayContextBuilder:
 
     def _merge_plate_names(self, plate: str, reason: str, themes: Iterable[str] = ()) -> tuple[str, ...]:
         reason_candidates = build_plate_candidates_from_reason(reason=reason) if reason else []
-        if reason_candidates:
-            names = prioritize_core_themes((plate, *reason_candidates), themes, max_count=2)
-        else:
-            names = merge_theme_lists((), (plate, *themes))
-        if plate:
-            normalized_plate = str(plate).strip()
+        names = merge_theme_lists((), (plate, *reason_candidates, *themes))
+        if not names:
+            return ()
+        normalized_plate = str(plate).strip()
+        if normalized_plate:
             names = [normalized_plate] + [name for name in names if name != normalized_plate]
-        return tuple(names)
+        primary = names[0]
+        secondary_candidates = [name for name in names[1:] if name != primary]
+        prioritized_reason_candidates = [
+            name for name in reason_candidates if name and name != primary and name in secondary_candidates
+        ]
+        for name in prioritized_reason_candidates:
+            return (primary, name)
+        nongeneric = [name for name in secondary_candidates if not is_generic_plate(name)]
+        generic = [name for name in secondary_candidates if is_generic_plate(name)]
+        ordered = [primary, *(nongeneric or generic)]
+        return tuple(ordered[:2])
 
     def _attach_theme_ranks(self, snapshots: list[StockStateSnapshot]) -> list[StockStateSnapshot]:
         grouped: dict[str, list[StockStateSnapshot]] = {}
@@ -899,9 +953,9 @@ class IntradayContextBuilder:
         auction_map: dict[str, dict],
         yest_limit_map: dict[str, dict],
         session_facts,
-        rust_market_extremes: dict[str, Any],
         cache_rows: tuple[dict[str, Any], ...],
         market_runtime_state: dict[str, Any],
+        previous_market_runtime_state: dict[str, Any] | None = None,
     ) -> IntradayMarketSummary:
         top_plate_name = ""
         top_plate_strength = 0.0
@@ -1001,6 +1055,27 @@ class IntradayContextBuilder:
         market_full_auc_amt = self._to_float(market_runtime_state.get("full_market_auc_amt"))
         market_avg_5d_vol = self._to_float(market_runtime_state.get("avg_5d_vol"))
         market_predicted_full_day_amount = self._to_float(market_runtime_state.get("predicted_full_day_amount"))
+        auction_top10_amount = self._to_float(market_runtime_state.get("auction_top10_amount"))
+        auction_top20_amount = self._to_float(market_runtime_state.get("auction_top20_amount"))
+        open_2m_top10_amount = self._to_float(market_runtime_state.get("open_2m_top10_amount"))
+        open_2m_top20_amount = self._to_float(market_runtime_state.get("open_2m_top20_amount"))
+        previous_market_runtime_state = previous_market_runtime_state or {}
+        previous_auction_top10_amount = self._to_float(previous_market_runtime_state.get("auction_top10_amount"))
+        previous_auction_top20_amount = self._to_float(previous_market_runtime_state.get("auction_top20_amount"))
+        previous_open_2m_top10_amount = self._to_float(previous_market_runtime_state.get("open_2m_top10_amount"))
+        previous_open_2m_top20_amount = self._to_float(previous_market_runtime_state.get("open_2m_top20_amount"))
+        auction_top10_vs_prev_ratio = (
+            auction_top10_amount / previous_auction_top10_amount if previous_auction_top10_amount > 0.0 else 1.0
+        )
+        auction_top20_vs_prev_ratio = (
+            auction_top20_amount / previous_auction_top20_amount if previous_auction_top20_amount > 0.0 else 1.0
+        )
+        open_2m_top10_vs_prev_ratio = (
+            open_2m_top10_amount / previous_open_2m_top10_amount if previous_open_2m_top10_amount > 0.0 else 1.0
+        )
+        open_2m_top20_vs_prev_ratio = (
+            open_2m_top20_amount / previous_open_2m_top20_amount if previous_open_2m_top20_amount > 0.0 else 1.0
+        )
         if market_predicted_full_day_amount <= 0.0 and market_full_auc_amt > 0.0:
             market_predicted_full_day_amount = market_full_auc_amt / 0.045
         market_volume_level = str(market_runtime_state.get("volume_level") or "")
@@ -1011,20 +1086,18 @@ class IntradayContextBuilder:
                 else ("low" if market_predicted_full_day_amount < market_avg_5d_vol * 0.9 else "flat")
             )
 
-        top_turnover_symbols = tuple(rust_market_extremes.get("top_turnover_symbols", ()))
-        if not top_turnover_symbols:
-            top_turnover_symbols = tuple(
-                snapshot.symbol
-                for snapshot in nlargest(
-                    20,
-                    snapshots,
-                    key=lambda item: (
-                        float(item.amount_day_yi or 0.0),
-                        float(item.auction_amount or 0.0),
-                    ),
-                )
-                if snapshot.symbol
+        top_turnover_symbols = tuple(
+            snapshot.symbol
+            for snapshot in nlargest(
+                20,
+                snapshots,
+                key=lambda item: (
+                    float(item.amount_day_yi or 0.0),
+                    float(item.auction_amount or 0.0),
+                ),
             )
+            if snapshot.symbol
+        )
 
         return IntradayMarketSummary(
             top_turnover_symbols=top_turnover_symbols,
@@ -1057,11 +1130,22 @@ class IntradayContextBuilder:
             sentiment_score=sentiment_score,
             red_green_ratio=red_green_ratio,
             avg_bid_amt=avg_bid_amt,
+            auction_top10_amount=auction_top10_amount,
+            auction_top20_amount=auction_top20_amount,
+            auction_top10_vs_prev_ratio=round(auction_top10_vs_prev_ratio, 3),
+            auction_top20_vs_prev_ratio=round(auction_top20_vs_prev_ratio, 3),
+            open_2m_top10_amount=open_2m_top10_amount,
+            open_2m_top20_amount=open_2m_top20_amount,
+            open_2m_top10_vs_prev_ratio=round(open_2m_top10_vs_prev_ratio, 3),
+            open_2m_top20_vs_prev_ratio=round(open_2m_top20_vs_prev_ratio, 3),
             battle_status=self._judge_battle_status(headshot_rate, promotion_rate, total),
             notes=(
                 "mainline sector is inferred from runtime snapshots and falls back to the strongest Kaipan hot-plate signal",
                 "top_plate_name remains the strongest Kaipan hot-plate signal for cross-checking runtime mainline",
-                "top turnover comes from Rust _EXTREMES_ snapshot when available",
+                "top turnover comes from t1_v2/q2 amount fields and falls back to auction amount",
+                "auction_top10/top20 compare front-row auction concentration against previous trade day",
+                "open_2m_top10/top20 compare opening two-minute front-row strength against previous trade day",
+                "open_2m market slice must come from explicit runtime summary cache and must not fall back to request-scope snapshots",
                 "hot-plate strength/change_pct/net inflow follow Kaipan normalized contract when present",
                 "net inflow is interpreted together with change_pct to distinguish buying pressure from distribution",
                 "plate migration is classified only from strength/change_pct/net inflow deltas plus today/yesterday presence",

@@ -83,6 +83,18 @@ def _is_equity_symbol(value: str) -> bool:
     )
 
 
+def _native_ingested_count(primed_runtime_state: PrimedIntradayRuntimeState | None) -> int:
+    if primed_runtime_state is None:
+        return 0
+    value = getattr(primed_runtime_state, "native_ingested", None)
+    if value is None:
+        value = getattr(primed_runtime_state, "rust_ingested", 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _dedupe_symbols(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(
@@ -270,6 +282,7 @@ class EngineApp:
         self._last_auction_cleanup_trade_date: str | None = None
         self._last_intraday_auction_recap_trade_date: str | None = None
         self._last_opening_validation_checkpoint_token: str | None = None
+        self._last_open_2m_runtime_refresh_token: str | None = None
 
     @property
     def redis(self):
@@ -520,6 +533,42 @@ class EngineApp:
             self._last_opening_validation_checkpoint_token = token
         return notes
 
+    def _refresh_open_2m_runtime_summary_if_needed(
+        self,
+        *,
+        request: EngineAppRequest,
+        phase: RunPhase,
+        offline_context_date: str,
+    ) -> tuple[str, ...]:
+        if request.historical_replay or phase != RunPhase.INTRADAY:
+            return ()
+        minute_tag = request.now.strftime("%H:%M")
+        if minute_tag < "09:32" or minute_tag > "09:34":
+            return ()
+        if not self._is_opening_strategy_window(request.now, phase):
+            return ()
+        token = f"{request.trade_date}:open2m_runtime_summary"
+        if self._last_open_2m_runtime_refresh_token == token:
+            return ()
+        result = self._market_runtime_summary_service.refresh_open_2m_runtime_summary(
+            request.trade_date,
+            offline_context_date=offline_context_date,
+            create_if_missing=False,
+        )
+        if result is None:
+            return ()
+        self._last_open_2m_runtime_refresh_token = token
+        summary = result.summary
+        return (
+            "open2m_runtime_summary refreshed",
+            (
+                "open2m_slice "
+                f"| top10={float(summary.get('open_2m_top10_amount', 0.0) or 0.0):.2f} "
+                f"| top20={float(summary.get('open_2m_top20_amount', 0.0) or 0.0):.2f} "
+                f"| keys={','.join(result.redis_keys_written) or '-'}"
+            ),
+        )
+
     def _hot_plate_freshness_limit_seconds(self, phase: RunPhase) -> int:
         if phase == RunPhase.PREMARKET:
             return 96 * 60 * 60
@@ -562,6 +611,32 @@ class EngineApp:
                     values.append(str(item))
         return _dedupe_symbols(values)
 
+    def _load_live_quote_symbols(
+        self,
+        *,
+        trade_date: str,
+        allow_full_scan_fallback: bool = False,
+    ) -> tuple[str, ...]:
+        date_tag = trade_date.replace("-", "")
+        q2_active_symbols = self._safe_smembers(f"q2:active:{date_tag}")
+        if q2_active_symbols:
+            return _dedupe_symbols(q2_active_symbols)
+        legacy_quote_symbols = tuple(
+            key.replace("stock:quote:", "")
+            for key in self._safe_keys("stock:quote:*")
+            if str(key).startswith("stock:quote:")
+        )
+        if legacy_quote_symbols:
+            return _dedupe_symbols(legacy_quote_symbols)
+        if not allow_full_scan_fallback:
+            return ()
+        q2_keys = self._safe_keys("q2:*")
+        return _dedupe_symbols(
+            key.replace("q2:", "")
+            for key in q2_keys
+            if str(key).startswith("q2:")
+        )
+
     def _discover_runtime_symbols(self, trade_date: str, previous_trade_date: str) -> tuple[str, ...]:
         candidates: list[str] = []
         candidates.extend(self._safe_hkeys(f"cache:yest_limit_pool:{previous_trade_date}"))
@@ -573,14 +648,12 @@ class EngineApp:
         )
         candidates.extend(self._safe_hkeys("market:stock_plate"))
         candidates.extend(self._safe_hkeys("config:plate_mapping:s2p"))
-        quote_keys = self._safe_keys("stock:quote:*")
-        candidates.extend(key.replace("stock:quote:", "") for key in quote_keys)
-        q2_active_symbols = self._safe_smembers(f"q2:active:{trade_date.replace('-', '')}")
-        if q2_active_symbols:
-            candidates.extend(q2_active_symbols)
-        else:
-            q2_keys = self._safe_keys("q2:*")
-            candidates.extend(key.replace("q2:", "") for key in q2_keys)
+        candidates.extend(
+            self._load_live_quote_symbols(
+                trade_date=trade_date,
+                allow_full_scan_fallback=True,
+            )
+        )
         return _dedupe_symbols(candidates)
 
     def _filter_active_runtime_symbols(
@@ -607,20 +680,12 @@ class EngineApp:
                 self._safe_hget(f"market:auction:{trade_date.replace('-', '')}:0925", "top_amount")
             )
         )
-        active_quote_symbols = {
-            key.replace("stock:quote:", "")
-            for key in self._safe_keys("stock:quote:*")
-            if str(key).startswith("stock:quote:")
-        }
-        q2_active_symbols = self._safe_smembers(f"q2:active:{trade_date.replace('-', '')}")
-        if q2_active_symbols:
-            active_quote_symbols.update(q2_active_symbols)
-        else:
-            active_quote_symbols.update(
-                key.replace("q2:", "")
-                for key in self._safe_keys("q2:*")
-                if str(key).startswith("q2:")
+        active_quote_symbols = set(
+            self._load_live_quote_symbols(
+                trade_date=trade_date,
+                allow_full_scan_fallback=False,
             )
+        )
         if not active_quote_symbols:
             return symbols
 
@@ -1189,12 +1254,14 @@ class EngineApp:
         )
 
         if phase in (RunPhase.AUCTION, RunPhase.INTRADAY):
+            max_healthy_age_seconds = 15 if phase == RunPhase.INTRADAY else stale_threshold_seconds
+            min_healthy_fresh_ratio = 0.95 if phase == RunPhase.INTRADAY else 0.90
             quote_feed_healthy = (
                 quote_rows > 0
-                and fresh_ratio >= 0.90
+                and fresh_ratio >= min_healthy_fresh_ratio
                 and latest_age_seconds is not None
                 and stale_threshold_seconds > 0
-                and latest_age_seconds <= stale_threshold_seconds
+                and latest_age_seconds <= max_healthy_age_seconds
             )
             quote_feed_degraded = (
                 quote_rows > 0
@@ -1270,14 +1337,14 @@ class EngineApp:
         now: datetime | None = None,
     ) -> tuple[str, ...]:
         quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-        rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+        native_count = _native_ingested_count(primed_runtime_state)
         live_notes = list(
             self._auction_runtime.render_postmarket_runtime_loop(
                 intraday_context=intraday_context,
                 runtime_readiness_label=runtime_readiness_label,
                 symbols=symbols,
                 quotes=quote_count,
-                rust=rust_count,
+                native=native_count,
                 now=now or datetime.now(),
                 quote_freshness_line=self._render_postmarket_snapshot_line(
                     primed_runtime_state=primed_runtime_state,
@@ -1369,13 +1436,13 @@ class EngineApp:
         primed_runtime_state: PrimedIntradayRuntimeState | None,
     ) -> tuple[str, ...]:
         quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-        rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+        native_count = _native_ingested_count(primed_runtime_state)
         return self._auction_runtime.render_auction_takeover(
             intraday_context=intraday_context,
             runtime_readiness_label=runtime_readiness_label,
             symbols=symbols,
             quotes=quote_count,
-            rust=rust_count,
+            native=native_count,
             quote_freshness_line=render_quote_freshness_line(
                 primed_runtime_state,
                 symbol_count=symbols,
@@ -1740,6 +1807,11 @@ class EngineApp:
             lifecycle_audit_ran=should_run_lifecycle_audit,
             scheduled_event_result=scheduled_event_result,
         )
+        open_2m_refresh_notes = self._refresh_open_2m_runtime_summary_if_needed(
+            request=request,
+            phase=phase,
+            offline_context_date=offline_context_date,
+        )
         live_runtime_result = self._live_runtime.execute(
             LiveRuntimeRequest(
                 phase=phase,
@@ -1787,6 +1859,8 @@ class EngineApp:
         notes = [f"runtime_event={loop_decision.label}"]
         if opening_validation_notes:
             notes.extend(opening_validation_notes)
+        if open_2m_refresh_notes:
+            notes.extend(open_2m_refresh_notes)
         is_auction_takeover = should_run_lifecycle_audit and phase == RunPhase.AUCTION
         is_postmarket_takeover = should_run_lifecycle_audit and phase == RunPhase.POSTMARKET
         if is_auction_takeover:
@@ -1853,28 +1927,28 @@ class EngineApp:
             notes.extend(self._summarize_integrated_sync(integrated_sync_results))
             if self._is_opening_strategy_window(request.now, phase):
                 quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                native_count = _native_ingested_count(primed_runtime_state)
                 notes.extend(
                     self._auction_runtime.render_opening_runtime_loop(
                         intraday_context=intraday_context,
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=None,
                     )
                 )
             elif phase == RunPhase.PREMARKET:
                 quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                native_count = _native_ingested_count(primed_runtime_state)
                 notes.extend(
                     self._auction_runtime.render_premarket_runtime_loop(
                         intraday_context=intraday_context,
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=None,
                         startup_report=startup_bundle.plan.report,
@@ -1883,21 +1957,21 @@ class EngineApp:
                 )
             elif phase == RunPhase.INTRADAY:
                 quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-                rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+                native_count = _native_ingested_count(primed_runtime_state)
                 notes.extend(
                     self._auction_runtime.render_intraday_runtime_loop(
                         intraday_context=intraday_context,
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=None,
                     )
                 )
         else:
             quote_count = len(primed_runtime_state.quote_rows) if primed_runtime_state is not None else 0
-            rust_count = int(primed_runtime_state.rust_ingested) if primed_runtime_state is not None else 0
+            native_count = _native_ingested_count(primed_runtime_state)
             if phase == RunPhase.AUCTION:
                 notes.extend(
                     self._auction_runtime.render_auction_runtime_loop(
@@ -1905,7 +1979,7 @@ class EngineApp:
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=quote_freshness_line,
                     )
@@ -1917,7 +1991,7 @@ class EngineApp:
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=quote_freshness_line,
                     )
@@ -1929,7 +2003,7 @@ class EngineApp:
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=quote_freshness_line,
                         startup_report=startup_bundle.plan.report,
@@ -1943,7 +2017,7 @@ class EngineApp:
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=quote_freshness_line,
                     )
@@ -1955,7 +2029,7 @@ class EngineApp:
                         runtime_readiness_label=runtime_readiness_label,
                         symbols=len(symbols),
                         quotes=quote_count,
-                        rust=rust_count,
+                        native=native_count,
                         now=request.now,
                         quote_freshness_line=self._render_postmarket_snapshot_line(
                             primed_runtime_state=primed_runtime_state,
@@ -2168,23 +2242,24 @@ def render_result_summary(result: EngineAppResult) -> str:
 
     runtime_state = ""
     quote_coverage = ""
-    rust_count = ""
+    native_count = ""
     if runtime_line:
-        matched = re.search(r"运行状态=([^|]+)\s*\|\s*行情=([^|]+)\s*\|\s*Rust=(.+)$", runtime_line)
+        matched = re.search(r"运行状态=([^|]+)\s*\|\s*行情=([^|]+)\s*\|\s*(?:Native|Rust)=(.+)$", runtime_line)
         if matched:
-            runtime_state, quote_coverage, rust_count = [part.strip() for part in matched.groups()]
+            runtime_state, quote_coverage, native_count = [part.strip() for part in matched.groups()]
 
     latest_quote = ""
     lag_seconds = ""
     missing_quotes = ""
     fresh_quotes = ""
+    stale_quotes = ""
     if quote_line:
         matched = re.search(
-            r"fresh=(\d+)/\d+\s*\|\s*stale=\d+\s*\|\s*missing=(\d+)\s*\|\s*latest=([^|]+)\s*\|\s*lag=(\d+)s",
+            r"fresh=(\d+)/\d+\s*\|\s*stale=(\d+)\s*(?:\|\s*cache_only=\d+\s*)?\|\s*missing=(\d+)\s*\|\s*latest=([^|]+)\s*\|\s*lag=(\d+)s",
             quote_line,
         )
         if matched:
-            fresh_quotes, missing_quotes, latest_quote, lag_seconds = [part.strip() for part in matched.groups()]
+            fresh_quotes, stale_quotes, missing_quotes, latest_quote, lag_seconds = [part.strip() for part in matched.groups()]
 
     overview_section = [
         f"当前阶段：{phase_text}",
@@ -2203,10 +2278,12 @@ def render_result_summary(result: EngineAppResult) -> str:
         quote_summary_bits.append(f"滞后 {lag_seconds} 秒")
     if missing_quotes:
         quote_summary_bits.append(f"缺失 {missing_quotes} 只")
+    if stale_quotes:
+        quote_summary_bits.append(f"只读缓存 {stale_quotes} 只")
     if fresh_quotes:
         quote_summary_bits.append(f"实时可用 {fresh_quotes} 只")
-    if rust_count:
-        quote_summary_bits.append(f"Rust {rust_count}")
+    if native_count:
+        quote_summary_bits.append(f"Native {native_count}")
     if quote_summary_bits:
         overview_section.append("行情状态：" + "，".join(quote_summary_bits))
     if readiness:
@@ -2218,6 +2295,38 @@ def render_result_summary(result: EngineAppResult) -> str:
     if sync_digest_line:
         gap_section.append("同步结果：" + sync_digest_line.split("|", 1)[1].strip())
     if impact_line:
+        gap_section.append("影响判断：" + impact_line.split("|", 1)[1].strip())
+
+    gap_section = []
+    normalized_impact_line = ""
+    if sync_digest_line:
+        sync_payload = sync_digest_line.split("|", 1)[1].strip()
+        gap_section.append("同步结果：" + sync_payload)
+        number_matches = [int(value) for value in re.findall(r"\d+", sync_payload)]
+        if len(number_matches) >= 7:
+            _, _, _, remaining_kline, remaining_dde, remaining_factor, remaining_chip = number_matches[:7]
+            remaining_parts: list[str] = []
+            if remaining_kline > 0:
+                remaining_parts.append(f"日线缺{remaining_kline}只")
+            if remaining_dde > 0:
+                remaining_parts.append(f"DDE缺{remaining_dde}只")
+            if remaining_factor > 0:
+                remaining_parts.append(f"因子缺{remaining_factor}只")
+            if remaining_chip > 0:
+                remaining_parts.append(f"筹码缺{remaining_chip}只")
+            if remaining_parts:
+                normalized_impact_line = (
+                    "影响判断：当前以同步后剩余缺口为准，"
+                    + "，".join(remaining_parts)
+                    + "；适合先看历史上下文和缺口修复。"
+                )
+            else:
+                normalized_impact_line = "影响判断：当前以同步后状态为准，正式离线链路已补齐，可按正常盘前视图使用。"
+    elif data_gap_line:
+        gap_section.append("数据缺口：" + data_gap_line.split("|", 1)[1].strip())
+    if normalized_impact_line:
+        gap_section.append(normalized_impact_line)
+    elif impact_line:
         gap_section.append("影响判断：" + impact_line.split("|", 1)[1].strip())
 
     strategy_lines: list[str] = []

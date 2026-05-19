@@ -115,7 +115,7 @@ def build_auction_plate_bucket_stats(
                 bucket["leader_count"] = int(bucket["leader_count"]) + 1
             if _is_limit_up_snapshot(snapshot):
                 bucket["limit_up_count"] = int(bucket["limit_up_count"]) + 1
-            if _is_limit_up_snapshot(snapshot):
+            if _is_strong_lock_snapshot(snapshot):
                 bucket["strong_lock_count"] = int(bucket["strong_lock_count"]) + 1
             if _is_turn_strong(snapshot):
                 bucket["turn_strong_count"] = int(bucket["turn_strong_count"]) + 1
@@ -361,6 +361,9 @@ def _resolve_theme_weights(snapshot: StockStateSnapshot) -> tuple[tuple[str, flo
     if not candidates:
         return ()
 
+    if len(candidates) >= 2 and is_generic_plate(candidates[0]) and not is_generic_plate(candidates[1]):
+        candidates = [candidates[1], candidates[0], *candidates[2:]]
+
     weights: list[tuple[str, float]] = []
     for idx, plate_name in enumerate(candidates[:2]):
         if idx == 0:
@@ -440,6 +443,10 @@ def _is_turn_strong(snapshot: StockStateSnapshot) -> bool:
 
 def _is_limit_up_snapshot(snapshot: StockStateSnapshot) -> bool:
     return bool(snapshot.is_locked or snapshot.touched_limit_today)
+
+
+def _is_strong_lock_snapshot(snapshot: StockStateSnapshot) -> bool:
+    return bool(snapshot.is_locked)
 
 
 def _hot_plate_capital_behavior_score(change_pct: float, net_inflow_yi: float) -> float:

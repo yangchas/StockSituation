@@ -251,3 +251,8 @@ web/data/*
 *.csv
 *.txt
 *.png
+
+# Generated backups and remote snapshots
+*.bak_*
+*.remote_server_*
+backup_*.patch

@@ -86,6 +86,7 @@ RuntimePipelineResult RuntimePipeline::process_batch(
         if (last_runtime_redis_ts_ms_ <= 0 ||
             batch.logical_ts_ms - last_runtime_redis_ts_ms_ >= interval_ms) {
             std::vector<RedisCommand> runtime_commands = redis_writer_.build_runtime_commands(
+                engine_.quote_store(),
                 result.runtime_stats,
                 batch.mode
             );

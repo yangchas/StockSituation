@@ -37,6 +37,8 @@ public:
     QuoteStateStore& mutable_quote_store();
 
 private:
+    void refresh_phase_for_active_quotes(MarketPhase phase);
+
     ConfigV2 config_;
     PhaseResolver phase_resolver_;
     MinuteRingUpdater minute_ring_updater_;
@@ -47,6 +49,8 @@ private:
     std::unique_ptr<SnapshotTrigger> snapshot_trigger_;
     std::unique_ptr<QuoteStateStore> quote_store_;
     bool initialized_ = false;
+    MarketPhase last_batch_phase_ = MarketPhase::Premarket;
+    bool has_last_batch_phase_ = false;
 };
 
 }  // namespace t1_v2
