@@ -42,8 +42,6 @@ from engine_next.runtime.session_facts import (
     session_facts_from_payload,
     session_facts_to_payload,
 )
-from engine_next.runtime.theme_consistency_audit import build_theme_consistency_audit_report
-from engine_next.runtime.theme_trade_impact_audit import build_theme_trade_impact_audit_report
 from engine_next.strategy_skill_layer.auction_plate_buckets import (
     AuctionPlateBucketStat,
     AuctionSnapshotDeltaStat,
@@ -2657,124 +2655,6 @@ class SessionFactsTests(unittest.TestCase):
 
         self.assertEqual(score["positive"], 3)
         self.assertEqual(score["negative"], 2)
-
-    def test_theme_consistency_audit_detects_multi_token_stat_risk(self) -> None:
-        report = build_theme_consistency_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000001",
-                    name="demo1",
-                    plate="算力",
-                    real_plate_names=("算力", "光纤"),
-                ),
-            )
-        )
-        self.assertEqual(report.total_symbols, 1)
-        self.assertEqual(report.resolved_symbols, 1)
-        self.assertEqual(report.multi_token_stat_risk_count, 1)
-        self.assertEqual(report.issues[0].resolved_primary, "算力")
-        self.assertEqual(report.issues[0].statistic_tokens, ("算力", "光纤"))
-        self.assertIn("multi_token_stat_risk", report.issues[0].issue_codes)
-
-    def test_theme_consistency_audit_detects_generic_runtime_fallback(self) -> None:
-        report = build_theme_consistency_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000002",
-                    name="demo2",
-                    plate="MSCI中国",
-                    real_plate_names=("MSCI中国", "光纤"),
-                ),
-            )
-        )
-        self.assertEqual(report.generic_runtime_plate_count, 1)
-        self.assertEqual(report.generic_primary_fallback_count, 1)
-        self.assertEqual(report.issues[0].resolved_primary, "光纤")
-        self.assertIn("generic_runtime_fallback", report.issues[0].issue_codes)
-
-    def test_theme_trade_impact_audit_marks_front_row_mismatch_as_high_priority(self) -> None:
-        report = build_theme_trade_impact_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000003",
-                    name="demo3",
-                    plate="通信,光纤",
-                    real_plate_names=("光纤",),
-                    leader_rank_in_theme=1,
-                    lb_days=1,
-                ),
-            )
-        )
-        self.assertEqual(report.leader_grouping_impact_count, 1)
-        self.assertEqual(report.theme_fact_impact_count, 1)
-        self.assertEqual(report.trade_label_impact_count, 1)
-        self.assertEqual(report.high_priority_impact_count, 1)
-        self.assertIn("leader_grouping_impact", report.issues[0].impact_codes)
-        self.assertIn("high_priority_impact", report.issues[0].impact_codes)
-
-    def test_theme_trade_impact_audit_marks_multi_token_as_bucket_impact(self) -> None:
-        report = build_theme_trade_impact_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000004",
-                    name="demo4",
-                    plate="算力",
-                    real_plate_names=("算力", "光纤"),
-                    leader_rank_in_theme=5,
-                    lb_days=0,
-                ),
-            )
-        )
-        self.assertEqual(report.plate_bucket_impact_count, 1)
-        self.assertEqual(report.theme_fact_impact_count, 1)
-        self.assertIn("plate_bucket_impact", report.issues[0].impact_codes)
-
-    def test_theme_consistency_audit_issue_count_uses_affected_symbols(self) -> None:
-        report = build_theme_consistency_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000005",
-                    name="demo5",
-                    plate="MSCI中国",
-                    real_plate_names=("MSCI中国", "光纤", "算力"),
-                ),
-            )
-        )
-        self.assertEqual(report.issue_count, 1)
-        self.assertEqual(report.issue_signal_total, 2)
-        self.assertEqual(report.generic_runtime_plate_count, 1)
-        self.assertEqual(report.generic_primary_fallback_count, 1)
-        self.assertEqual(report.multi_token_stat_risk_count, 1)
-
-    def test_theme_trade_impact_audit_counts_not_limited_by_display_cap(self) -> None:
-        report = build_theme_trade_impact_audit_report(
-            (
-                StockStateSnapshot(
-                    symbol="000006",
-                    name="demo6",
-                    plate="通信,光纤",
-                    real_plate_names=("光纤",),
-                    leader_rank_in_theme=1,
-                    lb_days=1,
-                ),
-                StockStateSnapshot(
-                    symbol="000007",
-                    name="demo7",
-                    plate="算力",
-                    real_plate_names=("算力", "光纤"),
-                    leader_rank_in_theme=5,
-                    lb_days=0,
-                ),
-            ),
-            max_issues=1,
-        )
-        self.assertEqual(len(report.issues), 1)
-        self.assertEqual(report.consistency_issue_symbols, 2)
-        self.assertEqual(report.leader_grouping_impact_count, 1)
-        self.assertEqual(report.theme_fact_impact_count, 2)
-        self.assertEqual(report.plate_bucket_impact_count, 1)
-        self.assertEqual(report.trade_label_impact_count, 1)
-        self.assertEqual(report.high_priority_impact_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

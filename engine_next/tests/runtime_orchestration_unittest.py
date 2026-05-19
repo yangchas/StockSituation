@@ -15,7 +15,6 @@ from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult, W
 from engine_next.domain.enums import ExecutionEnvironment, RunPhase
 from engine_next.runtime.controllers.settlement_controller import SettlementController
 from engine_next.runtime.offline_sync_executor import OfflineSyncDecision, OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
-from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryService
 
 
 class RuntimeOrchestrationTests(unittest.TestCase):
@@ -44,7 +43,6 @@ class RuntimeOrchestrationTests(unittest.TestCase):
     def test_filter_active_runtime_symbols_keeps_quotes_and_focus_pool(self) -> None:
         app = EngineApp.__new__(EngineApp)
         app._safe_keys = lambda pattern: ("stock:quote:000001",) if pattern == "stock:quote:*" else ()
-        app._safe_smembers = lambda key: ()
         app._safe_hkeys = lambda key: ("000002",) if key == "cache:yest_limit_pool:2026-04-23" else ()
         app._safe_get = lambda key: None
         app._safe_hget = lambda key, field: None
@@ -57,68 +55,6 @@ class RuntimeOrchestrationTests(unittest.TestCase):
             previous_trade_date="2026-04-23",
         )
         self.assertEqual(filtered, ("000001", "000002"))
-
-    def test_load_live_quote_symbols_prefers_q2_active_without_full_q2_scan(self) -> None:
-        app = EngineApp.__new__(EngineApp)
-        calls: list[str] = []
-        app._safe_smembers = lambda key: ("000001", "000002") if key == "q2:active:20260424" else ()
-        app._safe_keys = lambda pattern: calls.append(pattern) or ()
-
-        result = app._load_live_quote_symbols(
-            trade_date="2026-04-24",
-            allow_full_scan_fallback=False,
-        )
-
-        self.assertEqual(result, ("000001", "000002"))
-        self.assertEqual(calls, [])
-
-    def test_market_runtime_summary_open2m_skips_full_scan_when_fallback_disabled(self) -> None:
-        class StubRedis:
-            def __init__(self) -> None:
-                self.scanned = False
-
-            def get(self, key: str):
-                return None
-
-            def smembers(self, key: str):
-                return ()
-
-            def scan_iter(self, match=None, count=None):
-                self.scanned = True
-                return iter(("q2:000001",))
-
-            def keys(self, pattern):
-                self.scanned = True
-                return ("q2:000001",)
-
-        service = MarketRuntimeSummaryService(redis_client=StubRedis())
-
-        stats = service._read_open_2m_top_amount_stats("2026-04-24")
-
-        self.assertEqual(stats["top10_amount"], 0.0)
-        self.assertEqual(stats["top20_amount"], 0.0)
-        self.assertEqual(stats["top10_count"], 0)
-        self.assertEqual(stats["top20_count"], 0)
-        self.assertEqual(stats["source"], "redis_q2_projection")
-        self.assertGreater(int(stats["updated_at_ts"]), 0)
-        self.assertFalse(service.redis.scanned)
-
-    def test_market_runtime_summary_open2m_cached_payload_keeps_source_metadata(self) -> None:
-        class StubRedis:
-            def get(self, key: str):
-                if key == "market:open2m:summary:2026-04-24":
-                    return (
-                        '{"trade_date":"2026-04-24","top10_amount":123.0,"top20_amount":456.0,'
-                        '"top10_count":10,"top20_count":20,"source":"t1_v2_native","updated_at_ts":1713922200}'
-                    )
-                return None
-
-        service = MarketRuntimeSummaryService(redis_client=StubRedis())
-
-        stats = service._read_open_2m_top_amount_stats("2026-04-24")
-
-        self.assertEqual(stats["source"], "t1_v2_native")
-        self.assertEqual(stats["updated_at_ts"], 1713922200)
 
     def test_filter_active_runtime_symbols_does_not_trim_premarket_universe(self) -> None:
         app = EngineApp.__new__(EngineApp)

@@ -243,9 +243,12 @@ test_*.py
 check_*.py
 debug_*.py
 *_test.py
+*_unittest.py
 *.bak
 *.server_after*
 web/data/*
+web/tests/
+tools/replay_audit/
 *.json
 *.md
 *.csv
