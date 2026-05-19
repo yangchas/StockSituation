@@ -240,10 +240,14 @@ __pycache__/
 
 # Custom Excludes (Test & Debug scripts)
 test_*.py
+run_test_*.py
 check_*.py
 debug_*.py
 *_test.py
 *_unittest.py
+test.js
+C/test.cpp
+rabtd-app/test.go
 *.bak
 *.server_after*
 web/data/*
