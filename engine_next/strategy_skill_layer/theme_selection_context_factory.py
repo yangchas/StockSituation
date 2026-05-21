@@ -58,6 +58,7 @@ def build_theme_selection_context(
     plate_resistance_score: float = 0.0,
     plate_role: str = "neutral",
     rotation_bias: str = "neutral",
+    phase_priority_bias: float = 0.0,
     notes: tuple[str, ...] = (),
     trade_conclusion: str | None = None,
     high_open_fail_count: int = 0,
@@ -97,5 +98,6 @@ def build_theme_selection_context(
         plate_resistance_score=plate_resistance_score,
         plate_role=plate_role,
         rotation_bias=rotation_bias,
+        phase_priority_bias=round(float(phase_priority_bias or 0.0), 2),
         notes=notes,
     )

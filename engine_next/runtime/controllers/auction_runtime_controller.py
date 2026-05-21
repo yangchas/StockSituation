@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -487,7 +487,7 @@ class AuctionRuntimeController:
             summary_lines.append("auction_anchor | status=waiting_finalization | earliest=09:25:10 | action=hold_formal_analysis")
             return tuple(summary_lines)
         if settling_mode:
-            lines = [f"æ©æ„¯î”‘é˜èˆµâ‚¬?{self._runtime_text(runtime_readiness_label)} | ç›å±¾å„={quotes}/{symbols} | Native={native}"]
+            lines = [f"运行状态={self._runtime_text(runtime_readiness_label)} | 行情={quotes}/{symbols} | Native={native}"]
             if quote_freshness_line:
                 lines.append(quote_freshness_line)
             lines.append("auction_anchor | status=waiting_finalization | earliest=09:25:10 | action=hold_formal_analysis")
@@ -716,8 +716,8 @@ class AuctionRuntimeController:
             lines.extend(self._render_recap_ladder_recap(state, phase_label=phase_label))
             lines.extend(self._render_ladder_map(state))
             lines.extend(self._render_tomorrow_plan(state))
-            lines.extend(self._render_focus_pool(state, phase_label="postmarket"))
-            lines.extend(self._render_risk_guard(state, phase_label="postmarket"))
+            lines.extend(self._render_focus_pool(state, phase_label="premarket"))
+            lines.extend(self._render_risk_guard(state, phase_label="premarket"))
             return tuple(lines)
         if phase_label == "postmarket" and state.frozen_postmarket_snapshot:
             lines.append("冻结说明 | 当前仅有盘中冻结快照，先做过渡复盘；正式结算完成后，再切正式收盘结论。")
@@ -737,7 +737,7 @@ class AuctionRuntimeController:
             lines.extend(self._render_risk_guard(state, phase_label="postmarket"))
             return tuple(lines)
         lines.extend(self._render_market_narrative(state, phase_label=detail_phase_label))
-        lines.extend(self._render_mainline_board(state))
+        lines.extend(self._render_mainline_board(state, phase_label=detail_phase_label))
         if phase_label in {"auction", "auction_preview"}:
             lines.extend(self._render_auction_thermo(state))
             lines.extend(self._render_auction_structure(state))
@@ -780,11 +780,11 @@ class AuctionRuntimeController:
         return (
             "【主叙事】维度 | 内容",
             f"  市场在交易什么 | {self._narrative_current_trade_text(state, phase_label=phase_label)}",
-            f"  上一阶段判断 | {self._narrative_previous_hypothesis_text(state, phase_label=phase_label)}",
+            f"  此前预判什么 | {self._narrative_previous_hypothesis_text(state, phase_label=phase_label)}",
             f"  当前验证结果 | {self._narrative_validation_text(state, phase_label=phase_label)}",
             f"  切换说明 | {self._narrative_switch_text(state, phase_label=phase_label)}",
             f"  当前聚焦题材 | {self._narrative_focus_themes_text(state, phase_label=phase_label)}",
-            f"  当前聚焦个股 | {self._narrative_focus_stocks_text(state, phase_label=phase_label)}",
+            f"  当前机会锚点 | {self._narrative_current_trade_text(state, phase_label=phase_label)}",
             f"  当前回避方向 | {self._narrative_avoid_text(state, phase_label=phase_label)}",
         )
 
@@ -839,6 +839,13 @@ class AuctionRuntimeController:
             if strengthened:
                 return f"{'/'.join(strengthened[:2])} 获得开盘验证，延续主观察"
             if falsified:
+                leader_only = [
+                    name
+                    for name in falsified
+                    if self._is_theme_falsified_but_leader_alive(state, plate_name=name)
+                ]
+                if leader_only:
+                    return f"{'/'.join(leader_only[:2])} 板块证伪，只剩龙头独活，不做扩散"
                 return f"{'/'.join(falsified[:2])} 开盘验证偏弱，先降级到观察"
         top = self._top_theme_by_collision(state)
         summary = state.context.market_summary
@@ -850,24 +857,125 @@ class AuctionRuntimeController:
         return f"主线暂按延续处理，重点看 {top.row.plate_name} 是否从 {top.signal} 走到 {observation}"
 
     def _narrative_focus_themes_text(self, state: StrategyConsoleState, *, phase_label: str) -> str:
-        names = list(self._execution_theme_candidates(state)[:2])
+        names = list(self._narrative_priority_plates(state, phase_label=phase_label)[:2])
+        if not names:
+            names = list(self._execution_theme_candidates(state)[:2])
         if not names:
             rows = self._theme_collision_rows(state)[:2]
             names = [item.row.plate_name for item in rows if item.row.plate_name]
         return " / ".join(names) or "-"
 
     def _narrative_focus_stocks_text(self, state: StrategyConsoleState, *, phase_label: str) -> str:
-        decisions = self._focus_candidates_for_phase(state, phase_label=phase_label)
+        decisions = self._order_decisions_by_narrative(
+            state,
+            self._focus_candidates_for_phase(state, phase_label=phase_label),
+            phase_label=phase_label,
+        )
+        if not decisions and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
+            decisions = self._order_decisions_by_narrative(
+                state,
+                self._last_effective_focus_candidates(
+                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
+                    phase_label=phase_label,
+                ),
+                phase_label=phase_label,
+            )
         if not decisions:
-            decisions = tuple(
-                decision
-                for decision in state.watch_candidates
-                if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
+            preferred_plates = self._phase_priority_plates(state, phase_label=phase_label) if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"} else ()
+            decisions = self._order_decisions_by_narrative(
+                state,
+                tuple(
+                    decision
+                    for decision in state.watch_candidates
+                    if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
+                    and (
+                        not preferred_plates
+                        or self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates)
+                    )
+                ),
+                phase_label=phase_label,
             )
         parts: list[str] = []
         for decision in decisions[:3]:
             parts.append(f"{self._decision_name(state, decision)}={self._display_action_label(decision, state, phase_label=phase_label)}")
         return " ; ".join(parts) or "-"
+
+    def _narrative_priority_plates(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+    ) -> tuple[str, ...]:
+        ordered: list[str] = []
+        if phase_label in {"open_confirm", "intraday", "postmarket"}:
+            payload = self._load_opening_validation_payload(str(getattr(state.context, "trade_date", "") or ""))
+            for item in tuple(payload.get("theme_validation", ()) or ()):
+                if not isinstance(item, dict):
+                    continue
+                plate_name = normalize_plate_name(str(item.get("plate_name") or ""))
+                if not plate_name:
+                    continue
+                validation_state = str(item.get("validation_state") or "")
+                if validation_state == "strengthened" and plate_name not in ordered:
+                    ordered.append(plate_name)
+            for item in tuple(payload.get("theme_validation", ()) or ()):
+                if not isinstance(item, dict):
+                    continue
+                plate_name = normalize_plate_name(str(item.get("plate_name") or ""))
+                if plate_name and plate_name not in ordered:
+                    ordered.append(plate_name)
+        for plate_name in self._execution_theme_candidates(state):
+            normalized = normalize_plate_name(plate_name)
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+        top = self._top_theme_by_collision(state)
+        if top is not None:
+            normalized = normalize_plate_name(top.row.plate_name)
+            if normalized and normalized not in ordered:
+                ordered.append(normalized)
+        return tuple(ordered[:4])
+
+    def _decision_narrative_plate_index(
+        self,
+        state: StrategyConsoleState,
+        decision: AuctionLadderDecision,
+        *,
+        phase_label: str,
+    ) -> int:
+        preferred = self._narrative_priority_plates(state, phase_label=phase_label)
+        if not preferred:
+            return 999
+        snapshot = state.snapshot_map.get(decision.symbol)
+        if snapshot is None:
+            return 999
+        normalized_names = self._normalized_plate_names(snapshot)
+        for idx, plate_name in enumerate(preferred):
+            if plate_name in normalized_names:
+                return idx
+        return 999
+
+    def _order_decisions_by_narrative(
+        self,
+        state: StrategyConsoleState,
+        decisions: tuple[AuctionLadderDecision, ...],
+        *,
+        phase_label: str,
+    ) -> tuple[AuctionLadderDecision, ...]:
+        if len(decisions) <= 1:
+            return decisions
+        preferred = self._narrative_priority_plates(state, phase_label=phase_label)
+        if not preferred:
+            return decisions
+        return tuple(
+            sorted(
+                decisions,
+                key=lambda decision: (
+                    self._decision_narrative_plate_index(state, decision, phase_label=phase_label),
+                    -self._focus_candidate_priority_score(state, decision, phase_label=phase_label),
+                    -decision.confidence,
+                ),
+            )
+        )
 
     def _narrative_avoid_text(self, state: StrategyConsoleState, *, phase_label: str) -> str:
         parts: list[str] = []
@@ -1058,6 +1166,7 @@ class AuctionRuntimeController:
             formal_theme_context_map = self._build_formal_theme_context_map(
                 collision_rows,
                 theme_judge_map=theme_judge_map,
+                phase_label=phase_label,
             )
             bundle = build_context_strategy_bundle_for_symbols(
                 intraday_context,
@@ -1229,12 +1338,12 @@ class AuctionRuntimeController:
         if validation_state == "falsified" or item.fakeout_level == "strong" or item.x_score >= 6.0:
             return "trap_avoid"
         if row.limit_up_count >= 1 and row.highest_lb_days >= 2 and item.a_score >= 5.0:
-            if item.signal in {"鍏辨尟涓绘敾", "杩炴澘寤剁画"} and item.x_score < 5.0:
-                return "main_attack"
+            return "main_attack"
+        if item.a_score >= 5.0 and item.x_score < 5.0:
             return "anchor_only"
-        if item.signal in {"璧勯噾璇曢敊"} or item.fakeout_level == "warn":
+        if item.signal in {"资金试错"} or item.fakeout_level == "warn":
             return "observe"
-        if item.signal == "鏈夐噺鏃犳澘":
+        if item.signal == "有量无板":
             if (
                 row.leader_count >= 1
                 and row.auction_amount >= 80_000_000
@@ -1318,6 +1427,7 @@ class AuctionRuntimeController:
         collision_rows: Iterable[AuctionThemeCollisionStat],
         *,
         theme_judge_map: dict[str, ThemeJudgeResult] | None = None,
+        phase_label: str = "auction",
     ) -> dict[str, ThemeSelectionContext]:
         context_map: dict[str, ThemeSelectionContext] = {}
         for item in collision_rows:
@@ -1354,7 +1464,7 @@ class AuctionRuntimeController:
             )
             tradable = (
                 fakeout_level != "high"
-                and open_confirm_state != "falsified"
+                and external_confirm_state == "partial"
                 and (
                     (item.e_score >= 6.0 and item.a_score >= 6.0 and item.x_score < 5.0)
                     or (item.e_score <= 4.0 and item.a_score >= 6.0 and item.x_score < 5.0)
@@ -1381,6 +1491,30 @@ class AuctionRuntimeController:
                 open_confirm_state=open_confirm_state,
                 external_confirm_state=external_confirm_state,
             )
+            phase_priority_bias = 0.0
+            if judge is not None:
+                if judge.action_class == "main_attack":
+                    phase_priority_bias += 1.0
+                elif judge.action_class == "front_row_confirm":
+                    phase_priority_bias += 0.8
+                elif judge.action_class == "anchor_only":
+                    phase_priority_bias += 0.35
+                if judge.validation_state == "strengthened":
+                    phase_priority_bias += 0.8
+                elif judge.validation_state == "falsified":
+                    phase_priority_bias -= 0.8
+            if item.expectation_label in {"符合/强化", "局部转强"}:
+                phase_priority_bias += 0.3
+            if item.fakeout_level == "strong":
+                phase_priority_bias -= 0.8
+            elif item.fakeout_level == "warn":
+                phase_priority_bias -= 0.35
+            if phase_label in {"open_confirm", "intraday"}:
+                if open_confirm_state == "falsified":
+                    phase_priority_bias -= 0.6
+                elif open_confirm_state == "strengthened":
+                    phase_priority_bias += 0.4
+            phase_priority_bias = round(max(-1.0, min(2.0, phase_priority_bias)), 2)
 
             context_map[item.plate_name] = build_theme_selection_context(
                 plate_name=item.plate_name,
@@ -1394,6 +1528,7 @@ class AuctionRuntimeController:
                 tradable=tradable,
                 bias_action=bias_action,
                 open_confirm_state=open_confirm_state,
+                phase_priority_bias=phase_priority_bias,
                 high_open_fail_count=high_open_fail,
                 low_open_repair_count=low_open_repair,
                 expansion_count=expansion_count,
@@ -1406,6 +1541,7 @@ class AuctionRuntimeController:
                     f"expectation={item.expectation_label}",
                     f"eax={item.eax_label}",
                     f"action={item.eax_action}",
+                    f"phase_priority_bias={phase_priority_bias:.2f}",
                 ),
             )
         return context_map
@@ -1666,6 +1802,41 @@ class AuctionRuntimeController:
             getattr(summary, "avg_bid_amt", 0.0),
         )
         return all(float(value or 0.0) > 0.0 for value in metric_values)
+
+    def _auction_amount_readiness(
+        self,
+        state: StrategyConsoleState,
+        *,
+        amount: float,
+        ratio: float | None = None,
+    ) -> str:
+        if not self._auction_anchor_ready(state):
+            return "unavailable"
+        amount_value = float(amount or 0.0)
+        if amount_value > 0.0:
+            if ratio is None:
+                return "ready"
+            return "ready" if float(ratio or 0.0) > 0.0 else "partial"
+        return "warming_up"
+
+    def _format_auction_amount_readiness(
+        self,
+        state: StrategyConsoleState,
+        *,
+        amount: float,
+        ratio: float | None = None,
+    ) -> str:
+        readiness = self._auction_amount_readiness(state, amount=amount, ratio=ratio)
+        if readiness == "ready":
+            amount_text = self._fmt_amount_yi_precise(amount)
+            if ratio is None:
+                return amount_text
+            return f"{amount_text} / {float(ratio):.2f}x"
+        if readiness == "partial":
+            return f"{self._fmt_amount_yi_precise(amount)} / 昨比就绪中"
+        if readiness == "warming_up":
+            return "汇总就绪中"
+        return "--"
 
     def _top_theme_by_collision(self, state: StrategyConsoleState) -> AuctionThemeCollisionStat | None:
         rows = self._theme_collision_rows(state)
@@ -2352,16 +2523,16 @@ class AuctionRuntimeController:
         if row.hot_capital_behavior <= -0.3 and row.hot_change_pct > 0:
             return "兑现回避"
         if row.limit_up_count >= 2 and row.highest_lb_days >= 2 and row.turn_strong_count >= 1:
-            return "主线攻击"
+            return "strong"
         if row.limit_up_count >= 2 and (row.strong_lock_count >= 1 or row.highest_lb_days >= 2):
-            return "主线延续"
+            return "strong"
         if row.limit_up_count >= 2 and row.turn_strong_count <= 0:
-            return "兑现分歧"
+            return "strong"
         if row.hot_net_inflow_yi > 0 and row.limit_up_count <= 1:
             return "资金试错"
         if row.limit_up_count >= 1 and row.symbol_count >= 3:
             return "首板扩散"
-        return "观察题材"
+        return "瑙傚療棰樻潗"
 
     @staticmethod
     def _expectation_gap_display_text(label: str) -> str:
@@ -2409,17 +2580,17 @@ class AuctionRuntimeController:
     @staticmethod
     def _trade_conclusion_text(conclusion: str) -> str:
         mapping = {
-            "old_mainline_strong_continue": "??????: ???????",
-            "old_mainline_weak_continue": "??????: ????????",
-            "old_mainline_distribution": "?????: ????",
-            "switch_expansion_confirmed": "??????: ???????",
-            "switch_partially_confirmed": "??????: ??????",
-            "switch_wait_confirm": "?????: ???",
-            "switch_failed": "????: ????",
-            "leader_only_alive": "?????: ????",
-            "high_event_self_excited": "??????: ?????",
-            "independent_hug_failed": "????: ????",
-            "rotation_noise": "?????: ???",
+            "old_mainline_strong_continue": "旧主线延续: 强者恒强",
+            "old_mainline_weak_continue": "旧主线延续: 分歧延续",
+            "old_mainline_distribution": "旧主线兑现: 高位派发",
+            "switch_expansion_confirmed": "切换确认: 新主线扩散",
+            "switch_partially_confirmed": "切换确认: 但仍分歧",
+            "switch_wait_confirm": "切换观察: 等开盘确认",
+            "switch_failed": "切换失败: 回流旧线",
+            "leader_only_alive": "龙头独活: 板块掉队",
+            "high_event_self_excited": "事件自嗨: 群体跟随弱",
+            "independent_hug_failed": "抱团失败: 承接不足",
+            "rotation_noise": "轮动噪音: 持续性弱",
         }
         return mapping.get(str(conclusion or "").strip(), "-")
 
@@ -2452,15 +2623,45 @@ class AuctionRuntimeController:
         if judge is not None:
             execution_state = self._external_validation_state(judge.validation_state)
             if execution_state == "falsified":
-                return "证伪: 只进风险提示"
+                if conclusion == "leader_only_alive" or judge.action_class == "anchor_only":
+                    return "板块证伪: 只剩龙头独活"
+                return "证伪: 注意风险提示"
             if conclusion == "leader_only_alive" or judge.action_class == "anchor_only":
-                return "只看龙头: 关闭扩散预期"
+                return "龙头独活: 不做扩散"
             if execution_state == "partial":
-                return "观察确认: 只留前排"
+                return "观察修复: 先看前排"
             return self._trade_conclusion_text(conclusion) if conclusion != "unknown" else self._theme_action_class_text(judge.action_class)
         if conclusion != "unknown":
             return self._trade_conclusion_text(conclusion)
         return "-"
+
+    def _is_theme_falsified_but_leader_alive(
+        self,
+        state: StrategyConsoleState,
+        *,
+        plate_name: str,
+    ) -> bool:
+        judge = self._theme_judge_for_plate(state, plate_name)
+        if judge is None:
+            return False
+        conclusion = self._theme_conclusion_for_plate(state, plate_name)
+        execution_state = self._external_validation_state(judge.validation_state)
+        return execution_state == "falsified" and (
+            conclusion == "leader_only_alive" or judge.action_class == "anchor_only"
+        )
+
+    def _snapshot_is_falsified_but_leader_alive(
+        self,
+        state: StrategyConsoleState,
+        snapshot: StockStateSnapshot | None,
+    ) -> bool:
+        judge, matched_plate = self._matched_theme_judge(state, snapshot)
+        if judge is None:
+            return False
+        plate_name = normalize_plate_name(matched_plate)
+        if not plate_name:
+            return False
+        return self._is_theme_falsified_but_leader_alive(state, plate_name=plate_name)
 
     @staticmethod
     def _theme_action_priority(action_class: str) -> int:
@@ -2511,7 +2712,7 @@ class AuctionRuntimeController:
             *(row.plate_name for row in self._plate_rows_for_market(state)[:3]),
         ):
             name = normalize_plate_name(raw_name)
-            if name and name != "-" and name not in ordered:
+            if not name or name == "-" or name in ordered:
                 ordered.append(name)
         if not ordered:
             return "-", "-"
@@ -2537,7 +2738,7 @@ class AuctionRuntimeController:
                 execution_state = self._external_validation_state(judge.validation_state)
                 if not name or name == "-" or name in ordered or execution_state == "falsified":
                     continue
-                if execution_state == "partial" and judge.action_class != "anchor_only":
+                if execution_state == "partial" and judge.action_class == "anchor_only":
                     continue
                 if judge.action_class in {"main_attack", "front_row_confirm"}:
                     if name not in actionable:
@@ -2660,7 +2861,7 @@ class AuctionRuntimeController:
             parts.insert(2, f"25比{delta_stat.amount_ratio_avg:.2f}x")
         return "/".join(parts)
 
-    def _render_mainline_board(self, state: StrategyConsoleState) -> tuple[str, ...]:
+    def _render_mainline_board(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
         summary = state.context.market_summary
         market_rows = self._plate_rows_for_market(state)
         capital_row = self._top_theme_by_capital(state, market_scope=True)
@@ -2689,7 +2890,7 @@ class AuctionRuntimeController:
                 "  ◇ 是否切换/迁移 | -- / --",
                 "  ￥ 板块涨幅/净流入 | -- / --",
                 "  ◎ 资金/涨停/转强 | -- / -- / --",
-                "  ◎ 数据对撞 | --",
+                f"  ◎ 数据对撞 | {self._collision_brief_text(state)}",
                 f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
             )
         capital_name = capital_row.plate_name if capital_row else "-"
@@ -2710,7 +2911,6 @@ class AuctionRuntimeController:
             f"  ◎ 数据对撞 | {self._collision_brief_text(state)}",
             f"  ◎ 量能/成交核心 | {self._volume_text(summary.market_volume_level)}@{volume_pred} / {top_turnover}",
         )
-
     def _render_auction_thermo(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
         hot_plate_mode = self._hot_plate_render_mode(state)
@@ -2736,7 +2936,6 @@ class AuctionRuntimeController:
             f"  {headshot_marker} 核按钮率 | {headshot_text}",
             f"  {resonance_marker} 共振分 | {resonance_text}",
         )
-
     def _render_auction_structure(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
         hot_plate_mode = self._hot_plate_render_mode(state)
@@ -2748,21 +2947,21 @@ class AuctionRuntimeController:
                 f"{summary.persistent_plate_count}/{summary.emerging_plate_count}/{summary.fading_plate_count}"
             )
         elif hot_plate_mode == "fallback":
-            hot_plate_text = f"{len(state.context.yesterday_hot_plate_map)}(沿用昨日)"
+            hot_plate_text = f"{len(state.context.yesterday_hot_plate_map)}(娌跨敤鏄ㄦ棩)"
             migration_text = "--/--/--"
         else:
             hot_plate_text = "--"
             migration_text = "--/--/--"
         return (
             "【竞价结构】指标 | 数值",
-            f"  ￥ 全市场竞价额 | {self._fmt_amount_yi_precise(summary.market_full_auc_amt) if auction_ready else '--'}",
-            f"  ￥ 核心样本竞价额 | {self._fmt_amount_yi_precise(summary.context_auc_amt) if auction_ready else '--'}",
-            f"  ◎ Top10竞价额/昨比 | {self._fmt_amount_yi_precise(summary.auction_top10_amount) if auction_ready else '--'} / {(f'{float(summary.auction_top10_vs_prev_ratio):.2f}x' if auction_ready else '--')}",
-            f"  ◎ Top20竞价额/昨比 | {self._fmt_amount_yi_precise(summary.auction_top20_amount) if auction_ready else '--'} / {(f'{float(summary.auction_top20_vs_prev_ratio):.2f}x' if auction_ready else '--')}",
-            f"  ◎ 昨涨停样本平均竞价额 | {self._fmt_amount_wan(summary.avg_bid_amt) if auction_ready else '--'}",
-            f"  ◇ 昨涨停样本 | {summary.total_yest_limit_count if yest_limit_ready else '--'}",
-            f"  ◇ 热门题材数 | {hot_plate_text}",
-            f"  ⇄ 延续/新发酵/兑现 | {migration_text}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"额{self._fmt_amount_yi_precise(row.auction_amount)}",
+            f"  → 延续/新发酵/兑现 | {migration_text}",
         )
 
     def _render_auction_collision(self, state: StrategyConsoleState) -> tuple[str, ...]:
@@ -2818,7 +3017,7 @@ class AuctionRuntimeController:
 
     def _render_auction_delta_collision(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.auction_delta_stats:
-            return ("【竞价边际】暂无 0924→0925 对比样本",)
+            return ("【竞价边际】暂无 09:24→09:25 对比样本",)
         rows = ["【竞价边际】题材 | 0925额 | 0924→0925增额 | 额比 | 涨跌变化 | 封单变化 | 结论 | 代表"]
         for item in state.auction_delta_stats[:4]:
             representative = self._snapshot_name_by_symbol(state, item.sample_symbols[0]) if item.sample_symbols else "-"
@@ -2838,8 +3037,8 @@ class AuctionRuntimeController:
     def _render_eax_expectation_gap(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not self._expectation_ready(state):
             return (
-                "【EAX预期差】题材 | E/A/X | 预期差 | 动作 | 代表",
-                "  - | --/--/-- | -- | 等竞价锚点、昨日涨停池、今日热板同时就绪 | -",
+                "【EAX预期差】题材 | E/A/X | 预期差 | 动作 | 证据 | 代表",
+                "  - | - | - | - | 等待竞价或开盘验证 | -",
             )
         rows = self._theme_collision_rows(state)
         if not rows:
@@ -2866,7 +3065,7 @@ class AuctionRuntimeController:
     def _render_auction_attack_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
             return ("【竞价攻击图】暂无题材样本",)
-        rows = ["【竞价攻击图】定位 | 题材 | 强度 | 竞价额 | 龙头数 | 昨板 | 主力净额 | 资金定性 | 代表"]
+        rows = ["【数据对撞】定位 | 题材 | 资位/板位/强位/热位 | 昨热/昨板/涨停数/转强数 | 红绿/均涨 | 结果 | 预期差 | 代表"]
         for row in state.plate_stats[:3]:
             representative = self._snapshot_name_by_symbol(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             rows.append(
@@ -2894,7 +3093,7 @@ class AuctionRuntimeController:
             ranked_rows = list(state.plate_stats[:4])
         if not ranked_rows:
             return ("【题材区】暂无题材样本",)
-        rows = ["【题材区】定位 | 题材 | 热度 | 净额 | 竞价额 | 涨停/高标 | 转强/强封 | 红绿 | 前排 | 观察"]
+        rows = ["【数据对撞】定位 | 题材 | 资位/板位/强位/热位 | 昨热/昨板/涨停数/转强数 | 红绿/均涨 | 结果 | 预期差 | 代表"]
         for row in ranked_rows:
             leader, assist, follower = self._theme_internal_names(state, row.plate_name)
             front = " ; ".join(name for name in (leader, assist, follower) if name and name != "-") or "-"
@@ -2902,7 +3101,7 @@ class AuctionRuntimeController:
             limit_text = f"{row.limit_up_count}/{row.highest_lb_days}板"
             turn_text = f"{row.turn_strong_count}/{row.strong_lock_count}"
             ratio_text = self._theme_red_green_ratio_text(row)
-            breadth_text = f"{ratio_text}/{self._fmt_pct(row.avg_current_pct)}" if ratio_text != "--" else "--"
+            resonance_text = f"{summary.resonance_score:.2f}" if hot_plate_mode == "today" else "--"
             rows.append(
                 "  "
                 f"{self._plate_role_text(row)}"
@@ -2945,8 +3144,8 @@ class AuctionRuntimeController:
     def _render_yest_limit_feedback(self, state: StrategyConsoleState) -> tuple[str, ...]:
         summary = state.context.market_summary
         feedback_ready = self._feedback_metrics_ready(state)
-        verdict = "今日机会" if summary.promotion_rate >= 0.35 and summary.headshot_rate <= 0.08 else (
-            "昨日兑现" if summary.headshot_rate >= 0.12 or summary.promotion_rate <= 0.15 else "分歧观察"
+        verdict = "接力良好" if summary.promotion_rate >= 0.35 and summary.headshot_rate <= 0.08 else (
+            "接力恶劣" if summary.headshot_rate >= 0.12 or summary.promotion_rate <= 0.15 else "接力一般"
         )
         trade_env = self._yest_limit_trade_env(summary)
         opportunity_label, opportunity_action = self._yest_limit_opportunity_profile(summary)
@@ -2958,7 +3157,7 @@ class AuctionRuntimeController:
         elif hot_plate_mode == "missing":
             verdict_note = "热点题材缺失，先看昨日涨停反馈，不判主攻切换"
         else:
-            verdict_note = "先看中位还是先防兑现一眼能看懂"
+            verdict_note = "先看中位还是先防兑现，一眼能看懂"
         if not feedback_ready:
             if not self._auction_anchor_ready(state) and not self._yest_limit_ready(state):
                 verdict_note = "竞价锚点和昨日涨停池未就绪，先不判断接力环境"
@@ -2971,14 +3170,14 @@ class AuctionRuntimeController:
                 "  机会面 | 晋级率 -- | 样本不足，先不判断接力机会",
                 "  溢价面 | 红开率 -- | 样本不足，先不判断高开溢价",
                 "  风险面 | 核按钮率 -- | 样本不足，先不判断负反馈强弱",
-                f"  环境结论 | -- / -- | 样本 --，{verdict_note}",
+                f"  {switch_badge} 主线/副线 | {main_name}:{self._mainline_label_text(main_expect)} / {secondary}",
             )
         return (
             "【昨日涨停反馈】维度 | 数值 | 交易解读",
             f"  机会面 | 晋级率 {summary.promotion_rate:.1%} | {opportunity_label}，{opportunity_action}",
             f"  溢价面 | 红开率 {summary.red_open_rate:.1%} | {premium_label}，{premium_action}",
             f"  风险面 | 核按钮率 {summary.headshot_rate:.1%} | {risk_label}，{risk_action}",
-            f"  环境结论 | {trade_env} / {verdict} | 样本 {summary.total_yest_limit_count}，{verdict_note}",
+                f"  {switch_badge} 主线/副线 | {main_name}:{self._mainline_label_text(main_expect)} / {secondary}",
         )
 
     def _money_mode_metrics(self, state: StrategyConsoleState) -> dict[str, int]:
@@ -3326,7 +3525,7 @@ class AuctionRuntimeController:
             return ("partial", "模式不清但前排2m仍有跟随，继续盯前排")
         if self._opening_mode_is_no_clear(opening_mode_code):
             return ("falsified", "竞价预判未获得开盘2分钟确认")
-        return ("partial", f"开盘结构切到{self._money_mode_label(opening_mode_code)}，原预判需降级")
+        return ("partial", f"开盘结构切到 {self._money_mode_label(opening_mode_code)}，原预判需降级")
 
     def _money_mode_validation_label(self, validation_state: str) -> str:
         mapping = {
@@ -3366,7 +3565,7 @@ class AuctionRuntimeController:
         )
         if expansion_failed and high_board_huddle_count >= 1:
             plate_name = str(top.get("plate_name") or "-")
-            return "high_board_huddle", f"{plate_name}扩散未成立，只剩高位活口"
+            return "high_board_huddle", f"{plate_name} 高位抱团，扩散不足，先看龙头活口"
         return opening_mode_code, ""
 
     @staticmethod
@@ -3593,20 +3792,20 @@ class AuctionRuntimeController:
         mode_code = self._effective_money_mode_code(state)
         mode_confidence = self._money_mode_confidence(state, mode_code)
         return (
-            "【竞价预案】维度 | 内容",
-            f"  盘面归类 | {style}",
-            f"  数据对撞 | {collision_text}",
-            f"  主攻锚点 | 资金/涨停/转强 = {anchor_text}",
-            f"  赚钱模式 | {self._effective_money_mode(state)} / 置信{mode_confidence:.2f}",
-            f"  模式约束 | {self._money_mode_constraint_text(state)}",
-            f"  主预判 | {primary_prediction}",
-            f"  次预判 | {secondary_prediction}",
-            f"  竞价假设 | {plan}",
+                "front_confirm",
+            f"  形态风格识别 | {style}",
+            f"  板块碰撞判断 | {collision_text}",
+                "front_confirm",
+                "front_confirm",
+            f"  当前模式约束 | {self._money_mode_constraint_text(state)}",
+                "front_confirm",
+                "front_confirm",
+                "watch_only",
             f"  开盘验证点 | {validation_point}",
-            f"  禁做条件 | {no_trade}",
-            f"  修复观察 | {repair_watch}",
-            f"  失效条件 | {invalidation}",
-            f"  操作预案 | {action_plan}",
+            f"  执行禁做项 | {no_trade}",
+                "watch_only",
+            f"  证伪条件 | {invalidation}",
+                "watch_only",
         )
 
     def _auction_action_plan_text(
@@ -3645,12 +3844,12 @@ class AuctionRuntimeController:
                 return f"{row.plate_name} 看高标是否回封、中位晋级是否成立、前排2分钟承接是否过半"
             if collision_row.signal == "共振主攻":
                 return f"{row.plate_name} 看前排承接是否过半、中位扩散是否成立、是否不是只剩高位独立活口"
-            return f"{row.plate_name} 看前排2分钟承接、中位扩散、以及高位是否真的带动板块"
+            return f"{row.plate_name} 看前排2分钟承接、中位扩散，以及高位是否真的带动板块"
         if capital_row is not None and limitup_row is not None and capital_row.plate_name == limitup_row.plate_name:
             return f"{capital_row.plate_name} 看资金是否继续集中、板块是否补板成队"
         if turn_row is not None:
             return f"{turn_row.plate_name} 看转强前排是否获得2分钟承接确认"
-        return "看前排2分钟承接、中位扩散、以及高位是否真的带动板块"
+        return "看前排2分钟承接、中位扩散，以及高位是否真的带动板块"
 
     def _auction_no_trade_text(
         self,
@@ -3980,37 +4179,37 @@ class AuctionRuntimeController:
         plate_support = [plate for plate in plate_check_names if plate in final_leads]
         hot_plate_support = [plate for plate in hot_leads[:2] if plate in final_leads]
         if overlap and validation_score["negative"] > validation_score["positive"]:
-            verdict = "半对半错"
+            verdict = "预判偏错"
             adjust = (
-                f"竞价强桶与收盘主线仍重合在 {','.join(overlap)}，"
-                "但开盘验证偏弱，明天要把高开转虚和承接偏弱放在更前面过滤。"
+                f"竞价主看方向是 {','.join(overlap)}，"
+                "但开盘后的承接和回流没有兑现，说明预判需要降级处理。"
             )
         elif overlap:
-            verdict = "基本正确"
+            verdict = "预判半对"
             if validation_score["positive"] > 0:
-                adjust = f"竞价强桶与收盘主线重合在 {','.join(overlap)}，且开盘验证有正反馈，明天继续盯核心龙头与前排承接。"
+                adjust = f"竞价主看方向仍有 {','.join(overlap)}，但只有局部兑现，后续更适合只盯前排和回流确认。"
             else:
-                adjust = f"竞价强桶与收盘主线重合在 {','.join(overlap)}，明天继续盯核心龙头与前排承接。"
+                adjust = f"竞价主看方向仍是 {','.join(overlap)}，但强度没有明显扩散，说明更多是存量博弈。"
         elif validation_score["positive"] > 0 or plate_support or hot_plate_support:
-            verdict = "半对半错"
+            verdict = "预判修正"
             if plate_support:
-                adjust = f"竞价强桶本身不稳，但题材验证仍指向 {','.join(dict.fromkeys(plate_support[:2]))}，明天应提高热板延续和涨停成队权重。"
+                adjust = f"开盘后资金进一步收敛到 {','.join(dict.fromkeys(plate_support[:2]))}，说明盘面真实主攻已完成切换，需按新主线处理。"
             elif validation_score["positive"] > 0:
-                adjust = "竞价强桶未直接命中收盘主线，但开盘验证有真强样本，明天应提高开盘兑现和题材成队的联合权重。"
+                adjust = "开盘验证里出现了更强的承接和回流信号，说明真实机会不完全在竞价结论里，需用开盘结果修正预案。"
             else:
-                adjust = "前日热板延续比竞价瞬时量更有效，明天应提高热板延续和涨停成队权重。"
+                adjust = "竞价本身不够清楚，但开盘后的板块联动更完整，说明需要以后验主线为准。"
         else:
-            verdict = "明显偏离"
-            adjust = "竞价不能只看大额单，明天要把前日热板、前日涨停晋级链和题材成队一起校验。"
+            verdict = "继续观察"
+            adjust = "竞价和开盘都没有形成清晰主攻，先以防守和等待确认为主，不急着给强结论。"
         return (
-            "【预案复核】维度 | 结论",
-            f"  竞价强桶 | {', '.join(auction_leads) or '-'}",
+            "【竞价收盘对照】维度 | 结果",
+            f"  竞价主看 | {', '.join(auction_leads) or '-'}",
             f"  收盘主线 | {', '.join(dict.fromkeys(final_leads[:3])) or '-'}",
-            f"  开盘兑现 | {' ; '.join(opening_feedback_parts) or '-'}",
+            f"  开盘反馈 | {' ; '.join(opening_feedback_parts) or '-'}",
             f"  预判校验 | {' ; '.join(prediction_checks[:2]) or '-'}",
-            f"  开盘预案 | {' ; '.join(validated) or '-'}",
-            f"  题材验证 | {' ; '.join(plate_checks[:2]) or '-'}",
-            f"  预案判断 | {verdict}",
+            f"  开盘验证 | {' ; '.join(validated) or '-'}",
+            f"  板块验证 | {' ; '.join(plate_checks[:2]) or '-'}",
+            f"  结论判断 | {verdict}",
             f"  调整建议 | {adjust}",
         )
 
@@ -4110,7 +4309,7 @@ class AuctionRuntimeController:
                 "【主线复盘】维度 | 内容",
                 "  主线/副线 | -- / --",
                 f"  涨停主线/次主线 | {limitup_lead} / {limitup_secondary}",
-                f"  盘中最强 | -- ({hot_plate_note})",
+                f"  前日热板龙头 | -- ({hot_plate_note})",
                 "  是否切换/迁移 | -- / --",
                 "  延续/新发酵/兑现 | --/--/--",
             )
@@ -4125,7 +4324,7 @@ class AuctionRuntimeController:
             "【主线复盘】维度 | 内容",
             f"  主线/副线 | {lead} / {secondary}",
             f"  涨停主线/次主线 | {limitup_lead} / {limitup_secondary}",
-            f"  盘中最强 | {scope_lead}",
+            f"  前日热板龙头 | {scope_lead}",
             f"  是否切换/迁移 | {'是' if summary.mainline_switch else '否'} / {self._migration_text(summary.top_plate_migration_type or '-')}",
             f"  延续/新发酵/兑现 | {summary.persistent_plate_count}/{summary.emerging_plate_count}/{summary.fading_plate_count}",
         )
@@ -4146,7 +4345,7 @@ class AuctionRuntimeController:
         return (
             "【高位梯队复盘】指标 | 数值",
             f"  ▲ 三板及以上 | {high_board_count}",
-            f"  ◇ 昨日涨停 | {yest_limit_count}",
+            f"  ◇ 前日涨停反馈样本 | {yest_limit_count}",
             f"  ⛔ 封死数量 | {locked_count}",
             f"  {promotion_marker} 晋级率 | {promotion_text}",
             f"  {headshot_marker} 核按钮率 | {headshot_text}",
@@ -4158,11 +4357,11 @@ class AuctionRuntimeController:
         if summary.sentiment_score >= 6.0 and summary.headshot_rate <= 0.05:
             primary = "若主线继续强化，优先看核心龙头低风险延续和前排题材跟随。"
         elif summary.sentiment_score >= 4.0:
-            primary = "若龙头分歧但主线未死，只看回封与承接，不盲追后排。"
+            primary = "若主线延续，优先看前排分歧转强和中位卡位，不追一致后排。"
         else:
             primary = "若负反馈继续扩散，缩到观察名单，等新的低风险信号。"
         if summary.mainline_switch:
-            secondary = "若题材切换继续，老主线以冲高兑现为主，不再新增进攻。"
+            secondary = "若切换被确认，只做新主线前排，不在老主线后排里纠缠。"
         else:
             secondary = "若主线延续，明天先看核心龙头是否获得资金再承接。"
         return (
@@ -4188,10 +4387,10 @@ class AuctionRuntimeController:
             else "--，晋级率 --，核按钮率 --"
         )
         return (
-            "【全天回放】阶段 | 结论",
-            f"  竞价开局 | {open_text}",
-            f"  盘中主线 | {scope_lead}最强，主线/副线围绕 {lead} / {secondary} 演绎，{'发生切换' if summary.mainline_switch else '整体延续'}",
-            f"  收盘结果 | {close_text}",
+            "【竞价收盘对照】维度 | 结果",
+            f"  竞价观察 | {open_text}",
+            f"  主线演绎 | {scope_lead} 对比收盘主线 {lead} / {secondary}，{'发生切换' if summary.mainline_switch else '未发生切换'}",
+            f"  收盘结论 | {close_text}",
         )
 
     def _auction_outcome_summary(self, state: StrategyConsoleState) -> str:
@@ -4202,22 +4401,22 @@ class AuctionRuntimeController:
         opportunity_label, _opportunity_action = self._yest_limit_opportunity_profile(summary)
         risk_label, _risk_action = self._yest_limit_risk_profile(summary)
         if premium_label == "红开溢价足" and risk_label == "负反馈轻":
-            return "强开有溢价，但仍要防高开兑现"
+            return "竞价溢价与风险都健康"
         if premium_label == "溢价不足":
-            return "低开偏多，竞价承接一般"
+            return "溢价不足，先手错了就要快撤"
         if opportunity_label == "机会偏少" and risk_label in {"负反馈重", "负反馈可见"}:
-            return "高开转虚风险较大，先看分歧后谁回流"
-        if opportunity_label in {"中位有肉", "有少量机会"}:
-            return "有承接分歧，先看前排确认"
-        return f"{premium_action}，并结合{risk_label}"
+            return "机会少且风险高，接力环境差"
+        if opportunity_label in {"机会偏少", "有少量机会"}:
+            return "机会一般，尽量只看前排"
+        return f"{premium_action}，{risk_label}"
 
     def _render_today_hot_plates(self, state: StrategyConsoleState) -> tuple[str, ...]:
         hot_plate_mode = self._hot_plate_render_mode(state)
         if hot_plate_mode != "today":
-            return (f"【今日热点】{self._hot_plate_note(state)}，不输出今日强度/涨幅/净流入真值",)
+            return (f"【今日热点】{self._hot_plate_note(state)}，暂不展示当日热板排名/热度/强度。",)
         if not state.plate_stats:
             return ("【今日热点】暂无题材样本",)
-        rows = ["【今日热点】题材 | 强度 | 涨幅 | 净流入 | 资金定性 | 代表"]
+        rows = ["【今日热点】题材 | 热度 | 热度名次 | 涨跌/净额 | 结论"]
         for row in state.plate_stats[:4]:
             representative = self._snapshot_name_by_symbol_compact(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             rows.append(
@@ -4265,7 +4464,7 @@ class AuctionRuntimeController:
                 continue
             plate_rows[plate].append(snapshot)
         if not plate_rows:
-            return ("【涨停板块】暂无涨停板块样本",)
+            return ("暂无涨停板块归因",)
         ranked = sorted(
             plate_rows.items(),
             key=lambda item: (
@@ -4290,7 +4489,6 @@ class AuctionRuntimeController:
                 f" | {self._limitup_plate_comment(snapshots)}"
             )
         return tuple(rows)
-
     def _load_postmarket_limit_truth_rows(self, trade_date: str) -> tuple[dict[str, object], ...]:
         cache = getattr(self, "_postmarket_limit_truth_cache", None)
         if cache is None:
@@ -4403,8 +4601,7 @@ class AuctionRuntimeController:
             return "首板扩散明显"
         if count >= 2:
             return "前排联动"
-        return "单点表现"
-
+        return "零散轮动"
     def _normalize_limitup_truth_lb_days(self, raw: object) -> int:
         try:
             value = int(raw)  # type: ignore[arg-type]
@@ -4601,16 +4798,20 @@ class AuctionRuntimeController:
             f"  题材确认 | {' ; ' .join(confirmations) or '-'}",
             f"  预判校验 | {' ; ' .join(prediction_checks) or '-'}",
             f"  失效原因 | {' ; '.join(invalidation[:2]) or '-'}",
-            f"  预案兑现 | {' ; ' .join(validated) or '-'}",
+            f"  预判验证 | {' ; ' .join(validated) or '-'}",
             f"  修正结论 | {correction}",
-            f"  统一判定 | {' ; ' .join(theme_validation_summary) or '-'}",
-            f"  题材验证 | {' ; ' .join(plate_checks) or '-'}",
+            f"  统一判断 | {' ; ' .join(theme_validation_summary) or '-'}",
+            f"  板块验证 | {' ; ' .join(plate_checks) or '-'}",
         )
 
     def _render_opening_front_slice_line(self, comparison) -> str:
         return (
             f"  前排2m | Top10 {self._fmt_amount_yi_precise(comparison.top10_amount)} / 昨比 {comparison.top10_vs_prev_ratio:.2f}x"
             f" ; Top20 {self._fmt_amount_yi_precise(comparison.top20_amount)} / 昨比 {comparison.top20_vs_prev_ratio:.2f}x"
+        )
+        return (
+            f"{self._close_verdict_text(verdict)}，晋级率 {summary.promotion_rate:.1%}，核按钮率 {summary.headshot_rate:.1%}"
+            f"{self._close_verdict_text(verdict)}，晋级率 {summary.promotion_rate:.1%}，核按钮率 {summary.headshot_rate:.1%}"
         )
 
     def _build_opening_validation_payload(
@@ -4675,11 +4876,11 @@ class AuctionRuntimeController:
             representative = self._snapshot_name_by_symbol_compact(eval_state, row.sample_symbols[0]) if row.sample_symbols else "-"
             hot_rank = self._collision_rank_text(row, item.hot_rank, hot=True)
             yest_hot_rank = self._collision_rank_text(row, item.yesterday_hot_rank, hot=True)
-            confirm_label = "维持"
+            confirm_label = "缁存寔"
             if validation_state == "falsified":
-                confirm_label = "证伪"
+                confirm_label = "璇佷吉"
             elif validation_state == "strengthened":
-                confirm_label = "加强"
+                confirm_label = "鍔犲己"
             execution_state = self._external_validation_state(validation_state)
             confirmations.append(f"{row.plate_name}={confirm_label}")
             expected_bias = (
@@ -4713,12 +4914,21 @@ class AuctionRuntimeController:
                     "undertake_count_5m": int(validation_metrics.get("undertake_count_5m", 0.0)),
                     "undertake_count_10m_proxy": int(validation_metrics.get("undertake_count_10m_proxy", 0.0)),
                     "front_row_count": int(validation_metrics.get("front_row_count", 0.0)),
+                    "leader_only_alive": 1
+                    if (
+                        execution_state == "falsified"
+                        and (
+                            self._theme_conclusion_for_plate(eval_state, row.plate_name) == "leader_only_alive"
+                            or action_class == "anchor_only"
+                        )
+                    )
+                    else 0,
                 }
             )
             plate_checks.append(
-                f"{row.plate_name}(额{self._fmt_amount_yi_precise(row.auction_amount)}/竞价样本{row.auction_symbol_count}/昨热{yest_hot_rank}/昨板{row.yest_limit_count}/前排承接{int(validation_metrics.get('undertake_count', 0.0))}/{int(validation_metrics.get('front_row_count', 0.0))}/5m承接{int(validation_metrics.get('undertake_count_5m', 0.0))}/{int(validation_metrics.get('front_row_count', 0.0))}/10m代理{int(validation_metrics.get('undertake_count_10m_proxy', 0.0))}/{int(validation_metrics.get('front_row_count', 0.0))}/代表{representative})"
-                f"/对撞{item.signal}/预期差{item.expectation_label}/资位{item.capital_rank}/板位{item.limitup_rank}/强位{item.turn_rank}/热位{hot_rank}"
-                f"/位次{item.capital_rank}/{item.limitup_rank}/{item.turn_rank}/{hot_rank}"
+                f"{row.plate_name}"
+                f"{row.plate_name}"
+                f" | {row.weighted_score:.1f}"
             )
         if not invalidation_reasons and weak:
             invalidation_reasons.extend(f"{name}=高开后承接转弱" for name in weak[:2])
@@ -4791,17 +5001,27 @@ class AuctionRuntimeController:
     ) -> tuple[AuctionLadderDecision, ...]:
         picked: list[AuctionLadderDecision] = []
         seen_symbols: set[str] = set()
-        for decision in self._focus_candidates_for_phase(state, phase_label="open_confirm"):
+        for decision in self._order_decisions_by_narrative(
+            state,
+            self._focus_candidates_for_phase(state, phase_label="open_confirm"),
+            phase_label="open_confirm",
+        ):
             if decision.symbol in seen_symbols:
                 continue
             picked.append(decision)
             seen_symbols.add(decision.symbol)
             if len(picked) >= 5:
                 return tuple(picked)
-        for decision in state.watch_candidates:
+        for decision in self._order_decisions_by_narrative(
+            state,
+            tuple(
+                decision
+                for decision in state.watch_candidates
+                if self._decision_allowed_in_focus_output(state, decision, phase_label="open_confirm")
+            ),
+            phase_label="open_confirm",
+        ):
             if decision.symbol in seen_symbols:
-                continue
-            if not self._decision_allowed_in_focus_output(state, decision, phase_label="open_confirm"):
                 continue
             picked.append(decision)
             seen_symbols.add(decision.symbol)
@@ -4846,7 +5066,7 @@ class AuctionRuntimeController:
             return "首板扩散明显"
         if count >= 2:
             return "前排联动"
-        return "单点表现"
+        return "局部活跃"
 
     def _render_high_board_book(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
         snapshot_map = {snapshot.symbol: snapshot for snapshot in state.context.stock_snapshots}
@@ -4883,7 +5103,7 @@ class AuctionRuntimeController:
                 f" | {self._fmt_pct(snapshot.current_pct)}"
                 f" | {self._high_board_state_label(snapshot, phase_label=phase_label, historical_only=state.historical_only)}"
                 f" | {self._high_board_buy1_text(snapshot, phase_label=phase_label, historical_only=state.historical_only)}"
-                f" | {self._high_board_feature_tags(snapshot, top_board=top_board, buy1_king_symbol=buy1_king_symbol, historical_only=state.historical_only)}"
+                f" | {self._high_board_feature_tags(snapshot, state=state, top_board=top_board, buy1_king_symbol=buy1_king_symbol, historical_only=state.historical_only)}"
                 f" | {action}"
             )
         return tuple(rows)
@@ -4895,34 +5115,34 @@ class AuctionRuntimeController:
 
     def _high_board_open_text(self, snapshot: StockStateSnapshot, *, phase_label: str, historical_only: bool) -> str:
         if phase_label == "premarket" and historical_only:
-            return "待竞价"
+            return "--"
         return self._fmt_pct(snapshot.open_pct)
 
     def _high_board_state_label(self, snapshot: StockStateSnapshot, *, phase_label: str, historical_only: bool) -> str:
         if phase_label == "premarket" and historical_only:
             if snapshot.current_pct >= 0.098:
-                return "昨收封板"
+                return "封板"
             if snapshot.current_pct >= 0.05:
-                return "昨收强势"
+                return "强势"
             if snapshot.current_pct > 0:
-                return "昨收分歧"
-            return "昨收回落"
+                return "承接"
+            return "回落"
         if self._is_limit_up_snapshot(snapshot):
             return "封板"
         if snapshot.open_pct >= 0.08 and snapshot.current_pct < snapshot.open_pct - 0.02:
             return "炸板"
         if snapshot.current_pct < 0.0:
-            return "回落"
+            return "走弱"
         if snapshot.current_pct < snapshot.open_pct - 0.02:
-            return "分歧"
+            return "回落"
         return "承接"
 
     def _high_board_buy1_text(self, snapshot: StockStateSnapshot, *, phase_label: str, historical_only: bool) -> str:
         if phase_label == "premarket" and historical_only:
-            return "待盘口"
+            return "--"
         return self._leader_seal_quality(snapshot)
 
-    def _high_board_feature_tags(self, snapshot: StockStateSnapshot, *, top_board: int, buy1_king_symbol: str, historical_only: bool) -> str:
+    def _high_board_feature_tags(self, snapshot: StockStateSnapshot, *, state: StrategyConsoleState | None = None, top_board: int, buy1_king_symbol: str, historical_only: bool) -> str:
         tags: list[str] = []
         if snapshot.lb_days == top_board and top_board > 0:
             tags.append("[最高标]")
@@ -4941,11 +5161,10 @@ class AuctionRuntimeController:
         if snapshot.market_cap_yi >= 300 or snapshot.amount_day_yi >= 40:
             tags.append("[容量票]")
         return "".join(tags[:3]) or "[观察]"
-
     def _render_plate_heat(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
-            return ("【题材分桶】暂无题材样本",)
-        rows = ["【题材分桶】定位 | 题材 | 题材强度 | 涨幅 | 主力净额 | 资金定性 | 竞价额 | 昨板 | 机会类型 | 下手层 | 情绪先锋"]
+            return ("【题材区】暂无题材热度数据",)
+        rows = ["【题材区】定位 | 题材 | 热度 | 涨跌 | 净额 | 资金行为 | 竞价额 | 昨板 | 状态 | 动作 | 前排"]
         for row in state.plate_stats[:4]:
             leader = self._snapshot_name_by_symbol_compact(state, row.sample_symbols[0]) if row.sample_symbols else "-"
             theme_state, trade_state, _ = self._theme_trade_profile(row)
@@ -4964,11 +5183,10 @@ class AuctionRuntimeController:
                 f" | {leader}"
             )
         return tuple(rows)
-
     def _render_theme_internal_layers(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if not state.plate_stats:
-            return ("【题材层级】暂无题材样本",)
-        rows = ["【题材层级】题材 | 情绪先锋 | 前排助攻 | 跟风前排 | 层级判断"]
+            return ("【题材内部】暂无梯队结构数据",)
+        rows = ["【题材内部】题材 | 龙头 | 助攻 | 跟风 | 说明"]
         for row in state.plate_stats[:4]:
             leader, assist, follower = self._theme_internal_names(state, row.plate_name)
             rows.append(
@@ -4980,7 +5198,6 @@ class AuctionRuntimeController:
                 f" | {self._theme_layer_comment(state, row)}"
             )
         return tuple(rows)
-
     def _render_extreme_board(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
         snapshots = nlargest(
             4,
@@ -4997,11 +5214,11 @@ class AuctionRuntimeController:
             ),
         )
         if not snapshots:
-            return ("\u3010\u7ade\u4ef7\u6781\u503c\u699c\u3011\u6682\u65e0\u6781\u503c\u6837\u672c",)
+            return ("【竞价极值榜】暂无极值样本",)
         rows: list[str] = []
         if phase_label == "intraday" and state.stale_snapshot_only:
-            rows.append("\u3010\u7ade\u4ef7\u6781\u503c\u699c\u3011\u57fa\u4e8e\u76d8\u4e2d\u6ede\u540e\u5feb\u7167\uff0c\u4ec5\u4f9b\u590d\u76d8\u53c2\u8003")
-        rows.append("\u3010\u7ade\u4ef7\u6781\u503c\u699c\u3011\u4e2a\u80a1 | \u6781\u503c\u7c7b\u578b | \u7ade\u4ef7\u6da8\u8dcc | \u73b0\u6da8\u8dcc | \u7ade\u4ef7\u989d | \u524d2\u5206\u91d1\u989d | \u9898\u6750 | \u4e0a\u8f66\u7ed3\u8bba")
+            rows.append("【竞价极值榜】基于盘中滞后快照，仅供复盘参考")
+        rows.append("【竞价极值榜】个股 | 极值类型 | 竞价涨跌 | 现涨跌 | 竞价额 | 前2分金额 | 题材 | 上车结论")
         for snapshot in snapshots:
             rows.append(
                 "  "
@@ -5037,11 +5254,11 @@ class AuctionRuntimeController:
             ),
         )
         if not snapshots:
-            return ("\u3010\u627f\u63a5\u8f6c\u5f3a\u699c\u3011\u6682\u65e0\u627f\u63a5\u6837\u672c",)
+            return ("【承接转强榜】暂无承接样本",)
         rows: list[str] = []
         if phase_label == "intraday" and state.stale_snapshot_only:
-            rows.append("\u3010\u627f\u63a5\u8f6c\u5f3a\u699c\u3011\u57fa\u4e8e\u76d8\u4e2d\u6ede\u540e\u5feb\u7167\uff0c\u4ec5\u4f9b\u590d\u76d8\u53c2\u8003")
-        rows.append("\u3010\u627f\u63a5\u8f6c\u5f3a\u699c\u3011\u4e2a\u80a1 | \u673a\u4f1a\u6807\u7b7e | \u7ade\u4ef7\u6da8\u8dcc | \u73b0\u6da8\u8dcc | \u524d2\u5206\u91d1\u989d | \u9898\u6750 | \u8bc1\u636e")
+            rows.append("【承接转强榜】基于盘中滞后快照，仅供复盘参考")
+        rows.append("【承接转强榜】个股 | 机会标签 | 竞价涨跌 | 现涨跌 | 前2分金额 | 题材 | 证据")
         for snapshot in snapshots:
             decision = state.decision_map.get(snapshot.symbol)
             rows.append(
@@ -5176,7 +5393,7 @@ class AuctionRuntimeController:
 
     def _render_auction_execution_map(self, state: StrategyConsoleState) -> tuple[str, ...]:
         if state.bundle is None:
-            return ("【竞价预案拆解】候选样本尚未就绪",)
+            return ("【高标生死簿】暂无高位样本",)
         ordered_decisions = self._focus_ordered_decisions(state, phase_label="auction")
         focus_candidates = self._focus_candidates_for_phase(state, phase_label="auction")
         focus_symbols = {item.symbol for item in focus_candidates}
@@ -5284,26 +5501,51 @@ class AuctionRuntimeController:
             f"{self._decision_name(state, row)}:{self._display_action_label(row, state, phase_label='auction')}@{row.confidence}" for row in avoid
         ) or "无"
         return (
-            "【竞价预案拆解】方向 | 清单",
+            "【竞价执行图】方向 | 清单",
             f"  进攻 | {attack_text}",
             f"  跟踪 | {watch_text}",
             f"  持有 | {hold_text}",
-            f"  修复预备 | {repair_text}",
+            f"  修复 | {repair_text}",
             f"  回避 | {avoid_text}",
         )
 
     def _render_focus_pool(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
         if state.bundle is None:
-            return (("明日观察池" if phase_label == "postmarket" else "核心观察池") + " | 候选样本尚未就绪",)
-        focus_candidates = self._focus_candidates_for_phase(state, phase_label=phase_label)
-        watch_candidates = tuple(
-            decision
-            for decision in state.watch_candidates
-            if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
+            title = "【明日观察池】个股 | 动作 | 评分 | 竞价涨跌 | 现涨跌 | 热榜/热度 | 题材 | 证据" if phase_label == "postmarket" else "【核心观察池】个股 | 动作 | 评分 | 竞价涨跌 | 现涨跌 | 热榜/热度 | 题材 | 证据"
+            return (title,)
+        focus_candidates = self._order_decisions_by_narrative(
+            state,
+            self._focus_candidates_for_phase(state, phase_label=phase_label),
+            phase_label=phase_label,
+        )
+        if not focus_candidates and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
+            focus_candidates = self._order_decisions_by_narrative(
+                state,
+                self._last_effective_focus_candidates(
+                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
+                    phase_label=phase_label,
+                ),
+                phase_label=phase_label,
+            )
+        pinned_focus_symbols = tuple(decision.symbol for decision in focus_candidates)
+        preferred_plates = self._phase_priority_plates(state, phase_label=phase_label) if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"} else ()
+        watch_candidates = self._order_decisions_by_narrative(
+            state,
+            tuple(
+                decision
+                for decision in state.watch_candidates
+                if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
+                and (
+                    not preferred_plates
+                    or self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates)
+                )
+            ),
+            phase_label=phase_label,
         )
         buy_parts: list[str] = []
         selection_map = self._stock_selection_context_map(state)
         ensured_focus = list(focus_candidates)
+        confirmed_theme_note = ""
         if phase_label in {"auction", "auction_preview", "opening", "open_confirm"} and len(ensured_focus) < 4:
             existing_symbols = {item.symbol for item in ensured_focus}
             for decision in watch_candidates:
@@ -5321,16 +5563,74 @@ class AuctionRuntimeController:
                 ensured_focus.append(decision)
                 if len(ensured_focus) >= self.AUCTION_MIN_OUTPUT_COUNT:
                     break
+        if phase_label in {"opening", "open_confirm", "intraday", "postmarket"} and len(ensured_focus) < 2:
+            existing_symbols = {item.symbol for item in ensured_focus}
+            confirmed_backfill = self._backfill_candidates_from_confirmed_themes(
+                state,
+                phase_label=phase_label,
+                existing_symbols=existing_symbols,
+            )
+            for decision in confirmed_backfill:
+                if decision.symbol in existing_symbols:
+                    continue
+                ensured_focus.append(decision)
+                existing_symbols.add(decision.symbol)
+                if len(ensured_focus) >= 3:
+                    break
+            if not confirmed_backfill:
+                confirmed_plates = self._confirmed_theme_names_for_focus(state)
+                if confirmed_plates:
+                    confirmed_theme_note = f"{'/'.join(confirmed_plates[:2])} 已开盘确认，但候选仍需等个股承接"
+        if len(ensured_focus) > 1:
+            deduped_focus: list[AuctionLadderDecision] = []
+            seen_focus_symbols: set[str] = set()
+            for decision in ensured_focus:
+                if decision.symbol in seen_focus_symbols:
+                    continue
+                deduped_focus.append(decision)
+                seen_focus_symbols.add(decision.symbol)
+            ranked_deduped = tuple(
+                sorted(
+                    deduped_focus,
+                    key=lambda item: (
+                        self._focus_candidate_priority_score(state, item, phase_label=phase_label),
+                        item.confidence,
+                    ),
+                    reverse=True,
+                )
+            )
+            if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"} and pinned_focus_symbols:
+                pinned_set = set(pinned_focus_symbols)
+                pinned_ranked = tuple(item for item in ranked_deduped if item.symbol in pinned_set)
+                trailing_ranked = tuple(item for item in ranked_deduped if item.symbol not in pinned_set)
+                pinned_ordered = self._order_decisions_by_narrative(state, pinned_ranked, phase_label=phase_label)
+                trailing_ordered = self._order_decisions_by_narrative(state, trailing_ranked, phase_label=phase_label)
+                ensured_focus = list(pinned_ordered + trailing_ordered)
+            else:
+                ensured_focus = list(self._order_decisions_by_narrative(state, ranked_deduped, phase_label=phase_label))
         selected_symbols = {row.symbol for row in ensured_focus[:4]}
         for decision in ensured_focus[:4]:
             snapshot = state.snapshot_map.get(decision.symbol)
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             action = self._display_action_label(decision, state, phase_label=phase_label)
             evidence = self._focus_evidence_clean(snapshot, phase_label=phase_label, state=state)
-            buy_parts.append(self._format_focus_item(decision, snapshot, action=action, plate=plate, evidence=evidence, state=state))
+            buy_parts.append(
+                self._format_focus_item(
+                    decision,
+                    snapshot,
+                    action=action,
+                    plate=plate,
+                    evidence=evidence,
+                    state=state,
+                    phase_label=phase_label,
+                )
+            )
 
-        ordered_decisions = self._focus_ordered_decisions(state, phase_label=phase_label)
-        preferred_plates = self._focus_priority_plates(state) if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "postmarket"} else ()
+        ordered_decisions = self._order_decisions_by_narrative(
+            state,
+            self._focus_ordered_decisions(state, phase_label=phase_label),
+            phase_label=phase_label,
+        )
         alt_parts: list[str] = []
         for decision in watch_candidates:
             if decision.symbol in selected_symbols:
@@ -5343,7 +5643,17 @@ class AuctionRuntimeController:
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             action = self._display_action_label(decision, state, phase_label=phase_label)
             evidence = self._focus_evidence_clean(snapshot, phase_label=phase_label, state=state)
-            alt_parts.append(self._format_focus_item(decision, snapshot, action=action, plate=plate, evidence=evidence, state=state))
+            alt_parts.append(
+                self._format_focus_item(
+                    decision,
+                    snapshot,
+                    action=action,
+                    plate=plate,
+                    evidence=evidence,
+                    state=state,
+                    phase_label=phase_label,
+                )
+            )
             if len(alt_parts) >= 3:
                 break
         for decision in ordered_decisions:
@@ -5361,7 +5671,17 @@ class AuctionRuntimeController:
             plate = self._display_plate_name(snapshot, prefer_high_board=True)
             action = self._display_action_label(decision, state, phase_label=phase_label)
             evidence = self._focus_evidence_clean(snapshot, phase_label=phase_label, state=state)
-            alt_parts.append(self._format_focus_item(decision, snapshot, action=action, plate=plate, evidence=evidence, state=state))
+            alt_parts.append(
+                self._format_focus_item(
+                    decision,
+                    snapshot,
+                    action=action,
+                    plate=plate,
+                    evidence=evidence,
+                    state=state,
+                    phase_label=phase_label,
+                )
+            )
             if len(alt_parts) >= 3:
                 break
         if phase_label == "auction" and not alt_parts:
@@ -5374,25 +5694,39 @@ class AuctionRuntimeController:
                     continue
                 if not self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label):
                     continue
+                if preferred_plates and not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates):
+                    continue
                 plate = self._display_plate_name(snapshot, prefer_high_board=True)
                 action = self._display_action_label(decision, state, phase_label=phase_label)
                 evidence = self._focus_evidence_clean(snapshot, phase_label=phase_label, state=state)
-                alt_parts.append(self._format_focus_item(decision, snapshot, action=action, plate=plate, evidence=evidence, state=state))
+                alt_parts.append(
+                    self._format_focus_item(
+                        decision,
+                        snapshot,
+                        action=action,
+                        plate=plate,
+                        evidence=evidence,
+                        state=state,
+                        phase_label=phase_label,
+                    )
+                )
                 if len(alt_parts) >= 2:
                     break
 
         if not buy_parts:
-            buy_parts.append("无")
+            buy_parts.append("-")
         if not alt_parts:
-            alt_parts.append("无")
+            alt_parts.append("-")
 
         reasons: list[str] = []
         for decision in ensured_focus[:2]:
             reasons.append(self._candidate_reason_summary(state, decision, phase_label=phase_label))
+        if confirmed_theme_note and not reasons:
+            reasons.append(confirmed_theme_note)
         if not reasons:
             reasons.append("暂无=保持观察，等待确认")
-        reject_reasons = self._focus_reject_reasons(state, tuple(ensured_focus[:4]), phase_label=phase_label)
-        mode_note = self._mode_risk_prompt(state, phase_label=phase_label)
+        reject_reasons = self._aligned_focus_reject_reasons(state, tuple(ensured_focus[:4]), phase_label=phase_label)
+        mode_note = self._aligned_mode_risk_prompt(state, phase_label=phase_label)
 
         if phase_label == "postmarket":
             return (
@@ -5415,12 +5749,16 @@ class AuctionRuntimeController:
             )
 
         if phase_label == "intraday" and state.stale_snapshot_only:
-            watch_source = state.candidates[:4] or tuple(
+            cached_focus = self._last_effective_focus_candidates(
+                trade_date=str(getattr(state.context, "trade_date", "") or ""),
+                phase_label=phase_label,
+            )
+            watch_source = cached_focus[:4] or state.candidates[:4] or tuple(
                 decision
                 for decision in state.watch_candidates
                 if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
             )[:4]
-            watch_parts = [self._format_watch_item(decision, state.snapshot_map, state=state) for decision in watch_source] or ["无"]
+            watch_parts = [self._format_watch_item(decision, state.snapshot_map, state=state) for decision in watch_source] or ["-"]
             carry_parts = []
             for decision in state.bundle.decisions:
                 if decision.symbol in selected_symbols:
@@ -5461,16 +5799,118 @@ class AuctionRuntimeController:
         note = next((reason for reason in decision.reasons if reason), "wait for confirmation")
         reason_text = self._reason_text(note)
         action_text = self._display_action_label(decision, state, phase_label=phase_label)
-        breakdown = self._focus_candidate_score_breakdown(state, decision, phase_label=phase_label)
-        drivers = self._focus_score_driver_tags_for_decision(
+        breakdown = self._focus_candidate_story_breakdown(state, decision, phase_label=phase_label)
+        drivers = self._story_score_driver_tags_for_decision(
             state,
             decision,
             breakdown,
             phase_label=phase_label,
         )
-        prefix = f"{self._decision_name(state, decision)}(热{hot_text})" if hot_text != "-" else self._decision_name(state, decision)
+        prefix = f"{self._decision_name(state, decision)}({hot_text})" if hot_text != "-" else self._decision_name(state, decision)
         driver_text = "" if not drivers else f" | 驱动={drivers}"
         return f"{prefix}={action_text} | {reason_text}{driver_text}"
+
+    def _remember_effective_focus_candidates(
+        self,
+        *,
+        trade_date: str,
+        phase_label: str,
+        decisions: tuple[AuctionLadderDecision, ...],
+    ) -> None:
+        if not trade_date or not decisions:
+            return
+        cache = getattr(self, "_last_effective_focus_cache", None)
+        if cache is None:
+            cache = {}
+            self._last_effective_focus_cache = cache
+        cache[(trade_date, phase_label)] = tuple(decisions[:6])
+
+    def _last_effective_focus_candidates(
+        self,
+        *,
+        trade_date: str,
+        phase_label: str,
+    ) -> tuple[AuctionLadderDecision, ...]:
+        cache = getattr(self, "_last_effective_focus_cache", None) or {}
+        if not trade_date:
+            return ()
+        if phase_label == "intraday":
+            return tuple(cache.get((trade_date, "intraday"), ()) or cache.get((trade_date, "open_confirm"), ()) or ())
+        return tuple(cache.get((trade_date, phase_label), ()) or ())
+
+    def _aligned_focus_reject_reasons(
+        self,
+        state: StrategyConsoleState,
+        accepted: tuple[AuctionLadderDecision, ...],
+        *,
+        phase_label: str,
+    ) -> tuple[str, ...]:
+        preferred_plates = (
+            self._phase_priority_plates(state, phase_label=phase_label)
+            if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}
+            else ()
+        )
+        if not preferred_plates:
+            return self._focus_reject_reasons(state, accepted, phase_label=phase_label)
+        accepted_symbols = {item.symbol for item in accepted[:4]}
+        selection_map = self._stock_selection_context_map(state)
+        try:
+            mode_code = self._effective_money_mode_code(state)
+        except Exception:
+            mode_code = "observe"
+        results: list[str] = []
+        if state.bundle is not None:
+            for decision in state.bundle.decisions:
+                if decision.symbol in accepted_symbols:
+                    continue
+                if not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates):
+                    continue
+                snapshot = state.snapshot_map.get(decision.symbol)
+                selection = selection_map.get(decision.symbol)
+                if snapshot is None or selection is None:
+                    continue
+                plate = self._display_plate_name(snapshot, prefer_high_board=True)
+                reasons = list(
+                    self._selection_reject_reasons(
+                        state,
+                        decision=decision,
+                        snapshot=snapshot,
+                        selection=selection,
+                        phase_label=phase_label,
+                        mode_code=mode_code,
+                    )
+                )
+                if not reasons:
+                    continue
+                results.append(
+                    self._reject_reason_summary(
+                        state,
+                        decision=decision,
+                        snapshot=snapshot,
+                        plate=plate,
+                        reasons=tuple(reasons),
+                        phase_label=phase_label,
+                    )
+                )
+                if len(results) >= 3:
+                    break
+        if results:
+            return tuple(results)
+        return self._focus_reject_reasons(state, accepted, phase_label=phase_label)
+
+    def _aligned_mode_risk_prompt(self, state: StrategyConsoleState, *, phase_label: str) -> str:
+        base = self._mode_risk_prompt(state, phase_label=phase_label)
+        preferred_plates = (
+            self._phase_priority_plates(state, phase_label=phase_label)
+            if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}
+            else ()
+        )
+        if not preferred_plates:
+            return base
+        focus_text = f"鑱氱劍{'/'.join(preferred_plates[:2])}"
+        if focus_text in base:
+            return base
+        return f"{base} | {focus_text}"
 
     def _focus_candidates_for_phase(
         self,
@@ -5502,12 +5942,29 @@ class AuctionRuntimeController:
         if not filtered:
             return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
         _mode_name, allowed_actions, _mode_tiers, _mode_theme_cap = self._money_mode_profile(state)
+        selection_map = self._stock_selection_context_map(state)
         filtered = tuple(
             decision
             for decision in filtered
-            if decision.action in allowed_actions or decision.action == "hold_only"
+            if (
+                decision.action in allowed_actions
+                or decision.action == "hold_only"
+                or self._is_soft_focus_exception(
+                    state,
+                    decision,
+                    selection=selection_map.get(decision.symbol),
+                    snapshot=state.snapshot_map.get(decision.symbol),
+                    phase_label=phase_label,
+                )
+            )
         )
         if not filtered:
+            confirmed_backfill = self._try_confirmed_backfill_for_phase(
+                state,
+                phase_label=phase_label,
+            )
+            if confirmed_backfill:
+                return confirmed_backfill
             return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
         filtered = tuple(
             decision
@@ -5515,6 +5972,12 @@ class AuctionRuntimeController:
             if not self._is_decision_blocked_by_theme_risk(state, decision, phase_label=phase_label)
         )
         if not filtered:
+            confirmed_backfill = self._try_confirmed_backfill_for_phase(
+                state,
+                phase_label=phase_label,
+            )
+            if confirmed_backfill:
+                return confirmed_backfill
             return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
         if phase_label in {"auction", "opening", "open_confirm", "intraday"}:
             mode_matched = tuple(
@@ -5524,6 +5987,13 @@ class AuctionRuntimeController:
             )
             if mode_matched:
                 filtered = mode_matched
+            else:
+                confirmed_backfill = self._try_confirmed_backfill_for_phase(
+                    state,
+                    phase_label=phase_label,
+                )
+                if confirmed_backfill:
+                    return confirmed_backfill
         filtered_symbols = {decision.symbol for decision in filtered}
         prioritized = tuple(decision for decision in ordered if decision.symbol in filtered_symbols)
         ranked_source = prioritized or filtered
@@ -5557,9 +6027,49 @@ class AuctionRuntimeController:
                 stage="accepted",
             )
             if accepted:
+                self._remember_effective_focus_candidates(
+                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
+                    phase_label=phase_label,
+                    decisions=accepted,
+                )
                 return accepted
+            confirmed_backfill = self._try_confirmed_backfill_for_phase(
+                state,
+                phase_label=phase_label,
+            )
+            if confirmed_backfill:
+                return confirmed_backfill
             return self._focus_fallback_candidates(state, ranked, phase_label=phase_label)
+        if gated:
+            self._remember_effective_focus_candidates(
+                trade_date=str(getattr(state.context, "trade_date", "") or ""),
+                phase_label=phase_label,
+                decisions=gated,
+            )
         return gated
+
+    def _try_confirmed_backfill_for_phase(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+        existing_symbols: set[str] | None = None,
+    ) -> tuple[AuctionLadderDecision, ...]:
+        if phase_label not in {"opening", "open_confirm", "intraday"}:
+            return ()
+        confirmed_backfill = self._backfill_candidates_from_confirmed_themes(
+            state,
+            phase_label=phase_label,
+            existing_symbols=existing_symbols or set(),
+        )
+        if not confirmed_backfill:
+            return ()
+        self._remember_effective_focus_candidates(
+            trade_date=str(getattr(state.context, "trade_date", "") or ""),
+            phase_label=phase_label,
+            decisions=confirmed_backfill,
+        )
+        return confirmed_backfill
 
     def _focus_min_confidence_for_phase(self, phase_label: str) -> int:
         if phase_label in {"auction", "auction_preview", "opening", "open_confirm"}:
@@ -5576,19 +6086,101 @@ class AuctionRuntimeController:
         bundle = state.bundle
         if bundle is None:
             return ()
-        if hasattr(bundle, "context") and getattr(bundle, "context", None) is not None:
-            return filter_trade_candidates(bundle, min_confidence=min_confidence)
         ordered = self._focus_ordered_decisions(state, phase_label=phase_label)
-        fallback_filtered: list[AuctionLadderDecision] = []
         selection_map = self._stock_selection_context_map(state)
+        if hasattr(bundle, "context") and getattr(bundle, "context", None) is not None:
+            filtered = list(filter_trade_candidates(bundle, min_confidence=min_confidence))
+            seen_symbols = {decision.symbol for decision in filtered}
+            for decision in ordered:
+                if decision.symbol in seen_symbols:
+                    continue
+                if decision.confidence < max(55, min_confidence - 8):
+                    continue
+                selection = selection_map.get(decision.symbol)
+                snapshot = state.snapshot_map.get(decision.symbol)
+                if not self._is_soft_focus_exception(
+                    state,
+                    decision,
+                    selection=selection,
+                    snapshot=snapshot,
+                    phase_label=phase_label,
+                ):
+                    continue
+                filtered.append(decision)
+                seen_symbols.add(decision.symbol)
+            return tuple(filtered)
+        fallback_filtered: list[AuctionLadderDecision] = []
         for decision in ordered:
             if decision.confidence < min_confidence:
                 continue
             selection = selection_map.get(decision.symbol)
-            if selection is not None and not selection.theme_tradable:
+            snapshot = state.snapshot_map.get(decision.symbol)
+            if (
+                selection is not None
+                and not selection.theme_tradable
+                and not self._is_soft_focus_exception(
+                    state,
+                    decision,
+                    selection=selection,
+                    snapshot=snapshot,
+                    phase_label=phase_label,
+                )
+            ):
                 continue
             fallback_filtered.append(decision)
         return tuple(fallback_filtered)
+
+    def _is_soft_focus_exception(
+        self,
+        state: StrategyConsoleState,
+        decision: AuctionLadderDecision,
+        *,
+        selection: StockSelectionContext | None,
+        snapshot: StockStateSnapshot | None,
+        phase_label: str,
+    ) -> bool:
+        if selection is None or snapshot is None:
+            return False
+        if phase_label not in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}:
+            return False
+        if self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
+            return False
+        if self._is_high_dayk_weak_leader_trap(snapshot, selection, phase_label=phase_label):
+            return False
+        if selection.open_follow_state == "faded":
+            return False
+        strong_non_hot_signal = self._selection_has_non_hot_strength(selection, snapshot)
+        if decision.action == "hold_only":
+            if selection.is_true_leader:
+                return True
+            return bool(
+                selection.is_front_row
+                and (
+                    strong_non_hot_signal
+                    or selection.total_score >= 7.4
+                    or (
+                        selection.execution_quality_score >= 6.2
+                        and selection.open_undertake_score >= 5.8
+                    )
+                )
+            )
+        if decision.action != "observe_only" and decision.setup_id not in {"theme_not_tradable_watch", "theme_not_tradable_guard"}:
+            return False
+        if selection.theme_tradable:
+            return False
+        if selection.is_true_leader:
+            return True
+        return bool(
+            selection.is_front_row
+            and (
+                strong_non_hot_signal
+                or selection.theme_core_score >= 7.0
+                or selection.execution_quality_score >= 6.0
+                or selection.open_undertake_score >= 5.8
+                or selection.total_score >= 7.4
+                or selection.activity_score >= 6.8
+            )
+        )
 
     def _focus_fallback_candidates(
         self,
@@ -5600,32 +6192,182 @@ class AuctionRuntimeController:
         fallback: list[AuctionLadderDecision] = []
         seen_symbols: set[str] = set()
         selection_map = self._stock_selection_context_map(state)
-        for decision in ranked:
+        preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
+
+        def collect(*, require_priority_plate: bool) -> None:
+            for decision in ranked:
+                if decision.symbol in seen_symbols:
+                    continue
+                if require_priority_plate and preferred_plates:
+                    if not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates):
+                        continue
+                if not self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label):
+                    continue
+                snapshot = state.snapshot_map.get(decision.symbol)
+                selection = selection_map.get(decision.symbol)
+                if snapshot is None or selection is None:
+                    continue
+                judge = None
+                for plate_name in self._normalized_plate_names(snapshot):
+                    judge = self._theme_judge_for_plate(state, plate_name)
+                    if judge is not None:
+                        break
+                if not self._selection_is_focus_fallback_candidate(
+                    state,
+                    snapshot=snapshot,
+                    selection=selection,
+                    judge=judge,
+                ):
+                    continue
+                fallback.append(decision)
+                seen_symbols.add(decision.symbol)
+                if len(fallback) >= self.FOCUS_FALLBACK_LIMIT:
+                    break
+
+        collect(require_priority_plate=True)
+        if len(fallback) < self.FOCUS_FALLBACK_LIMIT:
+            collect(require_priority_plate=False)
+        return tuple(fallback)
+
+    def _confirmed_theme_names_for_focus(
+        self,
+        state: StrategyConsoleState,
+    ) -> tuple[str, ...]:
+        if not state.theme_judge_map:
+            return ()
+        ordered: list[str] = []
+        for judge in sorted(
+            state.theme_judge_map.values(),
+            key=lambda item: (
+                self._theme_action_priority(item.action_class),
+                item.opportunity_score,
+                -item.trap_score,
+            ),
+            reverse=True,
+        ):
+            if self._external_validation_state(judge.validation_state) != "confirmed":
+                continue
+            if judge.action_class not in {"main_attack", "front_row_confirm", "anchor_only"}:
+                continue
+            if judge.trap_score >= 7.0:
+                continue
+            name = normalize_plate_name(judge.plate_name)
+            if not name or name == "-" or name in ordered:
+                continue
+            ordered.append(name)
+        return tuple(ordered)
+
+    def _backfill_candidates_from_confirmed_themes(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+        existing_symbols: set[str],
+    ) -> tuple[AuctionLadderDecision, ...]:
+        if phase_label not in {"opening", "open_confirm", "intraday", "postmarket"}:
+            return ()
+        confirmed_plates = self._confirmed_theme_names_for_focus(state)
+        if not confirmed_plates:
+            return ()
+        preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
+        effective_confirmed_plates = confirmed_plates
+        if preferred_plates:
+            overlapped_plates = tuple(plate for plate in confirmed_plates if plate in preferred_plates)
+            if overlapped_plates:
+                effective_confirmed_plates = overlapped_plates
+
+        selection_map = self._stock_selection_context_map(state)
+        ranked_candidates: list[tuple[float, AuctionLadderDecision]] = []
+        seen_symbols = set(existing_symbols)
+        source: list[AuctionLadderDecision] = []
+        ordered_watch_candidates = self._order_decisions_by_narrative(
+            state,
+            tuple(
+                item
+                for item in state.watch_candidates
+                if item.symbol not in seen_symbols
+            ),
+            phase_label=phase_label,
+        )
+        for decision in ordered_watch_candidates:
+            source.append(decision)
+        for decision in self._focus_ordered_decisions(state, phase_label=phase_label):
             if decision.symbol in seen_symbols:
                 continue
-            if not self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label):
+            if any(item.symbol == decision.symbol for item in source):
                 continue
+            source.append(decision)
+
+        for decision in source:
             snapshot = state.snapshot_map.get(decision.symbol)
             selection = selection_map.get(decision.symbol)
             if snapshot is None or selection is None:
                 continue
-            judge = None
-            for plate_name in self._normalized_plate_names(snapshot):
-                judge = self._theme_judge_for_plate(state, plate_name)
-                if judge is not None:
-                    break
-            if not self._selection_is_focus_fallback_candidate(
-                state,
-                snapshot=snapshot,
-                selection=selection,
-                judge=judge,
+            judge, matched_plate = self._matched_theme_judge(state, snapshot)
+            if judge is None:
+                continue
+            plate_name = normalize_plate_name(matched_plate or judge.plate_name)
+            if plate_name not in effective_confirmed_plates:
+                continue
+            execution_state = self._external_validation_state(judge.validation_state)
+            if execution_state == "falsified":
+                continue
+            if self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
+                continue
+            if self._is_high_dayk_weak_leader_trap(snapshot, selection, phase_label=phase_label):
+                continue
+            if judge.action_class == "anchor_only" and not selection.is_true_leader:
+                continue
+            strong_non_hot_signal = self._selection_has_non_hot_strength(selection, snapshot)
+            if (
+                not selection.is_true_leader
+                and not selection.is_front_row
+                and not strong_non_hot_signal
             ):
                 continue
-            fallback.append(decision)
+            if (
+                selection.open_follow_state in {"weak_follow", "faded"}
+                and not selection.is_true_leader
+                and not strong_non_hot_signal
+            ):
+                continue
+            display_action = self._display_action_code(decision, state, phase_label=phase_label)
+            if display_action in {"failed_promo_guard", "do_not_chase"}:
+                continue
+            if (
+                display_action == "observe_only"
+                and not selection.is_true_leader
+                and not (
+                    selection.is_front_row
+                    and selection.open_follow_state in {"confirmed", "repair_strength"}
+                )
+                and not strong_non_hot_signal
+            ):
+                continue
+            score = self._focus_candidate_priority_score(
+                state,
+                decision,
+                phase_label=phase_label,
+            )
+            if selection.open_follow_state == "confirmed":
+                score += 1.2
+            elif selection.open_follow_state == "repair_strength":
+                score += 0.8
+            if self._decision_hits_priority_plate(
+                state,
+                decision,
+                preferred_plates=effective_confirmed_plates,
+            ):
+                score += 0.6
+            if selection.is_true_leader:
+                score += 0.5
+            elif selection.is_front_row:
+                score += 0.3
+            ranked_candidates.append((score, decision))
             seen_symbols.add(decision.symbol)
-            if len(fallback) >= self.FOCUS_FALLBACK_LIMIT:
-                break
-        return tuple(fallback)
+
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        return tuple(decision for _score, decision in ranked_candidates[:2])
 
     def _decision_allowed_in_focus_output(
         self,
@@ -5651,17 +6393,24 @@ class AuctionRuntimeController:
         if self._is_decision_blocked_by_theme_risk(state, decision, phase_label=phase_label):
             return False
         judge, _matched_plate = self._matched_theme_judge(state, snapshot)
+        repair_probe_exception = (
+            decision.setup_id == "theme_not_tradable_repair_probe"
+            and selection.open_follow_state in {"confirmed", "repair_strength"}
+        )
         if judge is not None:
             execution_state = self._external_validation_state(judge.validation_state)
             tier = self._selection_theme_tier(selection, snapshot)
             if execution_state == "falsified" and decision.action != "hold_only":
                 return False
             if judge.action_class == "anchor_only" and not selection.is_true_leader and decision.action != "hold_only":
-                return False
+                if not repair_probe_exception:
+                    return False
             if execution_state == "partial" and decision.action != "hold_only" and tier != "dragon":
-                return False
+                if not repair_probe_exception:
+                    return False
             if judge.action_class in {"observe", "anchor_only"} and not selection.is_true_leader and decision.action != "hold_only":
-                return False
+                if not repair_probe_exception:
+                    return False
         if (
             phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}
             and self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label)
@@ -5669,14 +6418,16 @@ class AuctionRuntimeController:
         ):
             return False
         if not selection.theme_tradable and not selection.is_true_leader and decision.action != "hold_only":
-            if decision.action != "observe_only" or not self._can_surface_watch_only_decision(
-                state,
-                decision=decision,
-                snapshot=snapshot,
-                selection=selection,
-                phase_label=phase_label,
-            ):
+            if not repair_probe_exception:
                 return False
+        if decision.action == "observe_only" and not self._can_surface_watch_only_decision(
+            state,
+            decision=decision,
+            snapshot=snapshot,
+            selection=selection,
+            phase_label=phase_label,
+        ):
+            return False
         return True
 
     def _can_surface_watch_only_decision(
@@ -5688,7 +6439,7 @@ class AuctionRuntimeController:
         selection: StockSelectionContext,
         phase_label: str,
     ) -> bool:
-        if phase_label not in {"auction", "auction_preview", "opening", "open_confirm"}:
+        if phase_label not in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
             return False
         if self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
             return False
@@ -5729,15 +6480,15 @@ class AuctionRuntimeController:
         if selection.open_undertake_score < 4.8:
             reasons.append("开盘承接偏弱")
         if self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
-            reasons.append("竞价骗炮风险")
+            reasons.append("竞价假强/骗炮风险")
         if selection.open_follow_state == "faded":
-            reasons.append("竞价后掉队")
+            reasons.append("开盘后掉队")
         elif selection.open_follow_state == "weak_follow" and selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"}:
             reasons.append("高开偏热但跟随不足")
         elif selection.open_follow_state == "repair_strength" and not selection.is_true_leader:
-            reasons.append("低开转强但未进核心")
+            reasons.append("高位票弱承接，易走成补跌陷阱")
         if selection.hot_rank > 80 and not self._selection_has_non_hot_strength(selection, snapshot):
-            reasons.append("热榜位次靠后")
+            reasons.append("高位票弱承接，易走成补跌陷阱")
         tier = self._selection_theme_tier(selection, snapshot)
         if tier == "back_noise":
             reasons.append("题材层级偏后")
@@ -5746,19 +6497,19 @@ class AuctionRuntimeController:
         judge, _matched_plate = self._matched_theme_judge(state, snapshot)
         execution_state = self._external_validation_state(judge.validation_state) if judge is not None else ""
         if not selection.theme_tradable and not selection.is_true_leader and decision.action != "hold_only":
-            reasons.append("题材暂不可交易")
+            reasons.append("题材不可交易")
         if execution_state == "falsified":
-            reasons.append("开盘证伪，题材未获验证")
+            reasons.append("开盘验证证伪")
         elif execution_state == "partial" and not selection.is_true_leader:
-            reasons.append("只剩前排活口，后排降级")
+            reasons.append("仅局部确认")
         if judge is not None and judge.action_class == "anchor_only" and not selection.is_true_leader and decision.action != "hold_only":
-            reasons.append("题材只剩锚点，非龙头不做")
+            reasons.append("只剩龙头活口")
         if execution_state == "partial" and decision.action != "hold_only" and tier != "dragon":
             reasons.append("题材待确认，仅保留龙头")
         if resolved_mode_code == "high_board_huddle" and not selection.is_true_leader:
-            reasons.append("高位抱团日，只看龙头")
+            reasons.append("高位票弱承接，易走成补跌陷阱")
         if displayed_action not in {"observe_only", "do_not_chase", "failed_promo_guard"} and displayed_action not in allowed_actions:
-            reasons.append("不符合今日赚钱模式")
+            reasons.append("高位票弱承接，易走成补跌陷阱")
         return tuple(reasons)
 
     def _selection_is_focus_fallback_candidate(
@@ -5808,6 +6559,18 @@ class AuctionRuntimeController:
             return True
         return selection.is_front_row and snapshot.open_pct <= 0.03
 
+    def _phase_priority_plates(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+    ) -> tuple[str, ...]:
+        if phase_label in {"open_confirm", "intraday", "postmarket"}:
+            preferred = self._narrative_priority_plates(state, phase_label=phase_label)
+            if preferred:
+                return preferred
+        return self._focus_priority_plates(state)
+
     def _focus_ordered_decisions(
         self,
         state: StrategyConsoleState,
@@ -5817,9 +6580,9 @@ class AuctionRuntimeController:
         if state.bundle is None:
             return ()
         decisions = tuple(state.bundle.decisions)
-        if phase_label not in {"auction", "auction_preview", "opening", "open_confirm", "postmarket"}:
+        if phase_label not in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}:
             return decisions
-        preferred_plates = self._focus_priority_plates(state)
+        preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
         if not preferred_plates:
             return decisions
         matched: list[AuctionLadderDecision] = []
@@ -5831,7 +6594,7 @@ class AuctionRuntimeController:
                 remainder.append(decision)
         if not matched:
             return decisions
-        if self._expectation_ready(state) and phase_label in {"auction", "auction_preview", "opening", "open_confirm"}:
+        if self._expectation_ready(state) and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
             preserved = [
                 decision
                 for decision in remainder
@@ -5953,14 +6716,19 @@ class AuctionRuntimeController:
         if phase_label not in {"auction", "opening", "open_confirm", "intraday"}:
             return False
         snapshot = state.snapshot_map.get(decision.symbol)
+        selection = self._stock_selection_context_map(state).get(decision.symbol)
+        repair_probe_exception = (
+            decision.setup_id == "theme_not_tradable_repair_probe"
+            and selection is not None
+            and selection.open_follow_state in {"confirmed", "repair_strength"}
+        )
         judge, _matched_plate = self._matched_theme_judge(state, snapshot)
         if judge is not None:
             execution_state = self._external_validation_state(judge.validation_state)
             if execution_state == "falsified":
                 return decision.action != "hold_only"
             if execution_state == "partial" and judge.action_class in {"observe", "anchor_only"} and decision.action != "hold_only":
-                selection = self._stock_selection_context_map(state).get(decision.symbol)
-                if selection is None or not selection.is_true_leader:
+                if not repair_probe_exception and (selection is None or not selection.is_true_leader):
                     return True
         collision = self._snapshot_theme_collision(state, snapshot)
         if collision is None:
@@ -6029,7 +6797,7 @@ class AuctionRuntimeController:
         if not decisions:
             return ()
         selection_map = self._stock_selection_context_map(state)
-        _mode_name, _allowed_actions, mode_allowed_tiers, mode_theme_cap = self._money_mode_profile(state)
+        _mode_name, _allowed_actions, _mode_allowed_tiers, mode_theme_cap = self._money_mode_profile(state)
         accepted: list[AuctionLadderDecision] = []
         plate_counts: dict[str, int] = defaultdict(int)
         for decision in decisions:
@@ -6051,19 +6819,12 @@ class AuctionRuntimeController:
                 allowed_count = min(allowed_count, mode_theme_cap) if allowed_count > 0 else 0
             if allowed_count <= 0 and decision.action != "hold_only":
                 continue
-            tier = self._selection_theme_tier(selection, snapshot)
-            if decision.action != "hold_only" and mode_allowed_tiers and tier not in mode_allowed_tiers:
-                continue
-            if decision.action != "hold_only" and allowed_tiers and tier not in allowed_tiers:
-                continue
             execution_state = self._external_validation_state(matched_judge.validation_state)
             if (
                 phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}
                 and execution_state == "falsified"
                 and decision.action != "hold_only"
             ):
-                continue
-            if execution_state == "partial" and decision.action != "hold_only" and tier != "dragon":
                 continue
             if decision.action != "hold_only" and matched_plate:
                 if plate_counts[matched_plate] >= allowed_count:
@@ -6117,6 +6878,19 @@ class AuctionRuntimeController:
             score += 3.0
         else:
             score -= 6.0
+        if not selection.theme_tradable:
+            if selection.is_true_leader:
+                score -= 2.0
+            elif selection.is_front_row and strong_non_hot_signal:
+                score -= 4.0
+            elif selection.is_front_row and (
+                selection.execution_quality_score >= 6.0
+                or selection.open_undertake_score >= 5.8
+                or selection.total_score >= 7.4
+            ):
+                score -= 6.0
+            else:
+                score -= 14.0
         score += self._focus_score_from_market_state(
             selection,
             front_state=front_state,
@@ -6368,6 +7142,143 @@ class AuctionRuntimeController:
             "total": total,
         }
 
+    def _focus_candidate_story_breakdown(
+        self,
+        state: StrategyConsoleState,
+        decision: AuctionLadderDecision,
+        *,
+        phase_label: str,
+    ) -> dict[str, float]:
+        selection = self._stock_selection_context_map(state).get(decision.symbol)
+        snapshot = state.snapshot_map.get(decision.symbol)
+        judge, matched_plate = self._matched_theme_judge(state, snapshot)
+        collision = self._snapshot_theme_collision(state, snapshot)
+        theme_context = self._theme_selection_for_symbol(state, decision.symbol)
+
+        theme_score = 0.0
+        role_score = 0.0
+        undertake_score = 0.0
+        flow_score = 0.0
+        risk_score = 0.0
+        action_score = 0.0
+
+        if judge is not None:
+            theme_score += float(judge.opportunity_score) * 1.8
+            theme_score -= float(judge.trap_score) * 1.2
+            if judge.action_class == "main_attack":
+                theme_score += 6.0
+            elif judge.action_class == "front_row_confirm":
+                theme_score += 4.0
+            elif judge.action_class == "anchor_only":
+                theme_score += 1.0
+            elif judge.action_class == "observe":
+                theme_score -= 3.0
+            elif judge.action_class == "trap_avoid":
+                risk_score -= 10.0
+            if judge.validation_state == "strengthened":
+                theme_score += 4.0
+            elif judge.validation_state == "falsified":
+                risk_score -= 9.0
+
+        if collision is not None:
+            if collision.expectation_label in {"绗﹀悎/寮哄寲", "局部转强"}:
+                theme_score += 2.0
+            if collision.fakeout_level == "strong":
+                risk_score -= 8.0
+            elif collision.fakeout_level == "warn":
+                risk_score -= 4.0
+
+        if theme_context is not None:
+            theme_score += float(getattr(theme_context, "phase_priority_bias", 0.0) or 0.0) * 3.0
+            if not bool(getattr(theme_context, "tradable", True)):
+                risk_score -= 4.0
+
+        if matched_plate:
+            preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
+            if matched_plate in preferred_plates:
+                theme_score += 3.0
+
+        if selection is not None:
+            if selection.is_true_leader:
+                role_score += 9.0
+            elif selection.is_front_row:
+                role_score += 5.0
+            else:
+                role_score -= 4.0
+            role_score += max(-3.0, min(5.0, (float(selection.theme_core_score) - 5.0) * 1.2))
+
+            undertake_score += max(-4.0, min(6.0, (float(selection.open_undertake_score) - 5.0) * 1.8))
+            undertake_score += self._focus_score_from_open_follow(selection, phase_label=phase_label) * 0.6
+            if snapshot is not None and snapshot.auction_amount > 0:
+                amount_ratio = float(snapshot.amount_2m or 0.0) / max(float(snapshot.auction_amount or 0.0), 1.0)
+                if amount_ratio >= 1.6:
+                    undertake_score += 4.0
+                elif amount_ratio >= 1.2:
+                    undertake_score += 2.5
+                elif amount_ratio <= 0.7:
+                    undertake_score -= 2.0
+
+            flow_score += max(-4.0, min(5.0, (float(selection.activity_score) - 5.0) * 1.4))
+            flow_score += max(-3.0, min(4.0, (float(selection.turnover_quality_score) - 5.0) * 1.2))
+            flow_score += max(-2.0, min(3.0, (float(selection.heat_flow_score) - 5.0) * 1.0))
+            if selection.hot_rank <= 20:
+                flow_score += 2.0
+            elif selection.hot_rank > 100:
+                flow_score -= 2.0
+
+            if not selection.theme_tradable:
+                if selection.is_true_leader:
+                    risk_score -= 1.0
+                elif selection.is_front_row:
+                    risk_score -= 3.0
+                else:
+                    risk_score -= 6.0
+            if selection.theme_x_score >= 6.0:
+                risk_score -= 5.0
+            elif selection.theme_x_score >= 4.5:
+                risk_score -= 2.5
+            if selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}:
+                risk_score -= 6.0
+            elif selection.kline_pattern == "high_divergence":
+                risk_score -= 3.0
+            elif selection.kline_pattern in {"platform_breakout", "breakout", "pullback_repair", "low_open_strength", "n_rebound"}:
+                role_score += 2.0
+            if selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"} and not selection.is_true_leader:
+                risk_score -= 3.0
+
+        if snapshot is not None:
+            opening_score = self._focus_score_from_opening_validation(snapshot, phase_label=phase_label)
+            undertake_score += opening_score * 0.5
+            if snapshot.amount_2m >= 50_000_000:
+                flow_score += 2.0
+
+        if decision.action == "hold_only":
+            action_score += 1.5
+        elif decision.action == "small_probe_only":
+            action_score -= 2.0
+        elif decision.action in {"avoid_after_failed_promotion", "do_not_chase"}:
+            action_score -= 6.0
+
+        total = round(
+            float(decision.confidence)
+            + theme_score
+            + role_score
+            + undertake_score
+            + flow_score
+            + risk_score
+            + action_score,
+            3,
+        )
+        return {
+            "theme": round(theme_score, 3),
+            "role": round(role_score, 3),
+            "undertake": round(undertake_score, 3),
+            "flow": round(flow_score, 3),
+            "risk": round(risk_score, 3),
+            "action": round(action_score, 3),
+            "total": total,
+        }
+
     @staticmethod
     def _focus_score_driver_text(breakdown: dict[str, float], *, top_n: int = 2) -> str:
         items = [
@@ -6383,13 +7294,13 @@ class AuctionRuntimeController:
     @staticmethod
     def _focus_score_driver_label(name: str, value: float) -> str:
         if name == "selection":
-            return "个股承接强" if value >= 0 else "个股质地弱"
+            return "base_only"
         if name == "judge":
-            return "题材验证加强" if value >= 0 else "题材验证走弱"
+            return "题材判断加分" if value >= 0 else "题材判断减分"
         if name == "opening":
-            return "开盘确认强" if value >= 0 else "开盘确认弱"
+            return "开盘验证加分" if value >= 0 else "开盘验证减分"
         if name == "action":
-            return "动作加分" if value >= 0 else "动作受限"
+            return "动作修正加分" if value >= 0 else "动作修正减分"
         return f"{name}{value:+.1f}"
 
     def _focus_score_driver_tags(self, breakdown: dict[str, float], *, top_n: int = 2) -> str:
@@ -6457,20 +7368,20 @@ class AuctionRuntimeController:
                         else:
                             tag = "有量无板待确认"
                     elif collision.signal == "连板延续":
-                        tag = "连板延续占优"
+                        tag = "连板延续看高标"
                     elif collision.signal in {"轮动观察", "观察跟踪"}:
-                        tag = "轮动观察等待确认"
+                        tag = "轮动观察等确认"
                 if not tag and judge is not None:
                     if judge.validation_state == "strengthened":
                         tag = "题材验证加强"
                     elif judge.validation_state == "falsified":
                         tag = "题材验证走弱"
                     elif judge.action_class == "main_attack":
-                        tag = "题材主攻明确"
+                        tag = "主攻确认"
                     elif judge.action_class == "front_row_confirm":
-                        tag = "前排验证占优"
+                        tag = "前排确认"
                     elif judge.action_class == "anchor_only":
-                        tag = "高位一致但板块不跟"
+                        tag = "龙头独活"
                 if not tag:
                     tag = self._focus_score_driver_label(name, breakdown.get(name, 0.0))
             elif name == "opening":
@@ -6504,6 +7415,140 @@ class AuctionRuntimeController:
                 break
         return "/".join(tags)
 
+    @staticmethod
+    def _story_score_driver_text(breakdown: dict[str, float], *, top_n: int = 3) -> str:
+        items = [
+            (name, float(value or 0.0))
+            for name, value in breakdown.items()
+            if name != "total" and abs(float(value or 0.0)) > 0.0
+        ]
+        if not items:
+            return "flat"
+        ranked = sorted(items, key=lambda item: (abs(item[1]), item[1]), reverse=True)
+        return ",".join(f"{name}={value:+.1f}" for name, value in ranked[:top_n])
+
+    @staticmethod
+    def _story_score_driver_label(name: str, value: float) -> str:
+        labels = {
+            "theme": ("题材确认占优", "题材确认走弱"),
+            "role": ("前排地位占优", "个股地位偏后"),
+            "undertake": ("开盘承接占优", "开盘承接偏弱"),
+            "flow": ("资金活跃占优", "资金活跃不足"),
+            "risk": ("风险收敛", "风险扣分明显"),
+            "action": ("动作加分", "动作受限"),
+        }
+        pair = labels.get(name)
+        if pair is None:
+            return f"{name}{value:+.1f}"
+        return pair[0] if value >= 0 else pair[1]
+
+    def _story_score_driver_tags_for_decision(
+        self,
+        state: StrategyConsoleState,
+        decision: AuctionLadderDecision,
+        breakdown: dict[str, float],
+        *,
+        phase_label: str,
+        top_n: int = 3,
+    ) -> str:
+        selection = self._stock_selection_context_map(state).get(decision.symbol)
+        snapshot = state.snapshot_map.get(decision.symbol)
+        judge, _matched_plate = self._matched_theme_judge(state, snapshot)
+        collision = self._snapshot_theme_collision(state, snapshot)
+
+        ranked_names = [
+            name
+            for name, value in sorted(
+                (
+                    (name, float(value or 0.0))
+                    for name, value in breakdown.items()
+                    if name != "total" and abs(float(value or 0.0)) > 0.0
+                ),
+                key=lambda item: (abs(item[1]), item[1]),
+                reverse=True,
+            )
+        ]
+        if not ranked_names:
+            return ""
+
+        tags: list[str] = []
+        for name in ranked_names:
+            tag = ""
+            if name == "theme":
+                if collision is not None:
+                    if collision.expectation_label in {"绗﹀悎/寮哄寲", "局部转强"}:
+                        tag = "开盘确认转强"
+                    elif collision.signal in {"有量无板", "资金试错"}:
+                        tag = "题材待开盘确认"
+                if not tag and judge is not None:
+                    if judge.validation_state == "strengthened":
+                        tag = "题材开盘验证加强"
+                    elif judge.validation_state == "falsified":
+                        tag = "题材开盘验证走弱"
+                    elif judge.action_class == "main_attack":
+                        tag = "主攻确认"
+                    elif judge.action_class == "front_row_confirm":
+                        tag = "前排确认"
+                    elif judge.action_class == "anchor_only":
+                        tag = "龙头独活"
+            elif name == "role":
+                if selection is not None:
+                    if selection.is_true_leader:
+                        tag = "龙头地位明确"
+                    elif selection.is_front_row:
+                        tag = "题材前排"
+                    elif selection.theme_core_score >= 7.0:
+                        tag = "板块核心度较高"
+            elif name == "undertake":
+                if selection is not None:
+                    if snapshot is not None and snapshot.auction_amount > 0 and snapshot.amount_2m >= snapshot.auction_amount * 1.2:
+                        tag = "2分钟放量承接强"
+                    elif selection.open_undertake_score >= 6.0:
+                        tag = "开盘承接强"
+                    elif selection.open_follow_state == "repair_strength":
+                        tag = "低开转强修复"
+                    elif phase_label in {"opening", "open_confirm"}:
+                        confirm_label = self._leader_truth_label(snapshot)
+                        if confirm_label == self.OPENING_VALIDATION_TRUE_STRONG:
+                            tag = "开盘确认真强"
+                        elif confirm_label in {self.OPENING_VALIDATION_LOW_OPEN_STRONG, self.OPENING_VALIDATION_PULLBACK_REBOUND}:
+                            tag = "开盘确认转强"
+                        elif confirm_label in {self.OPENING_VALIDATION_GAP_WEAK, self.OPENING_VALIDATION_UNDERTAKE_WEAK}:
+                            tag = "开盘确认偏弱"
+            elif name == "flow":
+                if selection is not None:
+                    if selection.activity_score >= 7.0 and selection.turnover_quality_score >= 6.0:
+                        tag = "活跃度与换手占优"
+                    elif selection.hot_rank <= 20:
+                        tag = "热榜位次靠前"
+                    elif snapshot is not None and snapshot.amount_2m >= 50_000_000:
+                        tag = "2分钟成交额靠前"
+            elif name == "risk":
+                if selection is not None:
+                    if selection.theme_x_score >= 6.0:
+                        tag = "题材兑现风险高"
+                    elif selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}:
+                        tag = "形态风险偏高"
+                    elif selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"} and not selection.is_true_leader:
+                        tag = "高开偏热易兑现"
+                    elif not selection.theme_tradable:
+                        tag = "题材未完全可做"
+            elif name == "action":
+                display_action = self._display_action_code(decision, state, phase_label=phase_label)
+                if display_action in {"leader_watch", "front_row_watch", "confirm_then_go"}:
+                    tag = "先跟踪等确认"
+                elif display_action in {"failed_promo_guard", "do_not_chase"}:
+                    tag = "鍔ㄤ綔鍙楅檺鍥為伩"
+                elif display_action == "leader_hold":
+                    tag = "宸叉湁浠撲綅鍗氬紙"
+            if not tag:
+                tag = self._story_score_driver_label(name, breakdown.get(name, 0.0))
+            if tag and tag not in tags:
+                tags.append(tag)
+            if len(tags) >= top_n:
+                break
+        return "/".join(tags)
+
     def _log_focus_candidate_breakdown(
         self,
         state: StrategyConsoleState,
@@ -6517,9 +7562,9 @@ class AuctionRuntimeController:
             return
         parts: list[str] = []
         for decision in decisions[:limit]:
-            breakdown = self._focus_candidate_score_breakdown(state, decision, phase_label=phase_label)
+            breakdown = self._focus_candidate_story_breakdown(state, decision, phase_label=phase_label)
             parts.append(
-                f"{decision.symbol}:{breakdown['total']:.1f}[{self._focus_score_driver_text(breakdown)}]"
+                f"{decision.symbol}:{breakdown['total']:.1f}[{self._story_score_driver_text(breakdown)}]"
             )
         logger.info(
             "focus score audit | phase=%s | stage=%s | picks=%s",
@@ -6555,26 +7600,49 @@ class AuctionRuntimeController:
         judge, matched_plate = self._matched_theme_judge(state, snapshot)
         if phase_label in {"auction", "opening", "open_confirm", "intraday"}:
             strong_non_hot_signal = self._selection_has_non_hot_strength(selection, snapshot)
+            preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
+            repair_probe_exception = (
+                decision.setup_id == "theme_not_tradable_repair_probe"
+                and selection.open_follow_state in {"confirmed", "repair_strength"}
+            )
+            priority_front_row_exception = (
+                selection.is_front_row
+                and strong_non_hot_signal
+                and phase_label in {"auction", "opening", "open_confirm"}
+            )
             if self._is_high_dayk_weak_leader_trap(snapshot, selection, phase_label=phase_label):
                 return False
             if self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
                 return False
-            if decision.action != "hold_only" and selection.open_follow_state == "faded":
+            if (
+                phase_label in {"opening", "open_confirm"}
+                and selection.open_follow_state == "weak_follow"
+            ):
                 return False
+            if (
+                phase_label in {"open_confirm", "intraday"}
+                and preferred_plates
+                and not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates)
+                and not selection.is_true_leader
+                and not strong_non_hot_signal
+            ):
+                if not repair_probe_exception and not priority_front_row_exception:
+                    return False
             if judge is not None:
                 tier = self._selection_theme_tier(selection, snapshot)
-                mode_name, _mode_actions, mode_allowed_tiers, _mode_theme_cap = self._money_mode_profile(state)
-                if decision.action != "hold_only" and mode_allowed_tiers and tier not in mode_allowed_tiers:
-                    return False
+                mode_name, _mode_actions, _mode_allowed_tiers, _mode_theme_cap = self._money_mode_profile(state)
                 allowed_count, allowed_tiers = self._theme_quota_for_action_class(judge.action_class)
                 if decision.action != "hold_only" and allowed_count <= 0:
                     return False
                 if decision.action != "hold_only" and allowed_tiers and tier not in allowed_tiers:
-                    return False
+                    if not repair_probe_exception:
+                        return False
                 if judge.action_class in {"observe", "trap_avoid"} and not selection.is_true_leader:
-                    return False
+                    if not repair_probe_exception:
+                        return False
                 if judge.action_class == "anchor_only" and not selection.is_true_leader:
-                    return False
+                    if not repair_probe_exception:
+                        return False
                 if (
                     judge.validation_state == "falsified"
                     and (decision.action != "hold_only" or not selection.is_true_leader)
@@ -6603,6 +7671,7 @@ class AuctionRuntimeController:
                     mode_name == "leader_only"
                     and not selection.is_true_leader
                     and selection.open_follow_state != "confirmed"
+                    and not repair_probe_exception
                 ):
                     return False
             if (
@@ -6611,37 +7680,41 @@ class AuctionRuntimeController:
                 and selection.theme_core_score < 7.2
                 and not strong_non_hot_signal
             ):
-                return False
+                if not repair_probe_exception and not priority_front_row_exception:
+                    return False
             if (
                 not selection.is_true_leader
                 and selection.kline_score < 5.2
                 and selection.structure_score < 5.4
                 and not strong_non_hot_signal
             ):
-                return False
+                if not repair_probe_exception and not priority_front_row_exception:
+                    return False
             if (
                 not selection.is_true_leader
                 and selection.shape_quality_score < 5.8
                 and selection.execution_quality_score < 5.6
                 and not strong_non_hot_signal
             ):
-                return False
+                if not repair_probe_exception and not priority_front_row_exception:
+                    return False
             if (
                 not selection.is_true_leader
                 and selection.open_undertake_score < 4.8
                 and selection.execution_quality_score < 5.8
                 and not strong_non_hot_signal
             ):
-                return False
+                if not repair_probe_exception and not priority_front_row_exception:
+                    return False
             if (
-                decision.action != "hold_only"
+                        decision.action == "hold_only"
                 and selection.auction_open_bucket == "near_limit_open"
                 and selection.open_follow_state != "confirmed"
                 and not selection.is_true_leader
             ):
                 return False
             if (
-                decision.action != "hold_only"
+                        decision.action == "hold_only"
                 and selection.auction_open_bucket == "overheat_high_open"
                 and selection.open_follow_state == "weak_follow"
                 and selection.open_undertake_score < 5.8
@@ -6831,11 +7904,11 @@ class AuctionRuntimeController:
 
     def _leader_open_strength(self, snapshot: StockStateSnapshot) -> str:
         if snapshot.open_pct >= 0.095:
-            return "一字过热"
+            return "买一承接强"
         if snapshot.open_pct >= 0.06:
             return "强开锚定"
         if snapshot.open_pct >= 0.02:
-            return "偏强可看"
+            return "买一一般"
         if snapshot.open_pct >= 0.0:
             return "平开待判"
         return "低开承压"
@@ -6844,7 +7917,7 @@ class AuctionRuntimeController:
         if snapshot.is_locked or snapshot.open_pct >= 0.095:
             if snapshot.volume_intensity >= 3.0:
                 return "买一强但热"
-            return "顶高偏虚"
+            return "顶强但过热"
         if (
             snapshot.open_pct >= 0.05
             and snapshot.auction_amount >= 50_000_000
@@ -6855,7 +7928,7 @@ class AuctionRuntimeController:
             return "强势锚定"
         if snapshot.volume_intensity >= 2.5:
             return "买一代理强"
-        return "买一一般"
+        return "抛压偏大"
 
     def _leader_turnover_quality(self, snapshot: StockStateSnapshot) -> str:
         if (
@@ -6864,14 +7937,13 @@ class AuctionRuntimeController:
             and (snapshot.speed_1m > 0 or snapshot.amount_2m >= 30_000_000)
         ):
             if snapshot.amount_2m >= 50_000_000 or snapshot.speed_1m > 0.01:
-                return "换手质量高"
-            return "有承接"
+                return "放量确认"
+            return "温和确认"
         if snapshot.open_pct <= 0.01 and snapshot.current_pct >= 0.03 and snapshot.amount_2m >= 20_000_000:
             return "低开转强"
         if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
-            return "分歧回拉"
-        return "换手一般"
-
+            return "回落修复"
+        return "强弱待判"
     def _leader_pressure_label(self, snapshot: StockStateSnapshot) -> str:
         if snapshot.resistance_gap > 0.12:
             return "抛压偏大"
@@ -6880,8 +7952,8 @@ class AuctionRuntimeController:
         if snapshot.market_cap_yi >= 300 or snapshot.amount_day_yi >= 40:
             return "大票承压"
         if snapshot.current_pct < snapshot.open_pct - 0.03:
-            return "承接转弱"
-        return "压力可控"
+            return "冲高回落"
+        return "承接正常"
 
     def _leader_heat_label(self, snapshot: StockStateSnapshot) -> str:
         return f"{self._leader_seal_quality(snapshot)}/{self._leader_turnover_quality(snapshot)}"
@@ -6915,66 +7987,66 @@ class AuctionRuntimeController:
     def _entry_window_label(self, snapshot: StockStateSnapshot, *, phase_label: str) -> str:
         if phase_label == "postmarket":
             if snapshot.open_pct >= 0.095:
-                return "只看回封"
+                return "一字不追"
             if (
                 0.02 <= snapshot.open_pct <= 0.07
                 and snapshot.leader_rank_in_theme <= 2
                 and snapshot.auction_amount >= 20_000_000
             ):
                 if snapshot.amount_2m >= 40_000_000 or snapshot.speed_1m > 0.01:
-                    return "换手后可上"
-                return "给过换手"
+                    return "换手确认"
+                return "放量观察"
             if snapshot.open_pct <= 0.01 and snapshot.current_pct > 0.03 and snapshot.amount_2m >= 20_000_000:
-                return "低开承接"
+                return "低吸回流"
             if snapshot.open_pct < 0.0 and snapshot.current_pct <= 0.0:
                 return "承接不足"
-            return "以观察为主"
+            return "等待确认"
         if snapshot.open_pct >= 0.095:
-            return "不追一字"
+            return "一字不追"
         if (
             0.02 <= snapshot.open_pct <= 0.07
             and snapshot.leader_rank_in_theme <= 2
             and snapshot.auction_amount >= 20_000_000
         ):
             if snapshot.amount_2m >= 40_000_000 or snapshot.speed_1m > 0.01:
-                return "换手后可上"
-            return "可换手上车"
+                return "换手确认"
+            return "确认后看"
         if snapshot.open_pct <= 0.01 and snapshot.auction_amount > 0 and snapshot.amount_2m >= 20_000_000:
-            return "看低开承接"
+            return "低位试错"
         if snapshot.open_pct < 0.0 and snapshot.current_pct <= 0.0:
-            return "承接不足"
-        return "先等确认"
+            return "先等承接"
+        return "等待确认"
 
     def _theme_trade_profile(self, row: AuctionPlateBucketStat) -> tuple[str, str, str]:
         expectation = self.EXPECTATION_LABELS.get(row.expectation, row.expectation)
         cohesion = self._theme_cohesion_level(row)
         if expectation == "distribution":
-            return ("兑现观察", "先不出手", "冲高兑现为主")
+            return ("兑现", "防守", "不追高")
         if row.generic:
-            return ("大题材泛化", "只看辨识度", "量大但太散")
+            return ("泛题材", "观察", "只看辨识度")
         if expectation == "attack":
             if cohesion == "weak":
-                return ("今日机会", "只看前排承接", "热度在但未成队")
+                return ("进攻", "分歧进攻", "只做前排确认")
             if row.auction_amount >= 150_000_000 and row.leader_count >= 2:
-                return ("今日主攻", "只做最前排", "竞价额极强")
-            return ("今日机会", "只做前排", "强度先手")
+                return ("进攻", "主攻强化", "优先前排换手")
+            return ("进攻", "局部进攻", "先盯核心龙头")
         if expectation == "follow":
             if row.hot_change_pct > 0 and row.auction_symbol_count >= 3:
-                return ("回流修复", "可看分歧转强", "回流确认")
-            return ("回流修复", "看前排分歧", "弱转强观察")
+                return ("跟随", "扩散跟随", "看板块联动")
+            return ("跟随", "局部跟随", "只看前排")
         if expectation == "ladder":
             if row.hot_change_pct <= 0 and row.yest_limit_count >= 2:
-                return ("昨日兑现", "不追后排", "高位先兑现")
+                return ("晋级", "高位分歧", "看活口承接")
             if row.leader_count >= 2 and row.auction_amount >= 80_000_000:
-                return ("主线延续", "可做中位晋级", "中位卡位")
-            return ("主线延续", "偏向中高位", "看高位活口")
+                return ("晋级", "梯队成型", "先看中位卡位")
+            return ("晋级", "梯队博弈", "只看前排")
         if expectation == "cluster":
             if cohesion == "weak":
-                return ("首板发酵", "只看辨识度", "单点发酵未成队")
+                return ("联动", "弱联动", "防止假强骗炮")
             if row.symbol_count >= 4 and row.auction_symbol_count >= 3:
-                return ("新发酵", "可找首板前排", "首板扩散")
-            return ("首板发酵", "可找前排", "前排试错")
-        return ("观察跟踪", "先不出手", "无突出极值")
+                return ("簇动", "共振加强", "看低位扩散")
+            return ("联动", "局部共振", "看龙头带动")
+        return ("观察", "等待确认", "先不下结论")
 
     def _theme_internal_names(self, state: StrategyConsoleState, plate_name: str) -> tuple[str, str, str]:
         theme_fact = state.context.session_facts.theme_fact_map.get(plate_name)
@@ -7006,16 +8078,16 @@ class AuctionRuntimeController:
         leader, assist, follower = self._theme_internal_names(state, row.plate_name)
         cohesion = self._theme_cohesion_level(row)
         if row.generic:
-            return "大题材太散，只看辨识度核心"
+            return "泛题材方向较散，更适合只看辨识度和承接。"
         if cohesion == "weak":
-            return f"{leader}有辨识度，但{assist}和{follower}跟随不足，先看成队"
+            return f"{leader}相对更强，但{assist}、{follower}跟随不足，容易出现龙头独强。"
         if row.leader_count >= 2 and row.auction_amount >= 80_000_000:
-            return f"{leader}带队，{assist}跟随，能看中位卡位"
+            return f"{leader}与{assist}能形成双前排，说明板块有一定扩散性。"
         if row.auction_symbol_count >= 3 and row.symbol_count >= 4:
-            return f"{leader}点火，{assist}助攻，{follower}属跟风观察"
+            return f"{leader}、{assist}到{follower}都出现跟随，板块梯队更完整。"
         if row.yest_limit_count >= 2 and row.hot_change_pct <= 0:
-            return f"{leader}仍在但后排易兑现，{follower}别乱接"
-        return f"{leader}是核心锚，{assist}和{follower}先看承接"
+            return f"{leader}仍在维持强度，但{follower}没有明显扩散，偏向高位博弈。"
+        return f"{leader}是当前核心，{assist}与{follower}还需要继续观察是否跟上。"
 
     def _premarket_plan_text(self, minute_tag: str | None) -> str:
         minute_text = str(minute_tag or "").strip()
@@ -7073,7 +8145,6 @@ class AuctionRuntimeController:
         if red_rate <= 0.3:
             return "开盘偏弱"
         return "分歧博弈"
-
     def _extreme_score(self, snapshot: StockStateSnapshot) -> float:
         score = 0.0
         score += max(snapshot.auction_amount / 100_000_000, 0.0) * 20
@@ -7092,16 +8163,16 @@ class AuctionRuntimeController:
 
     def _extreme_type_label(self, snapshot: StockStateSnapshot) -> str:
         if snapshot.auction_amount >= 100_000_000 and 0.02 <= snapshot.open_pct <= 0.07:
-            return "竞价额极强"
+            return "竞价强承接"
         if snapshot.amount_2m >= 80_000_000 and snapshot.speed_1m > 0.01:
-            return "开盘抢筹"
+            return "开盘放量"
         if snapshot.open_pct <= 0.01 and snapshot.current_pct >= 0.03 and snapshot.amount_2m >= 20_000_000:
             return "低开转强"
         if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
-            return "水下回拉"
+            return "回落修复"
         if snapshot.open_pct >= 0.095:
-            return "高开过热"
-        return "普通强样本"
+            return "一字顶强"
+        return "普通承接"
 
     def _rebound_score(self, snapshot: StockStateSnapshot) -> float:
         score = 0.0
@@ -7120,14 +8191,14 @@ class AuctionRuntimeController:
 
     def _rebound_type_label(self, snapshot: StockStateSnapshot) -> str:
         if snapshot.open_pct <= 0.01 and snapshot.current_pct >= 0.03 and snapshot.amount_2m >= 20_000_000:
-            return "低开转强"
+            return "低开走强"
         if snapshot.open_pct < 0.0 and snapshot.current_pct > 0.0:
-            return "水下回拉"
+            return "回落翻红"
         if snapshot.amount_2m >= 50_000_000 and snapshot.speed_1m > 0.01:
-            return "换手抢筹"
+            return "放量拉升"
         if snapshot.amount_2m >= snapshot.auction_amount > 0:
-            return "承接跟上"
-        return "观察承接"
+            return "量能接力"
+        return "普通修复"
 
     def _is_low_open_rebound_snapshot(self, snapshot: StockStateSnapshot) -> bool:
         if snapshot is None:
@@ -7170,10 +8241,10 @@ class AuctionRuntimeController:
 
     def _yest_limit_trade_env(self, summary) -> str:
         if summary.promotion_rate >= 0.35 and summary.headshot_rate <= 0.08:
-            return "接力友好"
+            return "可博弈"
         if summary.headshot_rate >= 0.12 or summary.promotion_rate <= 0.15:
-            return "接力恶劣"
-        return "接力一般"
+            return "风险大"
+        return "分歧市"
 
     def _yest_limit_bucket_strength(self, snapshots: list[StockStateSnapshot]) -> str:
         if not snapshots:
@@ -7182,12 +8253,12 @@ class AuctionRuntimeController:
         red = sum(1 for snapshot in snapshots if snapshot.open_pct > 0)
         weak = sum(1 for snapshot in snapshots if snapshot.current_pct < 0)
         if strong >= max(1, len(snapshots) // 2):
-            return "晋级偏强"
+            return "强反馈"
         if weak >= max(1, len(snapshots) // 2):
-            return "负反馈重"
+            return "弱反馈"
         if red >= max(1, len(snapshots) // 2):
             return "有溢价但分歧"
-        return "强弱一般"
+        return "中性反馈"
 
     def _yest_limit_bucket_action(self, bucket: str, snapshots: list[StockStateSnapshot]) -> str:
         if not snapshots:
@@ -7196,41 +8267,41 @@ class AuctionRuntimeController:
         weak = sum(1 for snapshot in snapshots if snapshot.current_pct < 0)
         if bucket == "high":
             if weak >= max(1, len(snapshots) // 2):
-                return "高位兑现为主，不接加速后排"
+                return "高位兑现为主，不接一致后排"
             if strong >= 1:
                 return "只看活口回封，不做一致顶"
-            return "高位只观察龙头承接"
+            return "高位分歧观察为主"
         if bucket == "mid":
             if strong >= max(1, len(snapshots) // 3):
-                return "中位可做卡位，是主要上车层"
+                return "中位分歧博弈，只做前排"
             if weak >= max(1, len(snapshots) // 2):
-                return "中位承接弱，谨防晋级失败"
-            return "中位分歧博弈，只做前排"
+                return "中位负反馈偏多，先防兑现"
+            return "中位以承接筛选为主"
         if strong >= 1:
-            return "首板有溢价，可看新题材前排"
+            return "低位首板可试错，看换手确认"
         if weak >= max(1, len(snapshots) // 2):
-            return "首板溢价不足，追板要谨慎"
-        return "首板偏试错，等题材共振"
+            return "低位也偏弱，减少盲打"
+        return "低位观察扩散和回流"
 
     def _yest_limit_opportunity_profile(self, summary) -> tuple[str, str]:
         if summary.promotion_rate >= 0.35:
-            return ("中位有肉", "可多看晋级和卡位")
+            return ("机会较多", "可以积极找前排")
         if summary.promotion_rate >= 0.2:
-            return ("有少量机会", "只看最前排")
+            return ("机会一般", "只做确认后的机会")
         return ("机会偏少", "不做盲目接力")
 
     def _yest_limit_premium_profile(self, summary) -> tuple[str, str]:
         if summary.red_open_rate >= 0.75:
-            return ("红开溢价足", "但要防高开兑现")
+            return ("溢价较强", "红开溢价足，但要防高开兑现")
         if summary.red_open_rate >= 0.45:
             return ("溢价一般", "看分歧后谁回流")
-        return ("溢价不足", "偏向先手错了就砍")
+        return ("溢价偏弱", "红开不多，承接更关键")
 
     def _yest_limit_risk_profile(self, summary) -> tuple[str, str]:
         if summary.headshot_rate >= 0.12:
-            return ("负反馈重", "高位和后排都要缩")
+            return ("风险较高", "核按钮偏多，先防高位负反馈")
         if summary.headshot_rate >= 0.06:
-            return ("负反馈可见", "只做辨识度")
+            return ("风险可控", "有分歧但还没到全面退潮")
         return ("负反馈轻", "允许前排试错")
 
     def _render_risk_guard(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
@@ -7261,13 +8332,40 @@ class AuctionRuntimeController:
             f"  - 数据 | {self._display_source_label(state, phase_label=phase_label)}",
         )
 
+    def _aligned_avoid_parts(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[str, ...]:
+        preferred_plates = (
+            self._phase_priority_plates(state, phase_label=phase_label)
+            if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}
+            else ()
+        )
+        if state.bundle is None:
+            return ()
+
+        def collect(*, require_priority_plate: bool) -> tuple[str, ...]:
+            parts: list[str] = []
+            for decision in state.bundle.decisions:
+                if require_priority_plate and preferred_plates:
+                    if not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates):
+                        continue
+                display_code = self._display_action_code(decision, state, phase_label=phase_label)
+                if display_code in {"failed_promo_guard", "do_not_chase"}:
+                    parts.append(f"{self._decision_name(state, decision)}:{self._action_text(display_code)}")
+                if len(parts) >= 4:
+                    break
+            return tuple(parts)
+
+        focused_parts = collect(require_priority_plate=True)
+        if focused_parts:
+            return focused_parts
+        return collect(require_priority_plate=False)
+
     def _score_marker(self, score: float) -> str:
         if score >= 6.0:
-            return "★★"
-        if score >= 4.5:
             return "★"
-        if score >= 3.0:
+        if score >= 4.5:
             return "△"
+        if score >= 3.0:
+            return "→"
         return "×"
 
     def _promotion_marker(self, value: float) -> str:
@@ -7289,7 +8387,7 @@ class AuctionRuntimeController:
             return "!"
         if value >= 0.05:
             return "△"
-        return "✓"
+        return "○"
 
     def _resonance_marker(self, value: float) -> str:
         if value >= 800:
@@ -7304,7 +8402,7 @@ class AuctionRuntimeController:
             "neutral": "→",
             "danger": "!",
             "frozen": "冻",
-            "historical": "□",
+            "historical": "史",
         }
         return mapping.get(battle, "·")
 
@@ -7312,7 +8410,7 @@ class AuctionRuntimeController:
         mapping = {
             "strong_close": "↑",
             "mixed_close": "→",
-            "risk_close": "⚠",
+            "risk_close": "△",
             "weak_close": "↓",
         }
         return mapping.get(verdict, "·")
@@ -7459,9 +8557,9 @@ class AuctionRuntimeController:
     def _hot_plate_note(self, state: StrategyConsoleState) -> str:
         mode = self._hot_plate_render_mode(state)
         if mode == "fallback":
-            return "沿用昨日热板"
+            return "today"
         if mode == "missing":
-            return "热点题材缺失"
+            return "today"
         return ""
 
     def _has_missing_inputs(self, state: StrategyConsoleState, *keys: str) -> bool:
@@ -7623,18 +8721,8 @@ class AuctionRuntimeController:
         label = self._action_text(action_code)
         if decision is None:
             return label
-        if decision.action != "hold_only":
-            return label
-        snapshot = state.snapshot_map.get(decision.symbol)
-        judge, _matched_plate = self._matched_theme_judge(state, snapshot)
-        execution_state = self._external_validation_state(judge.validation_state) if judge is not None else ""
-        mode_code = self._effective_money_mode_code(state)
-        if execution_state == "falsified":
-            return "只观察已有仓"
-        if mode_code == "high_board_huddle":
-            return "只看活口，不开新仓"
-        if phase_label in {"opening", "open_confirm"} and action_code == "observe_only":
-            return "先看承接，不急动"
+        if action_code == "observe_only" and phase_label in {"opening", "open_confirm"}:
+            return "开盘先观察"
         return label
 
     def _display_action_code(
@@ -7654,7 +8742,11 @@ class AuctionRuntimeController:
         snapshot = state.snapshot_map.get(decision.symbol)
         collision = self._snapshot_theme_collision(state, snapshot)
         selection = self._stock_selection_context_map(state).get(decision.symbol)
-        downgraded = self._downgrade_action_by_theme_judge(state, snapshot, action)
+        skip_theme_judge_downgrade = (
+            action == "ice_probe"
+            or decision.setup_id == "theme_not_tradable_repair_probe"
+        ) and selection is not None and selection.open_follow_state in {"confirmed", "repair_strength"}
+        downgraded = None if skip_theme_judge_downgrade else self._downgrade_action_by_theme_judge(state, snapshot, action)
         if downgraded is not None:
             return downgraded
         downgraded = self._downgrade_action_by_fakeout(snapshot, selection, collision, action, phase_label=phase_label)
@@ -7677,6 +8769,58 @@ class AuctionRuntimeController:
             if upgraded_watch is not None:
                 return upgraded_watch
         return action
+
+    def _display_action_reason_text(
+        self,
+        decision: AuctionLadderDecision | None,
+        state: StrategyConsoleState | None,
+        *,
+        phase_label: str,
+    ) -> str:
+        if decision is None or state is None:
+            return ""
+        snapshot = state.snapshot_map.get(decision.symbol)
+        selection = self._stock_selection_context_map(state).get(decision.symbol)
+        display_code = self._display_action_code(decision, state, phase_label=phase_label)
+        if state.stale_snapshot_only and phase_label == "intraday":
+            return "数据滞后，仅供参考"
+        if snapshot is not None and self._snapshot_is_falsified_but_leader_alive(state, snapshot):
+            return "板块被证伪，但龙头仍有独活迹象"
+        if selection is not None and decision.setup_id == "theme_not_tradable_repair_probe":
+            if selection.open_follow_state in {"confirmed", "repair_strength"}:
+                return "题材偏弱，但修复信号已经出现"
+            return "题材偏弱，先当修复观察"
+        if snapshot is not None and selection is not None and self._is_high_dayk_weak_leader_trap(snapshot, selection, phase_label=phase_label):
+            return "日K位置偏高，容易形成高位假强"
+        if snapshot is not None and selection is not None and self._is_stock_auction_fakeout(snapshot, selection, phase_label=phase_label):
+            return "竞价形态像假强骗炮"
+        if phase_label in {"opening", "open_confirm"} and snapshot is not None:
+            confirm_label = self._leader_truth_label(snapshot)
+            if confirm_label == self.OPENING_VALIDATION_TRUE_STRONG:
+                return "开盘验证为真强，允许继续盯前排"
+            if confirm_label in {self.OPENING_VALIDATION_LOW_OPEN_STRONG, self.OPENING_VALIDATION_PULLBACK_REBOUND}:
+                return "开盘出现低开转强/回落修复"
+            if confirm_label in {self.OPENING_VALIDATION_GAP_WEAK, self.OPENING_VALIDATION_UNDERTAKE_WEAK}:
+                return "开盘承接不足，先不追"
+            if confirm_label == self.OPENING_VALIDATION_HARD_TO_CHASE:
+                return "高开过热，性价比偏低"
+        if display_code == "confirm_then_go":
+            return "等确认后再出手"
+        if display_code == "leader_watch":
+            return "先看龙头怎么走"
+        if display_code == "front_row_watch":
+            return "只看前排是否继续加强"
+        if display_code == "ice_probe":
+            return "冰点试错，仓位从轻"
+        if display_code == "failed_promo_guard":
+            return "晋级失败风险较高"
+        if display_code == "do_not_chase":
+            return "位置过热，禁止追高"
+        if display_code == "observe_only":
+            return "当前只适合观察"
+        if display_code == "leader_hold":
+            return "已有先手可考虑持有"
+        return ""
 
     def _upgrade_watch_display_action(
         self,
@@ -8039,7 +9183,7 @@ class AuctionRuntimeController:
         phase_label: str,
     ) -> tuple[str, ...]:
         if state.bundle is None:
-            return ("暂无明显淘汰项",)
+            return ("暂无淘汰理由",)
         accepted_symbols = {item.symbol for item in accepted[:4]}
         selection_map = self._stock_selection_context_map(state)
         results: list[str] = []
@@ -8064,17 +9208,19 @@ class AuctionRuntimeController:
             )
             if not reasons:
                 continue
-            results.append(self._reject_reason_summary(
-                state,
-                decision=decision,
-                snapshot=snapshot,
-                plate=plate,
-                reasons=tuple(reasons),
-                phase_label=phase_label,
-            ))
+            results.append(
+                self._reject_reason_summary(
+                    state,
+                    decision=decision,
+                    snapshot=snapshot,
+                    plate=plate,
+                    reasons=tuple(reasons),
+                    phase_label=phase_label,
+                )
+            )
             if len(results) >= 3:
                 break
-        return tuple(results) or ("暂无明显淘汰项",)
+        return tuple(results) or ("暂无淘汰理由",)
 
     def _mode_risk_prompt(self, state: StrategyConsoleState, *, phase_label: str) -> str:
         mode_code = self._effective_money_mode_code(state)
@@ -8132,13 +9278,13 @@ class AuctionRuntimeController:
 
     def _auction_invalidation_text(self, state: StrategyConsoleState) -> str:
         if not self._expectation_ready(state):
-            return "开盘前排承接不足或高开转虚则不追"
+            return "开盘前排承接不足或高开转虚，则不追。"
         top = self._top_theme_by_collision(state)
         if top is None:
-            return "开盘前排承接不足或高开转虚则不追"
+            return "开盘前排承接不足或高开转虚，则不追。"
         return (
-            f"{top.row.plate_name} 若前排2分钟承接不足一半、"
-            "高开后快速回落，或5分钟仍未修复，则主预判失效"
+            f"{top.row.plate_name} 若前排2分钟承接不足一半，"
+            "高开后快速回落，或2分钟仍未修复，则主预判失效。"
         )
 
     def _opening_correction_conclusion(
@@ -8153,18 +9299,18 @@ class AuctionRuntimeController:
         strengthened = [item for item in validations if str(item.get("validation_state") or "") == "strengthened"]
         falsified = [item for item in validations if str(item.get("validation_state") or "") == "falsified"]
         if strengthened and not falsified:
-            return "维持主预判，继续只看前排承接和换手确认"
+            return "维持主预判，继续只看前排承接和换手确认。"
         if falsified and strengthened:
-            return "主预判部分失效，降级到分歧观察，只保留局部前排"
+            return "主预判部分失效，降级到分歧观察，只保留局部前排。"
         if falsified:
-            return "主预判失效，切到防守观察，回避后排扩散"
+            return "主预判失效，切到防守观察，回避后排扩散。"
         if tuple(rebound):
-            return "盘面有低开转强修复，优先看修复型前排"
+            return "盘面有低开转强修复，优先看修复型前排。"
         if tuple(weak):
-            return "高开兑现明显，先降速，等待回封和承接再判断"
+            return "高开兑现明显，先降速，等待回封和承接再判断。"
         if tuple(confirmations):
-            return "预判暂未证伪，继续等待更明确的板块确认"
-        return "暂无统一修正结论，保持观察"
+            return "预判暂未证伪，继续等待更明确的板块确认。"
+        return "暂无统一修正结论，保持观察。"
 
     def _format_focus_item(
         self,
@@ -8175,10 +9321,14 @@ class AuctionRuntimeController:
         plate: str,
         evidence: str,
         state: StrategyConsoleState | None = None,
+        phase_label: str = "auction",
     ) -> str:
         snapshot_map = {decision.symbol: snapshot} if snapshot is not None else {}
         tags = self._decision_meta_tags(decision, snapshot_map, state=state)
+        action_reason = self._display_action_reason_text(decision, state, phase_label=phase_label) if state is not None else ""
         merged_evidence = evidence if not tags else f"{tags} / {evidence}"
+        if action_reason:
+            merged_evidence = f"{merged_evidence} / {action_reason}" if merged_evidence else action_reason
         return (
             f"{self._short_stock_name(snapshot, symbol=decision.symbol)}"
             f" | {action}"
@@ -8208,7 +9358,7 @@ class AuctionRuntimeController:
         raw_name = ""
         if snapshot is not None:
             raw_name = str(snapshot.name or "").strip()
-        text = raw_name.replace(" ", "").replace("(", "").replace(")", "").replace("（", "").replace("）", "").replace("*", "")
+        text = raw_name.replace(" ", "").replace("(", "").replace(")", "").replace("?", "").replace("?", "").replace("*", "")
         text = _TRAILING_NAME_NOISE_RE.sub("", text)
         text = text.rstrip("-_")
         if text:
@@ -8220,22 +9370,21 @@ class AuctionRuntimeController:
         if row.generic:
             return "泛题材"
         if expectation == "attack":
-            return "主攻"
+            return "进攻"
         if expectation == "follow":
             return "跟随"
         if expectation == "ladder":
             if row.hot_change_pct <= 0 and row.yest_limit_count >= 2:
-                return "兑现"
-            return "晋级"
+                return "晋级"
+            return "梯队"
         if expectation == "cluster":
-            return "发酵"
+            return "联动"
         return "观察"
 
     def _fmt_volume_intensity(self, value: float) -> str:
         if value <= 1.0:
             return "-"
         return f"{value:.1f}倍"
-
     def _snapshot_name_by_symbol(self, state_or_context: StrategyConsoleState | IntradayContext, symbol: str) -> str:
         if isinstance(state_or_context, StrategyConsoleState):
             matched = state_or_context.snapshot_map.get(symbol)
@@ -8291,6 +9440,21 @@ class AuctionRuntimeController:
         }
         return mapping.get(phase_label, phase_label)
 
+    def _phase_window_label(self, phase_label: str) -> str:
+        if phase_label == "premarket":
+            return "00:00-09:25"
+        if phase_label == "auction_preview":
+            return "09:15-09:24"
+        if phase_label == "auction":
+            return "09:25-09:30"
+        if phase_label == "opening":
+            return "09:30-09:40"
+        if phase_label == "open_confirm":
+            return "09:31-09:35"
+        if phase_label == "postmarket":
+            return "15:00-17:40"
+        return "09:40-15:00"
+
     def _runtime_text(self, label: str) -> str:
         mapping = {
             "trade_ready_runtime": "可交易",
@@ -8303,6 +9467,10 @@ class AuctionRuntimeController:
             "postmarket_warming": "盘后加载中",
         }
         return mapping.get(label, label)
+
+    def _ladder_sort_value(self, key: str) -> int:
+        digits = "".join(ch for ch in key if ch.isdigit())
+        return int(digits or 0)
 
     def _action_text(self, action: str) -> str:
         mapping = {
@@ -8397,7 +9565,7 @@ class AuctionRuntimeController:
             "redis_runtime_projection": "全市场投影",
             "t1_v2_q2_live": "盘中实时快照",
             "startup_repair": "启动修复",
-            "hot_plate_cache": "热点题材缓存",
+            "hot_plate_cache": "热板缓存",
             "yest_limit_cache": "昨日涨停缓存",
             "redis_anchor": "竞价锚点",
             "redis_0925": "09:25竞价锚点",
@@ -8430,7 +9598,7 @@ class AuctionRuntimeController:
 
     def _close_verdict_text(self, verdict: str) -> str:
         mapping = {
-            "strong_close": "强修复",
+            "strong_close": "强收盘",
             "mixed_close": "分歧收盘",
             "risk_close": "风险收盘",
             "weak_close": "弱收盘",
@@ -8474,25 +9642,6 @@ class AuctionRuntimeController:
         }
         return mapping.get(item, item)
 
-    def _phase_window_label(self, phase_label: str) -> str:
-        if phase_label == "premarket":
-            return "00:00-09:25"
-        if phase_label == "auction_preview":
-            return "09:15-09:24"
-        if phase_label == "auction":
-            return "09:25-09:30"
-        if phase_label == "opening":
-            return "09:30-09:40"
-        if phase_label == "open_confirm":
-            return "09:31-09:35"
-        if phase_label == "postmarket":
-            return "15:00-17:40"
-        return "09:40-15:00"
-
-    def _ladder_sort_value(self, key: str) -> int:
-        digits = "".join(ch for ch in key if ch.isdigit())
-        return int(digits or 0)
-
     @staticmethod
     def _is_limit_up_snapshot(snapshot: StockStateSnapshot) -> bool:
         return bool(snapshot.is_locked or snapshot.touched_limit_today)
@@ -8527,13 +9676,12 @@ class AuctionRuntimeController:
 
     def _capital_behavior_text(self, value: float) -> str:
         if value >= 1.2:
-            return "主力流入"
+            return "主动进攻"
         if value >= 0.35:
-            return "偏强流入"
+            return "偏强承接"
         if value <= -0.3:
-            return "主力流出"
-        return "分歧震荡"
-
+            return "兑现流出"
+        return "中性震荡"
     def _infer_close_verdict(self, summary) -> str:
         if summary.sentiment_score >= 6.0 and summary.headshot_rate <= 0.05:
             return "strong_close"

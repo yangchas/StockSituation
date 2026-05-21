@@ -98,7 +98,25 @@ def build_auction_and_ladder_decision(
                 )
             )
         )
-        if strong_watch_candidate:
+        repair_probe_candidate = bool(
+            strong_watch_candidate
+            and stock_selection is not None
+            and stock_selection.open_follow_state in {"confirmed", "repair_strength"}
+            and (
+                theme_selection.open_confirm_state == "strengthened"
+                or stock_selection.execution_quality_score >= 6.2
+            )
+            and stock_selection.open_undertake_score >= 5.8
+            and stock_selection.timing_score >= 5.0
+            and stock_selection.kline_pattern not in _ENTRY_VETO_KLINE_PATTERNS
+            and stock_selection.auction_open_bucket not in {"overheat_high_open", "near_limit_open"}
+        )
+        if repair_probe_candidate:
+            confidence = 69 if stock_selection.is_true_leader else 65
+            setup_id = "theme_not_tradable_repair_probe"
+            action = "small_probe_only"
+            reasons.append("theme not fully tradable yet, but open-follow and execution justify a small repair probe")
+        elif strong_watch_candidate:
             confidence = 64 if stock_selection is not None and stock_selection.is_true_leader else 60
             setup_id = "theme_not_tradable_watch"
             action = "observe_only"
@@ -233,6 +251,10 @@ def build_auction_and_ladder_decision(
             reasons.append("high divergence only allows reduced-size probe")
 
     if theme_selection is not None:
+        priority_bias = float(getattr(theme_selection, "phase_priority_bias", 0.0) or 0.0)
+        if priority_bias > 0:
+            confidence += _clamp(priority_bias * 4.0, minimum=0, maximum=12)
+            reasons.append(f"phase-priority bias={priority_bias:.1f} supports current narrative line")
         if theme_selection.cohesion_level == "strong":
             confidence += 6
             reasons.append("theme cohesion supports continuation")

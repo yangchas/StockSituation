@@ -271,6 +271,7 @@ class ThemeSelectionContext:
     plate_resistance_score: float = 0.0
     plate_role: str = "neutral"
     rotation_bias: str = "neutral"
+    phase_priority_bias: float = 0.0
     notes: tuple[str, ...] = ()
 
 

@@ -144,6 +144,7 @@ def _theme_context_signature(theme_context: ThemeSelectionContext | None) -> tup
         bool(theme_context.tradable),
         str(theme_context.bias_action or ""),
         str(theme_context.open_confirm_state or ""),
+        round(float(theme_context.phase_priority_bias or 0.0), 3),
     )
 
 
@@ -230,13 +231,14 @@ def build_context_strategy_bundle_for_symbols(
     ranked = sorted(
         zip(decisions, stock_selection_contexts),
         key=lambda pair: (
+            pair[1].theme_tradable,
+            float(getattr(resolved_theme_context_map.get(pair[1].plate_name), "phase_priority_bias", 0.0) or 0.0),
             pair[1].total_score,
             pair[1].execution_quality_score,
             pair[1].open_undertake_score,
             pair[1].shape_quality_score,
             pair[1].heat_flow_score,
             -pair[1].hot_rank,
-            pair[1].theme_tradable,
             pair[1].is_active_pool,
             pair[1].theme_core_score,
             pair[1].activity_score,
@@ -317,6 +319,7 @@ def _passes_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
         and theme_context.bias_action in {"observe_only", "avoid_after_open_confirm"}
         and theme_context.open_confirm_state in {"maintained", "falsified"}
         and not selection.is_true_leader
+        and float(getattr(theme_context, "phase_priority_bias", 0.0) or 0.0) <= 0.0
     ):
         return False
     return True

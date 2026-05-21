@@ -2158,6 +2158,43 @@ def render_result_summary(result: EngineAppResult) -> str:
         RunPhase.NIGHT: "夜间",
     }.get(result.phase, result.phase.value)
 
+    def parse_quote_snapshot(line: str | None) -> tuple[int, str, int | None]:
+        if not line:
+            return 0, "", None
+        matched = re.search(
+            r"fresh=(\d+)/\d+\s*\|\s*stale=\d+\s*(?:\|\s*cache_only=\d+\s*)?\|\s*missing=\d+\s*\|\s*latest=([^|]+)\s*\|\s*lag=([0-9]+)s",
+            line,
+        )
+        if not matched:
+            return 0, "", None
+        fresh_text, latest_text, lag_text = matched.groups()
+        try:
+            fresh_count = int(fresh_text or 0)
+        except (TypeError, ValueError):
+            fresh_count = 0
+        try:
+            lag_seconds = int(lag_text or 0)
+        except (TypeError, ValueError):
+            lag_seconds = None
+        return fresh_count, str(latest_text or "").strip(), lag_seconds
+
+    def auction_live_quote_ready(line: str | None) -> bool:
+        fresh_count, latest_hms, lag_seconds = parse_quote_snapshot(line)
+        if result.phase != RunPhase.AUCTION:
+            return True
+        if fresh_count <= 0 or not latest_hms or lag_seconds is None:
+            return False
+        if lag_seconds > 120:
+            return False
+        if not re.fullmatch(r"\d{2}:\d{2}:\d{2}", latest_hms):
+            return False
+        now_hms = datetime.now().strftime("%H:%M:%S")
+        if latest_hms < "09:15:00" or latest_hms >= "15:00:00":
+            return False
+        if latest_hms > now_hms:
+            return False
+        return True
+
     raw_lines: list[str] = []
     for note in result.notes:
         raw_lines.extend(str(note).splitlines())
@@ -2260,6 +2297,10 @@ def render_result_summary(result: EngineAppResult) -> str:
         )
         if matched:
             fresh_quotes, stale_quotes, missing_quotes, latest_quote, lag_seconds = [part.strip() for part in matched.groups()]
+    auction_waiting_live = result.phase == RunPhase.AUCTION and not auction_live_quote_ready(quote_line)
+    if auction_waiting_live:
+        phase_text = "等待竞价"
+        runtime_state = "等待实时恢复"
 
     overview_section = [
         f"当前阶段：{phase_text}",
@@ -2286,6 +2327,8 @@ def render_result_summary(result: EngineAppResult) -> str:
         quote_summary_bits.append(f"Native {native_count}")
     if quote_summary_bits:
         overview_section.append("行情状态：" + "，".join(quote_summary_bits))
+    if auction_waiting_live:
+        overview_section.append("竞价状态：未恢复到当日09:15+有效实时流，暂不输出竞价策略。")
     if readiness:
         overview_section.append(f"就绪等级：{readiness}")
 
