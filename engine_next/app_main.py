@@ -223,6 +223,17 @@ class RuntimeScheduledEventResult:
     market_runtime_summary_result: MarketRuntimeSummaryResult | None = None
 
 
+@dataclass(frozen=True)
+class LateStartAuctionRecoveryResult:
+    status: str
+    executed: bool
+    notes: tuple[str, ...] = ()
+    yest_limit_result: IntradayFetchResult | None = None
+    hot_plate_result: IntradayFetchResult | None = None
+    auction_result: IntradayFetchResult | None = None
+    market_runtime_summary_result: MarketRuntimeSummaryResult | None = None
+
+
 class EngineApp:
     """
     Minimal runnable orchestrator for engine_next.
@@ -283,6 +294,7 @@ class EngineApp:
         self._last_intraday_auction_recap_trade_date: str | None = None
         self._last_opening_validation_checkpoint_token: str | None = None
         self._last_open_2m_runtime_refresh_token: str | None = None
+        self._last_late_start_auction_recovery_token: str | None = None
 
     @property
     def redis(self):
@@ -1658,6 +1670,67 @@ class EngineApp:
             market_runtime_summary_result=market_runtime_summary_result,
         )
 
+    def _should_attempt_late_start_auction_recovery(
+        self,
+        *,
+        request: EngineAppRequest,
+        phase: RunPhase,
+    ) -> bool:
+        if request.historical_replay or phase != RunPhase.INTRADAY:
+            return False
+        minute_tag = request.now.strftime("%H:%M")
+        return "09:30" <= minute_tag < "09:40"
+
+    def _ensure_late_start_auction_recovery(
+        self,
+        *,
+        request: EngineAppRequest,
+        phase: RunPhase,
+        offline_context_date: str,
+        runtime_readiness: dict[str, object],
+    ) -> LateStartAuctionRecoveryResult:
+        if not self._should_attempt_late_start_auction_recovery(request=request, phase=phase):
+            return LateStartAuctionRecoveryResult(status="not_applicable", executed=False)
+        token = f"{request.trade_date}:late_start_auction_recovery"
+        if self._last_late_start_auction_recovery_token == token:
+            return LateStartAuctionRecoveryResult(status="already_checked", executed=False)
+        self._last_late_start_auction_recovery_token = token
+        if bool(runtime_readiness.get("auction_anchor_ready")):
+            return LateStartAuctionRecoveryResult(
+                status="already_ready",
+                executed=False,
+                notes=(
+                    "late_start_auction_recovery | status=already_ready | action=skip_recovery",
+                    "auction_anchor_source | status=existing_before_intraday_start | source=redis_runtime",
+                ),
+            )
+        replay_result = self._auction_runtime.execute_auction_followup_0926(
+            trade_date=request.trade_date,
+            previous_trade_date=request.previous_trade_date,
+            offline_context_date=offline_context_date,
+        )
+        recovered = bool(replay_result.auction_result is not None and replay_result.auction_result.rows)
+        status = "recovered" if recovered else "still_missing"
+        notes = [
+            f"late_start_auction_recovery | status={status} | minute={request.now.strftime('%H:%M')} | action=followup_0926_replay",
+            (
+                "auction_anchor_source | status=recovered_after_late_start | "
+                "source=auction_followup_0926"
+                if recovered
+                else "auction_anchor_source | status=missing_after_late_start_recovery | source=auction_followup_0926"
+            ),
+            *replay_result.notes,
+        ]
+        return LateStartAuctionRecoveryResult(
+            status=status,
+            executed=True,
+            notes=tuple(notes),
+            yest_limit_result=replay_result.yest_limit_result,
+            hot_plate_result=replay_result.hot_plate_result,
+            auction_result=replay_result.auction_result,
+            market_runtime_summary_result=replay_result.market_runtime_summary_result,
+        )
+
     def run(self, request: EngineAppRequest) -> EngineAppResult:
         loop_decision = self._build_loop_decision(request.now, request.trade_date)
         preflight_notes = list(
@@ -1764,6 +1837,19 @@ class EngineApp:
                 offline_context_date=offline_context_date,
                 startup_bundle=startup_bundle,
             )
+        late_start_recovery_result = self._ensure_late_start_auction_recovery(
+            request=request,
+            phase=phase,
+            offline_context_date=offline_context_date,
+            runtime_readiness=runtime_readiness,
+        )
+        if late_start_recovery_result.executed:
+            startup_bundle, watermark_snapshot, runtime_readiness = self._refresh_startup_state_after_settlement(
+                request=request,
+                symbols=symbols,
+                offline_context_date=offline_context_date,
+                startup_bundle=startup_bundle,
+            )
         offline_decision = startup_bundle.plan.offline_decision or self._offline_executor.build_decision(effective_offline_request)
         should_audit_integrated_sync = self._settlement.should_audit_integrated_sync(
             phase=phase,
@@ -1857,6 +1943,8 @@ class EngineApp:
                     *recap_lines,
                 ]
         notes = [f"runtime_event={loop_decision.label}"]
+        if late_start_recovery_result.notes:
+            notes.extend(late_start_recovery_result.notes)
         if opening_validation_notes:
             notes.extend(opening_validation_notes)
         if open_2m_refresh_notes:
@@ -2199,6 +2287,11 @@ def render_result_summary(result: EngineAppResult) -> str:
     for note in result.notes:
         raw_lines.extend(str(note).splitlines())
 
+    if result.phase == RunPhase.INTRADAY:
+        strategy_phase_line = next((line for line in raw_lines if "| 阶段=" in line), "")
+        if "开盘确认" in strategy_phase_line:
+            phase_text = "开盘确认"
+
     def find_first(*prefixes: str) -> str | None:
         for line in raw_lines:
             if any(line.startswith(prefix) for prefix in prefixes):
@@ -2265,6 +2358,8 @@ def render_result_summary(result: EngineAppResult) -> str:
     quote_line = find_first("quote_freshness |")
     runtime_line = find_first("运行状态=")
     integrated_sync_line = find_first("integrated_sync targets=")
+    late_start_recovery_line = find_first("late_start_auction_recovery |")
+    auction_anchor_source_line = find_first("auction_anchor_source |")
 
     target_trade_date = ""
     formal_date = ""
@@ -2371,6 +2466,9 @@ def render_result_summary(result: EngineAppResult) -> str:
         gap_section.append(normalized_impact_line)
     elif impact_line:
         gap_section.append("影响判断：" + impact_line.split("|", 1)[1].strip())
+
+    if auction_anchor_source_line:
+        gap_section.append("auction_anchor | " + auction_anchor_source_line.split("|", 1)[1].strip())
 
     strategy_lines: list[str] = []
     for prefix in ("策略看板 |", "情绪总览 |"):
@@ -2497,6 +2595,15 @@ def render_result_summary(result: EngineAppResult) -> str:
             line = find_first(prefix)
             if line:
                 detailed_section.append(label + format_diagnostic_line(prefix, line))
+
+    if late_start_recovery_line:
+        if not detailed_section:
+            detailed_section.append("详细诊断：")
+        detailed_section.append("late_start_recovery | " + format_diagnostic_line("late_start_auction_recovery |", late_start_recovery_line))
+    if auction_anchor_source_line:
+        if not detailed_section:
+            detailed_section.append("详细诊断：")
+        detailed_section.append("auction_anchor_source | " + format_diagnostic_line("auction_anchor_source |", auction_anchor_source_line))
 
     phase_section: list[str] = []
     if result.phase_events:
