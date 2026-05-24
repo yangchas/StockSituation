@@ -5,7 +5,6 @@ from engine_next.domain.enums import (
     FailedPromotionType,
     FeedbackState,
     LeaderTier,
-    OperatorStyleHint,
     StockArchetype,
     StockStage,
     TradeWindowState,
@@ -49,23 +48,6 @@ def _infer_failed_promotion_type(snapshot: StockStateSnapshot) -> tuple[FailedPr
         notes.append("recent promotion failed and turned into weak continuation")
         return FailedPromotionType.WEAK_CONTINUATION, notes
     return FailedPromotionType.NONE, notes
-
-
-def _infer_operator_style(snapshot: StockStateSnapshot) -> tuple[OperatorStyleHint, list[str]]:
-    notes: list[str] = []
-    if snapshot.market_cap_yi >= 300 or snapshot.amount_day_yi >= 40:
-        if snapshot.lb_days <= 2:
-            notes.append("larger cap and turnover fit institutional style")
-            return OperatorStyleHint.INSTITUTION, notes
-        notes.append("large turnover but still active on board ladder")
-        return OperatorStyleHint.MIXED, notes
-    if snapshot.lb_days >= 1 and 5 <= snapshot.amount_day_yi <= 35:
-        notes.append("board preference plus medium turnover fits hot-money style")
-        return OperatorStyleHint.HOT_MONEY, notes
-    if snapshot.market_cap_yi > 0 or snapshot.amount_day_yi > 0:
-        notes.append("size and turnover suggest mixed style")
-        return OperatorStyleHint.MIXED, notes
-    return OperatorStyleHint.UNKNOWN, notes
 
 
 def _infer_archetype(snapshot: StockStateSnapshot) -> tuple[StockArchetype, list[str]]:
@@ -153,7 +135,7 @@ def _infer_feedback(
     return FeedbackState.NEUTRAL, notes
 
 
-def _infer_exposure(snapshot: StockStateSnapshot) -> tuple[ExposureState, int, int, list[str]]:
+def _infer_exposure(snapshot: StockStateSnapshot) -> tuple[ExposureState, int, list[str]]:
     notes: list[str] = []
     exposure_score = 0.0
     exposure_score += max(snapshot.lb_days - 1, 0) * 12
@@ -168,16 +150,13 @@ def _infer_exposure(snapshot: StockStateSnapshot) -> tuple[ExposureState, int, i
         exposure_score += max(0, 35 - snapshot.ths_hot_rank)
 
     score = _clamp_score(exposure_score)
-    retail_attention_proxy = score
-    if snapshot.ths_hot_rank is not None and snapshot.ths_hot_rank > 0:
-        retail_attention_proxy = _clamp_score(100 - min(snapshot.ths_hot_rank, 100))
     if score >= 70:
         notes.append("high attention / dark-forest exposure")
-        return ExposureState.OVEREXPOSED, score, retail_attention_proxy, notes
+        return ExposureState.OVEREXPOSED, score, notes
     if score <= 30:
         notes.append("still under the crowd radar")
-        return ExposureState.UNDEREXPOSED, score, retail_attention_proxy, notes
-    return ExposureState.BALANCED, score, retail_attention_proxy, notes
+        return ExposureState.UNDEREXPOSED, score, notes
+    return ExposureState.BALANCED, score, notes
 
 
 def _infer_trade_window(
@@ -230,11 +209,10 @@ def _infer_trade_window(
 def assess_stock_profile(snapshot: StockStateSnapshot) -> StockProfileAssessment:
     leader_tier, leader_notes = _infer_leader_tier(snapshot)
     failed_promotion_type, failed_notes = _infer_failed_promotion_type(snapshot)
-    operator_style_hint, operator_notes = _infer_operator_style(snapshot)
     archetype, archetype_notes = _infer_archetype(snapshot)
     stage, stage_notes = _infer_stage(snapshot)
     feedback_state, feedback_notes = _infer_feedback(snapshot, stage, failed_promotion_type)
-    exposure_state, exposure_score, retail_attention_proxy, exposure_notes = _infer_exposure(snapshot)
+    exposure_state, exposure_score, exposure_notes = _infer_exposure(snapshot)
     trade_window, continuation_score, trade_notes = _infer_trade_window(
         snapshot=snapshot,
         archetype=archetype,
@@ -246,7 +224,6 @@ def assess_stock_profile(snapshot: StockStateSnapshot) -> StockProfileAssessment
     notes = tuple(
         leader_notes
         + failed_notes
-        + operator_notes
         + archetype_notes
         + stage_notes
         + feedback_notes
@@ -259,12 +236,10 @@ def assess_stock_profile(snapshot: StockStateSnapshot) -> StockProfileAssessment
         leader_tier=leader_tier,
         stage=stage,
         failed_promotion_type=failed_promotion_type,
-        operator_style_hint=operator_style_hint,
         feedback_state=feedback_state,
         exposure_state=exposure_state,
         trade_window=trade_window,
         darkness_exposure_score=exposure_score,
         continuation_score=continuation_score,
-        retail_attention_proxy=retail_attention_proxy,
         notes=notes,
     )

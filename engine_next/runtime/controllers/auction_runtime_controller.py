@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -42,6 +42,10 @@ from engine_next.strategy_skill_layer.context_pipeline import (
     build_context_strategy_bundle_for_symbols,
     filter_trade_candidates,
     filter_watch_candidates,
+)
+from engine_next.strategy_skill_layer.opening_validation_hub import (
+    build_opening_validation_bundle,
+    match_opening_validation,
 )
 from engine_next.strategy_skill_layer.shape_engine import filter_shape_eval_scope
 from engine_next.strategy_skill_layer.slice_comparison import (
@@ -749,7 +753,7 @@ class AuctionRuntimeController:
             lines.extend(self._render_yest_limit_breakdown(state))
             lines.extend(self._render_auction_plan(state))
         if phase_label == "open_confirm":
-            lines.extend(self._render_opening_validation(state))
+            lines.extend(self._render_opening_validation_hub(state))
         if phase_label == "postmarket" and not state.frozen_postmarket_snapshot:
             lines.extend(self._render_close_recap(state))
             lines.extend(self._render_day_recap_story(state))
@@ -1175,6 +1179,19 @@ class AuctionRuntimeController:
                 theme_judge_map=theme_judge_map,
                 phase_label=phase_label,
             )
+            if (
+                phase_label in {"opening", "open_confirm", "intraday", "postmarket"}
+                and any(float(getattr(snapshot, "amount_2m", 0.0) or 0.0) > 0.0 for snapshot in intraday_context.stock_snapshots)
+            ):
+                opening_validation_bundle = build_opening_validation_bundle(
+                    intraday_context,
+                    formal_theme_context_map,
+                    phase_label=phase_label,
+                )
+                intraday_context = replace(
+                    intraday_context,
+                    opening_validation_bundle=opening_validation_bundle,
+                )
             bundle = build_context_strategy_bundle_for_symbols(
                 intraday_context,
                 symbols=shape_eval_scope or candidate_scope,
@@ -1249,12 +1266,12 @@ class AuctionRuntimeController:
         updated = dict(base_map)
         for item in collision_rows:
             validation_state, metrics = self._theme_opening_validation_state(state, item)
-            action_class = self._theme_action_class(item, validation_state=validation_state)
             previous = updated.get(item.plate_name)
             notes = list(previous.notes if previous is not None else ())
             notes.extend(
                 (
                     "source=open_confirm",
+                    f"open_confirm_validation={validation_state}",
                     f"undertake_2m={int(metrics.get('undertake_count', 0.0))}/{int(metrics.get('front_row_count', 0.0))}",
                     f"undertake_5m={int(metrics.get('undertake_count_5m', 0.0))}/{int(metrics.get('front_row_count', 0.0))}",
                     f"weak_count={int(metrics.get('weak_count', 0.0))}",
@@ -1266,15 +1283,16 @@ class AuctionRuntimeController:
             if previous is not None:
                 updated[item.plate_name] = replace(
                     previous,
-                    validation_state=validation_state,
-                    action_class=action_class,
                     notes=tuple(notes),
                 )
             else:
                 updated[item.plate_name] = self._build_theme_judge_result(
                     item,
-                    validation_state=validation_state,
-                    action_class=action_class,
+                    validation_state=self._theme_open_confirm_state(item),
+                    action_class=self._theme_action_class(
+                        item,
+                        validation_state=self._theme_open_confirm_state(item),
+                    ),
                     notes=tuple(notes),
                 )
         return updated
@@ -2908,11 +2926,18 @@ class AuctionRuntimeController:
             if capital_row
             else f"{summary.mainline_net_inflow_yi:.2f}亿"
         )
+        
+        migrating_out = ",".join(summary.migrating_out_plates) if summary.migrating_out_plates else "-"
+        migrating_in = ",".join(summary.migrating_in_plates) if summary.migrating_in_plates else "-"
+        migration_alert = ""
+        if summary.migrating_out_plates or summary.migrating_in_plates:
+            migration_alert = f" [资金流斜率预警: 抽离({migrating_out}) -> 攻击({migrating_in})]"
+
         return (
             "【主线脉络】摘要 | 内容",
             f"  {switch_badge} 主线/副线 | {main_name}:{self._mainline_label_text(main_expect)} / {secondary}",
             f"  ★ 题材主攻/次强 | {execution_lead}:{scope_expect} / {scope_secondary}",
-            f"  ◇ 是否切换/迁移 | {'是' if summary.mainline_switch else '否'} / {self._migration_text(summary.top_plate_migration_type or '-')}",
+            f"  ◇ 是否切换/迁移 | {'是' if summary.mainline_switch else '否'} / {self._migration_text(summary.top_plate_migration_type or '-')}{migration_alert}",
             f"  ￥ 板块涨幅/净流入 | {flow_change_text} / {flow_inflow_text}",
             f"  ◎ 资金/涨停/转强 | {capital_name} / {execution_lead} / {turn_name}",
             f"  ◎ 数据对撞 | {self._collision_brief_text(state)}",
@@ -4820,6 +4845,153 @@ class AuctionRuntimeController:
             f"  板块验证 | {' ; ' .join(plate_checks) or '-'}",
         )
 
+    def _render_opening_validation_hub(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        bundle = getattr(state.context, "opening_validation_bundle", None)
+        if bundle is None:
+            return ()
+        script_label = {
+            "extension": "延续",
+            "rotation": "切换",
+            "distribution": "兑现",
+            "unknown": "待判",
+        }
+        state_label = {
+            "confirmed": "确认",
+            "watch": "观察",
+            "falsified": "证伪",
+        }
+        tradable_label = {
+            "attack": "主攻",
+            "probe": "试错",
+            "watch": "观察",
+            "avoid": "回避",
+        }
+        confirmed = tuple((getattr(bundle, "confirmed_themes", {}) or {}).values())
+        falsified = tuple((getattr(bundle, "falsified_themes", {}) or {}).values())
+        watch = tuple((getattr(bundle, "watch_themes", {}) or {}).values())
+        lines = ["【剧本裁决】方向 | 结果"]
+        lines.append(
+            self._render_opening_front_slice_line(
+                self._market_slice_comparison_for_phase(state, phase_label="open_confirm")
+            )
+        )
+        lines.append(
+            f"  主验证题材 | {str(getattr(bundle, 'main_validated_theme', '') or '-')}"
+            f" / 次验证题材 {str(getattr(bundle, 'backup_validated_theme', '') or '-')}"
+        )
+        lines.append(f"  已确认/证伪/观察 | {len(confirmed)} / {len(falsified)} / {len(watch)}")
+        lines.append(f"  延续 | {', '.join(item.plate_name for item in confirmed if item.predicted_script == 'extension') or '-'}")
+        lines.append(f"  切换 | {', '.join(item.plate_name for item in confirmed if item.predicted_script == 'rotation') or '-'}")
+        lines.append(f"  兑现 | {', '.join(item.plate_name for item in falsified if item.predicted_script in {'distribution', 'extension'}) or '-'}")
+        lines.append("【验证后题材】题材 | 预判 | 验证 | 可做 | 证据")
+        top_rows = sorted(
+            list(confirmed) + list(watch) + list(falsified),
+            key=lambda item: (
+                str(getattr(item, "validation_state", "") or "") == "confirmed",
+                str(getattr(item, "tradable_level", "") or "") == "attack",
+                -float(getattr(item, "amount_2m_rank_pct", 1.0) or 1.0),
+            ),
+            reverse=True,
+        )[:6]
+        for item in top_rows:
+            evidence = " / ".join(tuple(getattr(item, "evidence", ()) or ())[:2]) or str(getattr(item, "invalid_reason", "") or "-")
+            lines.append(
+                f"  {item.plate_name} | {script_label.get(item.predicted_script, item.predicted_script)}"
+                f" | {state_label.get(item.validation_state, item.validation_state)}"
+                f" | {tradable_label.get(item.tradable_level, item.tradable_level)}"
+                f" | {evidence}"
+            )
+        lines.extend(self._render_validated_candidates(state))
+        return tuple(lines)
+
+    def _render_validated_candidates(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        bundle = getattr(state.context, "opening_validation_bundle", None)
+        if bundle is None:
+            return ()
+        selection_map = self._stock_selection_context_map(state)
+        confirmed_map = getattr(bundle, "confirmed_themes", {}) or {}
+        watch_map = getattr(bundle, "watch_themes", {}) or {}
+        falsified_map = getattr(bundle, "falsified_themes", {}) or {}
+        attack_items: list[str] = []
+        probe_items: list[str] = []
+        watch_items: list[str] = []
+        avoid_items: list[str] = []
+        for decision in state.candidates:
+            selection = selection_map.get(decision.symbol)
+            if selection is None:
+                continue
+            snapshot = state.snapshot_map.get(decision.symbol)
+            validation = self._opening_validation_for_display(
+                state,
+                snapshot=snapshot,
+                selection=selection,
+            )
+            if validation is None:
+                continue
+            plate_name = normalize_plate_name(str(getattr(validation, "plate_name", "") or selection.plate_name or "-"))
+            item_text = f"{decision.symbol}:{plate_name}/{decision.action}@{decision.confidence}"
+            level = str(getattr(validation, "tradable_level", "") or "")
+            status = str(getattr(validation, "validation_state", "") or "")
+            if status == "confirmed" and level == "attack":
+                attack_items.append(item_text)
+            elif status == "confirmed" and level == "probe":
+                probe_items.append(item_text)
+            elif status == "watch":
+                watch_items.append(item_text)
+            else:
+                avoid_items.append(item_text)
+        for decision in state.watch_candidates:
+            selection = selection_map.get(decision.symbol)
+            if selection is None:
+                continue
+            snapshot = state.snapshot_map.get(decision.symbol)
+            validation = self._opening_validation_for_display(
+                state,
+                snapshot=snapshot,
+                selection=selection,
+            )
+            if validation is None:
+                continue
+            plate_name = normalize_plate_name(str(getattr(validation, "plate_name", "") or selection.plate_name or "-"))
+            item_text = f"{decision.symbol}:{plate_name}/{decision.action}@{decision.confidence}"
+            status = str(getattr(validation, "validation_state", "") or "")
+            if status == "watch" and item_text not in watch_items:
+                watch_items.append(item_text)
+            elif status == "falsified" and item_text not in avoid_items:
+                avoid_items.append(item_text)
+        return (
+            "【验证后候选】方向 | 清单",
+            f"  主攻 | {' ; '.join(attack_items[:3]) or '-'}",
+            f"  试错 | {' ; '.join(probe_items[:3]) or '-'}",
+            f"  观察 | {' ; '.join(watch_items[:4]) or '-'}",
+            f"  回避 | {' ; '.join(avoid_items[:4]) or '-'}",
+        )
+
+    def _opening_validation_for_display(
+        self,
+        state: StrategyConsoleState,
+        *,
+        snapshot: StockStateSnapshot | None,
+        selection: StockSelectionContext | None,
+    ):
+        extra_plate_names: list[str] = []
+        if snapshot is not None:
+            judge, matched_plate = self._matched_theme_judge(state, snapshot)
+            if judge is not None:
+                matched_name = normalize_plate_name(matched_plate or judge.plate_name)
+                if matched_name and matched_name != "-":
+                    extra_plate_names.append(matched_name)
+            for plate_name in self._normalized_plate_names(snapshot):
+                normalized_name = normalize_plate_name(plate_name)
+                if normalized_name and normalized_name != "-" and normalized_name not in extra_plate_names:
+                    extra_plate_names.append(normalized_name)
+        return match_opening_validation(
+            getattr(state.context, "opening_validation_bundle", None),
+            snapshot=snapshot,
+            selection=selection,
+            extra_plate_names=tuple(extra_plate_names),
+        )
+
     def _render_opening_front_slice_line(self, comparison) -> str:
         return (
             f"  前排2m | Top10 {self._fmt_amount_yi_precise(comparison.top10_amount)} / 昨比 {comparison.top10_vs_prev_ratio:.2f}x"
@@ -6346,6 +6518,26 @@ class AuctionRuntimeController:
         self,
         state: StrategyConsoleState,
     ) -> tuple[str, ...]:
+        opening_bundle = getattr(state.context, "opening_validation_bundle", None)
+        if opening_bundle is not None:
+            ordered_bundle_items = sorted(
+                tuple((getattr(opening_bundle, "confirmed_themes", {}) or {}).values()),
+                key=lambda item: (
+                    str(getattr(item, "tradable_level", "") or "") == "attack",
+                    -float(getattr(item, "amount_2m_rank_pct", 1.0) or 1.0),
+                    bool(getattr(item, "front_row_confirmed", False)),
+                    bool(getattr(item, "mid_follow_confirmed", False)),
+                ),
+                reverse=True,
+            )
+            ordered_names: list[str] = []
+            for item in ordered_bundle_items:
+                name = normalize_plate_name(str(getattr(item, "plate_name", "") or ""))
+                if not name or name == "-" or name in ordered_names:
+                    continue
+                ordered_names.append(name)
+            if ordered_names:
+                return tuple(ordered_names)
         if not state.theme_judge_map:
             return ()
         ordered: list[str] = []
@@ -6480,7 +6672,7 @@ class AuctionRuntimeController:
             seen_symbols.add(decision.symbol)
 
         ranked_candidates.sort(key=lambda item: item[0], reverse=True)
-        return tuple(decision for _score, decision in ranked_candidates[:2])
+        return tuple(decision for _score, decision in ranked_candidates[:3])
 
     def _decision_allowed_in_focus_output(
         self,
@@ -6506,6 +6698,16 @@ class AuctionRuntimeController:
         if self._is_decision_blocked_by_theme_risk(state, decision, phase_label=phase_label):
             return False
         judge, _matched_plate = self._matched_theme_judge(state, snapshot)
+        opening_validation = self._opening_validation_for_display(
+            state,
+            snapshot=snapshot,
+            selection=selection,
+        )
+        opening_confirmed = bool(
+            opening_validation is not None
+            and str(getattr(opening_validation, "validation_state", "") or "") == "confirmed"
+            and str(getattr(opening_validation, "tradable_level", "") or "") in {"attack", "probe"}
+        )
         repair_probe_exception = (
             decision.setup_id == "theme_not_tradable_repair_probe"
             and selection.open_follow_state in {"confirmed", "repair_strength"}
@@ -6516,13 +6718,13 @@ class AuctionRuntimeController:
             if execution_state == "falsified" and decision.action != "hold_only":
                 return False
             if judge.action_class == "anchor_only" and not selection.is_true_leader and decision.action != "hold_only":
-                if not repair_probe_exception:
+                if not repair_probe_exception and not opening_confirmed:
                     return False
             if execution_state == "partial" and decision.action != "hold_only" and tier != "dragon":
-                if not repair_probe_exception:
+                if not repair_probe_exception and not opening_confirmed:
                     return False
             if judge.action_class in {"observe", "anchor_only"} and not selection.is_true_leader and decision.action != "hold_only":
-                if not repair_probe_exception:
+                if not repair_probe_exception and not opening_confirmed:
                     return False
         if (
             phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}
@@ -6531,7 +6733,7 @@ class AuctionRuntimeController:
         ):
             return False
         if not selection.theme_tradable and not selection.is_true_leader and decision.action != "hold_only":
-            if not repair_probe_exception:
+            if not repair_probe_exception and not opening_confirmed:
                 return False
         if decision.action == "observe_only" and not self._can_surface_watch_only_decision(
             state,
@@ -6559,7 +6761,17 @@ class AuctionRuntimeController:
         if self._is_high_dayk_weak_leader_trap(snapshot, selection, phase_label=phase_label):
             return False
         judge, _matched_plate = self._matched_theme_judge(state, snapshot)
-        if judge is not None and judge.action_class == "trap_avoid":
+        opening_validation = self._opening_validation_for_display(
+            state,
+            snapshot=snapshot,
+            selection=selection,
+        )
+        opening_confirmed = bool(
+            opening_validation is not None
+            and str(getattr(opening_validation, "validation_state", "") or "") == "confirmed"
+            and str(getattr(opening_validation, "tradable_level", "") or "") in {"attack", "probe"}
+        )
+        if judge is not None and judge.action_class == "trap_avoid" and not opening_confirmed:
             return False
         if selection.is_true_leader:
             return True
@@ -9057,8 +9269,25 @@ class AuctionRuntimeController:
             phase_label=phase_label,
         ):
             return None
+        if decision.action in {"leader_watch", "front_row_watch", "confirm_then_go"}:
+            return decision.action
+        opening_validation = self._opening_validation_for_display(
+            state,
+            snapshot=snapshot,
+            selection=selection,
+        )
+        opening_confirmed = bool(
+            opening_validation is not None
+            and str(getattr(opening_validation, "validation_state", "") or "") == "confirmed"
+            and str(getattr(opening_validation, "tradable_level", "") or "") in {"attack", "probe"}
+        )
         if selection.is_true_leader:
             return "leader_watch"
+        if opening_confirmed and phase_label in {"opening", "open_confirm", "intraday"}:
+            if selection.open_follow_state in {"confirmed", "repair_strength"}:
+                return "confirm_then_go"
+            if selection.is_front_row and selection.open_undertake_score >= 5.8 and selection.execution_quality_score >= 5.8:
+                return "confirm_then_go"
         if phase_label in {"opening", "open_confirm"} and selection.open_follow_state in {"confirmed", "repair_strength"}:
             return "confirm_then_go"
         if selection.is_front_row:

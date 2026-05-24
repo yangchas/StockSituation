@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .enums import (
     ExecutionEnvironment,
@@ -10,7 +10,6 @@ from .enums import (
     FetchIntent,
     FailedPromotionType,
     LeaderTier,
-    OperatorStyleHint,
     RunPhase,
     SourceName,
     StartupAction,
@@ -144,13 +143,11 @@ class StockProfileAssessment:
     leader_tier: LeaderTier
     stage: StockStage
     failed_promotion_type: FailedPromotionType
-    operator_style_hint: OperatorStyleHint
     feedback_state: FeedbackState
     exposure_state: ExposureState
     trade_window: TradeWindowState
     darkness_exposure_score: int
     continuation_score: int
-    retail_attention_proxy: int
     notes: tuple[str, ...] = ()
 
 
@@ -311,6 +308,7 @@ class StockSelectionContext:
     stock_execution_rank_in_theme_pct: float = 1.0
     stock_shape_rank_in_theme_pct: float = 1.0
     total_score: float = 0.0
+
     notes: tuple[str, ...] = ()
 
 
@@ -389,6 +387,9 @@ class IntradayContext:
     yest_limit_map: Dict[str, dict]
     auction_map: Dict[str, dict]
     session_facts: SessionFacts = field(default_factory=SessionFacts)
+    cached_theme_conclusions: Dict[str, str] = field(default_factory=dict)
+    sector_flow_trajectories: Dict[str, Any] = field(default_factory=dict)
+    opening_validation_bundle: "OpeningValidationBundle | None" = None
     notes: tuple[str, ...] = ()
 
 
@@ -409,6 +410,8 @@ class IntradayMarketSummary:
     emerging_plate_count: int = 0
     fading_plate_count: int = 0
     mainline_switch: bool = False
+    migrating_out_plates: tuple[str, ...] = ()
+    migrating_in_plates: tuple[str, ...] = ()
     total_yest_limit_count: int = 0
     context_auc_amt: float = 0.0
     context_avg_5d_vol: float = 0.0
@@ -433,4 +436,34 @@ class IntradayMarketSummary:
     open_2m_top10_vs_prev_ratio: float = 1.0
     open_2m_top20_vs_prev_ratio: float = 1.0
     battle_status: str = ""
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ThemeOpeningValidation:
+    plate_name: str
+    predicted_script: str
+    validation_state: str
+    tradable_level: str
+    front_row_confirmed: bool = False
+    mid_follow_confirmed: bool = False
+    high_level_feedback: str = "unknown"
+    amount_2m_rank_pct: float = 1.0
+    amount_2m_ratio_vs_auction: float = 0.0
+    net_inflow_delta_yi: float = 0.0
+    is_migrating_in: bool = False
+    is_migrating_out: bool = False
+    evidence: tuple[str, ...] = ()
+    invalid_reason: str = ""
+
+
+@dataclass(frozen=True)
+class OpeningValidationBundle:
+    trade_date: str
+    phase: str
+    confirmed_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    falsified_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    watch_themes: Dict[str, ThemeOpeningValidation] = field(default_factory=dict)
+    main_validated_theme: str = ""
+    backup_validated_theme: str = ""
     notes: tuple[str, ...] = ()

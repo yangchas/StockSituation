@@ -63,6 +63,39 @@ _BEARISH_KLINE_PATTERNS = {"high_open_then_weak", "volume_up_price_flat", "high_
 _ENTRY_VETO_KLINE_PATTERNS = {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}
 
 
+def _watch_action_for_selection(stock_selection: StockSelectionContext | None) -> str:
+    if stock_selection is None:
+        return "observe_only"
+    if stock_selection.is_true_leader:
+        return "leader_watch"
+    if stock_selection.is_front_row:
+        if (
+            stock_selection.open_follow_state in {"confirmed", "repair_strength"}
+            and stock_selection.open_undertake_score >= 5.8
+            and stock_selection.execution_quality_score >= 5.8
+        ):
+            return "confirm_then_go"
+        return "front_row_watch"
+    return "observe_only"
+
+
+def _apply_matrix_action_override(
+    *,
+    current_action: str,
+    override_action: str | None,
+    stock_selection: StockSelectionContext | None,
+) -> str:
+    if not override_action:
+        return current_action
+    if (
+        override_action == "observe_only"
+        and current_action in {"leader_watch", "front_row_watch", "confirm_then_go"}
+    ):
+        fallback_watch = _watch_action_for_selection(stock_selection)
+        return fallback_watch if fallback_watch != "observe_only" else current_action
+    return override_action
+
+
 def build_auction_and_ladder_decision(
     snapshot: StockStateSnapshot,
     *,
@@ -118,8 +151,14 @@ def build_auction_and_ladder_decision(
             reasons.append("theme not fully tradable yet, but open-follow and execution justify a small repair probe")
         elif strong_watch_candidate:
             confidence = 64 if stock_selection is not None and stock_selection.is_true_leader else 60
-            setup_id = "theme_not_tradable_watch"
-            action = "observe_only"
+            action = _watch_action_for_selection(stock_selection)
+            setup_id = (
+                "theme_not_tradable_leader_watch"
+                if action == "leader_watch"
+                else "theme_not_tradable_front_row_watch"
+                if action in {"front_row_watch", "confirm_then_go"}
+                else "theme_not_tradable_watch"
+            )
             reasons.append("theme is not tradable yet, keep only the leader/front-row on watchlist")
         else:
             confidence = 20
@@ -127,10 +166,16 @@ def build_auction_and_ladder_decision(
             action = "observe_only"
             reasons.append("theme is not tradable, so stock-level strength is not enough")
     elif theme_selection is not None and theme_selection.open_confirm_state == "falsified":
-        confidence = 18
-        setup_id = "open_confirm_falsified_guard"
-        action = "observe_only"
-        reasons.append("open confirmation falsified the theme, so entries are blocked")
+        if stock_selection is not None and stock_selection.is_true_leader:
+            confidence = 44
+            setup_id = "open_confirm_falsified_leader_watch"
+            action = "leader_watch"
+            reasons.append("open confirmation falsified the theme, keep only the leader alive on watch")
+        else:
+            confidence = 18
+            setup_id = "open_confirm_falsified_guard"
+            action = "observe_only"
+            reasons.append("open confirmation falsified the theme, so entries are blocked")
     elif (
         theme_selection is not None
         and theme_selection.fakeout_level in {"high", "extreme"}
@@ -198,7 +243,7 @@ def build_auction_and_ladder_decision(
             confidence -= 6
             reasons.append("back-row participant gets downgraded")
 
-        confidence += _clamp((stock_selection.total_score - 5.0) * 3.0, minimum=-12, maximum=15)
+
         confidence += _clamp((stock_selection.activity_score - 5.0) * 2.0, minimum=-8, maximum=10)
         if stock_selection.kline_score < 4.0:
             confidence -= 5
@@ -239,7 +284,8 @@ def build_auction_and_ladder_decision(
             stock_selection.kline_pattern in _ENTRY_VETO_KLINE_PATTERNS
             and action not in ("hold_only", "observe_only", "avoid_after_failed_promotion", "do_not_chase")
         ):
-            action = "observe_only"
+            downgraded_watch = _watch_action_for_selection(stock_selection)
+            action = downgraded_watch if downgraded_watch != "observe_only" else "observe_only"
             setup_id = "weak_shape_guard"
             reasons.append("weak opening shape blocks active entry until structure repairs")
         elif (
@@ -282,7 +328,7 @@ def build_auction_and_ladder_decision(
             and stock_selection is not None
             and stock_selection.open_follow_state in {"weak_follow", "faded"}
         ):
-            action = "observe_only"
+            action = _watch_action_for_selection(stock_selection)
             confidence -= 14
             setup_id = "fakeout_hold_downgrade"
             reasons.append("fakeout-heavy theme cannot keep weak hold-only leader in core action")
@@ -296,16 +342,18 @@ def build_auction_and_ladder_decision(
     if matrix_outcome.label != "neutral":
         confidence += int(matrix_outcome.confidence_delta)
         reasons.extend(matrix_outcome.notes)
-        if (
-            matrix_outcome.action_override is not None
-            and action not in {"hold_only", "avoid_after_failed_promotion", "do_not_chase"}
-        ):
-            action = matrix_outcome.action_override
+        if matrix_outcome.action_override is not None and action != "avoid_after_failed_promotion":
+            action = _apply_matrix_action_override(
+                current_action=action,
+                override_action=matrix_outcome.action_override,
+                stock_selection=stock_selection,
+            )
             setup_id = matrix_outcome.label
 
     if is_high_dayk_weak_trap(snapshot, stock_selection, theme_selection):
         if action == "hold_only":
-            action = "observe_only"
+            downgraded_watch = _watch_action_for_selection(stock_selection)
+            action = downgraded_watch if downgraded_watch != "observe_only" else "observe_only"
             setup_id = "high_dayk_weak_hold_guard"
             confidence -= 16
             reasons.append("high dayK leader with weak follow-through should exit core hold recommendation")
@@ -328,7 +376,8 @@ def build_auction_and_ladder_decision(
 
     risk_reward = _risk_reward_ratio(snapshot, profile)
     if risk_reward < 2.0 and action not in ("hold_only", "observe_only", "avoid_after_failed_promotion", "do_not_chase"):
-        action = "observe_only"
+        downgraded_watch = _watch_action_for_selection(stock_selection)
+        action = downgraded_watch if downgraded_watch != "observe_only" else "observe_only"
         setup_id = "risk_reward_filtered"
         reasons.append("risk-reward is below the minimum threshold")
 
@@ -339,7 +388,7 @@ def build_auction_and_ladder_decision(
     else:
         kelly_position = _calc_kelly_position(win_rate=win_rate)
 
-    if action in ("avoid_after_failed_promotion", "do_not_chase", "observe_only"):
+    if action in ("avoid_after_failed_promotion", "do_not_chase", "observe_only", "leader_watch", "front_row_watch", "confirm_then_go"):
         kelly_position = 0.02
 
     return AuctionLadderDecision(

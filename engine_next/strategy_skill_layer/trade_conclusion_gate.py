@@ -31,26 +31,21 @@ def stock_passes_conclusion_gate(
         return bool(
             selection.is_front_row
             and selection.theme_tradable
-            and selection.theme_core_score >= 7.2
-            and selection.shape_quality_score >= 6.4
-            and selection.execution_quality_score >= 6.2
-            and selection.open_undertake_score >= 5.8
-            and (selection.hot_rank <= 80 or selection.total_score >= 8.0)
+            and selection.hot_rank <= 80
+            and snapshot is not None and snapshot.leader_rank_in_theme <= 2
         )
     if permission == "limited":
         if selection.is_true_leader:
             return True
         if selection.leader_bucket not in {"front_row", "leader", "front_core"} and not selection.is_front_row:
             return False
-        if selection.open_undertake_score < 5.4 and selection.execution_quality_score < 5.8:
+        if snapshot is not None and snapshot.leader_rank_in_theme > 5:
             return False
         return True
     if permission == "promote":
         if selection.is_true_leader or selection.is_front_row:
             return True
-        if snapshot is not None and snapshot.leader_rank_in_theme <= 3:
-            return True
-        if selection.open_undertake_score >= 6.0 and selection.execution_quality_score >= 6.0:
+        if snapshot is not None and snapshot.leader_rank_in_theme <= 4:
             return True
         return False
     return True

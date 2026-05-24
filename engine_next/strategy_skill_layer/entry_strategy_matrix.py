@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from engine_next.domain.models import StockSelectionContext, StockStateSnapshot, ThemeSelectionContext
 from engine_next.strategy_skill_layer.slice_comparison import build_opening_2m_slice_comparison
+from engine_next.strategy_skill_layer.market_regime_resolver import market_is_defense, market_is_attack
 
 
 _REPAIR_PATTERNS = {"low_open_strength", "pullback_repair", "n_rebound"}
@@ -28,19 +29,13 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 def _market_is_defense(theme_selection: ThemeSelectionContext | None, market_summary: object | None) -> bool:
     if theme_selection is not None and str(theme_selection.market_regime or "") == "defense":
         return True
-    battle = str(getattr(market_summary, "battle_status", "") or "").lower()
-    sentiment = _safe_float(getattr(market_summary, "sentiment_score", 0.0))
-    red_open_rate = _safe_float(getattr(market_summary, "red_open_rate", 0.0))
-    return battle in {"defense", "bearish", "frozen"} or sentiment <= 4.8 or red_open_rate <= 0.42
+    return market_is_defense(market_summary)
 
 
 def _market_is_attack(theme_selection: ThemeSelectionContext | None, market_summary: object | None) -> bool:
     if theme_selection is not None and str(theme_selection.market_regime or "") == "attack":
         return True
-    battle = str(getattr(market_summary, "battle_status", "") or "").lower()
-    sentiment = _safe_float(getattr(market_summary, "sentiment_score", 0.0))
-    promotion_rate = _safe_float(getattr(market_summary, "promotion_rate", 0.0))
-    return battle in {"bullish", "attack"} or sentiment >= 6.2 or promotion_rate >= 0.32
+    return market_is_attack(market_summary)
 
 
 def _is_true_core(stock_selection: StockSelectionContext) -> bool:
@@ -72,6 +67,17 @@ def evaluate_entry_strategy_matrix(
     mainline_switch = bool(getattr(market_summary, "mainline_switch", False))
     amount_ratio_2m = (snapshot.amount_2m / snapshot.auction_amount) if snapshot.auction_amount > 0 else 0.0
     is_true_core = _is_true_core(stock_selection)
+
+    migrating_out = getattr(market_summary, "migrating_out_plates", ())
+    is_flow_withdrawing = theme_selection.plate_name in migrating_out
+
+    if is_flow_withdrawing and not stock_selection.is_true_leader:
+        return EntryStrategyMatrixOutcome(
+            label="sector_flow_withdrawal_trap",
+            confidence_delta=-20,
+            action_override="observe_only",
+            notes=("matrix=sector_flow_withdrawal_trap net_inflow_dropping_sharply",),
+        )
 
     if (
         stock_selection.auction_open_bucket in {"overheat_high_open", "near_limit_open"}

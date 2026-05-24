@@ -26,6 +26,7 @@ from engine_next.runtime.session_facts import (
 )
 from engine_next.runtime.tick_window_tracker import TickWindowTracker
 from engine_next.runtime.tick_window_tracker import TickWindowMetrics
+from engine_next.strategy_skill_layer.sector_flow_tracker import SectorFlowTracker
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -119,6 +120,7 @@ class IntradayContextBuilder:
         self._rust_feed = None
         self._f10_service: Any | None = None
         self._f10_name_cache: dict[str, str] = {}
+        self._sector_flow_tracker = SectorFlowTracker(self._hub)
 
     @property
     def hub(self) -> IntradayDataHub:
@@ -628,6 +630,26 @@ class IntradayContextBuilder:
             market_runtime_state=primed.market_runtime_state,
             previous_market_runtime_state=self._load_market_runtime_state(primed.previous_trade_date),
         )
+        cached_conclusions = self._load_string_hash(f"cache:theme_conclusions:{primed.trade_date}")
+        sector_flow_trajectories = self._sector_flow_tracker.update_and_evaluate(
+            trade_date=primed.trade_date,
+            phase=primed.phase,
+            session_facts=session_facts,
+            timestamp_ms=primed.latest_quote_timestamp_ms,
+        )
+
+        migrating_out_plates = [plate for plate, traj in sector_flow_trajectories.items() if traj.is_withdrawing]
+        migrating_in_plates = [plate for plate, traj in sector_flow_trajectories.items() if traj.is_accelerating]
+        
+        # update market summary with migration data
+        market_summary = type(market_summary)(
+            **{
+                **market_summary.__dict__,
+                "migrating_out_plates": tuple(migrating_out_plates),
+                "migrating_in_plates": tuple(migrating_in_plates),
+            }
+        )
+
         return IntradayContext(
             phase=primed.phase,
             trade_date=primed.trade_date,
@@ -639,6 +661,8 @@ class IntradayContextBuilder:
             yesterday_hot_plate_map=primed.yesterday_hot_plate_map,
             yest_limit_map=primed.yest_limit_map,
             auction_map=auction_map,
+            cached_theme_conclusions=cached_conclusions,
+            sector_flow_trajectories=sector_flow_trajectories,
             notes=primed.notes,
         )
 
@@ -863,6 +887,28 @@ class IntradayContextBuilder:
         )
         self._string_key_cache[self._session_facts_cache_key(trade_date, phase)] = payload
         self._string_key_cache[self._session_facts_meta_key(trade_date, phase)] = meta
+
+    def write_cached_theme_conclusions(self, trade_date: str, conclusions: dict[str, str]) -> None:
+        if not conclusions:
+            return
+        redis_key = f"cache:theme_conclusions:{trade_date}"
+        self.hub.redis.hset(redis_key, mapping=conclusions)
+        self.hub.redis.expire(redis_key, 300)
+        # update memory cache immediately
+        self._string_hash_cache[redis_key] = conclusions
+
+    def _load_string_hash(self, redis_key: str) -> dict[str, str]:
+        if redis_key in self._string_hash_cache:
+            return self._string_hash_cache[redis_key]
+        try:
+            raw_hash = self.hub.redis.hgetall(redis_key)
+            if not raw_hash:
+                return {}
+            decoded = {k.decode("utf-8") if isinstance(k, bytes) else str(k): v.decode("utf-8") if isinstance(v, bytes) else str(v) for k, v in raw_hash.items()}
+            self._string_hash_cache[redis_key] = decoded
+            return decoded
+        except Exception:
+            return {}
 
     def _plate_persistence_score(
         self,

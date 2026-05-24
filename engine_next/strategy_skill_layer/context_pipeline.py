@@ -10,7 +10,9 @@ from engine_next.domain.models import (
     StockSelectionContext,
     ThemeSelectionContext,
 )
+from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.strategy_skill_layer.auction_and_ladder import build_auction_and_ladder_decision
+from engine_next.strategy_skill_layer.opening_validation_hub import match_opening_validation
 from engine_next.strategy_skill_layer.shape_engine import (
     build_stock_selection_context,
     build_theme_context_map,
@@ -43,6 +45,7 @@ class _CachedStockSelectionEntry:
 
 
 _STOCK_SELECTION_CACHE: dict[tuple[str, str], _CachedStockSelectionEntry] = {}
+_THEME_CONCLUSION_CACHE_TTL_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,19 @@ class _RelativeStrengthProfile:
     shape_quality_top: frozenset[str]
     turnover_quality_top: frozenset[str]
     theme_core_top: frozenset[str]
+
+
+def _decision_action_priority(action: str) -> int:
+    priority_map = {
+        "dragon_early_board": 5,
+        "early_boarding_candidate": 4,
+        "confirm_then_go": 3,
+        "small_probe_only": 2,
+        "leader_watch": 2,
+        "front_row_watch": 1,
+        "n_rebound": 1,
+    }
+    return priority_map.get(str(action or ""), 0)
 
 
 def _rank_pct_desc(pairs: list[tuple[str, float]]) -> dict[str, float]:
@@ -167,6 +183,27 @@ def _stock_selection_signature(
     )
 
 
+def _persist_theme_conclusions(
+    context: IntradayContext,
+    theme_context_map: dict[str, ThemeSelectionContext],
+) -> None:
+    conclusions = {
+        plate: str(getattr(theme_context, "trade_conclusion", "") or "").strip()
+        for plate, theme_context in theme_context_map.items()
+        if str(getattr(theme_context, "trade_conclusion", "") or "").strip()
+        and str(getattr(theme_context, "trade_conclusion", "") or "").strip() != "unknown"
+    }
+    if not conclusions:
+        return
+    try:
+        hub = IntradayDataHub()
+        redis_key = f"cache:theme_conclusions:{context.trade_date}"
+        hub.redis.hset(redis_key, mapping=conclusions)
+        hub.redis.expire(redis_key, _THEME_CONCLUSION_CACHE_TTL_SECONDS)
+    except Exception:
+        return
+
+
 def build_context_strategy_bundle(context: IntradayContext) -> ContextStrategyBundle:
     return build_context_strategy_bundle_for_symbols(context, symbols=None)
 
@@ -192,6 +229,7 @@ def build_context_strategy_bundle_for_symbols(
         else 0.0
     )
     resolved_theme_context_map = theme_context_map or build_theme_context_map(context, tuple(context.stock_snapshots))
+    _persist_theme_conclusions(context, resolved_theme_context_map)
     profiles = tuple(assess_stock_profile(snapshot) for snapshot in selected_snapshots)
     _prune_stock_selection_cache(context.trade_date)
     stock_selection_context_list: list[StockSelectionContext] = []
@@ -228,29 +266,28 @@ def build_context_strategy_bundle_for_symbols(
         for snapshot, profile, selection in zip(selected_snapshots, profiles, stock_selection_contexts)
     )
 
+    pre_rank_bundle = ContextStrategyBundle(
+        context=context,
+        profiles=profiles,
+        theme_context_map=resolved_theme_context_map,
+        stock_selection_contexts=stock_selection_contexts,
+        decisions=decisions,
+        focus_symbols=(),
+        notes=(),
+    )
+    upgraded_bundle = _upgrade_bundle_decisions_by_opening_validation(pre_rank_bundle)
+    upgraded_decisions = upgraded_bundle.decisions
+
     ranked = sorted(
-        zip(decisions, stock_selection_contexts),
+        zip(upgraded_decisions, stock_selection_contexts),
         key=lambda pair: (
             pair[1].theme_tradable,
-            float(getattr(resolved_theme_context_map.get(pair[1].plate_name), "phase_priority_bias", 0.0) or 0.0),
-            pair[1].total_score,
-            pair[1].execution_quality_score,
-            pair[1].open_undertake_score,
-            pair[1].shape_quality_score,
-            pair[1].heat_flow_score,
-            -pair[1].hot_rank,
-            pair[1].is_active_pool,
-            pair[1].theme_core_score,
-            pair[1].activity_score,
-            pair[1].kline_score,
-            pair[1].structure_score,
+            _decision_action_priority(pair[0].action),
             pair[1].is_true_leader,
             pair[1].is_front_row,
-            pair[0].action == "dragon_early_board",
-            pair[0].action == "early_boarding_candidate",
-            pair[0].action == "hold_only",
             pair[0].confidence,
-            pair[0].profile.continuation_score,
+            -pair[1].hot_rank,
+            pair[1].is_active_pool,
             pair[0].risk_reward_ratio,
         ),
         reverse=True,
@@ -272,7 +309,7 @@ def build_context_strategy_bundle_for_symbols(
         f"stock_ctx_recomputed={stock_ctx_recomputed}",
         f"stock_ctx_reused={stock_ctx_reused}",
     )
-    return ContextStrategyBundle(
+    bundle = ContextStrategyBundle(
         context=context,
         profiles=profiles,
         theme_context_map=resolved_theme_context_map,
@@ -281,6 +318,7 @@ def build_context_strategy_bundle_for_symbols(
         focus_symbols=focus_symbols,
         notes=notes,
     )
+    return bundle
 
 
 def _passes_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
@@ -305,11 +343,7 @@ def _passes_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
         front_row_override = bool(
             selection.is_front_row
             and selection.theme_tradable
-            and selection.theme_core_score >= 7.2
-            and selection.shape_quality_score >= 6.4
-            and selection.execution_quality_score >= 6.2
-            and selection.open_undertake_score >= 5.8
-            and (selection.hot_rank <= 80 or selection.total_score >= 8.0)
+            and selection.hot_rank <= 80
         )
         if not front_row_override:
             return False
@@ -468,7 +502,7 @@ def _passes_shape_quality_gate(selection, snapshot, relative_profile: _RelativeS
         return False
     if not selection.is_true_leader and selection.open_undertake_score < 4.8 and selection.execution_quality_score < 5.4:
         return False
-    if selection.total_score < 5.8 and not selection.is_true_leader:
+    if not selection.is_front_row and not selection.is_true_leader:
         return False
     if (
         not selection.is_true_leader
@@ -532,13 +566,36 @@ def _passes_heat_and_board_gate(selection, snapshot, relative_profile: _Relative
     return True
 
 
-def _passes_action_gate(decision, selection, min_confidence: int) -> bool:
+def _passes_action_gate(
+    bundle: ContextStrategyBundle,
+    decision,
+    selection,
+    snapshot,
+    min_confidence: int,
+) -> bool:
     if selection is not None and decision.action in {"dragon_early_board", "early_boarding_candidate"}:
         if selection.timing_score < 4.5 and not selection.is_true_leader:
             return False
     if decision.confidence < min_confidence:
         return False
-    if decision.action in ("observe_only", "avoid_after_failed_promotion", "do_not_chase"):
+    if decision.action in ("avoid_after_failed_promotion", "do_not_chase"):
+        return False
+    if decision.action == "observe_only":
+        validation = _opening_validation_for_selection(bundle, selection, snapshot)
+        if (
+            validation is not None
+            and selection is not None
+            and str(getattr(validation, "validation_state", "") or "") == "confirmed"
+            and str(getattr(validation, "tradable_level", "") or "") in {"attack", "probe"}
+        ):
+            if selection.is_true_leader:
+                return True
+            return bool(
+                selection.is_front_row
+                and selection.open_follow_state not in {"weak_follow", "faded"}
+                and selection.open_undertake_score >= 5.8
+                and selection.execution_quality_score >= 5.8
+            )
         return False
     return True
 
@@ -598,7 +655,6 @@ def _passes_watch_shape_quality_gate(selection, snapshot, relative_profile: _Rel
         (selection.is_true_leader or selection.is_front_row or strong_non_hot_signal)
         and selection.execution_quality_score >= 5.4
         and selection.open_undertake_score >= 5.0
-        and selection.total_score >= 5.2
     )
 
 
@@ -616,6 +672,170 @@ def _passes_watch_heat_and_board_gate(selection, snapshot, relative_profile: _Re
     )
 
 
+def _opening_validation_for_selection(
+    bundle: ContextStrategyBundle,
+    selection: StockSelectionContext | None,
+    snapshot=None,
+):
+    return match_opening_validation(
+        getattr(bundle.context, "opening_validation_bundle", None),
+        snapshot=snapshot,
+        selection=selection,
+    )
+
+
+def _upgrade_decision_action_by_opening_validation(
+    bundle: ContextStrategyBundle,
+    decision: AuctionLadderDecision,
+    selection: StockSelectionContext | None,
+    snapshot,
+) -> AuctionLadderDecision:
+    if selection is None or snapshot is None or decision.action != "observe_only":
+        return decision
+    validation = _opening_validation_for_selection(bundle, selection, snapshot)
+    if validation is None:
+        return decision
+    if str(getattr(validation, "validation_state", "") or "") != "confirmed":
+        return decision
+    if str(getattr(validation, "tradable_level", "") or "") not in {"attack", "probe"}:
+        return decision
+    if selection.is_true_leader:
+        return replace(
+            decision,
+            action="leader_watch",
+            setup_id="opening_validation_leader_watch",
+            confidence=max(int(getattr(decision, "confidence", 0) or 0), 72),
+            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.03),
+            reasons=tuple(decision.reasons) + ("opening validation confirmed the theme leader",),
+        )
+    if (
+        selection.is_front_row
+        and selection.open_follow_state in {"confirmed", "repair_strength"}
+        and selection.open_undertake_score >= 5.8
+        and selection.execution_quality_score >= 5.8
+    ):
+        return replace(
+            decision,
+            action="confirm_then_go",
+            setup_id="opening_validation_confirm_then_go",
+            confidence=max(int(getattr(decision, "confidence", 0) or 0), 68),
+            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.04),
+            reasons=tuple(decision.reasons) + ("opening validation confirmed a front-row continuation candidate",),
+        )
+    if (
+        selection.is_front_row
+        and selection.open_follow_state not in {"weak_follow", "faded"}
+        and selection.open_undertake_score >= 5.6
+        and selection.execution_quality_score >= 5.6
+    ):
+        return replace(
+            decision,
+            action="front_row_watch",
+            setup_id="opening_validation_front_row_watch",
+            confidence=max(int(getattr(decision, "confidence", 0) or 0), 64),
+            kelly_position_pct=max(float(getattr(decision, "kelly_position_pct", 0.02) or 0.02), 0.03),
+            reasons=tuple(decision.reasons) + ("opening validation kept the front row tradable after the open",),
+        )
+    return decision
+
+
+def _upgrade_bundle_decisions_by_opening_validation(
+    bundle: ContextStrategyBundle,
+) -> ContextStrategyBundle:
+    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
+    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
+    upgraded = tuple(
+        _upgrade_decision_action_by_opening_validation(
+            bundle,
+            decision,
+            stock_context_map.get(decision.symbol),
+            snapshot_map.get(decision.symbol),
+        )
+        for decision in bundle.decisions
+    )
+    if upgraded == bundle.decisions:
+        return bundle
+    return replace(bundle, decisions=upgraded)
+
+
+def _opening_validation_trade_conclusion_override(
+    bundle: ContextStrategyBundle,
+    selection: StockSelectionContext | None,
+    snapshot,
+) -> bool:
+    validation = _opening_validation_for_selection(bundle, selection, snapshot)
+    if validation is None or selection is None or snapshot is None:
+        return False
+    state = str(getattr(validation, "validation_state", "") or "")
+    tradable_level = str(getattr(validation, "tradable_level", "") or "")
+    if state != "confirmed" or tradable_level not in {"attack", "probe"}:
+        return False
+    if selection.is_true_leader:
+        return True
+    if not selection.is_front_row:
+        return False
+    if selection.open_follow_state in {"weak_follow", "faded"}:
+        return False
+    if float(getattr(snapshot, "amount_2m", 0.0) or 0.0) <= 0.0:
+        return False
+    return bool(
+        selection.open_undertake_score >= 5.6
+        and selection.execution_quality_score >= 5.6
+    )
+
+
+def _passes_opening_validation_trade_gate(
+    bundle: ContextStrategyBundle,
+    decision: AuctionLadderDecision,
+    selection: StockSelectionContext | None,
+    snapshot=None,
+) -> bool:
+    validation = _opening_validation_for_selection(bundle, selection, snapshot)
+    if validation is None or selection is None:
+        return True
+    state = str(getattr(validation, "validation_state", "") or "")
+    tradable_level = str(getattr(validation, "tradable_level", "") or "")
+    if state == "confirmed":
+        if tradable_level == "attack":
+            return True
+        if tradable_level == "probe":
+            return bool(
+                selection.is_true_leader
+                or selection.is_front_row
+                or decision.action in {"small_probe_only", "leader_watch", "front_row_watch", "confirm_then_go"}
+            )
+        return selection.is_true_leader
+    if state == "watch":
+        return bool(
+            selection.is_true_leader
+            or (
+                selection.is_front_row
+                and selection.open_undertake_score >= 5.8
+                and selection.execution_quality_score >= 5.8
+            )
+        )
+    if state == "falsified" or tradable_level == "avoid":
+        return selection.is_true_leader
+    return True
+
+
+def _passes_opening_validation_watch_gate(
+    bundle: ContextStrategyBundle,
+    selection: StockSelectionContext | None,
+    snapshot=None,
+) -> bool:
+    validation = _opening_validation_for_selection(bundle, selection, snapshot)
+    if validation is None or selection is None:
+        return True
+    state = str(getattr(validation, "validation_state", "") or "")
+    tradable_level = str(getattr(validation, "tradable_level", "") or "")
+    if state in {"confirmed", "watch"}:
+        return True
+    if state == "falsified" or tradable_level == "avoid":
+        return selection.is_true_leader
+    return True
+
+
 def filter_trade_candidates(
     bundle: ContextStrategyBundle,
     *,
@@ -630,13 +850,18 @@ def filter_trade_candidates(
         snapshot = snapshot_map.get(decision.symbol)
         theme_context_map = getattr(bundle, "theme_context_map", None)
         theme_context = theme_context_map.get(selection.plate_name) if isinstance(theme_context_map, dict) and selection is not None else None
-        if not _passes_trade_conclusion_gate(selection, snapshot, theme_context):
+        if (
+            not _passes_trade_conclusion_gate(selection, snapshot, theme_context)
+            and not _opening_validation_trade_conclusion_override(bundle, selection, snapshot)
+        ):
+            continue
+        if not _passes_opening_validation_trade_gate(bundle, decision, selection, snapshot):
             continue
         if not _passes_shape_quality_gate(selection, snapshot, relative_profile):
             continue
         if not _passes_heat_and_board_gate(selection, snapshot, relative_profile):
             continue
-        if not _passes_action_gate(decision, selection, min_confidence):
+        if not _passes_action_gate(bundle, decision, selection, snapshot, min_confidence):
             continue
         candidates.append(decision)
     return tuple(candidates)
@@ -657,6 +882,8 @@ def filter_watch_candidates(
         theme_context_map = getattr(bundle, "theme_context_map", None)
         theme_context = theme_context_map.get(selection.plate_name) if isinstance(theme_context_map, dict) and selection is not None else None
         if not _passes_watch_trade_conclusion_gate(selection, snapshot, theme_context):
+            continue
+        if not _passes_opening_validation_watch_gate(bundle, selection, snapshot):
             continue
         if not _passes_watch_shape_quality_gate(selection, snapshot, relative_profile):
             continue

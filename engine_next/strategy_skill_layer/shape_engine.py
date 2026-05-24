@@ -10,6 +10,7 @@ from engine_next.strategy_skill_layer.theme_selection_context_factory import (
 )
 from engine_next.strategy_skill_layer.theme_trade_facts import build_theme_trade_fact_map
 from engine_next.strategy_skill_layer.theme_trade_labels import classify_theme_trade_label
+from engine_next.strategy_skill_layer.market_regime_resolver import resolve_market_regime
 
 
 def _safe_float(value: object) -> float:
@@ -257,16 +258,7 @@ def filter_shape_eval_scope(
 
 
 def market_regime_from_context(context: IntradayContext) -> str:
-    summary = context.market_summary
-    sentiment = _safe_float(getattr(summary, "sentiment_score", 0.0))
-    promotion_rate = _safe_float(getattr(summary, "promotion_rate", 0.0))
-    red_open_rate = _safe_float(getattr(summary, "red_open_rate", 0.0))
-    battle_status = str(getattr(summary, "battle_status", "") or "").lower()
-    if sentiment >= 6.5 or battle_status in {"bullish", "attack"} or promotion_rate >= 0.32:
-        return "attack"
-    if sentiment <= 4.2 or battle_status in {"bearish", "defense", "frozen"} or red_open_rate <= 0.42:
-        return "defense"
-    return "neutral"
+    return resolve_market_regime(context.market_summary)
 
 
 def build_theme_context_map(
@@ -427,13 +419,17 @@ def build_theme_context_map(
         elif trade_label == "independent_hug" and tradable:
             bias_action = "front_row_watch"
 
-        trade_conclusion = resolve_theme_trade_conclusion(
-            theme_trade_label=trade_label,
-            open_confirm_state="unknown",
-            fakeout_level=fakeout_level,
-            leader_count=leader_count,
-            yest_limit_count=yest_limit_count,
-        )
+        cached_conclusion = context.cached_theme_conclusions.get(plate_name)
+        if cached_conclusion and cached_conclusion != "unknown":
+            trade_conclusion = cached_conclusion
+        else:
+            trade_conclusion = resolve_theme_trade_conclusion(
+                theme_trade_label=trade_label,
+                open_confirm_state="unknown",
+                fakeout_level=fakeout_level,
+                leader_count=leader_count,
+                yest_limit_count=yest_limit_count,
+            )
         breadth_score = _clamp_score(
             (
                 min(red_count / max(len(plate_snapshots), 1), 1.0) * 4.0
@@ -1042,88 +1038,27 @@ def build_stock_selection_context(
         )
     )
 
-    plain_promotion_penalty = 0.0
-    if (
-        snapshot.lb_days >= 1
-        and not is_true_leader
-        and hot_rank > 100
-        and hot_heat < 20_000
-        and snapshot.leader_rank_in_theme > 5
-        and theme_core_score < 6.5
-        and activity_score < 6.0
-        and structure_score < 6.0
-    ):
-        plain_promotion_penalty = -2.2
-    if (
-        not is_true_leader
-        and snapshot.lb_days >= 1
-        and hot_rank > 80
-        and hot_heat < 25_000
-        and turnover_quality_score < 5.2
-        and shape_quality_score < 5.8
-        and not non_hot_front_row_strength
-    ):
-        plain_promotion_penalty -= 1.6
-    if (
-        not is_true_leader
-        and snapshot.leader_rank_in_theme > 5
-        and snapshot.auction_amount < 15_000_000
-        and snapshot.amount_2m < 15_000_000
-        and execution_quality_score < 5.5
-    ):
-        plain_promotion_penalty -= 1.2
-    if (
-        snapshot.lb_days >= 1
-        and not is_true_leader
-        and hot_rank > 60
-        and heat_flow_score < 5.0
-        and open_undertake_score < 5.6
-        and not non_hot_front_row_strength
-    ):
-        plain_promotion_penalty -= 2.4
-    if (
-        snapshot.lb_days >= 1
-        and not is_true_leader
-        and snapshot.leader_rank_in_theme > 3
-        and snapshot.auction_amount < 20_000_000
-        and snapshot.amount_2m < 25_000_000
-        and execution_quality_score < 6.0
-        and not non_hot_front_row_strength
-    ):
-        plain_promotion_penalty -= 1.8
-    if (
-        snapshot.lb_days >= 1
-        and not is_true_leader
-        and kline_pattern in {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}
-        and execution_quality_score < 6.0
-    ):
-        plain_promotion_penalty -= 2.2
-    hot_execution_bonus = 0.0
-    if hot_rank <= 30 and heat_flow_score >= 5.5 and open_undertake_score >= 5.8:
-        hot_execution_bonus += 1.2
-    elif hot_rank <= 50 and heat_flow_score >= 5.0 and open_undertake_score >= 5.4:
-        hot_execution_bonus += 0.6
-    elif non_hot_front_row_strength:
-        hot_execution_bonus += 0.9
     total_score = round(
-        activity_score * 0.18
-        + theme_core_score * 0.14
-        + kline_score * 0.18
-        + structure_score * 0.16
-        + chip_score * 0.12
+        activity_score * 0.14
+        + theme_core_score * 0.16
+        + kline_score * 0.10
+        + structure_score * 0.10
+        + chip_score * 0.08
         + auction_score * 0.08
         + timing_score * 0.06
-        + open_undertake_score * 0.14
-        + shape_quality_score * 0.16
-        + execution_quality_score * 0.14
-        + (1.0 if is_active_pool else -1.0)
-        + (1.0 if is_front_row else 0.0)
-        + (1.0 if theme_tradable else -1.0)
-        + quality_gate_bonus
-        + plain_promotion_penalty
-        + hot_execution_bonus,
+        + open_undertake_score * 0.12
+        + shape_quality_score * 0.08
+        + execution_quality_score * 0.08
+        + factor_edge_score * 0.04
+        + dde_flow_score * 0.04
+        + (0.6 if is_true_leader else 0.0)
+        + (0.4 if is_front_row else 0.0)
+        + (0.4 if theme_tradable else -0.2)
+        + quality_gate_bonus,
         2,
     )
+
+
 
     notes = [
         f"active_pool={int(is_active_pool)}",

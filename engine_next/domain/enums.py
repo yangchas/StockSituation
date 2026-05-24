@@ -117,8 +117,3 @@ class FailedPromotionType(str, Enum):
     UNKNOWN = "unknown"
 
 
-class OperatorStyleHint(str, Enum):
-    HOT_MONEY = "hot_money"
-    INSTITUTION = "institution"
-    MIXED = "mixed"
-    UNKNOWN = "unknown"
