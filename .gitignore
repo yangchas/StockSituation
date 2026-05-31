@@ -255,6 +255,8 @@ web/tests/
 tools/replay_audit/
 *.json
 *.md
+!.codex/skills/continuous-code-improvement-audit/SKILL.md
+!docs/audit/continuous-code-improvement.md
 *.csv
 *.txt
 *.png

@@ -94,6 +94,14 @@ class ExposureState(str, Enum):
     OVEREXPOSED = "overexposed"
 
 
+class OperatorStyleHint(str, Enum):
+    UNKNOWN = "unknown"
+    LEADER_RELAY = "leader_relay"
+    TREND_FOLLOW = "trend_follow"
+    REPAIR_LOW_SUCTION = "repair_low_suction"
+    AVOID_CHASE = "avoid_chase"
+
+
 class TradeWindowState(str, Enum):
     EARLY_BOARDING = "early_boarding"
     CHASE_RISK = "chase_risk"
@@ -115,5 +123,4 @@ class FailedPromotionType(str, Enum):
     INTRADAY_RELOCK_FAIL = "intraday_relock_fail"
     WEAK_CONTINUATION = "weak_continuation"
     UNKNOWN = "unknown"
-
 

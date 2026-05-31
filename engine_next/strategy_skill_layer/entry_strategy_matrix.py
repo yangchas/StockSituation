@@ -43,10 +43,8 @@ def _is_true_core(stock_selection: StockSelectionContext) -> bool:
         stock_selection.is_true_leader
         or (
             stock_selection.is_front_row
-            and stock_selection.theme_core_score >= 7.0
             and stock_selection.stock_amount_2m_rank_in_theme_pct <= 0.25
-            and stock_selection.stock_execution_rank_in_theme_pct <= 0.25
-            and stock_selection.stock_shape_rank_in_theme_pct <= 0.30
+            and stock_selection.open_follow_state in {"confirmed", "repair_strength"}
         )
     )
 
@@ -106,7 +104,6 @@ def evaluate_entry_strategy_matrix(
         and stock_selection.daily_height_bucket != "high"
         and stock_selection.stock_amount_2m_rank_in_theme_pct <= 0.35
         and stock_selection.stock_amount_ratio_2m_rank_in_theme_pct <= 0.45
-        and stock_selection.stock_execution_rank_in_theme_pct <= 0.40
         and stock_selection.kline_pattern in _ATTACK_PATTERNS
         and (market_attack or open2m.is_strong or amount_ratio_2m >= 1.2)
     ):
@@ -127,8 +124,6 @@ def evaluate_entry_strategy_matrix(
         and stock_selection.is_front_row
         and stock_selection.open_follow_state == "confirmed"
         and stock_selection.stock_amount_ratio_2m_rank_in_theme_pct <= 0.45
-        and stock_selection.stock_execution_rank_in_theme_pct <= 0.45
-        and stock_selection.stock_shape_rank_in_theme_pct <= 0.50
         and stock_selection.kline_pattern in _ATTACK_PATTERNS
         and (
             stock_selection.daily_height_bucket in {"low", "mid"}
@@ -175,7 +170,6 @@ def evaluate_entry_strategy_matrix(
         and stock_selection.open_follow_state in {"confirmed", "repair_strength"}
         and stock_selection.daily_height_bucket in {"low", "mid"}
         and stock_selection.stock_amount_ratio_2m_rank_in_theme_pct <= 0.45
-        and stock_selection.stock_execution_rank_in_theme_pct <= 0.45
         and stock_selection.kline_pattern in _REPAIR_PATTERNS
         and stock_selection.auction_open_bucket in {"deep_low_open", "low_open", "flat_open"}
         and (
@@ -197,7 +191,6 @@ def evaluate_entry_strategy_matrix(
         and theme_selection.plate_role in {"leader", "defensive_holder", "neutral"}
         and theme_selection.plate_resistance_score <= 5.8
         and stock_selection.open_follow_state in {"confirmed", "repair_strength"}
-        and stock_selection.stock_execution_rank_in_theme_pct <= 0.25
         and stock_selection.stock_amount_ratio_2m_rank_in_theme_pct <= 0.35
         and (
             stock_selection.daily_height_bucket in {"low", "mid"}
@@ -219,8 +212,6 @@ def evaluate_entry_strategy_matrix(
         and stock_selection.is_front_row
         and stock_selection.open_follow_state in {"confirmed", "repair_strength"}
         and stock_selection.daily_height_bucket in {"low", "mid"}
-        and stock_selection.stock_shape_rank_in_theme_pct <= 0.40
-        and stock_selection.stock_execution_rank_in_theme_pct <= 0.45
         and snapshot.t2_pct <= -0.04
         and snapshot.current_pct > 0
         and (

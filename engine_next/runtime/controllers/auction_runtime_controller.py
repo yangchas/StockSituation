@@ -20,6 +20,7 @@ from engine_next.domain.models import (
     StockStateSnapshot,
     ThemeSelectionContext,
 )
+from engine_next.domain.decision_models import PlaybookCandidateSlice, PlaybookCandidateView
 from engine_next.runtime.intraday_data_hub import IntradayDataHub, IntradayFetchResult, normalize_auction_pct_ratio
 from engine_next.runtime.plate_mapping_registry import (
     PLATE_MAPPING_S2P_KEY,
@@ -41,8 +42,12 @@ from engine_next.strategy_skill_layer.context_pipeline import (
     ContextStrategyBundle,
     build_context_strategy_bundle_for_symbols,
     filter_trade_candidates,
-    filter_watch_candidates,
 )
+from engine_next.strategy_skill_layer.playbook_candidate_adapter import (
+    build_playbook_candidate_view,
+    slice_playbook_candidate_views,
+)
+from engine_next.strategy_skill_layer.playbook_control import playbook_matrix_ready, playbook_row
 from engine_next.strategy_skill_layer.opening_validation_hub import (
     build_opening_validation_bundle,
     match_opening_validation,
@@ -85,13 +90,13 @@ class StrategyConsoleState:
     actual_source: str
     plate_stats: tuple[AuctionPlateBucketStat, ...]
     bundle: ContextStrategyBundle | None
-    candidates: tuple[AuctionLadderDecision, ...]
     missing_inputs: tuple[str, ...]
     snapshot_map: dict[str, StockStateSnapshot]
     stock_name_map: dict[str, str]
     plate_symbol_map: dict[str, tuple[str, ...]]
     decision_map: dict[str, AuctionLadderDecision]
-    watch_candidates: tuple[AuctionLadderDecision, ...] = ()
+    playbook_candidate_view_map: dict[str, PlaybookCandidateView] | None = None
+    playbook_candidate_slice: PlaybookCandidateSlice | None = None
     full_plate_stats: tuple[AuctionPlateBucketStat, ...] = ()
     historical_only: bool = False
     stale_snapshot_only: bool = False
@@ -876,30 +881,14 @@ class AuctionRuntimeController:
             self._focus_candidates_for_phase(state, phase_label=phase_label),
             phase_label=phase_label,
         )
-        if not decisions and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
-            decisions = self._order_decisions_by_narrative(
-                state,
-                self._last_effective_focus_candidates(
-                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
-                    phase_label=phase_label,
-                ),
-                phase_label=phase_label,
-            )
         if not decisions:
-            preferred_plates = self._phase_priority_plates(state, phase_label=phase_label) if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"} else ()
-            decisions = self._order_decisions_by_narrative(
-                state,
-                tuple(
-                    decision
-                    for decision in state.watch_candidates
-                    if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
-                    and (
-                        not preferred_plates
-                        or self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates)
-                    )
-                ),
-                phase_label=phase_label,
-            )
+            playbook_views = self._playbook_views_for_phase(state, phase_label=phase_label)
+            if playbook_views:
+                decisions = self._order_decisions_by_narrative(
+                    state,
+                    self._playbook_decisions_for_phase(state, phase_label=phase_label),
+                    phase_label=phase_label,
+                )
         parts: list[str] = []
         for decision in decisions[:3]:
             parts.append(f"{self._decision_name(state, decision)}={self._display_action_label(decision, state, phase_label=phase_label)}")
@@ -993,6 +982,109 @@ class AuctionRuntimeController:
                 if len(parts) >= 3:
                     break
         return " ; ".join(parts) or "-"
+
+    def _playbook_symbol_set(self, state: StrategyConsoleState) -> set[str]:
+        return set(self._playbook_symbol_tuple(state))
+
+    def _playbook_symbol_tuple(self, state: StrategyConsoleState) -> tuple[str, ...]:
+        if state.playbook_candidate_slice is None:
+            return ()
+        return tuple(
+            item.symbol
+            for item in (
+                state.playbook_candidate_slice.primary
+                + state.playbook_candidate_slice.watch
+                + state.playbook_candidate_slice.inactive
+            )
+        )
+
+    def _playbook_decisions_for_phase(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+    ) -> tuple[AuctionLadderDecision, ...]:
+        decision_map = state.decision_map
+        return tuple(
+            decision_map[view.symbol]
+            for view in self._playbook_slice_views(state, phase_label=phase_label)
+            if view.symbol in decision_map and decision_map[view.symbol] is not None
+        )
+
+    def _playbook_slice_views(self, state: StrategyConsoleState, *, phase_label: str) -> tuple[PlaybookCandidateView, ...]:
+        if state.playbook_candidate_slice is None:
+            return ()
+        if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}:
+            views = (
+                state.playbook_candidate_slice.primary
+                + state.playbook_candidate_slice.watch
+                + state.playbook_candidate_slice.inactive
+            )
+        else:
+            views = state.playbook_candidate_slice.primary + state.playbook_candidate_slice.watch
+        return tuple(view for view in views if not view.blocked)
+
+    def _playbook_views_for_phase(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+    ) -> tuple[PlaybookCandidateView, ...]:
+        return self._playbook_slice_views(state, phase_label=phase_label)
+
+    def _build_playbook_candidate_views(
+        self,
+        state: StrategyConsoleState,
+        *,
+        bundle: ContextStrategyBundle | None,
+    ) -> tuple[dict[str, PlaybookCandidateView], PlaybookCandidateSlice]:
+        if bundle is None or bundle.decision_bundle is None:
+            return {}, PlaybookCandidateSlice()
+        final_candidates = tuple(bundle.decision_bundle.final_candidates or ())
+        if not final_candidates:
+            return {}, PlaybookCandidateSlice()
+        decision_map = {item.symbol: item for item in bundle.decisions}
+        selection_map = {item.symbol: item for item in bundle.stock_selection_contexts}
+        matrix = bundle.decision_bundle.playbook_control_matrix
+        matrix_ready = playbook_matrix_ready(matrix)
+        view_map: dict[str, PlaybookCandidateView] = {}
+        ordered_views: list[PlaybookCandidateView] = []
+        for final_candidate in sorted(
+            final_candidates,
+            key=lambda item: (
+                int(item.priority_rank),
+                item.risk_level == "high",
+                item.action != "probe",
+                item.action != "watch",
+            ),
+        ):
+            decision = decision_map.get(final_candidate.symbol)
+            selection = selection_map.get(final_candidate.symbol)
+            if decision is None or selection is None:
+                continue
+            row = playbook_row(matrix, final_candidate.playbook)
+            evidence_refs: list[str] = []
+            if final_candidate.symbol:
+                evidence_refs.append(f"symbol:{final_candidate.symbol}")
+            evidence_refs.append(f"action:{final_candidate.action}")
+            if decision.symbol:
+                evidence_refs.append(f"decision:{decision.symbol}")
+            view = build_playbook_candidate_view(
+                symbol=final_candidate.symbol,
+                raw_action=final_candidate.action,
+                row=row,
+                source="decision_bundle",
+                playbook=final_candidate.playbook,
+                path_type=final_candidate.path_type,
+                action_hint=final_candidate.action,
+                priority_rank=final_candidate.priority_rank,
+                evidence_refs=tuple(evidence_refs),
+            )
+            if matrix_ready and view.playbook and view.display_bucket == "unclassified":
+                view = replace(view, display_bucket="inactive")
+            view_map[view.symbol] = view
+            ordered_views.append(view)
+        return view_map, slice_playbook_candidate_views(tuple(ordered_views))
 
     def _build_console_state(
         self,
@@ -1144,8 +1236,6 @@ class AuctionRuntimeController:
             actual_source=actual_source,
             plate_stats=plate_stats,
             bundle=None,
-            candidates=(),
-            watch_candidates=(),
             missing_inputs=missing_inputs,
             snapshot_map=snapshot_map,
             stock_name_map=stock_name_map,
@@ -1169,10 +1259,10 @@ class AuctionRuntimeController:
                 base_map=theme_judge_map,
             )
         bundle = None
-        candidates: tuple[AuctionLadderDecision, ...] = ()
-        watch_candidates: tuple[AuctionLadderDecision, ...] = ()
         decision_map: dict[str, AuctionLadderDecision] = {}
         selection_context_map: dict[str, StockSelectionContext] = {}
+        playbook_candidate_view_map: dict[str, PlaybookCandidateView] = {}
+        playbook_candidate_slice: PlaybookCandidateSlice = PlaybookCandidateSlice()
         if candidate_scope and not premarket_plan_mode:
             formal_theme_context_map = self._build_formal_theme_context_map(
                 collision_rows,
@@ -1197,11 +1287,12 @@ class AuctionRuntimeController:
                 symbols=shape_eval_scope or candidate_scope,
                 theme_context_map=formal_theme_context_map,
             )
-            candidates = filter_trade_candidates(bundle, min_confidence=min_confidence)
-            if phase_label in {"auction", "auction_preview", "opening", "open_confirm"}:
-                watch_candidates = filter_watch_candidates(bundle, min_confidence=min_confidence)
             decision_map = {decision.symbol: decision for decision in bundle.decisions}
             selection_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
+            playbook_candidate_view_map, playbook_candidate_slice = self._build_playbook_candidate_views(
+                pre_bundle_state,
+                bundle=bundle,
+            )
             try:
                 bundle_note_map = {
                     str(note).split("=", 1)[0]: str(note).split("=", 1)[1]
@@ -1209,14 +1300,15 @@ class AuctionRuntimeController:
                     if isinstance(note, str) and "=" in note
                 }
                 logger.info(
-                    "shape eval scope | phase=%s | mode=%s | selected=%s | total=%s | compression=%s | decisions=%s | candidates=%s | stock_ctx_recomputed=%s | stock_ctx_reused=%s",
+                    "shape eval scope | phase=%s | mode=%s | selected=%s | total=%s | compression=%s | decisions=%s | playbook_primary=%s | playbook_watch=%s | stock_ctx_recomputed=%s | stock_ctx_reused=%s",
                     phase_label,
                     bundle_note_map.get("shape_scope_mode", "-"),
                     bundle_note_map.get("selected_snapshot_count", "-"),
                     bundle_note_map.get("total_snapshot_count", "-"),
                     bundle_note_map.get("shape_prefilter_compression_ratio", "-"),
                     bundle_note_map.get("decision_count", "-"),
-                    len(candidates),
+                    len(playbook_candidate_slice.primary),
+                    len(playbook_candidate_slice.watch),
                     bundle_note_map.get("stock_ctx_recomputed", "-"),
                     bundle_note_map.get("stock_ctx_reused", "-"),
                 )
@@ -1236,8 +1328,6 @@ class AuctionRuntimeController:
             actual_source=actual_source,
             plate_stats=plate_stats,
             bundle=bundle,
-            candidates=candidates,
-            watch_candidates=watch_candidates,
             missing_inputs=missing_inputs,
             snapshot_map=snapshot_map,
             stock_name_map=stock_name_map,
@@ -1251,6 +1341,8 @@ class AuctionRuntimeController:
             auction_delta_stats=auction_delta_stats,
             theme_judge_map=theme_judge_map,
             selection_context_map=selection_context_map if bundle is not None else {},
+            playbook_candidate_view_map=playbook_candidate_view_map if bundle is not None else {},
+            playbook_candidate_slice=playbook_candidate_slice if bundle is not None else PlaybookCandidateSlice(),
             theme_collision_map=theme_collision_map,
             normalized_plate_names_map=normalized_plate_names_map,
             matched_theme_judge_map=matched_theme_judge_map,
@@ -4906,7 +4998,8 @@ class AuctionRuntimeController:
 
     def _render_validated_candidates(self, state: StrategyConsoleState) -> tuple[str, ...]:
         bundle = getattr(state.context, "opening_validation_bundle", None)
-        if bundle is None:
+        candidate_slice = state.playbook_candidate_slice
+        if bundle is None or candidate_slice is None:
             return ()
         selection_map = self._stock_selection_context_map(state)
         confirmed_map = getattr(bundle, "confirmed_themes", {}) or {}
@@ -4916,11 +5009,18 @@ class AuctionRuntimeController:
         probe_items: list[str] = []
         watch_items: list[str] = []
         avoid_items: list[str] = []
-        for decision in state.candidates:
-            selection = selection_map.get(decision.symbol)
+        ordered_views = (
+            candidate_slice.primary
+            + candidate_slice.watch
+            + candidate_slice.inactive
+            + candidate_slice.blocked
+            + candidate_slice.unclassified
+        )
+        for view in ordered_views:
+            selection = selection_map.get(view.symbol)
             if selection is None:
                 continue
-            snapshot = state.snapshot_map.get(decision.symbol)
+            snapshot = state.snapshot_map.get(view.symbol)
             validation = self._opening_validation_for_display(
                 state,
                 snapshot=snapshot,
@@ -4929,33 +5029,14 @@ class AuctionRuntimeController:
             if validation is None:
                 continue
             plate_name = normalize_plate_name(str(getattr(validation, "plate_name", "") or selection.plate_name or "-"))
-            item_text = f"{decision.symbol}:{plate_name}/{decision.action}@{decision.confidence}"
-            level = str(getattr(validation, "tradable_level", "") or "")
+            item_text = f"{view.symbol}:{plate_name}/{view.action_hint or view.playbook}@{view.priority_rank}"
             status = str(getattr(validation, "validation_state", "") or "")
+            level = str(getattr(validation, "tradable_level", "") or "")
             if status == "confirmed" and level == "attack":
                 attack_items.append(item_text)
             elif status == "confirmed" and level == "probe":
                 probe_items.append(item_text)
-            elif status == "watch":
-                watch_items.append(item_text)
-            else:
-                avoid_items.append(item_text)
-        for decision in state.watch_candidates:
-            selection = selection_map.get(decision.symbol)
-            if selection is None:
-                continue
-            snapshot = state.snapshot_map.get(decision.symbol)
-            validation = self._opening_validation_for_display(
-                state,
-                snapshot=snapshot,
-                selection=selection,
-            )
-            if validation is None:
-                continue
-            plate_name = normalize_plate_name(str(getattr(validation, "plate_name", "") or selection.plate_name or "-"))
-            item_text = f"{decision.symbol}:{plate_name}/{decision.action}@{decision.confidence}"
-            status = str(getattr(validation, "validation_state", "") or "")
-            if status == "watch" and item_text not in watch_items:
+            elif status == "watch" and item_text not in watch_items:
                 watch_items.append(item_text)
             elif status == "falsified" and item_text not in avoid_items:
                 avoid_items.append(item_text)
@@ -5189,9 +5270,15 @@ class AuctionRuntimeController:
     ) -> tuple[AuctionLadderDecision, ...]:
         picked: list[AuctionLadderDecision] = []
         seen_symbols: set[str] = set()
+        playbook_symbol_set = self._playbook_symbol_set(state)
+        focus_seed = tuple(
+            state.decision_map.get(view.symbol)
+            for view in self._playbook_views_for_phase(state, phase_label="open_confirm")
+            if state.decision_map.get(view.symbol) is not None
+        )
         for decision in self._order_decisions_by_narrative(
             state,
-            self._focus_candidates_for_phase(state, phase_label="open_confirm"),
+            focus_seed,
             phase_label="open_confirm",
         ):
             if decision.symbol in seen_symbols:
@@ -5200,13 +5287,21 @@ class AuctionRuntimeController:
             seen_symbols.add(decision.symbol)
             if len(picked) >= 5:
                 return tuple(picked)
+        watch_seed = tuple(
+            decision
+            for decision in self._focus_ordered_decisions(state, phase_label="open_confirm")
+            if self._decision_allowed_in_focus_output(state, decision, phase_label="open_confirm")
+            and decision.symbol in playbook_symbol_set
+        )
+        if not watch_seed and focus_seed:
+            watch_seed = tuple(
+                decision
+                for decision in focus_seed
+                if decision.symbol in playbook_symbol_set
+            )
         for decision in self._order_decisions_by_narrative(
             state,
-            tuple(
-                decision
-                for decision in state.watch_candidates
-                if self._decision_allowed_in_focus_output(state, decision, phase_label="open_confirm")
-            ),
+            watch_seed,
             phase_label="open_confirm",
         ):
             if decision.symbol in seen_symbols:
@@ -5701,27 +5796,18 @@ class AuctionRuntimeController:
         if state.bundle is None:
             title = "【明日观察池】个股 | 动作 | 评分 | 竞价涨跌 | 现涨跌 | 热榜/热度 | 题材 | 证据" if phase_label == "postmarket" else "【核心观察池】个股 | 动作 | 评分 | 竞价涨跌 | 现涨跌 | 热榜/热度 | 题材 | 证据"
             return (title,)
+        playbook_symbol_set = self._playbook_symbol_set(state)
         focus_candidates = self._order_decisions_by_narrative(
             state,
-            self._focus_candidates_for_phase(state, phase_label=phase_label),
+            self._playbook_decisions_for_phase(state, phase_label=phase_label),
             phase_label=phase_label,
         )
-        if not focus_candidates and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}:
-            focus_candidates = self._order_decisions_by_narrative(
-                state,
-                self._last_effective_focus_candidates(
-                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
-                    phase_label=phase_label,
-                ),
-                phase_label=phase_label,
-            )
-        pinned_focus_symbols = tuple(decision.symbol for decision in focus_candidates)
         preferred_plates = self._phase_priority_plates(state, phase_label=phase_label) if phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"} else ()
-        watch_candidates = self._order_decisions_by_narrative(
+        playbook_focus_candidates = self._order_decisions_by_narrative(
             state,
             tuple(
                 decision
-                for decision in state.watch_candidates
+                for decision in self._playbook_decisions_for_phase(state, phase_label=phase_label)
                 if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
                 and (
                     not preferred_plates
@@ -5736,7 +5822,7 @@ class AuctionRuntimeController:
         confirmed_theme_note = ""
         if phase_label in {"auction", "auction_preview", "opening", "open_confirm"} and len(ensured_focus) < 4:
             existing_symbols = {item.symbol for item in ensured_focus}
-            for decision in watch_candidates:
+            for decision in playbook_focus_candidates:
                 if decision.symbol in existing_symbols:
                     continue
                 ensured_focus.append(decision)
@@ -5744,31 +5830,27 @@ class AuctionRuntimeController:
                 if len(ensured_focus) >= 4:
                     break
         if phase_label == "auction" and len(ensured_focus) < self.AUCTION_MIN_OUTPUT_COUNT:
-            supplements = list(self._focus_fallback_candidates(state, self._focus_ordered_decisions(state, phase_label=phase_label), phase_label=phase_label))
-            for decision in supplements:
+            for decision in self._focus_ordered_decisions(state, phase_label=phase_label):
                 if decision.symbol in {item.symbol for item in ensured_focus}:
+                    continue
+                if playbook_symbol_set and decision.symbol not in playbook_symbol_set:
                     continue
                 ensured_focus.append(decision)
                 if len(ensured_focus) >= self.AUCTION_MIN_OUTPUT_COUNT:
                     break
         if phase_label in {"opening", "open_confirm", "intraday", "postmarket"} and len(ensured_focus) < 2:
             existing_symbols = {item.symbol for item in ensured_focus}
-            confirmed_backfill = self._backfill_candidates_from_confirmed_themes(
+            for decision in self._backfill_candidates_from_confirmed_themes(
                 state,
                 phase_label=phase_label,
                 existing_symbols=existing_symbols,
-            )
-            for decision in confirmed_backfill:
+            ):
                 if decision.symbol in existing_symbols:
                     continue
                 ensured_focus.append(decision)
                 existing_symbols.add(decision.symbol)
                 if len(ensured_focus) >= 3:
                     break
-            if not confirmed_backfill:
-                confirmed_plates = self._confirmed_theme_names_for_focus(state)
-                if confirmed_plates:
-                    confirmed_theme_note = f"{'/'.join(confirmed_plates[:2])} 已开盘确认，但候选仍需等个股承接"
         if len(ensured_focus) > 1:
             deduped_focus: list[AuctionLadderDecision] = []
             seen_focus_symbols: set[str] = set()
@@ -5820,7 +5902,7 @@ class AuctionRuntimeController:
             seen_display_symbols.add(decision.symbol)
 
         if phase_label in {"opening", "open_confirm", "intraday"} and len(primary_focus) < 3:
-            for decision in tuple(watch_candidates) + tuple(ordered_decisions):
+            for decision in tuple(playbook_focus_candidates) + tuple(ordered_decisions):
                 if decision.symbol in seen_display_symbols:
                     continue
                 if not self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label):
@@ -5877,11 +5959,6 @@ class AuctionRuntimeController:
                 continue
             watch_alt_source.append(decision)
             seen_alt_symbols.add(decision.symbol)
-        for decision in watch_candidates:
-            if decision.symbol in seen_alt_symbols:
-                continue
-            watch_alt_source.append(decision)
-            seen_alt_symbols.add(decision.symbol)
         for decision in watch_alt_source:
             snapshot = state.snapshot_map.get(decision.symbol)
             if snapshot is None:
@@ -5904,7 +5981,7 @@ class AuctionRuntimeController:
             )
             if len(alt_parts) >= 3:
                 break
-        for decision in watch_candidates:
+        for decision in playbook_focus_candidates:
             if decision.symbol in selected_symbols or decision.symbol in {item.symbol for item in watch_focus}:
                 continue
             snapshot = state.snapshot_map.get(decision.symbol)
@@ -5931,7 +6008,7 @@ class AuctionRuntimeController:
         for decision in ordered_decisions:
             if decision.symbol in selected_symbols:
                 continue
-            if decision.symbol in {item.symbol for item in watch_candidates}:
+            if decision.symbol in {item.symbol for item in playbook_focus_candidates}:
                 continue
             if decision.action in ("avoid_after_failed_promotion", "do_not_chase"):
                 continue
@@ -6034,15 +6111,13 @@ class AuctionRuntimeController:
             )
 
         if phase_label == "intraday" and state.stale_snapshot_only:
-            cached_focus = self._last_effective_focus_candidates(
-                trade_date=str(getattr(state.context, "trade_date", "") or ""),
-                phase_label=phase_label,
-            )
-            watch_source = cached_focus[:4] or state.candidates[:4] or tuple(
+            watch_source = tuple(
                 decision
-                for decision in state.watch_candidates
+                for decision in self._focus_candidates_for_phase(state, phase_label=phase_label)
                 if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
             )[:4]
+            if not watch_source and state.playbook_candidate_slice is not None:
+                watch_source = self._playbook_decisions_for_phase(state, phase_label=phase_label)[:4]
             watch_parts = [self._format_watch_item(decision, state.snapshot_map, state=state) for decision in watch_source] or ["-"]
             carry_parts = []
             for decision in state.bundle.decisions:
@@ -6094,34 +6169,6 @@ class AuctionRuntimeController:
         prefix = f"{self._decision_name(state, decision)}({hot_text})" if hot_text != "-" else self._decision_name(state, decision)
         driver_text = "" if not drivers else f" | 驱动={drivers}"
         return f"{prefix}={action_text} | {reason_text}{driver_text}"
-
-    def _remember_effective_focus_candidates(
-        self,
-        *,
-        trade_date: str,
-        phase_label: str,
-        decisions: tuple[AuctionLadderDecision, ...],
-    ) -> None:
-        if not trade_date or not decisions:
-            return
-        cache = getattr(self, "_last_effective_focus_cache", None)
-        if cache is None:
-            cache = {}
-            self._last_effective_focus_cache = cache
-        cache[(trade_date, phase_label)] = tuple(decisions[:6])
-
-    def _last_effective_focus_candidates(
-        self,
-        *,
-        trade_date: str,
-        phase_label: str,
-    ) -> tuple[AuctionLadderDecision, ...]:
-        cache = getattr(self, "_last_effective_focus_cache", None) or {}
-        if not trade_date:
-            return ()
-        if phase_label == "intraday":
-            return tuple(cache.get((trade_date, "intraday"), ()) or cache.get((trade_date, "open_confirm"), ()) or ())
-        return tuple(cache.get((trade_date, phase_label), ()) or ())
 
     def _aligned_focus_reject_reasons(
         self,
@@ -6212,20 +6259,6 @@ class AuctionRuntimeController:
             min_confidence=min_confidence,
             phase_label=phase_label,
         )
-        if (
-            not filtered
-            and phase_label in {"auction", "auction_preview", "opening", "open_confirm", "intraday"}
-            and state.watch_candidates
-        ):
-            watch_filtered = tuple(
-                decision
-                for decision in state.watch_candidates
-                if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
-            )
-            if watch_filtered:
-                return watch_filtered
-        if not filtered:
-            return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
         _mode_name, allowed_actions, _mode_tiers, _mode_theme_cap = self._money_mode_profile(state)
         selection_map = self._stock_selection_context_map(state)
         filtered = tuple(
@@ -6241,29 +6274,17 @@ class AuctionRuntimeController:
                     snapshot=state.snapshot_map.get(decision.symbol),
                     phase_label=phase_label,
                 )
+                )
             )
-        )
         if not filtered:
-            confirmed_backfill = self._try_confirmed_backfill_for_phase(
-                state,
-                phase_label=phase_label,
-            )
-            if confirmed_backfill:
-                return confirmed_backfill
-            return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
+            return self._playbook_fallback_focus(state, phase_label=phase_label, ordered=ordered)
         filtered = tuple(
             decision
             for decision in filtered
             if not self._is_decision_blocked_by_theme_risk(state, decision, phase_label=phase_label)
         )
         if not filtered:
-            confirmed_backfill = self._try_confirmed_backfill_for_phase(
-                state,
-                phase_label=phase_label,
-            )
-            if confirmed_backfill:
-                return confirmed_backfill
-            return self._focus_fallback_candidates(state, ordered, phase_label=phase_label)
+            return self._playbook_fallback_focus(state, phase_label=phase_label, ordered=ordered)
         if phase_label in {"auction", "opening", "open_confirm", "intraday"}:
             mode_matched = tuple(
                 decision
@@ -6273,12 +6294,7 @@ class AuctionRuntimeController:
             if mode_matched:
                 filtered = mode_matched
             else:
-                confirmed_backfill = self._try_confirmed_backfill_for_phase(
-                    state,
-                    phase_label=phase_label,
-                )
-                if confirmed_backfill:
-                    return confirmed_backfill
+                return self._playbook_fallback_focus(state, phase_label=phase_label, ordered=ordered)
         filtered_symbols = {decision.symbol for decision in filtered}
         prioritized = tuple(decision for decision in ordered if decision.symbol in filtered_symbols)
         ranked_source = prioritized or filtered
@@ -6312,11 +6328,6 @@ class AuctionRuntimeController:
                 stage="accepted",
             )
             if accepted:
-                self._remember_effective_focus_candidates(
-                    trade_date=str(getattr(state.context, "trade_date", "") or ""),
-                    phase_label=phase_label,
-                    decisions=accepted,
-                )
                 return accepted
             confirmed_backfill = self._try_confirmed_backfill_for_phase(
                 state,
@@ -6324,13 +6335,6 @@ class AuctionRuntimeController:
             )
             if confirmed_backfill:
                 return confirmed_backfill
-            return self._focus_fallback_candidates(state, ranked, phase_label=phase_label)
-        if gated:
-            self._remember_effective_focus_candidates(
-                trade_date=str(getattr(state.context, "trade_date", "") or ""),
-                phase_label=phase_label,
-                decisions=gated,
-            )
         return gated
 
     def _try_confirmed_backfill_for_phase(
@@ -6349,12 +6353,42 @@ class AuctionRuntimeController:
         )
         if not confirmed_backfill:
             return ()
-        self._remember_effective_focus_candidates(
-            trade_date=str(getattr(state.context, "trade_date", "") or ""),
-            phase_label=phase_label,
-            decisions=confirmed_backfill,
-        )
         return confirmed_backfill
+
+    def _playbook_fallback_focus(
+        self,
+        state: StrategyConsoleState,
+        *,
+        phase_label: str,
+        ordered: tuple[AuctionLadderDecision, ...] | None = None,
+    ) -> tuple[AuctionLadderDecision, ...]:
+        playbook_views = self._playbook_views_for_phase(state, phase_label=phase_label)
+        if not playbook_views:
+            return ()
+        decision_map = state.decision_map
+        playbook_decisions = tuple(
+            decision_map[view.symbol]
+            for view in playbook_views
+            if view.symbol in decision_map and decision_map[view.symbol] is not None
+        )
+        if not playbook_decisions and ordered:
+            playbook_symbol_set = self._playbook_symbol_set(state)
+            playbook_decisions = tuple(
+                decision
+                for decision in ordered
+                if decision.symbol in playbook_symbol_set
+            )
+        if not playbook_decisions:
+            return ()
+        return tuple(
+            decision
+            for decision in self._order_decisions_by_narrative(
+                state,
+                playbook_decisions,
+                phase_label=phase_label,
+            )
+            if self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label)
+        )
 
     def _focus_min_confidence_for_phase(self, phase_label: str) -> int:
         if phase_label in {"auction", "auction_preview", "opening", "open_confirm"}:
@@ -6373,11 +6407,14 @@ class AuctionRuntimeController:
             return ()
         ordered = self._focus_ordered_decisions(state, phase_label=phase_label)
         selection_map = self._stock_selection_context_map(state)
+        playbook_symbol_set = self._playbook_symbol_set(state)
         if hasattr(bundle, "context") and getattr(bundle, "context", None) is not None:
             filtered = list(filter_trade_candidates(bundle, min_confidence=min_confidence))
             seen_symbols = {decision.symbol for decision in filtered}
             for decision in ordered:
                 if decision.symbol in seen_symbols:
+                    continue
+                if playbook_symbol_set and decision.symbol not in playbook_symbol_set:
                     continue
                 if decision.confidence < max(55, min_confidence - 8):
                     continue
@@ -6397,6 +6434,8 @@ class AuctionRuntimeController:
         fallback_filtered: list[AuctionLadderDecision] = []
         for decision in ordered:
             if decision.confidence < min_confidence:
+                continue
+            if playbook_symbol_set and decision.symbol not in playbook_symbol_set:
                 continue
             selection = selection_map.get(decision.symbol)
             snapshot = state.snapshot_map.get(decision.symbol)
@@ -6466,53 +6505,6 @@ class AuctionRuntimeController:
                 or selection.activity_score >= 6.8
             )
         )
-
-    def _focus_fallback_candidates(
-        self,
-        state: StrategyConsoleState,
-        ranked: tuple[AuctionLadderDecision, ...],
-        *,
-        phase_label: str,
-    ) -> tuple[AuctionLadderDecision, ...]:
-        fallback: list[AuctionLadderDecision] = []
-        seen_symbols: set[str] = set()
-        selection_map = self._stock_selection_context_map(state)
-        preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
-
-        def collect(*, require_priority_plate: bool) -> None:
-            for decision in ranked:
-                if decision.symbol in seen_symbols:
-                    continue
-                if require_priority_plate and preferred_plates:
-                    if not self._decision_hits_priority_plate(state, decision, preferred_plates=preferred_plates):
-                        continue
-                if not self._decision_allowed_in_focus_output(state, decision, phase_label=phase_label):
-                    continue
-                snapshot = state.snapshot_map.get(decision.symbol)
-                selection = selection_map.get(decision.symbol)
-                if snapshot is None or selection is None:
-                    continue
-                judge = None
-                for plate_name in self._normalized_plate_names(snapshot):
-                    judge = self._theme_judge_for_plate(state, plate_name)
-                    if judge is not None:
-                        break
-                if not self._selection_is_focus_fallback_candidate(
-                    state,
-                    snapshot=snapshot,
-                    selection=selection,
-                    judge=judge,
-                ):
-                    continue
-                fallback.append(decision)
-                seen_symbols.add(decision.symbol)
-                if len(fallback) >= self.FOCUS_FALLBACK_LIMIT:
-                    break
-
-        collect(require_priority_plate=True)
-        if len(fallback) < self.FOCUS_FALLBACK_LIMIT:
-            collect(require_priority_plate=False)
-        return tuple(fallback)
 
     def _confirmed_theme_names_for_focus(
         self,
@@ -6585,21 +6577,13 @@ class AuctionRuntimeController:
         ranked_candidates: list[tuple[float, AuctionLadderDecision]] = []
         seen_symbols = set(existing_symbols)
         source: list[AuctionLadderDecision] = []
-        ordered_watch_candidates = self._order_decisions_by_narrative(
-            state,
-            tuple(
-                item
-                for item in state.watch_candidates
-                if item.symbol not in seen_symbols
-            ),
-            phase_label=phase_label,
-        )
-        for decision in ordered_watch_candidates:
-            source.append(decision)
+        playbook_symbol_set = self._playbook_symbol_set(state)
         for decision in self._focus_ordered_decisions(state, phase_label=phase_label):
             if decision.symbol in seen_symbols:
                 continue
             if any(item.symbol == decision.symbol for item in source):
+                continue
+            if playbook_symbol_set and decision.symbol not in playbook_symbol_set:
                 continue
             source.append(decision)
 
@@ -6837,38 +6821,6 @@ class AuctionRuntimeController:
             reasons.append("高位票弱承接，易走成补跌陷阱")
         return tuple(reasons)
 
-    def _selection_is_focus_fallback_candidate(
-        self,
-        state: StrategyConsoleState,
-        *,
-        snapshot: StockStateSnapshot,
-        selection: StockSelectionContext,
-        judge: ThemeJudgeResult | None,
-    ) -> bool:
-        strong_non_hot_signal = self._selection_has_non_hot_strength(selection, snapshot)
-        if judge is not None and judge.action_class == "trap_avoid":
-            return False
-        if (
-            judge is not None
-            and judge.validation_state == "falsified"
-            and not selection.is_true_leader
-            and not strong_non_hot_signal
-        ):
-            return False
-        if (
-            not selection.is_true_leader
-            and not selection.is_front_row
-            and not strong_non_hot_signal
-        ):
-            return False
-        if (
-            selection.execution_quality_score < 5.0
-            and selection.open_undertake_score < 5.0
-            and not strong_non_hot_signal
-        ):
-            return False
-        return True
-
     def _selection_is_repair_watch_candidate(
         self,
         *,
@@ -6996,6 +6948,10 @@ class AuctionRuntimeController:
         decisions = tuple(state.bundle.decisions)
         if phase_label not in {"auction", "auction_preview", "opening", "open_confirm", "intraday", "postmarket"}:
             return decisions
+        playbook_symbol_set = self._playbook_symbol_set(state)
+        if playbook_symbol_set:
+            prioritized = tuple(decision for decision in decisions if decision.symbol in playbook_symbol_set)
+            return prioritized or decisions
         preferred_plates = self._phase_priority_plates(state, phase_label=phase_label)
         if not preferred_plates:
             return decisions
@@ -8847,21 +8803,12 @@ class AuctionRuntimeController:
         if phase_label == "intraday" and state.stale_snapshot_only:
             return ("watch_only", "leader_review", "risk_scan")
         labels: list[str] = []
-        for decision in state.candidates:
-            label = self._display_action_code(decision, state, phase_label=phase_label)
+        for view in self._playbook_slice_views(state, phase_label=phase_label):
+            label = view.action_hint or view.playbook or "watch"
             if label not in labels:
                 labels.append(label)
             if len(labels) >= 3:
                 break
-        if not labels and phase_label in {"auction", "auction_preview", "opening", "open_confirm"}:
-            for decision in state.watch_candidates:
-                label = self._display_action_code(decision, state, phase_label=phase_label)
-                if label in {"failed_promo_guard", "do_not_chase", "observe_only"}:
-                    continue
-                if label not in labels:
-                    labels.append(label)
-                if len(labels) >= 3:
-                    break
         if not labels:
             labels.append("observe_only")
         return tuple(labels)
@@ -9401,6 +9348,10 @@ class AuctionRuntimeController:
         snapshot = snapshot_map.get(decision.symbol)
         plate = snapshot.plate if snapshot and snapshot.plate else "-"
         tags = self._decision_meta_tags(decision, snapshot_map, state=state)
+        if state is not None and state.playbook_candidate_view_map:
+            view = state.playbook_candidate_view_map.get(decision.symbol)
+            if view is not None and view.playbook:
+                tags = f"{tags} | playbook={view.playbook}" if tags else f"playbook={view.playbook}"
         return (
             f"{self._short_stock_name(snapshot, symbol=decision.symbol)}"
             f" | {decision.confidence}"

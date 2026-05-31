@@ -1,11 +1,11 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 from engine_next.domain.enums import RunPhase
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.runtime.session_facts import SessionFacts
+
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,14 @@ class SectorFlowTrajectory:
 
 
 class SectorFlowTracker:
-    """Tracks the slope of net inflows for top plates to detect intraday migration."""
+    """Track hot-plate net-inflow slope to detect intraday capital migration."""
 
     def __init__(self, hub: IntradayDataHub):
         self.hub = hub
-        self._history_window_seconds = 15 * 60  # 15 minutes
+        self._history_window_seconds = 15 * 60
 
-    def _get_redis_key(self, trade_date: str) -> str:
+    @staticmethod
+    def _get_redis_key(trade_date: str) -> str:
         return f"cache:sector_flow:{trade_date}"
 
     def update_and_evaluate(
@@ -37,57 +38,42 @@ class SectorFlowTracker:
         session_facts: SessionFacts,
         timestamp_ms: int,
     ) -> dict[str, SectorFlowTrajectory]:
-        """Records current inflow and evaluates trajectory for all hot plates."""
         if phase not in (RunPhase.INTRADAY, RunPhase.POSTMARKET):
             return {}
-            
-        if not session_facts.hot_plate_facts or timestamp_ms <= 0:
+        hot_plate_facts = tuple(getattr(session_facts, "hot_plate_today", ()) or getattr(session_facts, "hot_plate_facts", ()) or ())
+        if not hot_plate_facts or timestamp_ms <= 0:
+            return {}
+
+        snapshot = {
+            fact.plate_name: float(fact.net_inflow_yi or 0.0)
+        for fact in hot_plate_facts
+            if fact.plate_name
+        }
+        if not snapshot:
             return {}
 
         redis_key = self._get_redis_key(trade_date)
         current_time_sec = timestamp_ms / 1000.0
-        
-        # 1. Prepare current snapshot
-        snapshot = {}
-        for fact in session_facts.hot_plate_facts:
-            if not fact.plate_name:
-                continue
-            snapshot[fact.plate_name] = fact.net_inflow_yi
-
-        if not snapshot:
-            return {}
-
-        # 2. Append to Redis TimeSeries (we use ZSET for simple TS)
-        # ZSET member: JSON string of snapshot, score: timestamp
         payload = json.dumps(snapshot, ensure_ascii=False)
         try:
             self.hub.redis.zadd(redis_key, {payload: current_time_sec})
-            # Trim old data (older than 15 mins)
-            cutoff_time = current_time_sec - self._history_window_seconds
-            self.hub.redis.zremrangebyscore(redis_key, 0, cutoff_time)
-            # Expire after 2 hours (intraday only)
+            self.hub.redis.zremrangebyscore(redis_key, 0, current_time_sec - self._history_window_seconds)
             self.hub.redis.expire(redis_key, 7200)
-        except Exception as e:
-            logger.warning(f"Failed to update sector flow tracking: {e}")
-            return {}
-
-        # 3. Read back recent history to compute slope
-        try:
             raw_history = self.hub.redis.zrange(redis_key, 0, -1, withscores=True)
-        except Exception as e:
-            logger.warning(f"Failed to read sector flow tracking: {e}")
+        except Exception as exc:
+            logger.warning("sector flow tracking unavailable: %s", exc)
             return {}
 
-        history = []
+        history: list[tuple[float, dict[str, float]]] = []
         for raw_payload, ts in raw_history:
             try:
-                data = json.loads(raw_payload)
-                history.append((float(ts), data))
+                decoded = raw_payload.decode("utf-8") if isinstance(raw_payload, bytes) else raw_payload
+                data = json.loads(decoded)
+                history.append((float(ts), {str(k): float(v or 0.0) for k, v in data.items()}))
             except Exception:
                 continue
-                
+
         if len(history) < 2:
-            # Not enough data points to compute slope
             return {
                 plate: SectorFlowTrajectory(
                     plate_name=plate,
@@ -95,38 +81,27 @@ class SectorFlowTracker:
                     slope_15m_yi_per_min=0.0,
                     is_withdrawing=False,
                     is_accelerating=False,
-                    data_points=len(history)
-                ) for plate, inflow in snapshot.items()
+                    data_points=len(history),
+                )
+                for plate, inflow in snapshot.items()
             }
 
-        # 4. Compute slope
-        # For simplicity, we use (last - first) / (time_delta_minutes)
         first_ts, first_data = history[0]
-        last_ts, last_data = history[-1]
+        last_ts, _last_data = history[-1]
         time_delta_mins = (last_ts - first_ts) / 60.0
-        
-        results = {}
+
+        results: dict[str, SectorFlowTrajectory] = {}
         for plate, current_inflow in snapshot.items():
-            first_inflow = first_data.get(plate, current_inflow) # Assume steady if missing
-            
-            slope = 0.0
-            if time_delta_mins > 0:
-                slope = (current_inflow - first_inflow) / time_delta_mins
-                
-            # Definitions for migration:
-            # Withdrawing: Slope < -1.5 yi/min and current inflow dropping significantly
-            is_withdrawing = slope <= -1.5 and current_inflow < max(0, first_inflow - 10.0)
-            
-            # Accelerating: Slope > 2.0 yi/min and positive inflow
-            is_accelerating = slope >= 2.0 and current_inflow > 0
-            
+            first_inflow = float(first_data.get(plate, current_inflow) or 0.0)
+            slope = (current_inflow - first_inflow) / time_delta_mins if time_delta_mins > 0 else 0.0
+            is_withdrawing = slope <= -1.5 and current_inflow < max(0.0, first_inflow - 10.0)
+            is_accelerating = slope >= 2.0 and current_inflow > 0.0
             results[plate] = SectorFlowTrajectory(
                 plate_name=plate,
                 current_net_inflow_yi=current_inflow,
                 slope_15m_yi_per_min=slope,
                 is_withdrawing=is_withdrawing,
                 is_accelerating=is_accelerating,
-                data_points=len(history)
+                data_points=len(history),
             )
-            
         return results
