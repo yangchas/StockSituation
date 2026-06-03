@@ -14,6 +14,7 @@ from engine_next.runtime.plate_mapping_registry import (
     RUNTIME_PRIMARY_PLATE_KEY,
     RUNTIME_REASON_KEY,
     choose_primary_plate,
+    choose_runtime_primary_plate,
     decode_theme_list,
     encode_theme_list,
     is_generic_plate,
@@ -828,7 +829,12 @@ class IntradayDataHub:
             merged_themes = prioritize_core_themes((pool_plate,), existing_themes, max_count=2)
             if merged_themes:
                 self.redis.hset(PLATE_MAPPING_S2P_KEY, symbol, encode_theme_list(merged_themes))
-            primary_plate = choose_primary_plate(merged_themes, fallback=pool_plate)
+            primary_plate = choose_runtime_primary_plate(
+                merged_themes,
+                fallback=str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "") or pool_plate,
+                pool_plate=pool_plate,
+                reason_candidates=merged_themes,
+            )
             current_plate = str(self.redis.hget(RUNTIME_PRIMARY_PLATE_KEY, symbol) or "").strip()
             if primary_plate and (
                 not current_plate

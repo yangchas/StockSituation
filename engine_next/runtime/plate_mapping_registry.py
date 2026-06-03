@@ -123,6 +123,30 @@ PREFERRED_PLATE_KEYWORDS = (
     "铜缆",
 )
 
+PRIMARY_PLATE_ALIAS_EXACT = {
+    "\u73bb\u7483\u57fa\u677f": "\u82af\u7247",
+    "\u5148\u8fdb\u5c01\u88c5": "\u82af\u7247",
+    "\u5149\u82af\u7247": "\u82af\u7247",
+    "HBM": "\u82af\u7247",
+    "\u5b58\u50a8": "\u82af\u7247",
+    "EDA": "\u82af\u7247",
+    "\u9ad8\u901f\u8fde\u63a5": "\u901a\u4fe1",
+    "\u5149\u7ea4": "\u901a\u4fe1",
+    "CPO": "\u901a\u4fe1",
+    "\u94dc\u7f06\u9ad8\u901f\u8fde\u63a5": "\u901a\u4fe1",
+}
+
+PRIMARY_PLATE_ALIAS_KEYWORDS = (
+    ("\u82af\u7247", "\u82af\u7247"),
+    ("\u534a\u5bfc\u4f53", "\u82af\u7247"),
+    ("\u5148\u8fdb\u5c01\u88c5", "\u82af\u7247"),
+    ("\u73bb\u7483\u57fa\u677f", "\u82af\u7247"),
+    ("\u5149\u82af\u7247", "\u82af\u7247"),
+    ("\u9ad8\u901f\u8fde\u63a5", "\u901a\u4fe1"),
+    ("\u5149\u7ea4", "\u901a\u4fe1"),
+    ("\u901a\u4fe1", "\u901a\u4fe1"),
+)
+
 _SPLIT_PATTERN = re.compile(r"[+,，,、/|；;]+")
 _REASON_TAIL_PATTERN = re.compile(r"[。.].*$")
 _TRAILING_BRACKET_DETAIL_PATTERN = re.compile(r"([（(].*[）)])$")
@@ -338,6 +362,85 @@ def choose_pool_primary_plate(
     return choose_primary_plate((*merged_pool, *fallback_candidates), fallback=fallback)
 
 
+def collapse_runtime_primary_plate(name: str) -> str:
+    cleaned = normalize_plate_name(name)
+    if not cleaned:
+        return ""
+    exact = PRIMARY_PLATE_ALIAS_EXACT.get(cleaned)
+    if exact:
+        return exact
+    for keyword, target in PRIMARY_PLATE_ALIAS_KEYWORDS:
+        if keyword in cleaned:
+            return target
+    return cleaned
+
+
+def choose_runtime_primary_plate(
+    candidates: Sequence[str],
+    *,
+    fallback: str = "",
+    pool_plate: str = "",
+    reason_candidates: Sequence[str] = (),
+) -> str:
+    pool_candidates = merge_theme_lists((), split_plate_tokens(pool_plate))
+    reason_list = merge_theme_lists((), reason_candidates)
+    if pool_candidates:
+        primary_candidate = choose_pool_primary_plate(
+            candidates,
+            reason_list,
+            fallback=fallback or pool_plate,
+        )
+    else:
+        primary_candidate = choose_primary_plate(candidates, fallback=fallback)
+
+    candidate_family = collapse_runtime_primary_plate(primary_candidate)
+    fallback_clean = normalize_plate_name(fallback)
+    fallback_family = collapse_runtime_primary_plate(fallback_clean)
+    pool_family = collapse_runtime_primary_plate(pool_candidates[0]) if pool_candidates else ""
+
+    if fallback_clean and not is_generic_plate(fallback_clean):
+        if not candidate_family:
+            return fallback_clean
+        if fallback_family == candidate_family:
+            return fallback_clean
+        if pool_family and pool_family == fallback_family:
+            return fallback_clean
+        if not pool_family:
+            return fallback_clean
+
+    return candidate_family or primary_candidate
+
+
+def order_runtime_theme_candidates(
+    candidates: Sequence[str],
+    *,
+    primary_plate: str = "",
+) -> list[str]:
+    ordered = merge_theme_lists((), candidates)
+    if not ordered:
+        return []
+
+    primary = collapse_runtime_primary_plate(primary_plate) if primary_plate else ""
+    if not primary:
+        return ordered
+
+    result: list[str] = []
+    primary_aliases = {primary}
+    for name in ordered:
+        if not name:
+            continue
+        if collapse_runtime_primary_plate(name) == primary and primary not in result:
+            result.append(name)
+            primary_aliases.add(name)
+    for name in ordered:
+        if not name or name in result:
+            continue
+        if name in primary_aliases:
+            continue
+        result.append(name)
+    return result
+
+
 def build_yest_limit_theme_candidates(
     *,
     pool_plate: str = "",
@@ -406,16 +509,15 @@ def build_runtime_writebacks_from_reasons(
     if not candidates:
         candidates = merge_theme_lists(reason_candidates, existing_themes)
 
-    if pool_plate:
-        primary_plate = choose_pool_primary_plate(
-            candidates,
-            reason_candidates,
-            fallback=fallback_plate or pool_plate,
-        )
-    else:
-        primary_plate = choose_primary_plate(candidates, fallback=fallback_plate)
+    primary_plate = choose_runtime_primary_plate(
+        candidates,
+        fallback=fallback_plate or pool_plate,
+        pool_plate=pool_plate,
+        reason_candidates=reason_candidates,
+    )
+    ordered_candidates = order_runtime_theme_candidates(candidates, primary_plate=primary_plate)
     return {
-        PLATE_MAPPING_S2P_KEY: {normalized_symbol: list(candidates)} if candidates else {},
+        PLATE_MAPPING_S2P_KEY: {normalized_symbol: ordered_candidates} if ordered_candidates else {},
         RUNTIME_PRIMARY_PLATE_KEY: {normalized_symbol: primary_plate} if primary_plate else {},
         RUNTIME_REASON_KEY: {normalized_symbol: reason_texts[0]} if reason_texts else {},
     }

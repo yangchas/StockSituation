@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 from typing import Iterable
 
 from engine_next.domain.models import (
@@ -14,7 +15,6 @@ from engine_next.domain.decision_models import DecisionBundle
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.strategy_skill_layer.hypothesis_engine import build_hypothesis_decision_bundle
 from engine_next.strategy_skill_layer.local_decision_layer import build_local_decision_bundle
-from engine_next.strategy_skill_layer.opening_validation_hub import match_opening_validation
 from engine_next.strategy_skill_layer.relative_amount import enrich_snapshot_amount_rank_pcts
 from engine_next.strategy_skill_layer.shape_engine import (
     build_stock_selection_context,
@@ -27,6 +27,8 @@ from engine_next.strategy_skill_layer.slice_comparison import (
     topn_expansion_factor,
 )
 from engine_next.strategy_skill_layer.stock_profile import assess_stock_profile
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -271,36 +273,72 @@ def build_context_strategy_bundle_for_symbols(
             )
         )
     except Exception as exc:
+        logger.exception(
+            "context pipeline decision bundle failed | trade_date=%s | phase=%s | selected=%s",
+            getattr(context, "trade_date", ""),
+            getattr(getattr(context, "phase", None), "value", getattr(context, "phase", "")),
+            len(selected_snapshots),
+        )
         decision_notes = (f"local_decision_error={type(exc).__name__}",)
     final_candidate_rank = {
         item.symbol: item
         for item in (decision_bundle.final_candidates if decision_bundle is not None else ())
     }
-    candidate_pool = tuple(candidates or watch_candidates)
-    if candidate_pool:
-        ranked = sorted(
-            candidate_pool,
-            key=lambda decision: (
-                decision.symbol in final_candidate_rank,
-                -int(final_candidate_rank[decision.symbol].priority_rank) if decision.symbol in final_candidate_rank else -999,
-                _local_candidate_action_priority(final_candidate_rank[decision.symbol].action) if decision.symbol in final_candidate_rank else 0,
-                1 if decision.symbol in final_candidate_rank and final_candidate_rank[decision.symbol].risk_level != "high" else 0,
-                str(getattr(decision.profile.leader_tier, "value", decision.profile.leader_tier)) == "absolute",
-                _decision_action_priority(decision.action),
-                str(getattr(decision.profile.trade_window, "value", decision.profile.trade_window)) == "early_boarding",
-                str(getattr(decision.profile.archetype, "value", decision.profile.archetype)) == "dragon_leader",
-                -decision.kelly_position_pct,
-            ),
-            reverse=True,
+    profile_map = {profile.symbol: profile for profile in profiles}
+    seeded_decisions: list[AuctionLadderDecision] = []
+    missing_profile_count = 0
+    for final_candidate in sorted(
+        tuple(final_candidate_rank.values()),
+        key=lambda item: (
+            _local_candidate_action_priority(str(getattr(item, "action", "") or "")),
+            int(getattr(item, "priority_rank", 999) or 999) * -1,
+        ),
+        reverse=True,
+    ):
+        symbol = str(getattr(final_candidate, "symbol", "") or "")
+        if not symbol:
+            continue
+        profile = profile_map.get(symbol)
+        if profile is None:
+            missing_profile_count += 1
+            continue
+        raw_action = str(getattr(final_candidate, "action", "") or "")
+        risk_level = str(getattr(final_candidate, "risk_level", "") or "")
+        if raw_action in {"avoid", "avoid_chase", "disabled"} or risk_level == "high":
+            continue
+        mapped_action = "small_probe_only" if raw_action == "probe" else "observe_only"
+        priority_rank = int(getattr(final_candidate, "priority_rank", 999) or 999)
+        confidence = max(52, min(95, 100 - priority_rank))
+        if mapped_action == "observe_only":
+            confidence = min(confidence, 65)
+        seeded_decisions.append(
+            AuctionLadderDecision(
+                symbol=symbol,
+                setup_id=f"playbook_{str(getattr(final_candidate, 'playbook', '') or 'watch')}",
+                action=mapped_action,
+                confidence=confidence,
+                kelly_position_pct=0.10 if mapped_action == "small_probe_only" else 0.0,
+                risk_reward_ratio=1.6 if mapped_action == "small_probe_only" else 1.0,
+                profile=profile,
+                reasons=(
+                    f"final_candidate={raw_action}",
+                    f"path={str(getattr(final_candidate, 'path_type', '') or '-')}",
+                    f"rank={priority_rank}",
+                ),
+            )
         )
-        ranked_decisions = tuple(ranked)
-    elif decision_bundle is not None and decision_bundle.final_candidates:
-        ranked_decisions = tuple(candidates)
-    else:
-        ranked_decisions = ()
+    ranked_decisions = tuple(seeded_decisions)
+    logger.info(
+        "context pipeline seed | selected=%s | final_candidates=%s | seeded=%s | missing_profile=%s",
+        len(selected_snapshots),
+        len(final_candidate_rank),
+        len(ranked_decisions),
+        missing_profile_count,
+    )
     focus_symbols = tuple(decision.symbol for decision in ranked_decisions[:10])
     summary = context.market_summary
 
+    context_notes = tuple(str(note) for note in tuple(getattr(context, "notes", ()) or ()) if str(note))
     notes = (
         f"mainline_sector={summary.mainline_sector or 'N/A'}",
         f"top_turnover_count={len(summary.top_turnover_symbols)}",
@@ -315,7 +353,7 @@ def build_context_strategy_bundle_for_symbols(
         f"stock_ctx_recomputed={stock_ctx_recomputed}",
         f"stock_ctx_reused={stock_ctx_reused}",
         "legacy_candidate_fallback=removed",
-    ) + decision_notes
+    ) + context_notes + decision_notes
     bundle = ContextStrategyBundle(
         context=context,
         profiles=profiles,
@@ -327,228 +365,3 @@ def build_context_strategy_bundle_for_symbols(
         notes=notes,
     )
     return bundle
-
-
-def _passes_watch_trade_conclusion_gate(selection, snapshot, theme_context) -> bool:
-    if selection is None:
-        return False
-    if selection.open_confirm_state == "falsified" and not selection.is_true_leader:
-        return False
-    if selection.theme_fakeout_level == "extreme" and not selection.is_true_leader:
-        return False
-    if selection.theme_x_score >= 5.6 and not selection.is_true_leader:
-        return False
-    if selection.theme_tradable and theme_context is not None:
-        if getattr(theme_context, "trade_conclusion", "") == "leader_only_alive" and not selection.is_true_leader:
-            return bool(
-                selection.is_front_row
-                and selection.open_follow_state not in {"weak_follow", "faded"}
-                and float(getattr(snapshot, "amount_2m", 0.0) or 0.0) >= 15_000_000
-            )
-    return bool(
-        selection.is_true_leader
-        or (
-            selection.is_front_row
-            and selection.open_follow_state not in {"weak_follow", "faded"}
-        )
-    )
-
-
-def _opening_validation_for_selection(
-    bundle: ContextStrategyBundle,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-):
-    return match_opening_validation(
-        getattr(bundle.context, "opening_validation_bundle", None),
-        snapshot=snapshot,
-        selection=selection,
-    )
-
-
-def _passes_opening_validation_trade_gate(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None or selection is None:
-        return True
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if state == "confirmed":
-        if tradable_level == "attack":
-            return True
-        if tradable_level == "probe":
-            return bool(
-                selection.is_true_leader
-                or selection.is_front_row
-                or decision.action in {"small_probe_only", "leader_watch", "front_row_watch", "confirm_then_go"}
-            )
-        return selection.is_true_leader
-    if state == "watch":
-        return bool(
-            selection.is_true_leader
-            or (
-                selection.is_front_row
-                and selection.open_follow_state not in {"weak_follow", "faded"}
-                and float(getattr(snapshot, "amount_2m", 0.0) or 0.0) >= 15_000_000
-            )
-        )
-    if state == "falsified" or tradable_level == "avoid":
-        return selection.is_true_leader
-    return True
-
-
-def _passes_opening_validation_watch_gate(
-    bundle: ContextStrategyBundle,
-    selection: StockSelectionContext | None,
-    snapshot=None,
-) -> bool:
-    validation = _opening_validation_for_selection(bundle, selection, snapshot)
-    if validation is None or selection is None:
-        return True
-    state = str(getattr(validation, "validation_state", "") or "")
-    tradable_level = str(getattr(validation, "tradable_level", "") or "")
-    if state in {"confirmed", "watch"}:
-        return True
-    if state == "falsified" or tradable_level == "avoid":
-        return selection.is_true_leader
-    return True
-
-
-def _passes_hard_trade_veto_only(
-    bundle: ContextStrategyBundle,
-    decision: AuctionLadderDecision,
-    selection: StockSelectionContext | None,
-    snapshot,
-) -> bool:
-    if decision.action in {"avoid_after_failed_promotion", "do_not_chase"}:
-        return False
-    if not _passes_opening_validation_trade_gate(bundle, decision, selection, snapshot):
-        return False
-    return True
-
-
-def _final_candidate_is_tradeable_probe(final_candidate) -> bool:
-    if final_candidate is None:
-        return False
-    if str(getattr(final_candidate, "action", "") or "") != "probe":
-        return False
-    if str(getattr(final_candidate, "risk_level", "") or "") == "high":
-        return False
-    risk_tags = set(getattr(getattr(final_candidate, "trace", None), "risk_tags", ()) or ())
-    if "relative_risk_theme" in risk_tags:
-        return False
-    return True
-
-
-def _final_candidate_is_watchable(final_candidate) -> bool:
-    if final_candidate is None:
-        return False
-    if str(getattr(final_candidate, "risk_level", "") or "") == "high":
-        return False
-    return str(getattr(final_candidate, "action", "") or "") in {"probe", "watch"}
-
-
-def _append_playbook_final_trade_candidates(
-    bundle: ContextStrategyBundle,
-    candidates: list[AuctionLadderDecision],
-) -> list[AuctionLadderDecision]:
-    decision_bundle = bundle.decision_bundle
-    if decision_bundle is None or not decision_bundle.final_candidates:
-        return candidates
-    decision_map = {item.symbol: item for item in bundle.decisions}
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    existing = {item.symbol for item in candidates}
-    for final_candidate in sorted(
-        decision_bundle.final_candidates,
-        key=lambda item: (
-            item.action == "probe",
-            item.risk_level != "high",
-            -int(item.priority_rank),
-        ),
-        reverse=True,
-    ):
-        if final_candidate.symbol in existing:
-            continue
-        if not _final_candidate_is_tradeable_probe(final_candidate):
-            continue
-        decision = decision_map.get(final_candidate.symbol)
-        selection = stock_context_map.get(final_candidate.symbol)
-        snapshot = snapshot_map.get(final_candidate.symbol)
-        if decision is None or selection is None or snapshot is None:
-            continue
-        if not _passes_hard_trade_veto_only(bundle, decision, selection, snapshot):
-            continue
-        if selection.kline_pattern in {"high_open_then_weak", "volume_up_price_flat", "explosive_failed_board"}:
-            continue
-        if selection.open_follow_state == "faded":
-            continue
-        if selection.daily_height_bucket == "high" and not selection.is_true_leader:
-            continue
-        candidates.append(decision)
-        existing.add(decision.symbol)
-    return candidates
-
-
-def _append_playbook_final_watch_candidates(
-    bundle: ContextStrategyBundle,
-    candidates: list[AuctionLadderDecision],
-) -> list[AuctionLadderDecision]:
-    decision_bundle = bundle.decision_bundle
-    if decision_bundle is None or not decision_bundle.final_candidates:
-        return candidates
-    decision_map = {item.symbol: item for item in bundle.decisions}
-    stock_context_map = {item.symbol: item for item in bundle.stock_selection_contexts}
-    snapshot_map = {item.symbol: item for item in bundle.context.stock_snapshots}
-    theme_context_map = getattr(bundle, "theme_context_map", None)
-    existing = {item.symbol for item in candidates}
-    for final_candidate in sorted(
-        decision_bundle.final_candidates,
-        key=lambda item: (
-            item.action in {"probe", "watch"},
-            item.risk_level != "high",
-            -int(item.priority_rank),
-        ),
-        reverse=True,
-    ):
-        if final_candidate.symbol in existing:
-            continue
-        if not _final_candidate_is_watchable(final_candidate):
-            continue
-        decision = decision_map.get(final_candidate.symbol)
-        selection = stock_context_map.get(final_candidate.symbol)
-        snapshot = snapshot_map.get(final_candidate.symbol)
-        if decision is None or selection is None or snapshot is None:
-            continue
-        theme_context = theme_context_map.get(selection.plate_name) if isinstance(theme_context_map, dict) else None
-        if not _passes_opening_validation_watch_gate(bundle, selection, snapshot):
-            continue
-        if final_candidate.action == "watch" and theme_context is not None and not _passes_watch_trade_conclusion_gate(selection, snapshot, theme_context):
-            continue
-        candidates.append(decision)
-        existing.add(decision.symbol)
-    return candidates
-
-
-def filter_trade_candidates(
-    bundle: ContextStrategyBundle,
-    *,
-    min_confidence: int = 60,
-) -> tuple[AuctionLadderDecision, ...]:
-    candidates = _append_playbook_final_trade_candidates(bundle, [])
-    return tuple(candidates)
-
-
-def filter_watch_candidates(
-    bundle: ContextStrategyBundle,
-    *,
-    min_confidence: int = 60,
-) -> tuple[AuctionLadderDecision, ...]:
-    candidates = _append_playbook_final_watch_candidates(bundle, [])
-    if candidates:
-        return tuple(candidates)
-    return ()

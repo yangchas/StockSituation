@@ -31,6 +31,14 @@ def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 10.0) -> f
     return max(minimum, min(maximum, value))
 
 
+def _score_bucket(value: float, *, strong: float = 7.0, weak: float = 4.5) -> str:
+    if value >= strong:
+        return "strong"
+    if value >= weak:
+        return "normal"
+    return "weak"
+
+
 def _neutral_shape_score(value: object, default: float = 5.0) -> float:
     if value in (None, ""):
         return default
@@ -1058,6 +1066,24 @@ def build_stock_selection_context(
         2,
     )
 
+    shape_bucket = _score_bucket(shape_quality_score, strong=7.0, weak=4.8)
+    execution_bucket = _score_bucket(execution_quality_score, strong=7.0, weak=4.8)
+    undertake_bucket = _score_bucket(open_undertake_score, strong=6.6, weak=4.6)
+    risk_bucket = "normal"
+    if (
+        overheat_risk >= 6.5
+        or theme_x_score >= 6.0
+        or auction_open_bucket in {"overheat_high_open", "near_limit_open"}
+        or daily_height_bucket == "high"
+    ):
+        risk_bucket = "elevated"
+    if (
+        open_follow_state in {"weak_follow", "faded"}
+        or theme_fakeout_level in {"high", "trap"}
+        or (daily_height_bucket == "high" and execution_bucket == "weak")
+    ):
+        risk_bucket = "high"
+
 
 
     notes = [
@@ -1075,8 +1101,13 @@ def build_stock_selection_context(
         f"heat_flow={heat_flow_score:.1f}",
         f"turnover_quality={turnover_quality_score:.1f}",
         f"open_undertake={open_undertake_score:.1f}",
-        f"shape_quality={shape_quality_score:.1f}",
-        f"execution_quality={execution_quality_score:.1f}",
+        f"shape_bucket={shape_bucket}",
+        f"execution_bucket={execution_bucket}",
+        f"undertake_bucket={undertake_bucket}",
+        f"risk_bucket={risk_bucket}",
+        f"legacy_shape_quality={shape_quality_score:.1f}",
+        f"legacy_execution_quality={execution_quality_score:.1f}",
+        f"legacy_total_score={total_score:.1f}",
         f"factor_edge={factor_edge_score:.1f}",
         f"dde_flow={dde_flow_score:.1f}",
         f"quality_gates={quality_gate_count}",
@@ -1117,6 +1148,10 @@ def build_stock_selection_context(
         open_undertake_score=round(open_undertake_score, 2),
         shape_quality_score=round(shape_quality_score, 2),
         execution_quality_score=round(execution_quality_score, 2),
+        shape_bucket=shape_bucket,
+        execution_bucket=execution_bucket,
+        undertake_bucket=undertake_bucket,
+        risk_bucket=risk_bucket,
         theme_tradable=theme_tradable,
         theme_fakeout_level=theme_fakeout_level,
         theme_x_score=round(theme_x_score, 2),

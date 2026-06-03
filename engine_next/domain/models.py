@@ -137,6 +137,7 @@ class StockStateSnapshot:
     is_yest_limit: bool = False
     is_locked: bool = False
     real_plate_names: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -333,6 +334,10 @@ class StockSelectionContext:
     open_undertake_score: float = 0.0
     shape_quality_score: float = 0.0
     execution_quality_score: float = 0.0
+    shape_bucket: str = "unknown"
+    execution_bucket: str = "unknown"
+    undertake_bucket: str = "unknown"
+    risk_bucket: str = "normal"
     theme_tradable: bool = False
     theme_fakeout_level: str = "unknown"
     theme_x_score: float = 0.0
@@ -420,6 +425,9 @@ class IntradayContext:
     yesterday_hot_plate_map: Dict[str, dict]
     yest_limit_map: Dict[str, dict]
     auction_map: Dict[str, dict]
+    latest_quote_timestamp_ms: int = 0
+    latest_quote_time: str = ""
+    latest_quote_age_seconds: Optional[int] = None
     session_facts: SessionFacts = field(default_factory=SessionFacts)
     opening_validation_bundle: OpeningValidationBundle | None = None
     cached_theme_conclusions: Dict[str, str] = field(default_factory=dict)

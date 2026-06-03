@@ -14,6 +14,11 @@ PLAYBOOK_LABELS: dict[str, str] = {
 }
 
 PLAYBOOK_BY_CANDIDATE_PATH: tuple[tuple[str, str], ...] = (
+    ("hot_plate_hard_risk_watch", "dragon_head_risk_control"),
+    ("hot_plate_anchor_attack", "sector_rotation"),
+    ("hot_plate_anchor_watch", "sector_rotation"),
+    ("timeframe_aligned_attack", "sector_rotation"),
+    ("timeframe_watch", "sector_rotation"),
     ("local_pack_pressure_repair", "dragon_pressure_repair"),
     ("local_pack_main_attack", "mainline_attack"),
     ("local_pack_aligned", "mainline_attack"),

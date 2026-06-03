@@ -1,27 +1,105 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 
 from engine_next.domain.local_strategy_models import LocalMetric, LocalSignal, LocalStrategyScopeSummary
 from engine_next.domain.decision_models import (
     DecisionTrace,
     DecisionBundle,
     FinalCandidateDecision,
+    FocusAssetStressDecision,
     GlobalMarketDecision,
+    HotPlateAnchorDecision,
     HypothesisValidation,
     MarketHypothesis,
     PlaybookControlMatrix,
     PlaybookControlRow,
+    PlaybookOutputSummary,
     ShadowTakeoverDecision,
     StockLocalDecision,
     ThemeLocalDecision,
 )
 from engine_next.domain.models import IntradayContext
-from engine_next.strategy_skill_layer.playbook_control import playbook_for_candidate_path
+from engine_next.strategy_skill_layer.playbook_control import playbook_for_candidate_path, playbook_row
+from engine_next.strategy_skill_layer.playbook_decision_adapter import (
+    build_playbook_decision_view,
+    slice_playbook_decision_views,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _phase_name(context: IntradayContext) -> str:
     return str(getattr(context.phase, "value", context.phase) or "")
+
+
+def _metric_value(trace: DecisionTrace | None, name: str, default: float = 0.0) -> float:
+    if trace is None:
+        return default
+    for metric_name, value in trace.metric_values:
+        if metric_name == name:
+            return float(value)
+    return default
+
+
+def _fmt_amount_yuan(value: float) -> str:
+    number = float(value or 0.0)
+    if abs(number) >= 100_000_000:
+        return f"{number / 100_000_000:.2f}e"
+    if abs(number) >= 10_000:
+        return f"{number / 10_000:.0f}w"
+    return f"{number:.0f}"
+
+
+def _fmt_metric_pct(value: float) -> str:
+    return f"{float(value or 0.0) * 100:.1f}%"
+
+
+def _fmt_plain_pct(value: float) -> str:
+    return f"{float(value or 0.0):.2f}%"
+
+
+def _hot_metric_line_text(line) -> str:
+    return (
+        f"hot_metric:{line.plate_name};rank={line.rank};yest={line.yest_rank};"
+        f"chg={_fmt_plain_pct(line.change_pct)};strength={line.strength:.0f};"
+        f"inflow={line.net_inflow_yi:.2f}e;2m={_fmt_amount_yuan(line.amount_2m)};"
+        f"front2m={line.front_2m_count};delta={line.net_inflow_yi_delta:.2f}e;"
+        f"state={line.state};pct=s{line.strength_rank_pct:.2f},"
+        f"chg{line.change_rank_pct:.2f},in{line.inflow_rank_pct:.2f},2m{line.amount_2m_rank_pct:.2f}"
+    )
+
+
+def _hot_quant_summary(hot_anchor: HotPlateAnchorDecision | None) -> str:
+    if hot_anchor is None:
+        return "hot:state=-"
+    base = (
+        f"hot:state={hot_anchor.anchor_state};primary={len(hot_anchor.primary_themes)};"
+        f"continue={len(hot_anchor.continuation_themes)};rotate={len(hot_anchor.rotation_themes)};"
+        f"risk={len(hot_anchor.fading_themes) + len(hot_anchor.fakeout_themes)}"
+    )
+    if not hot_anchor.metric_lines:
+        return f"{base};top=-;top_chg=-;top_inflow=-"
+    top = hot_anchor.metric_lines[0]
+    return f"{base};top={top.plate_name};top_chg={_fmt_plain_pct(top.change_pct)};top_inflow={top.net_inflow_yi:.2f}e"
+
+
+def _hot_metric_state_map(hot_anchor: HotPlateAnchorDecision | None) -> dict[str, str]:
+    if hot_anchor is None:
+        return {}
+    return {
+        line.plate_name: str(line.state or "observe")
+        for line in tuple(getattr(hot_anchor, "metric_lines", ()) or ())
+        if line.plate_name
+    }
+
+
+def _hot_theme_is_hard_risk(theme_name: str, hot_anchor: HotPlateAnchorDecision | None) -> bool:
+    if not theme_name or hot_anchor is None:
+        return False
+    state = _hot_metric_state_map(hot_anchor).get(theme_name, "")
+    return theme_name in tuple(hot_anchor.fading_themes) or theme_name in tuple(hot_anchor.fakeout_themes) or state in {"fading", "fakeout"}
 
 
 def _hypothesis_id(script: str, scope: str, context: IntradayContext) -> str:
@@ -136,9 +214,10 @@ def _validate_hypothesis(
     passed: list[str] = []
     failed: list[str] = []
     missing: list[str] = []
-    if theme is None:
+    needs_theme = hypothesis.script in {"mainline_extension", "capital_rotation", "fakeout_pulse"}
+    if theme is None and needs_theme:
         missing.append("theme_local_decision")
-    else:
+    elif theme is not None:
         if theme.local_validation_hint == "confirmed_like":
             passed.append("theme_local_confirmed")
         elif theme.local_validation_hint == "falsified_like":
@@ -163,6 +242,8 @@ def _validate_hypothesis(
             missing.append("high_focus_feedback")
     if hypothesis.script == "high_level_distribution" and high_focus_state == "negative":
         passed.append("high_focus_distribution")
+    if hypothesis.script == "focus_asset_stress":
+        passed.append("focus_asset_stress")
     if hypothesis.script == "fakeout_pulse" and theme is not None:
         if theme.local_script_hint in {"fakeout", "distribution"}:
             passed.append("fakeout_or_distribution")
@@ -203,7 +284,7 @@ def _summary_ref(prefix: str, summary: LocalStrategyScopeSummary) -> str:
     return f"{prefix}:{summary.scope_type}:{summary.scope}"
 
 
-def _metric_value(metrics: tuple[LocalMetric, ...], name: str, default: str = "") -> str:
+def _metric_text_value(metrics: tuple[LocalMetric, ...], name: str, default: str = "") -> str:
     for metric in metrics:
         if metric.name == name:
             return str(metric.value)
@@ -235,7 +316,7 @@ def _build_local_pack_hypotheses(
     if graph is not None:
         for summary in pack.stock_alignments:
             bridge = _bridge_signal_for_symbol(decision_bundle, summary.scope)
-            theme_name = _metric_value(bridge.metrics, "theme") if bridge is not None else ""
+            theme_name = _metric_text_value(bridge.metrics, "theme") if bridge is not None else ""
             if theme_name:
                 aligned_themes.add(theme_name)
                 if bridge is not None and bridge.state == "theme_stock_pressure_repair":
@@ -398,8 +479,13 @@ def _build_global_decision(
     hypotheses: tuple[MarketHypothesis, ...],
     validations: tuple[HypothesisValidation, ...],
     high_focus_state: str,
+    focus_stress: FocusAssetStressDecision | None = None,
     theme_relative_trace: DecisionTrace | None = None,
     relative_risk_themes: tuple[str, ...] = (),
+    temporal_trace: DecisionTrace | None = None,
+    temporal_targets: tuple[str, ...] = (),
+    temporal_fading: tuple[str, ...] = (),
+    hot_anchor: HotPlateAnchorDecision | None = None,
 ) -> GlobalMarketDecision:
     validation_map = {validation.hypothesis_id: validation for validation in validations}
     confirmed_attack: list[MarketHypothesis] = []
@@ -421,10 +507,13 @@ def _build_global_decision(
         elif validation.result == "rejected":
             rejected_risk.append(hypothesis)
 
-    main_attack = confirmed_attack[0].scope if confirmed_attack else ""
+    hypothesis_main_attack = confirmed_attack[0].scope if confirmed_attack else ""
     pressure_repair_attack = any(item.script == "local_pack_high_pressure_repair" for item in confirmed_attack)
-    secondary = tuple(item.scope for item in confirmed_attack[1:3] if item.scope and item.scope != "market")
-    watch = tuple(item.scope for item in partial_watch[:5] if item.scope and item.scope != "market")
+    hypothesis_secondary = tuple(item.scope for item in confirmed_attack[1:3] if item.scope and item.scope != "market")
+    hypothesis_watch = tuple(item.scope for item in partial_watch[:5] if item.scope and item.scope != "market")
+    main_attack = hypothesis_main_attack
+    secondary = hypothesis_secondary
+    watch = hypothesis_watch
     avoid = tuple(item.scope for item in rejected_risk[:5] if item.scope and item.scope != "market")
     market_script = "observe"
     action_hint = "watch"
@@ -433,24 +522,133 @@ def _build_global_decision(
     risk_tags: tuple[str, ...] = ()
     migrating_in = tuple(getattr(context.market_summary, "migrating_in_plates", ()) or ())
     migrating_out = tuple(getattr(context.market_summary, "migrating_out_plates", ()) or ())
+    hot_primary = hot_anchor.primary_themes if hot_anchor is not None else ()
+    hot_fading = hot_anchor.fading_themes if hot_anchor is not None else ()
+    hot_fakeout = hot_anchor.fakeout_themes if hot_anchor is not None else ()
+    hot_trace = hot_anchor.trace if hot_anchor is not None else None
+    relative_trace = theme_relative_trace
+    hot_main_attack = next(
+        (
+            theme
+            for theme in hot_primary
+            if theme
+            and theme not in hot_fading
+            and theme not in hot_fakeout
+        ),
+        "",
+    )
+    hot_secondary = tuple(theme for theme in hot_primary if theme and theme != hot_main_attack)[:3]
+    temporal_main_attack = next(
+        (
+            theme
+            for theme in temporal_targets
+            if theme and (theme == hot_main_attack or theme in hot_primary)
+        ),
+        "",
+    )
+    if hot_main_attack and temporal_main_attack:
+        main_attack = hot_main_attack
+    elif hot_main_attack and not main_attack:
+        main_attack = hot_main_attack
+    elif not main_attack and temporal_main_attack:
+        main_attack = temporal_main_attack
+
     if main_attack:
-        market_script = "attack_confirmed"
-        action_hint = "probe"
-        position_cap = 0.12 if pressure_repair_attack else (0.2 if high_focus_state == "negative" else 0.35)
+        secondary_items: list[str] = []
+        secondary_items.extend(theme for theme in hot_secondary if theme and theme != main_attack)
+        secondary_items.extend(theme for theme in hypothesis_secondary if theme and theme != main_attack)
+        secondary_items.extend(theme for theme in temporal_targets if theme and theme != main_attack)
+        secondary = tuple(dict.fromkeys(secondary_items))[:3]
+        watch_items: list[str] = []
+        watch_items.extend(theme for theme in hypothesis_watch if theme and theme != main_attack and theme not in secondary)
+        watch_items.extend(theme for theme in hot_primary if theme and theme != main_attack and theme not in secondary)
+        watch_items.extend(theme for theme in partial_watch[:5] if theme.scope and theme.scope != "market" and theme.scope != main_attack and theme.scope not in secondary)
+        watch = tuple(dict.fromkeys(watch_items))[:4]
+    elif not secondary and hot_primary:
+        secondary = tuple(theme for theme in hot_primary if theme)[:3]
+    elif not watch and hot_primary:
+        watch = tuple(theme for theme in hot_primary[:4] if theme)
+    focus_stress_trace = focus_stress.trace if focus_stress is not None else None
+    focus_stress_state = focus_stress.stress_state if focus_stress is not None else "unknown"
+    focus_stress_spread = focus_stress.spread_level if focus_stress is not None else "unknown"
+    focus_stress_themes = focus_stress.stressed_themes if focus_stress is not None else ()
+    dragon_alone_themes = focus_stress.dragon_alone_themes if focus_stress is not None else ()
+    focus_stress_risk_count = len(focus_stress_themes)
+    main_attack_has_process_support = bool(
+        main_attack
+        and (main_attack in temporal_targets or main_attack in migrating_in or main_attack in hot_primary)
+    )
+    main_attack_hot_hard_risk = _hot_theme_is_hard_risk(main_attack, hot_anchor)
+    hot_anchor_first = bool(
+        hot_anchor is not None
+        and hot_anchor.anchor_state in {"hot_rotation", "hot_continuation", "hot_probe"}
+        and bool(main_attack)
+        and not hypothesis_main_attack
+    )
+    if main_attack:
+        market_script = "hot_risk_validation" if main_attack_hot_hard_risk else "attack_confirmed"
+        action_hint = "watch" if main_attack_hot_hard_risk else "probe"
+        position_cap = 0.05 if main_attack_hot_hard_risk else (0.12 if pressure_repair_attack else (0.2 if high_focus_state == "negative" else 0.35))
         reason_list = ["validated_attack_hypothesis"]
+        if hot_anchor_first:
+            reason_list = ["hot_plate_first_anchor"]
+            market_script = "watch_validation"
+            action_hint = "watch"
+            position_cap = 0.1
+            if hot_anchor is not None and hot_anchor.anchor_state in {"hot_rotation", "hot_continuation"}:
+                market_script = "attack_confirmed"
+                action_hint = "probe"
+                position_cap = 0.12 if high_focus_state == "negative" else 0.18
         risk_list: list[str] = []
+        if main_attack_hot_hard_risk:
+            reason_list.append("hot_plate_hard_risk_validation")
+            risk_list.append("hot_plate_hard_risk")
         if pressure_repair_attack:
             reason_list.append("pressure_repair_probe")
             risk_list.append("risk_capped_pressure_repair")
         if main_attack in migrating_in:
             reason_list.append("sector_flow_migrating_in")
+        if main_attack in temporal_targets:
+            reason_list.append("timeframe_chain_confirmed")
+        if main_attack in hot_primary:
+            reason_list.append("hot_plate_anchor")
         if main_attack in migrating_out:
             risk_list.append("sector_flow_migrating_out")
+        if main_attack in temporal_fading:
+            risk_list.append("timeframe_chain_fading")
+        if main_attack in hot_fading or main_attack in hot_fakeout:
+            risk_list.append("hot_plate_anchor_risk")
         if main_attack in relative_risk_themes:
             risk_list.append("relative_risk_theme")
+        if main_attack in focus_stress_themes:
+            reason_list.append("focus_asset_stress_theme")
+            risk_list.append("focus_asset_stress")
+            position_cap = min(position_cap, 0.12)
+        if main_attack in dragon_alone_themes:
+            reason_list.append("dragon_alone_only")
+            risk_list.append("dragon_alone_risk")
+            position_cap = min(position_cap, 0.08)
+            action_hint = "watch"
+        if focus_stress_state == "market_risk_spread":
+            market_script = "pressure_validation" if main_attack_has_process_support else "risk_validation"
+            action_hint = "watch"
+            position_cap = min(position_cap, 0.08 if main_attack_has_process_support else 0.05)
+            reason_list.append("focus_asset_market_risk_spread")
+            risk_list.append("focus_asset_market_risk")
+        elif focus_stress_state == "theme_pressure" and main_attack in focus_stress_themes:
+            market_script = "pressure_validation"
+            action_hint = "watch"
+            position_cap = min(position_cap, 0.08)
+            reason_list.append("focus_asset_theme_pressure")
         reason_codes = tuple(reason_list)
         risk_tags = tuple(risk_list)
-    elif high_focus_state == "negative":
+    elif focus_stress_state == "market_risk_spread":
+        market_script = "risk_off"
+        action_hint = "avoid_chase"
+        position_cap = 0.0
+        reason_codes = ("focus_asset_market_risk_spread",)
+        risk_tags = ("focus_asset_market_risk",)
+    elif high_focus_state == "negative" and not hot_primary:
         market_script = "risk_off"
         action_hint = "avoid_chase"
         position_cap = 0.0
@@ -460,7 +658,7 @@ def _build_global_decision(
         market_script = "watch_validation"
         action_hint = "watch"
         position_cap = 0.1
-        reason_codes = ("partial_hypothesis",)
+        reason_codes = ("hot_plate_watch_validation",) if hot_primary else ("partial_hypothesis",)
     elif relative_risk_themes:
         market_script = "risk_off"
         action_hint = "avoid_chase"
@@ -476,6 +674,12 @@ def _build_global_decision(
     )
     if theme_relative_trace is not None:
         lower_refs = (theme_relative_trace.decision_id, *lower_refs)
+    if temporal_trace is not None:
+        lower_refs = (temporal_trace.decision_id, *lower_refs)
+    if hot_anchor is not None:
+        lower_refs = (hot_anchor.trace.decision_id, *lower_refs)
+    if focus_stress is not None:
+        lower_refs = (focus_stress.trace.decision_id, *lower_refs)
     trace = DecisionTrace(
         decision_id=f"global_market:{context.trade_date}:{_phase_name(context)}",
         decision_type="global_market",
@@ -491,15 +695,56 @@ def _build_global_decision(
         risk_tags=risk_tags,
         reject_reason="no_validated_attack" if not main_attack else "",
         invalidation_points=("confirmed_theme_fades", "risk_spread_expands") if main_attack else (),
+        metrics=(
+            f"confirmed_attack_count={len(confirmed_attack)}",
+            f"partial_watch_count={len(partial_watch)}",
+            f"rejected_risk_count={len(rejected_risk)}",
+            f"hot_primary_count={len(hot_primary)}",
+            f"hot_risk_count={len(hot_fading) + len(hot_fakeout)}",
+            f"temporal_target_count={len(temporal_targets)}",
+            f"temporal_fading_count={len(temporal_fading)}",
+            f"relative_risk_count={len(relative_risk_themes)}",
+            f"focus_stress_theme_count={focus_stress_risk_count}",
+            f"focus_stress_dragon_alone_count={len(dragon_alone_themes)}",
+            f"relative_top_hot_rank={_metric_value(relative_trace, 'top_hot_rank', 999):.0f}",
+            f"relative_top_hot_inflow={_metric_value(relative_trace, 'top_hot_net_inflow_yi'):.2f}",
+            f"position_cap={position_cap:.2f}",
+        ),
+        metric_values=(
+            ("confirmed_attack_count", float(len(confirmed_attack))),
+            ("partial_watch_count", float(len(partial_watch))),
+            ("rejected_risk_count", float(len(rejected_risk))),
+            ("hot_primary_count", _metric_value(hot_trace, "primary_theme_count", float(len(hot_primary)))),
+            ("hot_risk_count", float(len(hot_fading) + len(hot_fakeout))),
+            ("temporal_target_count", float(len(temporal_targets))),
+            ("temporal_fading_count", float(len(temporal_fading))),
+            ("relative_risk_count", float(len(relative_risk_themes))),
+            ("focus_stress_theme_count", float(focus_stress_risk_count)),
+            ("focus_stress_dragon_alone_count", float(len(dragon_alone_themes))),
+            ("focus_stress_spread_level_num", _metric_value(focus_stress_trace, "stress_spread_level_num")),
+            ("focus_stress_front_follow_fail_rate", _metric_value(focus_stress_trace, "front_follow_fail_rate")),
+            ("relative_top_hot_rank", _metric_value(relative_trace, "top_hot_rank", 999.0)),
+            ("relative_top_hot_change_pct", _metric_value(relative_trace, "top_hot_change_pct")),
+            ("relative_top_hot_strength", _metric_value(relative_trace, "top_hot_strength")),
+            ("relative_top_hot_net_inflow_yi", _metric_value(relative_trace, "top_hot_net_inflow_yi")),
+            ("relative_top_hot_amount_2m", _metric_value(relative_trace, "top_hot_amount_2m")),
+            ("position_cap", float(position_cap)),
+        ),
         evidence_summary=(
             f"confirmed_attack={len(confirmed_attack)}",
             f"partial_watch={len(partial_watch)}",
             f"rejected_risk={len(rejected_risk)}",
             f"high_focus={high_focus_state}",
             f"pressure_repair={pressure_repair_attack}",
+            f"focus_stress={focus_stress_state}",
+            f"focus_spread={focus_stress_spread}",
             f"migrating_in={','.join(migrating_in[:3]) or '-'}",
             f"migrating_out={','.join(migrating_out[:3]) or '-'}",
             f"relative_risk={','.join(relative_risk_themes[:3]) or '-'}",
+            f"temporal_targets={','.join(temporal_targets[:3]) or '-'}",
+            f"temporal_fading={','.join(temporal_fading[:3]) or '-'}",
+            f"hot_anchor={hot_anchor.anchor_state if hot_anchor is not None else '-'}",
+            f"hot_primary={','.join(hot_primary[:3]) or '-'}",
         ),
     )
     return GlobalMarketDecision(
@@ -523,19 +768,80 @@ def _build_final_candidates(
     rotation_order = theme_relative.rotation_candidates if theme_relative is not None else ()
     risk_themes = theme_relative.risk_themes if theme_relative is not None else ()
     pack = decision_bundle.local_strategy_evidence_pack
+    temporal = decision_bundle.temporal_migration_decision
+    hot_anchor = decision_bundle.hot_plate_anchor_decision
+    focus_stress = decision_bundle.focus_asset_stress_decision
     local_pack_themes = tuple(summary.scope for summary in pack.theme_opportunities) if pack is not None else ()
     local_pack_risk_themes = tuple(summary.scope for summary in pack.theme_risks) if pack is not None else ()
     local_aligned_symbols = {summary.scope for summary in pack.stock_alignments} if pack is not None else set()
+    temporal_targets = temporal.target_themes if temporal is not None else ()
+    temporal_fading = temporal.fading_themes if temporal is not None else ()
+    hot_primary = hot_anchor.primary_themes if hot_anchor is not None else ()
+    hot_continuation = hot_anchor.continuation_themes if hot_anchor is not None else ()
+    hot_rotation = hot_anchor.rotation_themes if hot_anchor is not None else ()
+    hot_state_map = _hot_metric_state_map(hot_anchor)
+    hot_risk = (
+        tuple(hot_anchor.fading_themes) + tuple(hot_anchor.fakeout_themes)
+        if hot_anchor is not None
+        else ()
+    )
+    focus_stress_state = focus_stress.stress_state if focus_stress is not None else "unknown"
+    focus_stress_themes = focus_stress.stressed_themes if focus_stress is not None else ()
+    dragon_alone_themes = focus_stress.dragon_alone_themes if focus_stress is not None else ()
     target_theme_items: list[str] = []
+    target_theme_items.extend(hot_primary)
+    target_theme_items.extend(hot_continuation)
+    target_theme_items.extend(hot_rotation)
     if global_decision.main_attack_theme:
         target_theme_items.append(global_decision.main_attack_theme)
+    target_theme_items.extend(global_decision.secondary_themes)
+    target_theme_items.extend(global_decision.watch_themes)
     target_theme_items.extend(mainline_order)
     target_theme_items.extend(rotation_order)
+    target_theme_items.extend(temporal_targets)
     target_theme_items.extend(local_pack_themes)
     target_themes = tuple(dict.fromkeys(target_theme_items))
+    main_attack_theme = global_decision.main_attack_theme or ""
+    secondary_theme_set = set(global_decision.secondary_themes)
+    watch_theme_set = set(global_decision.watch_themes)
+    stock_local_all = tuple(decision_bundle.stock_local_decisions)
+    stock_local_candidate_count = sum(1 for decision in stock_local_all if decision.trace.state == "candidate")
+    stock_local_front_count = sum(
+        1 for decision in stock_local_all if decision.role_hint in {"true_leader", "front_row"}
+    )
+    stock_local_mid_count = sum(1 for decision in stock_local_all if decision.role_hint == "mid_follow")
     if not target_themes:
+        target_themes = tuple(
+            dict.fromkeys(
+                decision.theme_name
+                for decision in decision_bundle.stock_local_decisions
+                if decision.theme_name
+                and decision.role_hint in {"true_leader", "front_row"}
+                and decision.trace.state == "candidate"
+            )
+        )[:8]
+    if not target_themes:
+        target_themes = tuple(
+            dict.fromkeys(
+                decision.theme_name
+                for decision in decision_bundle.stock_local_decisions
+                if decision.theme_name and decision.role_hint in {"true_leader", "front_row"}
+            )
+        )[:8]
+    if not target_themes:
+        logger.info(
+            "final candidate debug | phase=%s | target_themes=0 | stock_local=%s | candidate=%s | front=%s | mid=%s | hot_primary=%s | temporal_targets=%s | local_pack_themes=%s",
+            _phase_name(context),
+            len(stock_local_all),
+            stock_local_candidate_count,
+            stock_local_front_count,
+            stock_local_mid_count,
+            len(hot_primary),
+            len(temporal_targets),
+            len(local_pack_themes),
+        )
         return ()
-    raw_candidates: list[StockLocalDecision] = [
+    raw_candidates_strict: list[StockLocalDecision] = [
         decision
         for decision in decision_bundle.stock_local_decisions
         if decision.theme_name in target_themes
@@ -543,25 +849,110 @@ def _build_final_candidates(
         and decision.role_hint in {"true_leader", "front_row"}
         and decision.entry_behavior not in {"high_open_distribution", "weak_follow"}
     ]
+    raw_candidates = raw_candidates_strict
+    raw_candidates_relaxed_front: list[StockLocalDecision] = []
+    raw_candidates_candidate_any: list[StockLocalDecision] = []
+    raw_candidates_relaxed_mid: list[StockLocalDecision] = []
     if not raw_candidates:
-        raw_candidates = [
+        raw_candidates_relaxed_front = [
             decision
             for decision in decision_bundle.stock_local_decisions
             if decision.theme_name in target_themes
             and decision.role_hint in {"true_leader", "front_row"}
             and decision.entry_behavior != "high_open_distribution"
         ]
-    ranked: list[tuple[tuple[int, int, int, int, str], StockLocalDecision, str, str, str]] = []
+        raw_candidates = raw_candidates_relaxed_front
+    if not raw_candidates:
+        raw_candidates_candidate_any = [
+            decision
+            for decision in decision_bundle.stock_local_decisions
+            if decision.trace.state == "candidate"
+            and decision.role_hint in {"true_leader", "front_row"}
+            and decision.entry_behavior != "high_open_distribution"
+        ]
+        raw_candidates = raw_candidates_candidate_any
+    if not raw_candidates:
+        raw_candidates_relaxed_mid = [
+            decision
+            for decision in decision_bundle.stock_local_decisions
+            if (
+                decision.theme_name in target_themes
+                or decision.symbol in local_aligned_symbols
+                or decision.trace.state == "candidate"
+            )
+            and decision.role_hint in {"true_leader", "front_row", "mid_follow"}
+            and decision.entry_behavior not in {"high_open_distribution", "weak_follow"}
+        ]
+        raw_candidates = raw_candidates_relaxed_mid
+    raw_main_attack = [
+        decision
+        for decision in raw_candidates
+        if main_attack_theme and decision.theme_name == main_attack_theme
+    ]
+    raw_secondary = [
+        decision
+        for decision in raw_candidates
+        if decision.theme_name in secondary_theme_set
+    ]
+    raw_watch = [
+        decision
+        for decision in raw_candidates
+        if decision.theme_name in watch_theme_set
+    ]
+    main_attack_ready = any(
+        decision.role_hint in {"true_leader", "front_row"} and decision.trace.state == "candidate"
+        for decision in raw_main_attack
+    )
+    mainline_family_ready = bool(main_attack_ready or raw_secondary)
+    ranked: list[tuple[tuple[float, float, float, float, float, float, str], StockLocalDecision, str, str, str]] = []
     for decision in raw_candidates:
         bridge_signal = _bridge_signal_for_symbol(decision_bundle, decision.symbol)
         is_local_aligned = decision.symbol in local_aligned_symbols
         bridge_state = bridge_signal.state if bridge_signal is not None else ""
-        if decision.theme_name in risk_themes + local_pack_risk_themes and decision.role_hint != "true_leader":
+        theme_tier = 3
+        if main_attack_theme and decision.theme_name == main_attack_theme:
+            theme_tier = 0
+        elif decision.theme_name in secondary_theme_set:
+            theme_tier = 1
+        elif decision.theme_name in watch_theme_set:
+            theme_tier = 2
+        hot_hard_risk = _hot_theme_is_hard_risk(decision.theme_name, hot_anchor)
+        if hot_hard_risk:
+            path_type = "hot_plate_hard_risk_watch"
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "elevated"
+            path_rank = 7 if decision.role_hint == "true_leader" else 15
+        elif decision.theme_name in risk_themes + local_pack_risk_themes + temporal_fading + hot_risk and decision.role_hint != "true_leader":
             path_type = "risk_theme_watch"
             action = "watch"
             bucket = "shadow_watch"
             risk_level = "elevated"
             path_rank = 8
+        elif decision.theme_name in hot_primary and is_local_aligned:
+            path_type = "hot_plate_anchor_attack"
+            action = "probe"
+            bucket = "shadow_attack"
+            risk_level = "normal"
+            path_rank = _theme_order_index(decision.theme_name, hot_primary)
+        elif decision.theme_name in hot_primary:
+            path_type = "hot_plate_anchor_watch"
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "normal"
+            path_rank = 12 + _theme_order_index(decision.theme_name, hot_primary)
+        elif decision.theme_name in temporal_targets and is_local_aligned:
+            path_type = "timeframe_aligned_attack"
+            action = "probe"
+            bucket = "shadow_attack"
+            risk_level = "normal"
+            path_rank = 1 + _theme_order_index(decision.theme_name, temporal_targets)
+        elif decision.theme_name in temporal_targets:
+            path_type = "timeframe_watch"
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "normal"
+            path_rank = 18 + _theme_order_index(decision.theme_name, temporal_targets)
         elif is_local_aligned and bridge_state == "theme_stock_pressure_repair":
             path_type = "local_pack_pressure_repair"
             action = "probe"
@@ -579,19 +970,25 @@ def _build_final_candidates(
             action = "probe"
             bucket = "shadow_attack"
             risk_level = "normal"
-            path_rank = 2 + _theme_order_index(decision.theme_name, local_pack_themes)
+            path_rank = (2 if decision.theme_name in secondary_theme_set else 6) + _theme_order_index(decision.theme_name, local_pack_themes)
         elif decision.theme_name == global_decision.main_attack_theme:
             path_type = "main_attack"
             action = "probe"
             bucket = "shadow_attack"
             risk_level = "normal"
             path_rank = 0
+        elif decision.theme_name in secondary_theme_set:
+            path_type = "secondary_follow"
+            action = "probe"
+            bucket = "shadow_attack"
+            risk_level = "normal"
+            path_rank = 3 + _theme_order_index(decision.theme_name, global_decision.secondary_themes)
         elif decision.theme_name in mainline_order:
             path_type = "mainline_follow"
             action = "probe"
             bucket = "shadow_attack"
             risk_level = "normal"
-            path_rank = 1 + _theme_order_index(decision.theme_name, mainline_order)
+            path_rank = (4 if decision.theme_name in secondary_theme_set else 9) + _theme_order_index(decision.theme_name, mainline_order)
         elif decision.theme_name in rotation_order:
             path_type = "rotation_probe"
             action = "probe"
@@ -604,6 +1001,18 @@ def _build_final_candidates(
             bucket = "shadow_watch"
             risk_level = "normal"
             path_rank = 50
+        if decision.theme_name in focus_stress_themes and decision.role_hint != "true_leader":
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "elevated"
+            path_rank = max(path_rank, 14)
+            path_type = f"{path_type}_focus_stress"
+        if decision.theme_name in dragon_alone_themes and decision.role_hint != "true_leader":
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "elevated"
+            path_rank = max(path_rank, 16)
+            path_type = f"{path_type}_dragon_alone"
         if global_decision.market_script == "risk_off":
             action = "watch"
             bucket = "shadow_watch"
@@ -622,15 +1031,32 @@ def _build_final_candidates(
             bucket = "shadow_watch"
             risk_level = "elevated"
             path_type = f"{path_type}_bridge_risk"
+        if (
+            mainline_family_ready
+            and theme_tier >= 2
+            and path_type not in {"local_pack_pressure_repair"}
+            and action == "probe"
+        ):
+            action = "watch"
+            bucket = "shadow_watch"
+            risk_level = "normal" if theme_tier == 2 else "elevated"
+            path_rank += 18 if theme_tier == 2 else 28
+            path_type = f"{path_type}_off_mainline"
         behavior_rank = 0 if decision.entry_behavior in {"volume_confirm", "low_open_repair", "limit_attack"} else 1
         role_rank = 0 if decision.role_hint == "true_leader" else 1
+        amount_2m = _metric_value(decision.trace, "amount_2m")
+        speed_1m = _metric_value(decision.trace, "speed_1m")
+        auction_amount = _metric_value(decision.trace, "auction_amount")
         ranked.append(
             (
                 (
-                    path_rank,
-                    role_rank,
-                    behavior_rank,
-                    decision.local_rank,
+                    float(path_rank),
+                    float(theme_tier),
+                    float(role_rank),
+                    float(behavior_rank),
+                    -amount_2m,
+                    -speed_1m,
+                    -auction_amount,
                     decision.symbol,
                 ),
                 decision,
@@ -646,8 +1072,17 @@ def _build_final_candidates(
     for sort_key, decision, path_type, action, risk_level in ranked:
         if decision.symbol in seen_symbols:
             continue
+        if (
+            focus_stress_state == "market_risk_spread"
+            and action == "probe"
+            and path_type != "local_pack_pressure_repair"
+        ):
+            continue
+        if decision.theme_name in dragon_alone_themes and decision.role_hint != "true_leader":
+            continue
         theme_count = per_theme_count.get(decision.theme_name, 0)
-        if theme_count >= 2:
+        max_per_theme = 1 if decision.theme_name in dragon_alone_themes else 2
+        if theme_count >= max_per_theme:
             continue
         bucket = "shadow_rotation" if path_type == "rotation_probe" else ("shadow_watch" if action == "watch" else "shadow_attack")
         selected.append((decision, path_type, action, risk_level, bucket, sort_key[0]))
@@ -659,9 +1094,30 @@ def _build_final_candidates(
         key=lambda item: (
             item[5],
             item[0].role_hint != "true_leader",
-            item[0].local_rank,
+            -_metric_value(item[0].trace, "amount_2m"),
+            -_metric_value(item[0].trace, "speed_1m"),
             item[0].symbol,
         )
+    )
+    logger.info(
+        "final candidate debug | phase=%s | stock_local=%s | candidate=%s | front=%s | mid=%s | target_themes=%s | strict=%s | relaxed_front=%s | candidate_any=%s | relaxed_mid=%s | selected=%s | main_ready=%s | second_ready=%s | hot_primary=%s | temporal_targets=%s | local_align=%s | risk_themes=%s",
+        _phase_name(context),
+        len(stock_local_all),
+        stock_local_candidate_count,
+        stock_local_front_count,
+        stock_local_mid_count,
+        len(target_themes),
+        len(raw_candidates_strict),
+        len(raw_candidates_relaxed_front),
+        len(raw_candidates_candidate_any),
+        len(raw_candidates_relaxed_mid),
+        len(selected),
+        len(raw_main_attack),
+        len(raw_secondary),
+        len(hot_primary),
+        len(temporal_targets),
+        len(local_aligned_symbols),
+        len(risk_themes),
     )
     final_candidates: list[FinalCandidateDecision] = []
     for priority_rank, (stock_decision, path_type, action, risk_level, bucket, _path_rank) in enumerate(selected[:5], start=1):
@@ -672,12 +1128,27 @@ def _build_final_candidates(
             stock_decision.entry_behavior,
         )
         risk_tag_items = list(stock_decision.trace.risk_tags)
-        if stock_decision.theme_name in risk_themes + local_pack_risk_themes:
+        if stock_decision.theme_name in risk_themes + local_pack_risk_themes + temporal_fading + hot_risk:
             risk_tag_items.append("relative_risk_theme")
+        if _hot_theme_is_hard_risk(stock_decision.theme_name, hot_anchor):
+            risk_tag_items.append("hot_plate_hard_risk")
+        if stock_decision.theme_name in hot_primary:
+            risk_tag_items.append("hot_plate_anchor")
+        if stock_decision.theme_name in focus_stress_themes:
+            risk_tag_items.append("focus_asset_stress")
+        if stock_decision.theme_name in dragon_alone_themes and stock_decision.role_hint != "true_leader":
+            risk_tag_items.append("dragon_alone_risk")
         bridge_signal = _bridge_signal_for_symbol(decision_bundle, stock_decision.symbol)
         if bridge_signal is not None:
             risk_tag_items.extend(bridge_signal.risk_tags)
         risk_tags = tuple(dict.fromkeys(risk_tag_items))
+        temporal_chain = ()
+        if temporal is not None:
+            temporal_chain = tuple(
+                item
+                for item in temporal.chain_summary
+                if item.startswith(f"{stock_decision.theme_name}:")
+            )[:2]
         trace = DecisionTrace(
             decision_id=f"final_candidate:{stock_decision.symbol}:{_phase_name(context)}",
             decision_type="final_candidate",
@@ -695,9 +1166,14 @@ def _build_final_candidates(
             reason_codes=reason_codes,
             risk_tags=risk_tags,
             invalidation_points=("theme_global_fades", "stock_2m_fades"),
+            metrics=stock_decision.trace.metrics,
+            metric_values=stock_decision.trace.metric_values,
             evidence_summary=(
                 f"path={path_type}",
+                f"hot_state={hot_state_map.get(stock_decision.theme_name, '-')}",
+                f"focus_stress={focus_stress_state if stock_decision.theme_name in focus_stress_themes else '-'}",
                 f"bridge={bridge_signal.state if bridge_signal is not None else '-'}",
+                *(temporal_chain or ("timeframe_chain=-",)),
                 stock_decision.evidence_text,
                 *stock_decision.trace.evidence_summary,
             ),
@@ -725,6 +1201,7 @@ def _build_shadow_takeover_decision(
     final_candidates: tuple[FinalCandidateDecision, ...],
     validations: tuple[HypothesisValidation, ...],
 ) -> ShadowTakeoverDecision:
+    focus_stress = decision_bundle.focus_asset_stress_decision
     probe_candidates = tuple(
         item
         for item in final_candidates
@@ -763,6 +1240,8 @@ def _build_shadow_takeover_decision(
     high_focus = decision_bundle.high_focus_decision
     if high_focus is not None and high_focus.feedback_state == "negative" and not pressure_bridge_mode:
         block_reasons.append("high_focus_negative")
+    if focus_stress is not None and focus_stress.stress_state == "market_risk_spread":
+        block_reasons.append("focus_asset_market_risk")
     allowed = not block_reasons
     state = "ready_to_shadow_takeover" if allowed else "blocked"
     action_hint = "shadow_can_rank" if allowed else "shadow_only"
@@ -836,6 +1315,7 @@ def _build_playbook_control_matrix(
     high_pressure_count = len(pack.high_pressure_alerts) if pack is not None else 0
     emotion_risk = any(item.action_hint in {"avoid", "avoid_chase"} or item.avoid_count > 0 for item in (pack.emotion_alerts if pack is not None else ()))
     risk_tags = tuple(global_decision.trace.risk_tags)
+    hot_hard_risk_global = global_decision.market_script == "hot_risk_validation" or "hot_plate_hard_risk" in risk_tags
     rows: list[PlaybookControlRow] = []
 
     def add_row(
@@ -888,30 +1368,51 @@ def _build_playbook_control_matrix(
     )
 
     high_pressure_block = high_pressure_count > 0 and not pressure_enabled
+    risk_control_enabled = high_pressure_block or hot_hard_risk_global
     add_row(
         "dragon_head_risk_control",
-        enabled=high_pressure_block,
-        action_hint="avoid_chase" if high_pressure_block else "watch",
+        enabled=risk_control_enabled,
+        action_hint="avoid_chase" if risk_control_enabled else "watch",
         cap=0.0,
-        reason="high-focus pressure blocks same-theme attack" if high_pressure_block else "no active high-pressure block",
-        risks=("high_focus_pressure",) if high_pressure_block else (),
+        reason=(
+            "hot plate hard risk blocks sector chase"
+            if hot_hard_risk_global
+            else ("high-focus pressure blocks same-theme attack" if high_pressure_block else "no active high-pressure block")
+        ),
+        risks=("hot_plate_hard_risk",) if hot_hard_risk_global else (("high_focus_pressure",) if high_pressure_block else ()),
         refs=tuple(summary.scope for summary in (pack.high_pressure_alerts[:3] if pack is not None else ())),
     )
 
-    rotation_confirmed = "capital_rotation" in confirmed_scripts
-    rotation_partial = any(
+    timeframe_rotation_confirmed = any(path.startswith("timeframe_aligned") for path in candidate_paths) and not hot_hard_risk_global
+    hot_anchor_confirmed = any(path.startswith("hot_plate_anchor_attack") for path in candidate_paths) and not hot_hard_risk_global
+    hot_anchor_watch = any(path.startswith("hot_plate_anchor_watch") for path in candidate_paths)
+    rotation_confirmed = "capital_rotation" in confirmed_scripts or timeframe_rotation_confirmed or hot_anchor_confirmed
+    rotation_partial = hot_hard_risk_global or any(
         hypothesis_by_id.get(item.hypothesis_id) is not None
         and hypothesis_by_id[item.hypothesis_id].script == "capital_rotation"
         and item.result in {"partial", "pending"}
         for item in validations
-    )
+    ) or hot_anchor_watch
+    rotation_cap = 0.0
+    if rotation_confirmed:
+        rotation_cap = min(max(global_decision.position_cap, 0.08 if hot_anchor_confirmed else 0.0), 0.18)
+    elif rotation_partial:
+        rotation_cap = 0.05
     add_row(
         "sector_rotation",
         enabled=rotation_confirmed,
         action_hint="probe" if rotation_confirmed else ("watch" if rotation_partial else "disabled"),
-        cap=min(global_decision.position_cap, 0.18) if rotation_confirmed else (0.05 if rotation_partial else 0.0),
-        reason="rotation confirmed" if rotation_confirmed else ("rotation needs validation" if rotation_partial else "no rotation path"),
-        risks=("rotation_unconfirmed",) if rotation_partial and not rotation_confirmed else (),
+        cap=rotation_cap,
+        reason=(
+            "timeframe rotation confirmed"
+            if timeframe_rotation_confirmed
+            else (
+                "hot plate anchor confirmed"
+                if hot_anchor_confirmed
+                else ("hot plate hard risk validation" if hot_hard_risk_global else ("rotation confirmed" if rotation_confirmed else ("rotation needs validation" if rotation_partial else "no rotation path")))
+            )
+        ),
+        risks=("hot_plate_hard_risk",) if hot_hard_risk_global else (("rotation_unconfirmed",) if rotation_partial and not rotation_confirmed else ()),
         refs=candidate_refs_by_playbook.get("sector_rotation", ()),
     )
 
@@ -955,6 +1456,251 @@ def _build_playbook_control_matrix(
     )
 
 
+def _build_playbook_candidate_slice(
+    final_candidates: tuple[FinalCandidateDecision, ...],
+    matrix: PlaybookControlMatrix | None,
+):
+    views = []
+    for candidate in sorted(
+        final_candidates,
+        key=lambda item: (
+            int(item.priority_rank or 999),
+            item.risk_level == "high",
+            item.action != "probe",
+            item.symbol,
+        ),
+    ):
+        row = playbook_row(matrix, candidate.playbook)
+        views.append(
+            build_playbook_decision_view(
+                symbol=candidate.symbol,
+                raw_action=candidate.action,
+                row=row,
+                source="decision_bundle",
+                playbook=candidate.playbook,
+                path_type=candidate.path_type,
+                action_hint=candidate.action,
+                priority_rank=candidate.priority_rank,
+                evidence_refs=(
+                    candidate.trace.decision_id,
+                    *candidate.trace.evidence_refs[:2],
+                ),
+            )
+        )
+    return slice_playbook_decision_views(tuple(views))
+
+
+def _build_playbook_output_summary(
+    *,
+    candidate_slice,
+    final_candidates: tuple[FinalCandidateDecision, ...],
+    global_decision: GlobalMarketDecision,
+    matrix: PlaybookControlMatrix,
+    temporal,
+    hot_anchor: HotPlateAnchorDecision | None,
+) -> PlaybookOutputSummary:
+    candidate_map = {item.symbol: item for item in final_candidates}
+
+    def _candidate_line(view, *, bucket: str) -> str:
+        candidate = candidate_map.get(view.symbol)
+        theme = candidate.theme_name if candidate is not None else "-"
+        action = candidate.action if candidate is not None else view.action_hint
+        risk = candidate.risk_level if candidate is not None else ("blocked" if view.blocked else "normal")
+        evidence = "-"
+        invalidation = "-"
+        quant = "-"
+        if candidate is not None:
+            evidence = " / ".join(candidate.trace.evidence_summary[:3]) or "-"
+            invalidation = ",".join(candidate.trace.invalidation_points[:2]) or "-"
+            quant = (
+                f"2m={_fmt_amount_yuan(_metric_value(candidate.trace, 'amount_2m'))},"
+                f"1m={_fmt_metric_pct(_metric_value(candidate.trace, 'speed_1m'))},"
+                f"auc={_fmt_amount_yuan(_metric_value(candidate.trace, 'auction_amount'))},"
+                f"open={_fmt_metric_pct(_metric_value(candidate.trace, 'open_pct'))},"
+                f"now={_fmt_metric_pct(_metric_value(candidate.trace, 'current_pct'))}"
+            )
+        action_text = {
+            "probe": "试错",
+            "watch": "观察",
+            "avoid": "回避",
+            "avoid_chase": "回避追高",
+            "disabled": "禁做",
+        }.get(action, action or "-")
+        bucket_text = {
+            "primary": "主攻",
+            "watch": "观察",
+            "repair": "修复",
+            "avoid": "回避",
+        }.get(bucket, bucket)
+        playbook_text = {
+            "mainline_attack": "主线进攻",
+            "sector_rotation": "题材切换",
+            "dragon_pressure_repair": "高标修复",
+            "dragon_head_risk_control": "高标风控",
+            "weak_to_strong_repair": "弱转强修复",
+            "yesterday_limit_relay": "昨日涨停接力",
+            "watch": "观察",
+        }.get(view.playbook or "", view.playbook or "-")
+        return (
+            f"{view.symbol}={action_text}/{theme}/{playbook_text}/"
+            f"{bucket_text}/risk={risk}/cap={view.cap:.0%}/"
+            f"quant={quant}/"
+            f"证据={evidence}/证伪={invalidation}"
+        )
+
+    primary = tuple(view.symbol for view in candidate_slice.primary)
+    watch = tuple(view.symbol for view in candidate_slice.watch)
+    inactive = tuple(view.symbol for view in candidate_slice.inactive)
+    blocked = tuple(view.symbol for view in candidate_slice.blocked)
+    primary_actions = tuple(_candidate_line(view, bucket="primary") for view in candidate_slice.primary[:5])
+    watch_actions = tuple(
+        _candidate_line(view, bucket="watch")
+        for view in (candidate_slice.watch + candidate_slice.inactive)[:8]
+    )
+    repair_actions = tuple(
+        _candidate_line(view, bucket="repair")
+        for view in (candidate_slice.primary + candidate_slice.watch + candidate_slice.inactive)
+        if "repair" in (view.playbook or "")
+        or "repair" in (view.path_type or "")
+        or "low_open_repair" in tuple(candidate_map.get(view.symbol).trace.reason_codes if candidate_map.get(view.symbol) is not None else ())
+    )[:5]
+    avoid_actions = tuple(
+        _candidate_line(view, bucket="avoid")
+        for view in (candidate_slice.blocked + candidate_slice.unclassified)[:8]
+    )
+    primary_reasons = tuple(
+        f"{view.symbol}=playbook:{view.playbook or '-'};path:{view.path_type or '-'};cap:{view.cap:.0%};reason:{view.reason or '-'}"
+        for view in candidate_slice.primary[:5]
+    )
+    watch_reasons = tuple(
+        f"{view.symbol}=watch;playbook:{view.playbook or '-'};bucket:{view.display_bucket};reason:{view.reason or '-'}"
+        for view in (candidate_slice.watch + candidate_slice.inactive)[:5]
+    )
+    reject_reasons = tuple(
+        f"{view.symbol}=blocked;playbook:{view.playbook or '-'};risk:{','.join(view.risk_tags) or view.reason or '-'}"
+        for view in (candidate_slice.blocked + candidate_slice.unclassified)[:8]
+    )
+    risk_tags = tuple(dict.fromkeys(tuple(global_decision.trace.risk_tags) + tuple(tag for view in candidate_slice.blocked for tag in view.risk_tags)))
+    temporal_text = ""
+    if temporal is not None:
+        temporal_text = (
+            f"temporal={temporal.exchange_state};"
+            f"targets={','.join(temporal.target_themes[:3]) or '-'};"
+            f"fading={','.join(temporal.fading_themes[:3]) or '-'}"
+        )
+    focus_stress_state = next(
+        (item.split("=", 1)[1] for item in tuple(global_decision.trace.evidence_summary or ()) if item.startswith("focus_stress=")),
+        "-",
+    )
+    focus_spread = next(
+        (item.split("=", 1)[1] for item in tuple(global_decision.trace.evidence_summary or ()) if item.startswith("focus_spread=")),
+        "-",
+    )
+    narrative_lines = (
+        f"script={global_decision.market_script};main={global_decision.main_attack_theme or '-'};"
+        f"secondary={','.join(global_decision.secondary_themes[:3]) or '-'};cap={global_decision.position_cap:.0%}",
+        f"playbooks=active:{','.join(matrix.active_playbooks) or '-'};blocked:{','.join(matrix.blocked_playbooks) or '-'}",
+        f"focus_stress={focus_stress_state};spread={focus_spread};themes={_metric_value(global_decision.trace, 'focus_stress_theme_count'):.0f};dragon_alone={_metric_value(global_decision.trace, 'focus_stress_dragon_alone_count'):.0f}",
+        (
+            f"hot_anchor={hot_anchor.anchor_state};primary={','.join(hot_anchor.primary_themes[:3]) or '-'};"
+            f"continue={','.join(hot_anchor.continuation_themes[:3]) or '-'};"
+            f"rotate={','.join(hot_anchor.rotation_themes[:3]) or '-'};"
+            f"risk={','.join((hot_anchor.fading_themes + hot_anchor.fakeout_themes)[:3]) or '-'}"
+            if hot_anchor is not None
+            else "hot_anchor=-"
+        ),
+    )
+    hot_metric_lines = tuple(
+        _hot_metric_line_text(line) for line in tuple(getattr(hot_anchor, "metric_lines", ()) or ())[:4]
+    ) if hot_anchor is not None else ()
+    hot_lines = hot_metric_lines or (tuple(getattr(hot_anchor, "hot_evidence", ()) or ())[:4] if hot_anchor is not None else ())
+    temporal_lines = tuple(getattr(temporal, "chain_summary", ()) or ()) if temporal is not None else ()
+    hot_context_lines = tuple(
+        f"{line.plate_name}:hot_rank={int(line.rank or 999)}/state={line.state}/"
+        f"chg={float(line.change_pct or 0.0):.2f}/inflow={float(line.net_inflow_yi or 0.0):.2f}e/"
+        f"2m={_fmt_amount_yuan(float(line.amount_2m or 0.0))}/front2m={int(line.front_2m_count or 0)}"
+        for line in tuple(getattr(hot_anchor, "metric_lines", ()) or ())[:3]
+        if getattr(line, "plate_name", "")
+    ) if hot_anchor is not None else ()
+    migration_lines = ()
+    if temporal_lines:
+        migration_lines = temporal_lines[:6]
+        if hot_context_lines:
+            migration_lines = (*migration_lines, *hot_context_lines[:2])[:8]
+    elif hot_context_lines:
+        migration_lines = hot_context_lines[:4]
+    else:
+        migration_lines = hot_lines[:4]
+    top_candidate_quant = tuple(
+        (
+            f"{candidate.symbol}:theme={candidate.theme_name};"
+            f"2m={_fmt_amount_yuan(_metric_value(candidate.trace, 'amount_2m'))};"
+            f"1m={_fmt_metric_pct(_metric_value(candidate.trace, 'speed_1m'))};"
+            f"auction={_fmt_amount_yuan(_metric_value(candidate.trace, 'auction_amount'))};"
+            f"open={_fmt_metric_pct(_metric_value(candidate.trace, 'open_pct'))};"
+            f"now={_fmt_metric_pct(_metric_value(candidate.trace, 'current_pct'))}"
+        )
+        for candidate in final_candidates[:5]
+    )
+    quant_lines = (
+        (
+            f"global:confirmed={_metric_value(global_decision.trace, 'confirmed_attack_count'):.0f};"
+            f"watch={_metric_value(global_decision.trace, 'partial_watch_count'):.0f};"
+            f"risk={_metric_value(global_decision.trace, 'rejected_risk_count'):.0f};"
+            f"hot_primary={_metric_value(global_decision.trace, 'hot_primary_count'):.0f};"
+            f"focus_stress={_metric_value(global_decision.trace, 'focus_stress_theme_count'):.0f};"
+            f"rel_hot_rank={_metric_value(global_decision.trace, 'relative_top_hot_rank', 999):.0f};"
+            f"rel_hot_inflow={_metric_value(global_decision.trace, 'relative_top_hot_net_inflow_yi'):.2f}e;"
+            f"cap={global_decision.position_cap:.0%}"
+        ),
+        _hot_quant_summary(hot_anchor),
+        (
+            f"time:state={temporal.exchange_state};targets={len(temporal.target_themes)};"
+            f"fading={len(temporal.fading_themes)};"
+            f"rolling_acc={_metric_value(temporal.trace, 'rolling_accelerating_count'):.0f};"
+            f"rolling_out={_metric_value(temporal.trace, 'rolling_withdrawing_count'):.0f};"
+            f"rolling_repair={_metric_value(temporal.trace, 'rolling_rebound_count'):.0f}"
+            if temporal is not None
+            else "time:state=-"
+        ),
+        *top_candidate_quant[:5],
+    )
+    invalidation_points = tuple(
+        dict.fromkeys(
+            point
+            for candidate in final_candidates
+            for point in tuple(candidate.trace.invalidation_points or ())
+        )
+    )[:8]
+    mode_note = (
+        f"global={global_decision.market_script};"
+        f"cap={global_decision.position_cap:.0%};"
+        f"active={','.join(matrix.active_playbooks) or '-'};"
+        f"blocked={','.join(matrix.blocked_playbooks) or '-'}"
+    )
+    if temporal_text:
+        mode_note = f"{mode_note};{temporal_text}"
+    return PlaybookOutputSummary(
+        primary_symbols=primary,
+        watch_symbols=watch,
+        inactive_symbols=inactive,
+        blocked_symbols=blocked,
+        primary_actions=primary_actions,
+        watch_actions=watch_actions,
+        repair_actions=repair_actions,
+        avoid_actions=avoid_actions,
+        mode_note=mode_note,
+        primary_reasons=primary_reasons,
+        watch_reasons=watch_reasons,
+        reject_reasons=reject_reasons,
+        invalidation_points=invalidation_points,
+        narrative_lines=narrative_lines,
+        migration_lines=migration_lines,
+        quant_lines=quant_lines,
+        risk_tags=risk_tags,
+    )
+
+
 def build_hypothesis_decision_bundle(
     context: IntradayContext,
     decision_bundle: DecisionBundle,
@@ -965,11 +1711,20 @@ def build_hypothesis_decision_bundle(
     high_focus = decision_bundle.high_focus_decision
     high_focus_state = high_focus.feedback_state if high_focus is not None else "unknown"
     high_focus_ref = (high_focus.trace.decision_id,) if high_focus is not None else ()
+    focus_stress = decision_bundle.focus_asset_stress_decision
+    focus_stress_state = focus_stress.stress_state if focus_stress is not None else "unknown"
+    focus_stress_ref = (focus_stress.trace.decision_id,) if focus_stress is not None else ()
     theme_relative = decision_bundle.theme_relative_decision
+    temporal = decision_bundle.temporal_migration_decision
+    hot_anchor = decision_bundle.hot_plate_anchor_decision
     relative_mainline_order = theme_relative.mainline_candidates if theme_relative is not None else ()
     relative_rotation_order = theme_relative.rotation_candidates if theme_relative is not None else ()
     relative_risk_order = theme_relative.risk_themes if theme_relative is not None else ()
     relative_ref = (theme_relative.trace.decision_id,) if theme_relative is not None else ()
+    temporal_ref = (temporal.trace.decision_id,) if temporal is not None else ()
+    temporal_targets = temporal.target_themes if temporal is not None else ()
+    temporal_fading = temporal.fading_themes if temporal is not None else ()
+    hot_ref = (hot_anchor.trace.decision_id,) if hot_anchor is not None else ()
 
     hypothesis_items: list[tuple[MarketHypothesis, ThemeLocalDecision | None]] = []
     validations: list[HypothesisValidation] = []
@@ -1025,7 +1780,7 @@ def build_hypothesis_decision_bundle(
                 claim=f"{theme.theme_name} may extend if front row and spread keep confirming",
                 required_validations=("theme_local_confirmed", "theme_spread", "profit_center_candidate"),
                 invalidation_points=("front_row_fades", "mid_follow_missing"),
-                extra_local_refs=high_focus_ref + relative_ref,
+                extra_local_refs=high_focus_ref + focus_stress_ref + relative_ref + temporal_ref + hot_ref,
                 ),
                 theme,
             )
@@ -1041,7 +1796,7 @@ def build_hypothesis_decision_bundle(
                 claim=f"{theme.theme_name} may be the lower-resistance rotation path",
                 required_validations=("theme_local_confirmed", "theme_spread", "high_focus_feedback"),
                 invalidation_points=("rotation_volume_fades", "old_mainline_reclaims"),
-                extra_local_refs=high_focus_ref + relative_ref,
+                extra_local_refs=high_focus_ref + focus_stress_ref + relative_ref + temporal_ref + hot_ref,
                 ),
                 theme,
             )
@@ -1057,7 +1812,23 @@ def build_hypothesis_decision_bundle(
                 required_validations=("high_focus_distribution",),
                 invalidation_points=("leader_repair", "risk_spread_recedes"),
                 trigger_refs=high_focus_ref,
-                extra_local_refs=high_focus_ref + relative_ref,
+                extra_local_refs=high_focus_ref + focus_stress_ref + relative_ref + temporal_ref + hot_ref,
+                ),
+                None,
+            )
+        )
+    if focus_stress_state in {"theme_pressure", "market_risk_spread", "dragon_alone"}:
+        hypothesis_items.append(
+            (
+                _build_hypothesis(
+                    context=context,
+                    script="focus_asset_stress",
+                    theme=None,
+                    claim="focus assets are retreating or only dragon survives, watch for rotation or risk spread",
+                    required_validations=("focus_asset_stress",),
+                    invalidation_points=("leader_repair", "mid_core_reclaims"),
+                    trigger_refs=focus_stress_ref,
+                    extra_local_refs=high_focus_ref + focus_stress_ref + relative_ref + temporal_ref + hot_ref,
                 ),
                 None,
             )
@@ -1073,7 +1844,7 @@ def build_hypothesis_decision_bundle(
                 claim=f"{theme.theme_name} has amount without enough tradable spread",
                 required_validations=("fakeout_or_distribution", "theme_spread"),
                 invalidation_points=("front_row_reclaims", "spread_expands"),
-                extra_local_refs=high_focus_ref + relative_ref,
+                extra_local_refs=high_focus_ref + focus_stress_ref + relative_ref + temporal_ref + hot_ref,
                 ),
                 theme,
             )
@@ -1105,8 +1876,13 @@ def build_hypothesis_decision_bundle(
         final_hypotheses,
         final_validations,
         high_focus_state,
+        focus_stress,
         theme_relative.trace if theme_relative is not None else None,
         relative_risk_order,
+        temporal.trace if temporal is not None else None,
+        temporal_targets,
+        temporal_fading,
+        hot_anchor,
     )
     final_candidates = _build_final_candidates(context, decision_bundle, global_decision)
     shadow_takeover = _build_shadow_takeover_decision(
@@ -1124,6 +1900,15 @@ def build_hypothesis_decision_bundle(
         final_validations,
         shadow_takeover,
     )
+    playbook_candidate_slice = _build_playbook_candidate_slice(final_candidates, playbook_matrix)
+    playbook_output_summary = _build_playbook_output_summary(
+        candidate_slice=playbook_candidate_slice,
+        final_candidates=final_candidates,
+        global_decision=global_decision,
+        matrix=playbook_matrix,
+        temporal=temporal,
+        hot_anchor=hot_anchor,
+    )
     final_bucket_counts: dict[str, int] = {}
     for item in final_candidates:
         final_bucket_counts[item.bucket] = final_bucket_counts.get(item.bucket, 0) + 1
@@ -1133,11 +1918,19 @@ def build_hypothesis_decision_bundle(
         f"local_pack_hypotheses={len(pack_pairs)}",
         f"hypothesis_confirmed={sum(1 for item in validations if item.result == 'confirmed')}",
         f"global_script={global_decision.market_script}",
+        f"focus_asset_stress={focus_stress_state}",
+        f"focus_asset_themes={','.join(focus_stress.stressed_themes[:3]) if focus_stress is not None else '-'}",
+        f"hot_anchor={hot_anchor.anchor_state if hot_anchor is not None else '-'}",
+        f"hot_primary={','.join(hot_anchor.primary_themes[:3]) if hot_anchor is not None else '-'}",
+        f"temporal_migration={temporal.exchange_state if temporal is not None else '-'}",
+        f"temporal_targets={','.join(temporal_targets[:3]) or '-'}",
         f"final_candidates={len(final_candidates)}",
         f"final_buckets={bucket_summary}",
         f"shadow_takeover={shadow_takeover.trace.state}",
         f"playbook_active={','.join(playbook_matrix.active_playbooks) or '-'}",
         f"playbook_cap={playbook_matrix.max_cap:.0%}",
+        f"playbook_slice=primary:{len(playbook_candidate_slice.primary)},watch:{len(playbook_candidate_slice.watch)},inactive:{len(playbook_candidate_slice.inactive)},blocked:{len(playbook_candidate_slice.blocked)}",
+        f"playbook_output=primary:{len(playbook_output_summary.primary_symbols)},watch:{len(playbook_output_summary.watch_symbols)},reject:{len(playbook_output_summary.reject_reasons)}",
     )
     return replace(
         decision_bundle,
@@ -1147,5 +1940,7 @@ def build_hypothesis_decision_bundle(
         final_candidates=final_candidates,
         shadow_takeover_decision=shadow_takeover,
         playbook_control_matrix=playbook_matrix,
+        playbook_candidate_slice=playbook_candidate_slice,
+        playbook_output_summary=playbook_output_summary,
         notes=notes,
     )

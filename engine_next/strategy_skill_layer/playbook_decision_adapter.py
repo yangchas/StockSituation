@@ -21,7 +21,7 @@ NON_ATTACK_ACTIONS = {
 }
 
 
-def build_playbook_candidate_view(
+def build_playbook_decision_view(
     *,
     symbol: str,
     raw_action: str,
@@ -78,7 +78,7 @@ def build_playbook_candidate_view(
     )
 
 
-def playbook_candidate_order_bucket(view: PlaybookCandidateView, *, matrix_ready: bool) -> int:
+def playbook_decision_order_bucket(view: PlaybookCandidateView, *, matrix_ready: bool) -> int:
     if not view.playbook:
         return 3 if matrix_ready else 1
     if view.blocked:
@@ -92,7 +92,7 @@ def playbook_candidate_order_bucket(view: PlaybookCandidateView, *, matrix_ready
     return 3
 
 
-def slice_playbook_candidate_views(
+def slice_playbook_decision_views(
     views: tuple[PlaybookCandidateView, ...],
 ) -> PlaybookCandidateSlice:
     primary = []

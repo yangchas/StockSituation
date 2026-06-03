@@ -509,9 +509,12 @@ class EngineApp:
         *,
         phase: RunPhase,
         trade_date: str,
+        now: datetime,
         lifecycle_audit_ran: bool,
     ) -> bool:
         if phase != RunPhase.INTRADAY or not lifecycle_audit_ran:
+            return False
+        if not self._is_opening_strategy_window(now, phase):
             return False
         if self._last_intraday_auction_recap_trade_date == trade_date:
             return False
@@ -1678,8 +1681,12 @@ class EngineApp:
     ) -> bool:
         if request.historical_replay or phase != RunPhase.INTRADAY:
             return False
+        if request.require_auction_recovery:
+            return True
+        if not _is_live_target_session(request.now, request.trade_date):
+            return False
         minute_tag = request.now.strftime("%H:%M")
-        return "09:30" <= minute_tag < "09:40"
+        return "09:30" <= minute_tag < "15:00"
 
     def _ensure_late_start_auction_recovery(
         self,
@@ -1934,12 +1941,14 @@ class EngineApp:
         if self._should_emit_intraday_startup_auction_recap(
             phase=phase,
             trade_date=request.trade_date,
+            now=request.now,
             lifecycle_audit_ran=should_run_lifecycle_audit,
         ):
             recap_lines = self._auction_runtime.render_auction_view(intraday_context)
             if recap_lines:
                 auction_recap_notes = [
                     "runtime_event=intraday startup auction recap",
+                    "startup_recap_scope | startup replay of auction snapshot; not the main intraday view",
                     *recap_lines,
                 ]
         notes = [f"runtime_event={loop_decision.label}"]
