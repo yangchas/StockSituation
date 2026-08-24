@@ -1,8 +1,11 @@
 #include "runtime_loop.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <thread>
+
+#include "runtime_log.h"
 
 namespace t1_v2 {
 
@@ -20,6 +23,9 @@ RuntimeLoop::RuntimeLoop(
 
 RuntimeLoopStats RuntimeLoop::run() {
     RuntimeLoopStats stats;
+    uint32_t consecutive_failures = 0;
+    bool boot_preflight_ok = false;
+    bool boot_source_ok = false;
     if (!source_) {
         stats.ok = false;
         stats.failure_stage = "bootstrap.null_source";
@@ -42,28 +48,58 @@ RuntimeLoopStats RuntimeLoop::run() {
         should_preflight_redis(),
         should_preflight_tdengine()
     );
+    boot_preflight_ok = preflight.ok;
     if (!preflight.ok) {
-        pipeline_.shutdown();
-        stats.ok = false;
-        stats.failure_stage = "bootstrap.preflight";
-        stats.error = preflight.error.empty() ? "runtime preflight failed" : preflight.error;
-        return stats;
+        if (!should_tolerate_runtime_failure()) {
+            pipeline_.shutdown();
+            stats.ok = false;
+            stats.failure_stage = "bootstrap.preflight";
+            stats.error = preflight.error.empty() ? "runtime preflight failed" : preflight.error;
+            return stats;
+        }
+        log_transient_failure(
+            "bootstrap.preflight",
+            preflight.error.empty() ? "runtime preflight failed" : preflight.error,
+            ++consecutive_failures
+        );
     }
     if (!source_->start()) {
-        pipeline_.shutdown();
-        stats.ok = false;
-        stats.failure_stage = "bootstrap.source_start";
         const std::string source_error = source_->error_message();
-        stats.source_error = source_error;
-        stats.error = source_error.empty() ? "tick source is not ready" : source_error;
-        return stats;
+        if (!should_tolerate_runtime_failure()) {
+            pipeline_.shutdown();
+            stats.ok = false;
+            stats.failure_stage = "bootstrap.source_start";
+            stats.source_error = source_error;
+            stats.error = source_error.empty() ? "tick source is not ready" : source_error;
+            return stats;
+        }
+        log_transient_failure(
+            "bootstrap.source_start",
+            source_error.empty() ? "tick source is not ready" : source_error,
+            ++consecutive_failures
+        );
+    } else {
+        boot_source_ok = true;
     }
     if (config_.logging.verbose) {
-        std::cout << "t1_v2 preflight | mode="
+        const bool local_q2frame_replay = config_.runtime_mode == RuntimeMode::Replay &&
+            !config_.replay.q2frame_path.empty();
+        std::cout << runtime_log_ts() << " | t1_v2 preflight | mode="
                   << (config_.runtime_mode == RuntimeMode::Replay ? "replay" : "live")
-                  << " | redis=" << (preflight.redis_checked ? "ok" : "skip")
-                  << " | tdengine=" << (preflight.tdengine_checked ? "ok" : "skip")
-                  << " | source=ok"
+                  << " | redis=" << (local_q2frame_replay ? "skip" : (
+                        preflight.redis_checked
+                            ? (boot_preflight_ok || preflight.redis.ok ? "ok" : "degraded")
+                            : "skip"
+                     ))
+                  << " | q2frame=" << (local_q2frame_replay
+                        ? (boot_preflight_ok ? "ok" : "degraded")
+                        : "skip")
+                  << " | tdengine=" << (
+                        preflight.tdengine_checked
+                            ? (boot_preflight_ok || preflight.tdengine.ok ? "ok" : "degraded")
+                            : "skip"
+                     )
+                  << " | source=" << (boot_source_ok ? "ok" : "degraded")
                   << std::endl;
     }
 
@@ -82,13 +118,23 @@ RuntimeLoopStats RuntimeLoop::run() {
                     ++stats.source_rejects;
                 } else {
                     ++stats.source_reject_failures;
-                    stats.ok = false;
-                    stats.failure_stage = "source.reject_after_skip";
-                    stats.source_error = source_->error_message();
-                    stats.error = "source reject failed";
-                    break;
+                    if (!should_tolerate_runtime_failure()) {
+                        stats.ok = false;
+                        stats.failure_stage = "source.reject_after_skip";
+                        stats.source_error = source_->error_message();
+                        stats.error = "source reject failed";
+                        break;
+                    }
+                    log_transient_failure(
+                        "source.reject_after_skip",
+                        source_->error_message().empty() ? "source reject failed" : source_->error_message(),
+                        ++consecutive_failures
+                    );
+                    sleep_after_failure(consecutive_failures);
+                    continue;
                 }
             }
+            consecutive_failures = 0;
             continue;
         }
         if (source_result.status == TickSourceStatus::Empty) {
@@ -110,11 +156,21 @@ RuntimeLoopStats RuntimeLoop::run() {
                     ++stats.source_reject_failures;
                 }
             }
-            stats.ok = false;
-            stats.failure_stage = "source.batch_error";
-            stats.source_error = source_->error_message();
-            stats.error = source_result.error_msg ? source_result.error_msg : "tick source error";
-            break;
+            if (!should_tolerate_runtime_failure()) {
+                stats.ok = false;
+                stats.failure_stage = "source.batch_error";
+                stats.source_error = source_->error_message();
+                stats.error = source_result.error_msg ? source_result.error_msg : "tick source error";
+                break;
+            }
+            log_transient_failure(
+                "source.batch_error",
+                source_result.error_msg ? source_result.error_msg : (source_->error_message().empty() ? "tick source error" : source_->error_message()),
+                ++consecutive_failures
+            );
+            try_full_recovery(consecutive_failures);
+            sleep_after_failure(consecutive_failures);
+            continue;
         }
 
         RuntimePipelineResult batch_result = pipeline_.process_batch(
@@ -138,14 +194,27 @@ RuntimeLoopStats RuntimeLoop::run() {
                     ++stats.source_reject_failures;
                 }
             }
-            stats.ok = false;
-            stats.failure_stage = execution_result.tdengine.ok ? "commit.redis" : "commit.tdengine";
-            stats.source_error = source_->error_message();
-            stats.error = execution_result.tdengine.ok ? execution_result.redis.error : execution_result.tdengine.error;
-            if (stats.error.empty()) {
-                stats.error = "runtime execution failed";
+            const std::string execution_error = execution_result.tdengine.ok
+                ? execution_result.redis.error
+                : execution_result.tdengine.error;
+            if (!should_tolerate_runtime_failure()) {
+                stats.ok = false;
+                stats.failure_stage = execution_result.tdengine.ok ? "commit.redis" : "commit.tdengine";
+                stats.source_error = source_->error_message();
+                stats.error = execution_error;
+                if (stats.error.empty()) {
+                    stats.error = "runtime execution failed";
+                }
+                break;
             }
-            break;
+            log_transient_failure(
+                execution_result.tdengine.ok ? "commit.redis" : "commit.tdengine",
+                execution_error.empty() ? "runtime execution failed" : execution_error,
+                ++consecutive_failures
+            );
+            try_full_recovery(consecutive_failures);
+            sleep_after_failure(consecutive_failures);
+            continue;
         }
         if (source_result.requires_ack) {
             if (!should_ack_source()) {
@@ -154,14 +223,32 @@ RuntimeLoopStats RuntimeLoop::run() {
                 ++stats.source_acks;
             } else {
                 ++stats.source_ack_failures;
-                stats.ok = false;
-                stats.failure_stage = "source.ack";
-                stats.source_error = source_->error_message();
-                stats.error = "source ack failed";
-                break;
+                if (!should_tolerate_runtime_failure()) {
+                    stats.ok = false;
+                    stats.failure_stage = "source.ack";
+                    stats.source_error = source_->error_message();
+                    stats.error = "source ack failed";
+                    break;
+                }
+                log_transient_failure(
+                    "source.ack",
+                    source_->error_message().empty() ? "source ack failed" : source_->error_message(),
+                    ++consecutive_failures
+                );
+                try_full_recovery(consecutive_failures);
+                sleep_after_failure(consecutive_failures);
+                continue;
             }
         }
 
+        if (consecutive_failures > 0 && config_.logging.verbose) {
+            std::cout << runtime_log_ts()
+                      << " | t1_v2 recovered"
+                      << " | after_failures=" << consecutive_failures
+                      << " | batches=" << stats.batches + 1
+                      << std::endl;
+        }
+        consecutive_failures = 0;
         ++stats.batches;
         stats.source_input += batch_result.runtime_stats.source_input;
         stats.source_rejected += batch_result.runtime_stats.source_rejected;
@@ -183,7 +270,10 @@ bool RuntimeLoop::should_preflight_redis() const {
     if (config_.processing.dry_run) {
         return false;
     }
-    return config_.runtime_mode != RuntimeMode::Replay || config_.replay.write_redis;
+    // A Q2Frame replay must preflight its local file executor, while keeping
+    // external Redis writes disabled.
+    return config_.runtime_mode != RuntimeMode::Replay ||
+        config_.replay.write_redis || !config_.replay.q2frame_path.empty();
 }
 
 bool RuntimeLoop::should_preflight_tdengine() const {
@@ -206,11 +296,63 @@ bool RuntimeLoop::has_runtime_bound() const {
         config_.processing.max_batches > 0 || config_.processing.max_empty_polls > 0;
 }
 
+bool RuntimeLoop::should_tolerate_runtime_failure() const {
+    return config_.runtime_mode == RuntimeMode::Live;
+}
+
 void RuntimeLoop::sleep_after_empty() const {
     if (!config_.processing.enable_rate_limiting || config_.processing.processing_delay_ms <= 0) {
         return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(config_.processing.processing_delay_ms));
+}
+
+void RuntimeLoop::sleep_after_failure(uint32_t consecutive_failures) const {
+    int base_delay_ms = config_.processing.retry_delay_ms > 0 ? config_.processing.retry_delay_ms : 1000;
+    const uint32_t multiplier = std::min<uint32_t>(consecutive_failures == 0 ? 1 : consecutive_failures, 5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(base_delay_ms * static_cast<int>(multiplier)));
+}
+
+void RuntimeLoop::log_transient_failure(const char* stage, const std::string& error, uint32_t consecutive_failures) const {
+    std::cerr << runtime_log_ts()
+              << " | t1_v2 transient"
+              << " | stage=" << (stage ? stage : "-")
+              << " | consecutive=" << consecutive_failures
+              << " | error=" << (error.empty() ? "-" : error)
+              << std::endl;
+}
+
+uint32_t RuntimeLoop::transient_reset_threshold() const {
+    return static_cast<uint32_t>(
+        config_.processing.transient_failures_before_reset > 0
+            ? config_.processing.transient_failures_before_reset
+            : 3
+    );
+}
+
+void RuntimeLoop::try_full_recovery(uint32_t consecutive_failures) {
+    if (consecutive_failures < transient_reset_threshold()) {
+        return;
+    }
+    const RuntimePreflightResult recheck = coordinator_.recheck_after_reset(
+        should_preflight_redis(),
+        should_preflight_tdengine()
+    );
+    std::cerr << runtime_log_ts()
+              << " | t1_v2 reset"
+              << " | threshold=" << transient_reset_threshold()
+              << " | consecutive=" << consecutive_failures
+              << " | redis=" << (recheck.redis_checked ? (recheck.redis.ok ? "ok" : "fail") : "skip")
+              << " | tdengine=" << (recheck.tdengine_checked ? (recheck.tdengine.ok ? "ok" : "fail") : "skip")
+              << " | error=" << (recheck.error.empty() ? "-" : recheck.error)
+              << std::endl;
+    source_->stop();
+    const bool restarted = source_->start();
+    std::cerr << runtime_log_ts()
+              << " | t1_v2 source_restart"
+              << " | ok=" << (restarted ? "yes" : "no")
+              << " | error=" << (source_->error_message().empty() ? "-" : source_->error_message())
+              << std::endl;
 }
 
 }  // namespace t1_v2

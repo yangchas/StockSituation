@@ -44,9 +44,11 @@ RuntimePipelineResult RuntimePipeline::process_batch(
     }
 
     result.engine_stats = engine_.on_batch(batch);
-    const bool write_redis = !config_.processing.dry_run &&
-        (batch.mode != RuntimeMode::Replay || config_.replay.write_redis);
-    if (write_redis) {
+    const bool local_q2frame_replay = batch.mode == RuntimeMode::Replay &&
+        !config_.replay.q2frame_path.empty();
+    const bool emit_redis_projection = !config_.processing.dry_run &&
+        (batch.mode != RuntimeMode::Replay || config_.replay.write_redis || local_q2frame_replay);
+    if (emit_redis_projection) {
         result.redis_commands = redis_writer_.build_q2_commands(engine_.quote_store(), batch.logical_ts_ms);
         result.has_q2_commands = !result.redis_commands.empty();
         std::vector<RedisCommand> auction_commands = redis_writer_.build_a2_commands(
@@ -79,7 +81,7 @@ RuntimePipelineResult RuntimePipeline::process_batch(
         result.engine_stats,
         result.redis_format_stats
     );
-    if (write_redis) {
+    if (emit_redis_projection) {
         const int interval_ms = config_.processing.runtime_interval_ms > 0
             ? config_.processing.runtime_interval_ms
             : 2000;

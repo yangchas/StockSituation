@@ -2,7 +2,9 @@
 #include <memory>
 
 #include "config_v2.h"
+#include "q2frame_command_executor.h"
 #include "redis_command_executor.h"
+#include "runtime_log.h"
 #include "runtime_loop.h"
 #include "self_test.h"
 #include "tdengine_command_executor.h"
@@ -26,14 +28,33 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    const ConfigV2& config = manager.get();
+    ConfigV2 config = manager.get();
+    if (!config.replay.tickpack_path.empty()) {
+        if (config.replay.q2frame_path.empty()) {
+            std::cerr << "--tickpack requires --q2frame" << std::endl;
+            return 2;
+        }
+        // The existing pipeline builds the stable RedisCommand Q2 projection.
+        // In this mode it is consumed by a local file executor, never Redis.
+        // Keep the external-write flag false; q2frame output is enabled by the
+        // local output path in RuntimePipeline, not by Redis permission.
+        config.runtime_mode = RuntimeMode::Replay;
+        config.replay.write_redis = false;
+        config.replay.write_tdengine = false;
+        config.processing.dry_run = false;
+    }
     std::unique_ptr<ITickSource> source = TickSourceFactory::create(config);
 
+    std::unique_ptr<IRedisCommandExecutor> replay_executor;
+    if (config.runtime_mode == RuntimeMode::Replay && !config.replay.tickpack_path.empty()) {
+        replay_executor = std::make_unique<Q2FrameCommandExecutor>(config);
+    }
 #if defined(T1_V2_ENABLE_REDIS)
-    HiredisRedisCommandExecutor redis_executor(config);
+    HiredisRedisCommandExecutor live_redis_executor(config);
 #else
-    NullRedisCommandExecutor redis_executor;
+    NullRedisCommandExecutor live_redis_executor;
 #endif
+    IRedisCommandExecutor& redis_executor = replay_executor ? *replay_executor : live_redis_executor;
 
 #if defined(T1_V2_ENABLE_TDENGINE)
     TaosTDengineCommandExecutor tdengine_executor(config);
@@ -47,7 +68,7 @@ int main(int argc, char* argv[]) {
     RuntimeLoop loop(config, std::move(source), redis_executor, tdengine_executor, options);
     const RuntimeLoopStats stats = loop.run();
     if (!stats.ok) {
-        std::cerr << "t1_v2 fatal"
+        std::cerr << runtime_log_ts() << " | t1_v2 fatal"
                   << " | stage=" << (stats.failure_stage.empty() ? "-" : stats.failure_stage)
                   << " | error=" << (stats.error.empty() ? "-" : stats.error)
                   << " | source_error=" << (stats.source_error.empty() ? "-" : stats.source_error)
@@ -72,7 +93,7 @@ int main(int argc, char* argv[]) {
         return 3;
     }
     if (config.logging.verbose) {
-        std::cout << "t1_v2 summary | batches=" << stats.batches
+        std::cout << runtime_log_ts() << " | t1_v2 summary | batches=" << stats.batches
                   << " | source_in=" << stats.source_input
                   << " | source_reject=" << stats.source_rejected
                   << " | ack=" << stats.source_acks

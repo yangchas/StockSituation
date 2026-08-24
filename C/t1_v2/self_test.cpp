@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "config_v2.h"
+#include "auction_calculator.h"
 #include "engine_core.h"
 #include "payload_decompressor.h"
 #include "protobuf_tick_decoder.h"
@@ -560,6 +561,76 @@ bool run_self_test() {
     if (!expect(state.amt5m_yuan == 60000000, "amount_5m fallback inside window")) return false;
     if (!expect(state.vec3m_bp == 0, "speed_3m remains zero without exact 3m slot")) return false;
 
+    // MiniQMT auction ticks can have no last trade while level-1 carries the
+    // virtual match price.  The existing RawTick contract must still produce
+    // anchors and matched amount without using lastClose as a substitute.
+    EngineCore qmt_auction_engine(config);
+    if (!expect(qmt_auction_engine.initialize(), "qmt auction engine initialize")) return false;
+    RawTick qmt_auction_tick = make_tick("000004", ts_0920, 0, 0, "sz");
+    qmt_auction_tick.ap_milli[0] = 10000;
+    qmt_auction_tick.bp_milli[0] = 10000;
+    qmt_auction_tick.ap_milli[1] = 10000;
+    qmt_auction_tick.bp_milli[1] = 10000;
+    qmt_auction_tick.av[0] = 100;
+    qmt_auction_tick.bv[0] = 200;
+    qmt_auction_tick.av[1] = 50;
+    qmt_auction_tick.bv[1] = 0;
+    TickBatch qmt_auction_batch;
+    qmt_auction_batch.logical_ts_ms = ts_0920;
+    qmt_auction_batch.ticks.push_back(qmt_auction_tick);
+    qmt_auction_engine.on_batch(qmt_auction_batch);
+    const QuoteState* qmt_auction_state = nullptr;
+    qmt_auction_engine.quote_store().for_each_active([&](const QuoteState& quote) {
+        if (std::string(quote.symbol) == "000004") {
+            qmt_auction_state = &quote;
+        }
+    });
+    if (!expect(qmt_auction_state != nullptr, "qmt auction quote state exists")) return false;
+    if (!expect(qmt_auction_state->auction.a20_px_milli == 10000, "qmt auction a20 uses l1 virtual price")) return false;
+    if (!expect(qmt_auction_state->auction.match_amt_yuan == 100000, "qmt auction match uses l1 virtual price")) return false;
+    if (!expect(qmt_auction_state->auction.rest_ask_amt_yuan == 50000, "qmt auction rest ask uses canonical l2 price")) return false;
+
+    // The virtual-price fallback is intentionally narrow: it applies only to
+    // auction ticks with an invalid last trade and equal, valid level-1 book
+    // prices.  It must not become a generic price repair path.
+    AuctionCalculator auction_calculator;
+    RawTick valid_last_price = make_tick("000005", ts_0920, 9900, 0, "sz");
+    valid_last_price.ap_milli[0] = 10000;
+    valid_last_price.bp_milli[0] = 10000;
+    valid_last_price.ap_milli[1] = 10000;
+    valid_last_price.bp_milli[1] = 10000;
+    QuoteState valid_last_state;
+    if (!expect(auction_calculator.apply_tick(valid_last_state, valid_last_price, MarketPhase::Auction), "valid last price auction update")) return false;
+    if (!expect(valid_last_state.auction.a20_px_milli == 9900, "valid last price wins over virtual fallback")) return false;
+    if (!expect(valid_last_state.auction.match_amt_yuan == 792000, "valid last price match amount")) return false;
+
+    RawTick mismatched_book = valid_last_price;
+    mismatched_book.symbol[5] = '6';
+    mismatched_book.px_milli = 0;
+    mismatched_book.ap_milli[0] = 10000;
+    mismatched_book.bp_milli[0] = 10100;
+    QuoteState mismatched_book_state;
+    auction_calculator.apply_tick(mismatched_book_state, mismatched_book, MarketPhase::Auction);
+    if (!expect(mismatched_book_state.auction.a20_px_milli == 0 && mismatched_book_state.auction.match_amt_yuan == 0, "mismatched book remains invalid")) return false;
+
+    RawTick missing_book = valid_last_price;
+    missing_book.symbol[5] = '7';
+    missing_book.px_milli = 0;
+    missing_book.ap_milli[0] = 0;
+    missing_book.bp_milli[0] = 0;
+    QuoteState missing_book_state;
+    auction_calculator.apply_tick(missing_book_state, missing_book, MarketPhase::Auction);
+    if (!expect(missing_book_state.auction.a20_px_milli == 0 && missing_book_state.auction.match_amt_yuan == 0, "missing book remains invalid")) return false;
+
+    RawTick continuous_book = valid_last_price;
+    continuous_book.symbol[5] = '8';
+    continuous_book.px_milli = 0;
+    continuous_book.ap_milli[0] = 10000;
+    continuous_book.bp_milli[0] = 10000;
+    QuoteState continuous_book_state;
+    if (!expect(!auction_calculator.apply_tick(continuous_book_state, continuous_book, MarketPhase::Intraday), "continuous book rejects auction fallback")) return false;
+    if (!expect(continuous_book_state.auction.a20_px_milli == 0 && continuous_book_state.auction.match_amt_yuan == 0, "continuous book remains untouched")) return false;
+
     EngineCore phase_refresh_engine(config);
     if (!expect(phase_refresh_engine.initialize(), "phase refresh engine initialize")) return false;
     TickBatch phase_batch_auction;
@@ -791,8 +862,10 @@ bool run_self_test() {
             for (const auto& field : command.fields) {
                 if (field.first == "top_amount" && field.second.find("\"symbol\"") != std::string::npos) {
                     has_legacy_auction_key = true;
-                    if (!expect(field.second.find("\"change_pct\":0.020000") != std::string::npos,
-                                "legacy auction change_pct uses ratio units")) return false;
+                    if (!expect(field.second.find("\"price\":10") != std::string::npos,
+                                "legacy auction uses virtual auction price")) return false;
+                    if (!expect(field.second.find("\"change_pct\":0.000000") != std::string::npos,
+                                "legacy auction change_pct uses virtual price")) return false;
                 }
             }
         }
@@ -869,6 +942,19 @@ bool run_self_test() {
         }
     }
     if (!expect(has_open_2m_summary_command, "intraday runtime pipeline open2m summary command")) return false;
+    TickBatch tail_batch;
+    const int64_t ts_1500_open2m_guard = make_local_ts_ms(2026, 4, 29, 15, 0, 0);
+    tail_batch.logical_ts_ms = ts_1500_open2m_guard;
+    tail_batch.ticks.push_back(make_tick("000002", ts_1500_open2m_guard, 10400, 260000000));
+    RuntimePipelineResult tail_pipeline_result = intraday_pipeline.process_batch(tail_batch, intraday_build_stats);
+    bool has_tail_open_2m_summary_command = false;
+    for (const RedisCommand& command : tail_pipeline_result.redis_commands) {
+        if (command.type == RedisCommandType::SetString &&
+            command.key.find("market:open2m:summary:") == 0) {
+            has_tail_open_2m_summary_command = true;
+        }
+    }
+    if (!expect(!has_tail_open_2m_summary_command, "tail runtime does not overwrite open2m summary")) return false;
     intraday_pipeline.shutdown();
 
     TickSourceResult loop_source_result;
@@ -906,8 +992,10 @@ bool run_self_test() {
     reject_loop_results.push_back(loop_eos_result);
     FakeTickSource::Counters reject_counters;
     FailingRedisCommandExecutor failing_redis_executor;
+    ConfigV2 reject_loop_config = config;
+    reject_loop_config.runtime_mode = RuntimeMode::Replay;
     RuntimeLoop reject_loop(
-        config,
+        reject_loop_config,
         std::make_unique<FakeTickSource>(std::move(reject_loop_results), &reject_counters),
         failing_redis_executor,
         null_td_executor_for_runtime,
