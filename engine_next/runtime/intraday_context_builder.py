@@ -17,6 +17,7 @@ from engine_next.runtime.plate_mapping_registry import (
     decode_theme_list,
     is_generic_plate,
     merge_theme_lists,
+    normalize_plate_name,
     split_plate_tokens,
 )
 from engine_next.runtime.intraday_data_hub import IntradayDataHub, normalize_auction_pct_ratio
@@ -985,6 +986,10 @@ class IntradayContextBuilder:
             "yest_limit_signature": yest_limit_signature,
             "auction_signature": auction_signature,
         }
+        if bool(getattr(self.hub.redis, "replay_read_only", False)):
+            self._string_key_cache[self._session_facts_cache_key(trade_date, phase)] = payload
+            self._string_key_cache[self._session_facts_meta_key(trade_date, phase)] = meta
+            return
         self.hub.redis.set(
             self._session_facts_cache_key(trade_date, phase),
             json.dumps(payload, ensure_ascii=False),
