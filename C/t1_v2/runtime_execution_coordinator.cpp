@@ -58,4 +58,14 @@ RuntimeExecutionResult RuntimeExecutionCoordinator::execute_and_commit(
     return result;
 }
 
+RuntimePreflightResult RuntimeExecutionCoordinator::recheck_after_reset(bool check_redis, bool check_tdengine) {
+    reset_all_connections();
+    return preflight(check_redis, check_tdengine);
+}
+
+void RuntimeExecutionCoordinator::reset_all_connections() {
+    redis_executor_.reset_connection();
+    tdengine_executor_.reset_connection();
+}
+
 }  // namespace t1_v2

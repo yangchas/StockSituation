@@ -46,6 +46,9 @@ struct TdengineConfig {
 struct ReplayConfig {
     std::string start_time = "2026-04-29 09:25:00";
     std::string end_time = "2026-04-29 09:25:03";
+    std::string tickpack_path;
+    std::string q2frame_path;
+    std::string auction_command_path;
     int speed = 1;
     bool loop = false;
     int tick_interval_ms = 3000;
@@ -74,6 +77,7 @@ struct ProcessingConfig {
     bool ack_in_dry_run = false;
     int max_batches = 0;
     int max_empty_polls = 0;
+    int transient_failures_before_reset = 3;
 };
 
 struct LoggingConfig {

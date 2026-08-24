@@ -30,6 +30,8 @@ public:
 
     RuntimePreflightResult preflight(bool check_redis, bool check_tdengine);
     RuntimeExecutionResult execute_and_commit(RuntimePipeline& pipeline, const RuntimePipelineResult& batch_result);
+    RuntimePreflightResult recheck_after_reset(bool check_redis, bool check_tdengine);
+    void reset_all_connections();
 
 private:
     IRedisCommandExecutor& redis_executor_;

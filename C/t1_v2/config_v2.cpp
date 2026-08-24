@@ -55,6 +55,9 @@ void ConfigManagerV2::reload_from_environment() {
 
     config_.replay.start_time = read_env_string("REPLAY_START_TIME", config_.replay.start_time);
     config_.replay.end_time = read_env_string("REPLAY_END_TIME", config_.replay.end_time);
+    config_.replay.tickpack_path = read_env_string("REPLAY_TICKPACK_PATH", config_.replay.tickpack_path);
+    config_.replay.q2frame_path = read_env_string("REPLAY_Q2FRAME_PATH", config_.replay.q2frame_path);
+    config_.replay.auction_command_path = read_env_string("REPLAY_AUCTION_COMMAND_PATH", config_.replay.auction_command_path);
     config_.replay.speed = read_env_int("REPLAY_SPEED", config_.replay.speed);
     config_.replay.loop = read_env_bool("REPLAY_LOOP", config_.replay.loop);
     config_.replay.tick_interval_ms = read_env_int("REPLAY_TICK_INTERVAL_MS", config_.replay.tick_interval_ms);
@@ -131,6 +134,25 @@ CommandLineParseResult ConfigManagerV2::apply_command_line_to_config(int argc, c
             const char* value = require_value(arg.c_str());
             if (!result.ok) return result;
             config.replay.end_time = value;
+            continue;
+        }
+        if (arg == "--tickpack") {
+            const char* value = require_value(arg.c_str());
+            if (!result.ok) return result;
+            config.replay.tickpack_path = value;
+            config.runtime_mode = RuntimeMode::Replay;
+            continue;
+        }
+        if (arg == "--q2frame") {
+            const char* value = require_value(arg.c_str());
+            if (!result.ok) return result;
+            config.replay.q2frame_path = value;
+            continue;
+        }
+        if (arg == "--auction-commands") {
+            const char* value = require_value(arg.c_str());
+            if (!result.ok) return result;
+            config.replay.auction_command_path = value;
             continue;
         }
         if (arg == "--speed" || arg == "-sp") {
@@ -219,6 +241,10 @@ std::string ConfigManagerV2::usage_text(const char* program_name) {
         << "  -s, --start <time>           Replay start time, YYYY-MM-DD HH:MM:SS\n"
         << "  -e, --end <time>             Replay end time, YYYY-MM-DD HH:MM:SS\n"
         << "  -sp, --speed <n>             Replay speed multiplier\n"
+        << "      --tickpack <path>       Read local TickPack fixture instead of TDengine\n"
+        << "      --q2frame <path>        Write Q2Frame JSONL without opening Redis\n"
+        << "      --auction-commands <path>\n"
+        << "                               Replay-only journal of existing auction Redis commands\n"
         << "      --queue <name>           RabbitMQ queue name\n"
         << "      --replay-table <name>    TDengine replay table, default stock_tick_v2\n"
         << "      --replay-write-redis     Write Redis while replaying, enabled by default\n"

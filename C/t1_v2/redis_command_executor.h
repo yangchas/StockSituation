@@ -24,6 +24,7 @@ public:
     virtual ~IRedisCommandExecutor() = default;
     virtual RedisExecutionResult preflight() = 0;
     virtual RedisExecutionResult execute(const std::vector<RedisCommand>& commands) = 0;
+    virtual void reset_connection() {}
 };
 
 class NullRedisCommandExecutor final : public IRedisCommandExecutor {

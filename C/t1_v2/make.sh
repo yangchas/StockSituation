@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${OUT:-}"
 CXX="${CXX:-g++}"
+REQUIRED_PROTOC_VERSION="libprotoc 3.21.12"
 
 WITH_ZLIB=1
 WITH_PROTOBUF=1
@@ -82,6 +83,32 @@ if [[ -z "$OUT" ]]; then
     fi
 fi
 
+generate_protobuf_sources() {
+    local protoc_version
+    if ! command -v protoc >/dev/null 2>&1; then
+        echo "required protoc is not installed: ${REQUIRED_PROTOC_VERSION}" >&2
+        exit 1
+    fi
+    protoc_version="$(protoc --version)"
+    if [[ "$protoc_version" != "$REQUIRED_PROTOC_VERSION" ]]; then
+        echo "unsupported protoc version: ${protoc_version}; required ${REQUIRED_PROTOC_VERSION}" >&2
+        exit 1
+    fi
+    local proto_root="$ROOT_DIR/.."
+    local proto_file="$proto_root/schema.proto"
+    protoc -I "$proto_root" --cpp_out="$proto_root" "$proto_file"
+    local generated_cc="$proto_root/schema.pb.cc"
+    local generated_h="$proto_root/schema.pb.h"
+    if [[ ! -s "$generated_cc" || ! -s "$generated_h" ]]; then
+        echo "protoc did not generate schema.pb.cc/schema.pb.h" >&2
+        exit 1
+    fi
+    echo "protoc_version=${protoc_version}"
+    echo "generation_command=protoc -I ${proto_root} --cpp_out=${proto_root} ${proto_file}"
+    echo "generated_schema_pb_cc_sha256=$(sha256sum "$generated_cc" | awk '{print $1}')"
+    echo "generated_schema_pb_h_sha256=$(sha256sum "$generated_h" | awk '{print $1}')"
+}
+
 CXXFLAGS_ARR=(-std=c++17 -O2 -Wall -Wextra -I "$ROOT_DIR")
 LDFLAGS_ARR=()
 SOURCES=("$ROOT_DIR"/*.cpp)
@@ -92,6 +119,7 @@ if [[ "$WITH_ZLIB" == "1" ]]; then
 fi
 
 if [[ "$WITH_PROTOBUF" == "1" ]]; then
+    generate_protobuf_sources
     CXXFLAGS_ARR+=(-DT1_V2_ENABLE_PROTOBUF -I /usr/local/protobuf/include -I "$ROOT_DIR/..")
     LDFLAGS_ARR+=(-L/usr/local/protobuf/lib -lprotobuf -Wl,-rpath,/usr/local/protobuf/lib)
     SOURCES+=("$ROOT_DIR/../schema.pb.cc")

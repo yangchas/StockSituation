@@ -22,6 +22,7 @@ public:
     virtual ~ITDengineCommandExecutor() = default;
     virtual TDengineExecutionResult preflight() = 0;
     virtual TDengineExecutionResult execute(const std::vector<std::string>& statements) = 0;
+    virtual void reset_connection() {}
 };
 
 class NullTDengineCommandExecutor final : public ITDengineCommandExecutor {

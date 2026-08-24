@@ -61,7 +61,12 @@ private:
     bool should_stop_after_empty(RuntimeLoopStats& stats) const;
     bool should_ack_source() const;
     bool has_runtime_bound() const;
+    bool should_tolerate_runtime_failure() const;
     void sleep_after_empty() const;
+    void sleep_after_failure(uint32_t consecutive_failures) const;
+    void log_transient_failure(const char* stage, const std::string& error, uint32_t consecutive_failures) const;
+    uint32_t transient_reset_threshold() const;
+    void try_full_recovery(uint32_t consecutive_failures);
 
 private:
     ConfigV2 config_;
