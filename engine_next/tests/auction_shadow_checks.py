@@ -63,6 +63,8 @@ def test_snapshot_rows_build_fact_only_plate_shadow() -> None:
     )
     stats = result["plate_stats"]["0924_to_0925"]["AI"]
     assert result["format"] == "PlateAuctionShadowV1"
+    assert result["contract_version"] == "PlateAuctionShadowV1"
+    assert result["mapping_coverage"]["canonical_mapped_count"] == 2
     assert result["strategy_impact"] == "none"
     assert result["decision_bundle"] is None
     assert stats["stock_count"] == 2

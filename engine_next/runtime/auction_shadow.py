@@ -308,12 +308,21 @@ def build_plate_shadow_from_snapshot_rows(
 
     return {
         "format": "PlateAuctionShadowV1",
+        "contract_version": "PlateAuctionShadowV1",
         "mapping_origin": dict(mapping_origin or {"canonical": "market:stock_plate"}),
         "data_origin": data_origin,
         "trade_date": str(trade_date),
         "historical_valid": bool(historical_valid),
         "observation_time": observation_time,
         "source_provenance": dict(source_provenance or {}),
+        "mapping_coverage": {
+            "auction_symbol_count": len(grouped),
+            "canonical_mapped_count": sum(len(bucket["symbols"]) for bucket in buckets.values()),
+            "unmapped_count": sum(1 for row in detail_rows if row.get("reason") == "stock_plate_missing"),
+            "multi_label_conflict_symbols": sum(
+                bucket["multi_theme_conflict_count"] for bucket in buckets.values()
+            ),
+        },
         "plate_stats": {"0924_to_0925": stats},
         "symbol_details": {"0924_to_0925": {"detail_rows": detail_rows}},
         "automatic_analysis": {"auction_locked_orders": {"limit_up": [], "limit_down": []}},
