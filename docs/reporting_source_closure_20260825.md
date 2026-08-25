@@ -9,7 +9,7 @@ enable production reporting.
 ## Commit
 
 - Source baseline: `7af7f79c1372b956e8711e297413047434f5cb3c`
-- Closure commit: `5b1f708`
+- Closure commits: `5b1f708`, `23dceb8`, `d6029e8`
 - Worktree: independent clean worktree
 - Production changes: none
 
@@ -17,6 +17,7 @@ enable production reporting.
 
 - Existing `AuctionEmailReportV1` HTML template;
 - Optional HTML alternative on the existing notification payload;
+- Explicit `notify_auction_report(report, request)` input boundary; notification does not read report files;
 - Existing file-based OpenConfirmation wrapper preserved;
 - New pure-input OpenConfirmation boundary using the same computation;
 - Tracked closure test for live-compatible Q2 input.
@@ -29,11 +30,13 @@ python -m pytest -q \
   engine_next/tests/auction_email_report_checks.py \
   engine_next/tests/auction_open_confirmation_checks.py
 
-40 passed
+42 passed
 ```
 
 The live-input test verifies that the pure input path and existing file/replay
 path produce the same open facts for the same auction shadow and Q2 frames.
+The notification test verifies that a caller-provided report is deduplicated
+without making the generic runtime notification path read stale files.
 
 ## Not evaluated
 
