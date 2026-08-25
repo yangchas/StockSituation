@@ -30,7 +30,7 @@
 
 ## 当前生产审计结论
 
-只读检查目标机器为 `cobra-ion`（SSH broker 8878）。当前生产 release 仍为旧版本，运行中的 t1 二进制为临时路径 artifact；今天检查时未发现完整的 0920/0924/0925/anchor Redis 事实闭包，也没有已部署的新 Auction/Open report source。因此本次只完成本地闭包和 fail-closed 接线，未进行远程写入、重启或邮件发送。
+只读检查目标机器为 `cobra-ion`（SSH broker 8878；本次 broker 探针挂起后使用一次性只读 SSH 复核）。当前生产 release 仍为旧版本，运行中的 t1 二进制为临时路径 artifact；2026-08-25 16:36（Asia/Shanghai）复核未发现 `market:auction*` 事实键，也没有已部署的新 Auction/Open report source。因此本次只完成本地闭包和 fail-closed 接线，未进行远程写入、重启或邮件发送。
 
 ## 下一停止线
 
