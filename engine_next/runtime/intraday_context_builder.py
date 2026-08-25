@@ -444,7 +444,7 @@ class IntradayContextBuilder:
         symbols = tuple(dict.fromkeys(_normalize_symbol(symbol) for symbol in request.symbols if _normalize_symbol(symbol)))
 
         if request.now is not None and request.now.strftime("%Y-%m-%d") == request.trade_date:
-            self._ensure_hot_rank_cache(request.trade_date, request.phase)
+            self._ensure_hot_rank_cache(request.trade_date, request.phase, now=request.now)
         quotes_result = self.hub.fetch_redis_quotes(symbols)
         cache_result = self.hub.load_runtime_cache_views(
             offline_context_date,
@@ -884,7 +884,13 @@ class IntradayContextBuilder:
         payload = self._load_json_string(f"cache:hot_rank_meta:{trade_date}")
         return payload if isinstance(payload, dict) else {}
 
-    def _ensure_hot_rank_cache(self, trade_date: str, phase: RunPhase) -> None:
+    def _ensure_hot_rank_cache(
+        self,
+        trade_date: str,
+        phase: RunPhase,
+        *,
+        now: datetime | None = None,
+    ) -> None:
         if phase not in (RunPhase.PREMARKET, RunPhase.AUCTION, RunPhase.INTRADAY):
             return
         redis_key = f"cache:hot_rank:{trade_date}"
@@ -894,11 +900,16 @@ class IntradayContextBuilder:
             updated_at_ts = int(float(meta.get("updated_at_ts", 0) or 0))
         except (TypeError, ValueError):
             updated_at_ts = 0
-        age_seconds = max(int(datetime.now().timestamp()) - updated_at_ts, 0) if updated_at_ts > 0 else None
+        reference_now = now or datetime.now()
+        age_seconds = max(int(reference_now.timestamp()) - updated_at_ts, 0) if updated_at_ts > 0 else None
         has_cache = bool(self.hub.redis.hlen(redis_key) or 0)
         is_fresh = bool(has_cache and age_seconds is not None and age_seconds <= stale_limit_seconds)
         if is_fresh:
             return
+        if bool(getattr(self.hub.redis, "replay_read_only", False)):
+            raise RuntimeError(
+                "replay hot-rank fixture is missing or stale; external refresh is disabled"
+            )
         try:
             self.hub.fetch_hot_rank(trade_date, phase, top_n=200)
         except Exception:

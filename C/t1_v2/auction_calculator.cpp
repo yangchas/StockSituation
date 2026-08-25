@@ -24,25 +24,26 @@ bool AuctionCalculator::apply_tick(QuoteState& state, const RawTick& tick, Marke
     AuctionState& auction = state.auction;
     auction.ts_ms = tick.ts_ms;
     auction.limit_state = state.limit_state;
-    bool changed = capture_anchor_prices(auction, tick);
+    bool changed = capture_anchor_prices(auction, tick, phase);
     changed = update_match_and_rest(auction, tick, phase) || changed;
     return changed;
 }
 
-bool AuctionCalculator::capture_anchor_prices(AuctionState& auction, const RawTick& tick) const {
+bool AuctionCalculator::capture_anchor_prices(AuctionState& auction, const RawTick& tick, MarketPhase phase) const {
     bool changed = false;
     const int hms = hms_from_timestamp_ms(tick.ts_ms);
+    const int price_milli = effective_matching_price_milli(tick, phase);
     if (hms >= 92000 && hms <= 92020) {
-        changed = changed || auction.a20_px_milli != tick.px_milli;
-        auction.a20_px_milli = tick.px_milli;
+        changed = changed || auction.a20_px_milli != price_milli;
+        auction.a20_px_milli = price_milli;
     }
     if (hms >= 92400 && hms <= 92420) {
-        changed = changed || auction.a24_px_milli != tick.px_milli;
-        auction.a24_px_milli = tick.px_milli;
+        changed = changed || auction.a24_px_milli != price_milli;
+        auction.a24_px_milli = price_milli;
     }
     if (hms >= 92500 && hms <= 92520) {
-        changed = changed || auction.a25_px_milli != tick.px_milli;
-        auction.a25_px_milli = tick.px_milli;
+        changed = changed || auction.a25_px_milli != price_milli;
+        auction.a25_px_milli = price_milli;
     }
     return changed;
 }
@@ -61,7 +62,8 @@ bool AuctionCalculator::update_match_and_rest(AuctionState& auction, const RawTi
 }
 
 int64_t AuctionCalculator::calc_match_amt_yuan(const RawTick& tick, MarketPhase phase) const {
-    if (phase != MarketPhase::Auction || tick.px_milli <= 0) {
+    const int price_milli = effective_matching_price_milli(tick, phase);
+    if (phase != MarketPhase::Auction || price_milli <= 0) {
         return 0;
     }
 
@@ -70,12 +72,27 @@ int64_t AuctionCalculator::calc_match_amt_yuan(const RawTick& tick, MarketPhase 
         return tick.amt_yuan;
     }
     if (hms >= 92500 && tick.vol_units > 0) {
-        return order_book_amount_yuan(tick.px_milli, tick.vol_units);
+        return order_book_amount_yuan(price_milli, tick.vol_units);
     }
 
     const int64_t bid1_amt = order_book_amount_yuan(tick.bp_milli[0], tick.bv[0]);
     const int64_t ask1_amt = order_book_amount_yuan(tick.ap_milli[0], tick.av[0]);
     return std::max<int64_t>(0, std::min(bid1_amt, ask1_amt));
+}
+
+int AuctionCalculator::effective_matching_price_milli(const RawTick& tick, MarketPhase phase) const {
+    if (tick.px_milli > 0) {
+        return tick.px_milli;
+    }
+    if (phase != MarketPhase::Auction) {
+        return 0;
+    }
+    const int bid1 = tick.bp_milli[0];
+    const int ask1 = tick.ap_milli[0];
+    if (bid1 > 0 && ask1 > 0 && bid1 == ask1) {
+        return bid1;
+    }
+    return 0;
 }
 
 int64_t AuctionCalculator::calc_rest_bid_amt_yuan(const RawTick& tick) const {

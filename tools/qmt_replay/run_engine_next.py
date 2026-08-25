@@ -28,7 +28,7 @@ from engine_next.strategy_skill_layer import context_pipeline, local_decision_la
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EVIDENCE_CONTRACT_VERSION = "AuctionPhase1A"
-EVENT_MINUTES = ((9, 20, "auction_preview_0920"), (9, 24, "auction_preview_0924"), (9, 25, "auction_finalize_0925"), (9, 26, "auction_followup_0926"), (9, 30, "intraday_open_0930"))
+REPLAY_CHECKPOINTS = ((9, 20, "0920"), (9, 24, "0924"), (9, 25, "0925"), (9, 26, "0926"), (9, 30, "0930"))
 
 
 def _jsonable(value: Any) -> Any:
@@ -129,13 +129,30 @@ def _minute_index(now: datetime) -> int:
     return max((now.hour * 60 + now.minute) - (9 * 60 + 15), 0)
 
 
-def _events_due(now: datetime, fired: set[str]) -> list[dict[str, Any]]:
+def _reached_clock_checkpoints(now: datetime, reached: set[str]) -> list[dict[str, Any]]:
     due: list[dict[str, Any]] = []
-    for hour, minute, name in EVENT_MINUTES:
-        if (hour, minute) <= (now.hour, now.minute) and name not in fired:
-            fired.add(name)
-            due.append({"name": name, "scheduled_local": f"{hour:02d}:{minute:02d}"})
+    for hour, minute, name in REPLAY_CHECKPOINTS:
+        if (hour, minute) <= (now.hour, now.minute) and name not in reached:
+            reached.add(name)
+            due.append({"checkpoint": name, "reached_local": f"{hour:02d}:{minute:02d}"})
     return due
+
+
+def _restore_intraday_hub_refs(func):
+    """Restore replay monkeypatches even when strategy execution raises."""
+
+    def wrapped(*args: Any, **kwargs: Any):
+        original_context_hub = context_pipeline.IntradayDataHub
+        original_local_hub = local_decision_layer.IntradayDataHub
+        try:
+            return func(*args, **kwargs)
+        finally:
+            context_pipeline.IntradayDataHub = original_context_hub
+            local_decision_layer.IntradayDataHub = original_local_hub
+
+    wrapped.__name__ = getattr(func, "__name__", "run_replay")
+    wrapped.__doc__ = getattr(func, "__doc__", None)
+    return wrapped
 
 
 def _load_fixture(path: Path) -> tuple[dict[str, Any], ReplayRedisView]:
@@ -181,6 +198,7 @@ def _load_fixture(path: Path) -> tuple[dict[str, Any], ReplayRedisView]:
     return payload, ReplayRedisView(hashes=hashes, strings=strings, sets=sets)
 
 
+@_restore_intraday_hub_refs
 def run_replay(
     *,
     q2_path: Path,
@@ -226,7 +244,7 @@ def run_replay(
     source_state_sha256 = _git_source_state_sha256()
     evidence_run_id = str(run_id or f"replay-{trade_date}-{q2_sha256[:12]}")
     clock = ReplayClock(datetime.fromtimestamp(first_ts / 1000.0, SHANGHAI))
-    fired_events: set[str] = set()
+    reached_checkpoints: set[str] = set()
     records: list[bytes] = []
     total_frames = 0
     first_local = ""
@@ -245,7 +263,7 @@ def run_replay(
         clock._set(logical_now)
         view.apply_q2_frame(frame)
         phase, phase_label = _phase_for(clock.now())
-        events = _events_due(clock.now(), fired_events)
+        checkpoints = _reached_clock_checkpoints(clock.now(), reached_checkpoints)
         request = IntradayContextRequest(
             phase=phase,
             trade_date=trade_date,
@@ -301,7 +319,7 @@ def run_replay(
             "seq_no": int(frame["seq_no"]),
             "logical_ts_ms": frame_ts,
             "phase": phase.value,
-            "events": events,
+            "reached_clock_checkpoints": checkpoints,
             "coverage_scope": state.coverage_scope,
             "actual_source": state.actual_source,
             "missing_inputs": state.missing_inputs,
@@ -386,7 +404,8 @@ def run_replay(
         "last_logical_local": last_local,
         "l2_sha256": l2,
         "accessed_keys": str(accessed_keys_path),
-        "triggered_events": sorted(fired_events),
+        "reached_clock_checkpoints": sorted(reached_checkpoints),
+        "production_scheduler_equivalence": "NOT_EVALUATED",
     }
     manifest.update(shadow_manifest)
     manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
