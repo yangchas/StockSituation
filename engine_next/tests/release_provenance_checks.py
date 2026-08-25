@@ -18,7 +18,13 @@ def test_release_manifest_binds_source_and_artifact_hashes(tmp_path: Path) -> No
         artifacts={"engine": artifact},
         config_hash="config-a",
     )
-    ok, errors = validate_manifest(manifest, source_root=source, artifacts={"engine": artifact}, config_hash="config-a")
+    ok, errors = validate_manifest(
+        manifest,
+        source_root=source,
+        artifacts={"engine": artifact},
+        config_hash="config-a",
+        expected_git_commit="7af7f79c",
+    )
     assert ok and errors == []
     artifact.write_bytes(b"binary-b")
     ok, errors = validate_manifest(manifest, source_root=source, artifacts={"engine": artifact}, config_hash="config-a")
@@ -35,3 +41,20 @@ def test_release_manifest_detects_config_mismatch(tmp_path: Path) -> None:
     ok, errors = validate_manifest(manifest, source_root=source, artifacts={"engine": artifact}, config_hash="config-b")
     assert not ok
     assert errors == ["config_hash"]
+
+
+def test_release_manifest_rejects_unexpected_git_commit(tmp_path: Path) -> None:
+    source = tmp_path / "release"
+    source.mkdir()
+    artifact = source / "engine.bin"
+    artifact.write_bytes(b"binary")
+    manifest = build_manifest(source_root=source, git_commit="commit-a", artifacts={"engine": artifact}, config_hash="config-a")
+    ok, errors = validate_manifest(
+        manifest,
+        source_root=source,
+        artifacts={"engine": artifact},
+        config_hash="config-a",
+        expected_git_commit="commit-b",
+    )
+    assert not ok
+    assert errors == ["git_commit"]

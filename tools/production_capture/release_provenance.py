@@ -64,10 +64,22 @@ def build_manifest(
     }
 
 
-def validate_manifest(manifest: Mapping[str, Any], *, source_root: Path, artifacts: Mapping[str, Path], config_hash: str) -> tuple[bool, list[str]]:
+def validate_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    source_root: Path,
+    artifacts: Mapping[str, Path],
+    config_hash: str,
+    expected_git_commit: str | None = None,
+) -> tuple[bool, list[str]]:
     errors: list[str] = []
     if manifest.get("format") != "ReleaseProvenanceV1":
         errors.append("format")
+    recorded_commit = str(manifest.get("git_commit") or "").strip()
+    if not recorded_commit:
+        errors.append("git_commit")
+    if expected_git_commit is not None and recorded_commit != str(expected_git_commit).strip():
+        errors.append("git_commit")
     artifact_paths = [path.resolve().relative_to(source_root.resolve()).as_posix() for path in artifacts.values()]
     if manifest.get("source_state_sha256") != sha256_tree(source_root, exclude_paths=artifact_paths):
         errors.append("source_state_sha256")
