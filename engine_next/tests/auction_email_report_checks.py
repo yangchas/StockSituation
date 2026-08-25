@@ -117,6 +117,12 @@ def test_fixture_report_is_deterministic_and_read_only() -> None:
     assert hashlib.sha256(ledger).hexdigest() == ledger_hash
 
 
+def test_production_realtime_origin_is_accepted_for_fact_report() -> None:
+    report = build_auction_email_report(plate_shadow=_plate_shadow(data_origin="production_realtime"))
+    assert report.metadata["data_origin"] == "production_realtime"
+    assert report.metadata["strategy_impact"] == "none"
+
+
 def test_empty_optional_inputs_render_unavailable() -> None:
     shadow = _plate_shadow(data_origin="current_cache_only", capture_time="2026-08-21T09:25:30+08:00")
     shadow["plate_stats"] = {"0924_to_0925": {}}

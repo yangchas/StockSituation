@@ -265,6 +265,10 @@ class IntradayDataHub:
     @staticmethod
     def _standardize_auction_snapshot_row(row: dict[str, Any], *, tag: str, summary: dict[str, Any]) -> dict[str, Any]:
         symbol = _normalize_symbol(row.get("symbol") or row.get("code"))
+        ask_amount_present = any(
+            key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+            for key in ("ask_amount_yuan", "ask_amount", "ar")
+        )
         return {
             "symbol": symbol,
             "name": str(row.get("name", row.get("stock_name", "")) or ""),
@@ -276,6 +280,9 @@ class IntradayDataHub:
             "auction_amount_yuan": _safe_float(row.get("auction_amount_yuan", row.get("amount", 0.0))),
             "bid_amount": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
             "bid_amount_yuan": _safe_float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0))),
+            "ask_amount": _safe_float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0)))),
+            "ask_amount_yuan": _safe_float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0)))),
+            "ask_amount_present": ask_amount_present,
             "snapshot_total_stocks": _safe_int(summary.get("total_stocks", 0)),
             "snapshot_high_open_count": _safe_int(summary.get("high_open_count", 0)),
             "snapshot_low_open_count": _safe_int(summary.get("low_open_count", 0)),
@@ -329,6 +336,11 @@ class IntradayDataHub:
             if isinstance(raw, dict):
                 amount = float(raw.get("amount", 0.0) or 0.0)
                 bid_amount = float(raw.get("bid_amount", 0.0) or 0.0)
+                ask_amount_present = any(
+                    key in raw and raw.get(key) is not None and str(raw.get(key)).strip() != ""
+                    for key in ("ask_amount_yuan", "ask_amount", "ar")
+                )
+                ask_amount = float(raw.get("ask_amount_yuan", raw.get("ask_amount", raw.get("ar", 0.0))) or 0.0)
                 tag = str(raw.get("tag") or "").strip()
                 source = str(raw.get("source") or "redis_anchor").strip() or "redis_anchor"
                 rows.append(
@@ -338,11 +350,14 @@ class IntradayDataHub:
                         "change_pct": normalize_auction_pct_ratio(raw.get("change_pct", 0.0)),
                         "amount": amount,
                         "bid_amount": bid_amount,
+                        "ask_amount": ask_amount,
+                        "ask_amount_yuan": ask_amount,
+                        "ask_amount_present": ask_amount_present,
                         "tag": tag,
                         "source": source,
                     }
                 )
-                if amount > 0 or bid_amount > 0 or bool(tag):
+                if amount > 0 or bid_amount > 0 or ask_amount > 0 or bool(tag):
                     has_extended_fields = True
                 continue
             rows.append(
@@ -352,6 +367,9 @@ class IntradayDataHub:
                     "change_pct": normalize_auction_pct_ratio(raw),
                     "amount": 0.0,
                     "bid_amount": 0.0,
+                    "ask_amount": 0.0,
+                    "ask_amount_yuan": 0.0,
+                    "ask_amount_present": False,
                     "source": "redis_anchor",
                 }
             )
@@ -369,6 +387,9 @@ class IntradayDataHub:
                 "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                 "amount": float(row.get("amount", 0.0) or 0.0),
                 "bid_amount": float(row.get("bid_amount", 0.0) or 0.0),
+                "ask_amount": float(row.get("ask_amount", row.get("ask_amount_yuan", 0.0)) or 0.0),
+                "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", 0.0)) or 0.0),
+                "ask_amount_present": bool(row.get("ask_amount_present", False)),
                 "tag": tag,
                 "source": source,
             }
@@ -412,6 +433,12 @@ class IntradayDataHub:
                         "change_pct": change_pct,
                         "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                         "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
+                        "ask_amount": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                        "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                        "ask_amount_present": any(
+                            key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+                            for key in ("ask_amount_yuan", "ask_amount", "ar")
+                        ),
                         "source": "redis_0925",
                     }
                 )
@@ -463,6 +490,12 @@ class IntradayDataHub:
                             "change_pct": normalize_auction_pct_ratio(row.get("change_pct", 0.0)),
                             "amount": float(row.get("auction_amount_yuan", row.get("amount", 0.0)) or 0.0),
                             "bid_amount": float(row.get("bid_amount_yuan", row.get("bid_amount", 0.0)) or 0.0),
+                            "ask_amount": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                            "ask_amount_yuan": float(row.get("ask_amount_yuan", row.get("ask_amount", row.get("ar", 0.0))) or 0.0),
+                            "ask_amount_present": any(
+                                key in row and row.get(key) is not None and str(row.get(key)).strip() != ""
+                                for key in ("ask_amount_yuan", "ask_amount", "ar")
+                            ),
                             "source": f"redis_preview_{latest_tag}",
                         }
                     )
@@ -595,6 +628,14 @@ class IntradayDataHub:
             row["amount_delta"] = amount - prev_amount
             row["bid_amount_delta"] = _safe_float(row.get("bid_amount", 0.0)) - _safe_float(
                 previous.get("bid_amount", 0.0)
+            )
+            ask_present = bool(row.get("ask_amount_present", False)) and bool(
+                previous.get("ask_amount_present", False)
+            )
+            row["ask_amount_delta"] = (
+                _safe_float(row.get("ask_amount", 0.0)) - _safe_float(previous.get("ask_amount", 0.0))
+                if ask_present
+                else None
             )
             row["amount_ratio"] = (amount / prev_amount) if prev_amount > 0 else 0.0
 

@@ -12,7 +12,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 
-ALLOWED_DATA_ORIGINS = {"production_capture", "replay_fixture_only", "current_cache_only"}
+ALLOWED_DATA_ORIGINS = {"production_realtime", "production_capture", "replay_fixture_only", "current_cache_only"}
 DEFAULT_TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "auction_report.html"
 CROSS_SECTION_RANK_MIN_VALID_COUNT = 10
 CORE_OBSERVATION_LIMIT = 6
