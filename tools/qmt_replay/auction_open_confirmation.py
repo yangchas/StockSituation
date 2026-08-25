@@ -144,10 +144,7 @@ def _mapped_symbols_by_plate(shadow: Mapping[str, Any]) -> dict[str, set[str]]:
 
 def _open_rows(q2_path: Path, trade_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Read Q2 frames once, retaining only first/latest rows in the open window."""
-    first: dict[str, dict[str, Any]] = {}
-    latest: dict[str, dict[str, Any]] = {}
-    latest_ts = 0
-    frame_count = 0
+    frames: list[Mapping[str, Any]] = []
     with q2_path.open("r", encoding="utf-8", newline="") as handle:
         for line_no, line in enumerate(handle, 1):
             text = line.rstrip("\r\n")
@@ -159,28 +156,45 @@ def _open_rows(q2_path: Path, trade_date: str) -> tuple[dict[str, dict[str, Any]
                 raise ValueError(f"invalid Q2Frame JSON at line {line_no}") from exc
             if not isinstance(frame, Mapping):
                 raise ValueError(f"Q2Frame line {line_no} is not an object")
-            timestamp_ms = _number(frame.get("logical_ts_ms"))
-            if timestamp_ms is None or timestamp_ms <= 0:
+            frames.append(frame)
+    return _open_rows_from_frames(frames, trade_date=trade_date)
+
+
+def _open_rows_from_frames(
+    frames: Iterable[Mapping[str, Any]],
+    *,
+    trade_date: str,
+    observation_cutoff: datetime | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Normalize online or replay Q2 frames without changing Q2 semantics."""
+    first: dict[str, dict[str, Any]] = {}
+    latest: dict[str, dict[str, Any]] = {}
+    latest_ts = 0
+    frame_count = 0
+    cutoff_ms = int(observation_cutoff.timestamp() * 1000) if observation_cutoff is not None else None
+    for frame in frames:
+        timestamp_ms = _number(frame.get("logical_ts_ms"))
+        if timestamp_ms is None or timestamp_ms <= 0 or (cutoff_ms is not None and timestamp_ms > cutoff_ms):
+            continue
+        local = datetime.fromtimestamp(timestamp_ms / 1000.0, SHANGHAI)
+        if local.date().isoformat() != trade_date or not (OPEN_START <= local.time() <= OPEN_END):
+            continue
+        frame_count += 1
+        latest_ts = max(latest_ts, int(timestamp_ms))
+        for raw in _rows(frame.get("q2_updates")):
+            symbol = str(raw.get("symbol") or "").strip()
+            if not symbol:
                 continue
-            local = datetime.fromtimestamp(timestamp_ms / 1000.0, SHANGHAI)
-            if local.date().isoformat() != trade_date or not (OPEN_START <= local.time() <= OPEN_END):
-                continue
-            frame_count += 1
-            latest_ts = max(latest_ts, int(timestamp_ms))
-            for raw in _rows(frame.get("q2_updates")):
-                symbol = str(raw.get("symbol") or "").strip()
-                if not symbol:
-                    continue
-                row = {
-                    "symbol": symbol,
-                    "timestamp_ms": int(timestamp_ms),
-                    "price_milli": _number(raw.get("px")),
-                    "previous_close_milli": _number(raw.get("pc")),
-                    "amount_2m_yuan": _number(raw.get("amt2m")),
-                    "limit_state": _number(raw.get("ls")),
-                }
-                first.setdefault(symbol, row)
-                latest[symbol] = row
+            row = {
+                "symbol": symbol,
+                "timestamp_ms": int(timestamp_ms),
+                "price_milli": _number(raw.get("px")),
+                "previous_close_milli": _number(raw.get("pc")),
+                "amount_2m_yuan": _number(raw.get("amt2m")),
+                "limit_state": _number(raw.get("ls")),
+            }
+            first.setdefault(symbol, row)
+            latest[symbol] = row
     latest_rows = list(latest.values())
     amount_present = sum(_number(row.get("amount_2m_yuan")) is not None for row in latest_rows)
     limit_present = sum(_number(row.get("limit_state")) is not None for row in latest_rows)
@@ -372,9 +386,16 @@ def _observation(row: Mapping[str, Any]) -> dict[str, Any]:
     return {"plate": row["plate"], "text": text, "evidence_refs": refs, "evidence_values": dict(row)}
 
 
-def build_observation(*, auction_report: Path, plate_shadow: Path, q2: Path, data_origin: str = "replay_fixture_only") -> dict[str, Any]:
-    report = _parse_report(auction_report)
-    shadow = _parse_shadow(plate_shadow)
+def _build_observation_from_payloads(
+    *,
+    report: Mapping[str, Any],
+    shadow: Mapping[str, Any],
+    q2_rows: Mapping[str, Mapping[str, Any]],
+    q2_meta: Mapping[str, Any],
+    data_origin: str,
+) -> dict[str, Any]:
+    report = dict(report)
+    shadow = dict(shadow)
     trade_date = str(report.get("trade_date") or shadow.get("trade_date") or "").strip()
     if not trade_date:
         raise ValueError("trade_date is required")
@@ -386,7 +407,6 @@ def build_observation(*, auction_report: Path, plate_shadow: Path, q2: Path, dat
         raise ValueError("auction report and plate shadow mapping provenance differ")
     auction_symbols_by_plate = _auction_symbols_by_plate(shadow)
     mapped_symbols_by_plate = _mapped_symbols_by_plate(shadow)
-    q2_rows, q2_meta = _open_rows(q2, trade_date)
     open_facts = {symbol: _open_fact(row) for symbol, row in q2_rows.items()}
     targets = _plate_targets(report)
     plate_rows: list[dict[str, Any]] = []
@@ -451,6 +471,63 @@ def build_observation(*, auction_report: Path, plate_shadow: Path, q2: Path, dat
     result["business_sha256"] = _sha256({key: result[key] for key in ("trade_date", "market", "plates", "observations")})
     result["sha256"] = _sha256(result)
     return result
+
+
+def build_observation(*, auction_report: Path, plate_shadow: Path, q2: Path, data_origin: str = "replay_fixture_only") -> dict[str, Any]:
+    """Compatibility wrapper for the existing file-based replay CLI."""
+
+    report = _parse_report(auction_report)
+    shadow = _parse_shadow(plate_shadow)
+    trade_date = str(report.get("trade_date") or shadow.get("trade_date") or "").strip()
+    if not trade_date:
+        raise ValueError("trade_date is required")
+    q2_rows, q2_meta = _open_rows(q2, trade_date)
+    return _build_observation_from_payloads(
+        report=report,
+        shadow=shadow,
+        q2_rows=q2_rows,
+        q2_meta=q2_meta,
+        data_origin=data_origin,
+    )
+
+
+def build_observation_from_inputs(
+    *,
+    auction_evidence: Mapping[str, Any],
+    plate_shadow: Mapping[str, Any],
+    open_q2_rows: Iterable[Mapping[str, Any]],
+    observation_cutoff: datetime | None = None,
+    data_origin: str = "production_capture",
+) -> dict[str, Any]:
+    """Build the same observation from live-compatible mappings and Q2 frames.
+
+    ``PlateAuctionShadowV1`` is the sole plate/symbol auction fact input.  The
+    report builder is reused only to create the shared auction fact view; the
+    production path never reads a report or Q2Frame file.
+    """
+
+    from engine_next.runtime.auction_email_report import build_auction_email_report
+
+    shadow = dict(plate_shadow)
+    report = build_auction_email_report(plate_shadow=shadow, auction_evidence=dict(auction_evidence)).metadata
+    trade_date = str(report.get("trade_date") or shadow.get("trade_date") or "").strip()
+    if not trade_date:
+        raise ValueError("trade_date is required")
+    q2_rows, q2_meta = _open_rows_from_frames(
+        open_q2_rows,
+        trade_date=trade_date,
+        observation_cutoff=observation_cutoff,
+    )
+    q2_meta = dict(q2_meta)
+    q2_meta["source"] = "production_online_q2"
+    q2_meta["observation_cutoff"] = observation_cutoff.isoformat() if observation_cutoff is not None else None
+    return _build_observation_from_payloads(
+        report=report,
+        shadow=shadow,
+        q2_rows=q2_rows,
+        q2_meta=q2_meta,
+        data_origin=data_origin,
+    )
 
 
 def _fmt_count(value: Any) -> str:

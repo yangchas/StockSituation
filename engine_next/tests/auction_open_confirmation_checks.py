@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from tools.qmt_replay.auction_open_confirmation import build_observation, render_markdown, write_outputs
+from tools.qmt_replay.auction_open_confirmation import build_observation, build_observation_from_inputs, render_markdown, write_outputs
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -68,6 +68,35 @@ def test_same_mapping_and_symbol_coverage_are_explicit(tmp_path: Path) -> None:
     assert plate["auction_valid_count"] == 2
     assert plate["open_valid_count"] == 2
     assert plate["common_symbol_count"] == 2
+
+
+def test_live_input_boundary_reuses_same_observation_logic(tmp_path: Path) -> None:
+    report_path, shadow_path, q2_path = _inputs(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    shadow = json.loads(shadow_path.read_text(encoding="utf-8"))
+    shadow["data_origin"] = "replay_fixture_only"
+    shadow["plate_stats"] = {
+        "0924_to_0925": {
+            "AI": {
+                "stock_count": 2,
+                "valid_auction_stock_count": 2,
+                "auction_amount_total_yuan": 1000.0,
+                "change_pct_distribution": {"positive_count": 1, "negative_count": 1, "zero_count": 0, "count": 2, "median_pct": 1.0},
+            }
+        }
+    }
+    frames = [json.loads(line) for line in q2_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    file_result = build_observation(auction_report=report_path, plate_shadow=shadow_path, q2=q2_path)
+    live_result = build_observation_from_inputs(
+        auction_evidence=report.get("market_overview", {}),
+        plate_shadow=shadow,
+        open_q2_rows=frames,
+        data_origin="production_capture",
+    )
+    assert live_result["market"]["open"]["observation_time"] == file_result["market"]["open"]["observation_time"]
+    assert live_result["plates"] == file_result["plates"]
+    assert live_result["market"]["open"]["open_valid_count"] == file_result["market"]["open"]["open_valid_count"]
+    assert live_result["data_origin"] == "production_capture"
 
 
 def test_deltas_are_exact_and_amount_ratio_is_protected(tmp_path: Path) -> None:

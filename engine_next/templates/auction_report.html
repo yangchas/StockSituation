@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{{SUBJECT}}</title>
+  <style>
+    body { font-family: Arial, "Microsoft YaHei", sans-serif; color: #1f2937; background: #f4f6f8; margin: 0; padding: 16px; }
+    .card { max-width: 1240px; margin: 0 auto 12px; background: #fff; border: 1px solid #dfe3e8; border-radius: 7px; padding: 14px; }
+    h1 { font-size: 20px; margin: 0 0 6px; } h2 { font-size: 16px; margin: 0 0 9px; } h3 { font-size: 14px; margin: 8px 0; } h4 { color: #59636e; font-size: 12px; margin: 10px 0 4px; }
+    .meta, .footnote { color: #59636e; font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
+    .metric { background: #f7f8fa; padding: 8px; border-radius: 5px; font-size: 12px; } .metric b { display: block; margin-top: 3px; font-size: 15px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; } th, td { border: 1px solid #e1e5ea; padding: 5px; text-align: right; vertical-align: top; } th:first-child, td:first-child { text-align: left; } th { background: #f0f3f6; }
+    ul { margin: 5px 0; padding-left: 20px; } li { margin: 3px 0; }
+    .secondary { background: #fafbfc; border-color: #e8ebef; } .secondary h2 { color: #66717d; font-size: 14px; } .secondary table { font-size: 10px; } .provenance { font-size: 11px; }
+  </style>
+</head>
+<body>
+  <section class="card">
+    <h1>{{SUBJECT}}</h1>
+    <div class="meta">trade_date={{TRADE_DATE}} · data_origin={{DATA_ORIGIN}} · market_status={{MARKET_STATUS}} · source={{MARKET_SOURCE}} · observation_time={{MARKET_OBSERVATION_TIME}}</div>
+  </section>
+  <section class="card">
+    <h2>1. 09:25市场概览</h2>
+    <div class="grid">
+      <div class="metric">有效价格股票<b>{{MARKET_VALID_COUNT}}</b></div>
+      <div class="metric">上涨/下跌/平盘<b>{{MARKET_RISE_FALL_FLAT}}</b></div>
+      <div class="metric">总预撮合金额<b>{{MARKET_AMOUNT}}</b></div>
+      <div class="metric">涨停/跌停<b>{{MARKET_LIMITS}}</b></div>
+      <div class="metric">涨停封单<b>{{MARKET_SEAL}}</b></div>
+    </div>
+  </section>
+  <section class="card">
+    <h2>2. 核心事实观察</h2>
+    <ul>{{CORE_OBSERVATIONS}}</ul>
+  </section>
+  <section class="card">
+    <h2>3. 重点板块事实（按竞价金额降序）</h2>
+    <table><thead><tr><th>板块</th><th>股票数</th><th>有效价格</th><th>涨/跌/平</th><th>上涨覆盖</th><th>下跌覆盖</th><th>中位涨幅</th><th>竞价金额</th><th>Top1</th><th>Top3</th><th>pressure</th><th>withdrawal</th><th>Top3贡献个股</th></tr></thead><tbody>{{PLATE_ROWS}}</tbody></table>
+  </section>
+  <section class="card">
+    <h2>4. 涨跌停封单</h2>
+    <p class="footnote">涨停/跌停：{{LOCKED_COUNTS}} · 涨停封单：{{LOCKED_TOTAL}} · {{LOCKED_TOP}}</p>
+    <table><thead><tr><th>代码</th><th>板块</th><th>方向</th><th>封单金额</th><th>涨跌幅</th></tr></thead><tbody>{{LOCKED_ROWS}}</tbody></table>
+  </section>
+  <section class="card">
+    <h2>5. 三锚点变化</h2>
+    <p class="footnote">状态：{{ANCHOR_STATUS}}；仅在0920/0924/0925同合同事实完整时展示。</p>
+    <ul>{{ANCHOR_ROWS}}</ul>
+  </section>
+  <section class="card secondary">
+    <h2>6. 附录：其他客观排序</h2>
+    {{APPENDIX}}
+  </section>
+  <section class="card provenance secondary">
+    <h2>7. Provenance / 数据质量</h2>
+    <table><tbody>{{PROVENANCE_ROWS}}</tbody></table>
+  </section>
+</body>
+</html>

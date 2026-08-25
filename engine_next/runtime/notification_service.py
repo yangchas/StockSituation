@@ -8,11 +8,13 @@ import re
 import smtplib
 import ssl
 from dataclasses import dataclass
+from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from zoneinfo import ZoneInfo
 
 from engine_next.domain.enums import RunPhase
 
@@ -27,6 +29,7 @@ class RuntimeNotificationPayload:
     body: str
     digest: str
     signal_digest: str
+    html_body: str | None = None
 
 
 class RuntimeNotificationService:
@@ -45,6 +48,7 @@ class RuntimeNotificationService:
         self._config = self._load_config_dict(self._config_path)
         smtp_config = self._smtp_config()
         webhook_config = self._webhook_config()
+        auction_report_config = self._auction_report_config()
         self._enabled = self._env_or_config_bool("ENGINE_NEXT_NOTIFY_ENABLED", self._config.get("enabled"), default=False)
         self._smtp_host = self._env_or_config_text("ENGINE_NEXT_NOTIFY_SMTP_HOST", smtp_config.get("host"))
         self._smtp_port = self._env_or_config_int("ENGINE_NEXT_NOTIFY_SMTP_PORT", smtp_config.get("port"), default=465)
@@ -60,6 +64,23 @@ class RuntimeNotificationService:
             self._config.get("dedupe_prefix"),
             default="engine_next:notify",
         )
+        self._auction_report_enabled = self._env_or_config_bool(
+            "ENGINE_NEXT_AUCTION_REPORT_ENABLED",
+            auction_report_config.get("enabled"),
+            default=False,
+        )
+        self._auction_report_plate_shadow = self._env_or_config_text(
+            "ENGINE_NEXT_AUCTION_REPORT_PLATE_SHADOW",
+            auction_report_config.get("plate_shadow_path"),
+        )
+        self._auction_report_evidence = self._env_or_config_text(
+            "ENGINE_NEXT_AUCTION_REPORT_EVIDENCE",
+            auction_report_config.get("auction_evidence_path"),
+        )
+        self._auction_report_context = self._env_or_config_text(
+            "ENGINE_NEXT_AUCTION_REPORT_MARKET_CONTEXT",
+            auction_report_config.get("market_context_path"),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -71,6 +92,10 @@ class RuntimeNotificationService:
 
     def _webhook_config(self) -> dict[str, Any]:
         value = self._config.get("webhooks")
+        return value if isinstance(value, dict) else {}
+
+    def _auction_report_config(self) -> dict[str, Any]:
+        value = self._config.get("auction_report")
         return value if isinstance(value, dict) else {}
 
     def notify_if_needed(
@@ -86,9 +111,10 @@ class RuntimeNotificationService:
             return False
         if request.now.strftime("%Y-%m-%d") != str(getattr(request, "trade_date", "") or "").strip():
             return False
+        auction_report_delivered = self._notify_auction_report_if_needed(request=request)
         payload = self._build_payload(result=result, request=request, summary_text=summary_text)
         if payload is None:
-            return False
+            return auction_report_delivered
         dedupe_key = f"{self._dedupe_prefix}:{request.trade_date}:{payload.category}"
         if self._is_duplicate(dedupe_key=dedupe_key, digest=payload.signal_digest):
             return False
@@ -99,7 +125,90 @@ class RuntimeNotificationService:
             delivered = self._send_webhooks(payload, trade_date=request.trade_date) or delivered
         if delivered:
             self._remember_digest(dedupe_key=dedupe_key, digest=payload.signal_digest)
+        return delivered or auction_report_delivered
+
+    def _notify_auction_report_if_needed(self, *, request) -> bool:
+        """Deliver a precomputed evidence report without touching strategy state."""
+
+        if not self._auction_report_enabled or not self._smtp_to:
+            return False
+        if request.now.strftime("%H:%M") != "09:26":
+            return False
+        path = self._configured_report_path(self._auction_report_plate_shadow, request.trade_date)
+        if path is None or not path.is_file():
+            logger.debug("auction evidence email skipped | reason=plate_shadow_missing | path=%s", path)
+            return False
+        try:
+            from engine_next.runtime.auction_email_report import build_auction_email_report, load_json_mapping
+
+            report = build_auction_email_report(
+                plate_shadow=load_json_mapping(path) or {},
+                auction_evidence=self._load_optional_report_mapping(self._auction_report_evidence, request.trade_date),
+                market_context=self._load_optional_report_mapping(self._auction_report_context, request.trade_date),
+            )
+            if report.metadata.get("trade_date") != request.trade_date:
+                logger.warning("auction evidence email skipped | reason=trade_date_mismatch")
+                return False
+            if report.metadata.get("data_origin") not in {"production_capture", "current_cache_only"}:
+                logger.warning("auction evidence email skipped | reason=non_production_origin | data_origin=%s", report.metadata.get("data_origin"))
+                return False
+            if not self._capture_time_is_live(report.metadata.get("capture_time"), request.now, request.trade_date):
+                logger.warning("auction evidence email skipped | reason=invalid_capture_time | capture_time=%s", report.metadata.get("capture_time"))
+                return False
+            payload = RuntimeNotificationPayload(
+                category="auction_evidence",
+                phase_label="竞价事实",
+                subject=report.subject,
+                body=report.text_body,
+                digest=report.html_sha256,
+                signal_digest=report.html_sha256,
+                html_body=report.html_body,
+            )
+            return self._deliver_email_once(payload=payload, trade_date=request.trade_date)
+        except Exception:
+            logger.exception("auction evidence email skipped | reason=report_failure")
+            return False
+
+    def _deliver_email_once(self, *, payload: RuntimeNotificationPayload, trade_date: str) -> bool:
+        dedupe_key = f"{self._dedupe_prefix}:{trade_date}:{payload.category}"
+        if self._is_duplicate(dedupe_key=dedupe_key, digest=payload.signal_digest):
+            return False
+        delivered = self._send_email(payload)
+        if delivered:
+            self._remember_digest(dedupe_key=dedupe_key, digest=payload.signal_digest)
         return delivered
+
+    def _configured_report_path(self, raw_path: str, trade_date: str) -> Path | None:
+        text = str(raw_path or "").strip()
+        if not text:
+            return None
+        path = Path(text.replace("{trade_date}", trade_date).replace("{trade_date_compact}", trade_date.replace("-", ""))).expanduser()
+        if not path.is_absolute() and self._config_path is not None:
+            path = self._config_path.parent / path
+        return path.resolve(strict=False)
+
+    def _load_optional_report_mapping(self, raw_path: str, trade_date: str) -> dict[str, Any] | None:
+        path = self._configured_report_path(raw_path, trade_date)
+        if path is None or not path.is_file():
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"auction report input must be a JSON object: {path}")
+        return payload
+
+    @staticmethod
+    def _capture_time_is_live(raw_capture_time: object, now: datetime, trade_date: str) -> bool:
+        text = str(raw_capture_time or "").strip()
+        if not text:
+            return False
+        try:
+            capture_time = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        shanghai = ZoneInfo("Asia/Shanghai")
+        capture_time = capture_time.replace(tzinfo=shanghai) if capture_time.tzinfo is None else capture_time.astimezone(shanghai)
+        normalized_now = now.replace(tzinfo=shanghai) if now.tzinfo is None else now.astimezone(shanghai)
+        return capture_time.strftime("%Y-%m-%d") == trade_date and capture_time <= normalized_now
 
     def _build_payload(self, *, result, request, summary_text: str) -> RuntimeNotificationPayload | None:
         normalized_summary = str(summary_text or "").strip()
@@ -642,6 +751,8 @@ class RuntimeNotificationService:
         message["From"] = self._smtp_from
         message["To"] = ", ".join(self._smtp_to)
         message.set_content(payload.body, subtype="plain", charset="utf-8")
+        if str(payload.html_body or "").strip():
+            message.add_alternative(str(payload.html_body), subtype="html", charset="utf-8")
         try:
             if self._smtp_port == 465 and not self._smtp_starttls:
                 context = ssl.create_default_context()
