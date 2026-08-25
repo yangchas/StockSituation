@@ -33,6 +33,7 @@ Q2_SLOTS = (
     "09:32:00", "09:32:10",
 )
 F10_PATH = Path("/home/exedev/services/engine-next/current/data/f10.csv")
+CONTROL_FILES = frozenset({"capture_manifest.partial.json", "capture_manifest.sealed.json"})
 
 
 class CaptureError(RuntimeError):
@@ -288,18 +289,63 @@ def artifact_record(
     }
 
 
-def inventory_valid(manifest: Mapping[str, Any], root: Path) -> tuple[bool, list[str]]:
-    errors = []
+def inventory_valid(
+    manifest: Mapping[str, Any],
+    root: Path,
+    *,
+    control_files: frozenset[str] = CONTROL_FILES,
+    require_capture_started: bool = False,
+) -> tuple[bool, list[str]]:
+    """Validate both registered artifacts and the closed output directory."""
+    errors: list[str] = []
+    registered: dict[str, Mapping[str, Any]] = {}
     for item in manifest.get("artifact_inventory", []):
-        path = root / str(item.get("relative_path", ""))
+        relative_path = item.get("relative_path")
+        if not isinstance(relative_path, str) or not relative_path:
+            errors.append("invalid_path:<empty>")
+            continue
+        if relative_path in {".", ".."} or "/" in relative_path or "\\" in relative_path:
+            errors.append(f"invalid_path:{relative_path}")
+            continue
+        if relative_path in registered:
+            errors.append(f"duplicate:{relative_path}")
+            continue
+        if relative_path in control_files:
+            errors.append(f"control_registered:{relative_path}")
+            continue
+        registered[relative_path] = item
+
+    if require_capture_started and "capture_started.json" not in registered:
+        errors.append("missing_registration:capture_started.json")
+
+    for relative_path, item in registered.items():
+        path = root / relative_path
+        if path.is_symlink():
+            errors.append(f"symlink:{relative_path}")
+            continue
         if not path.is_file():
-            errors.append(f"missing:{item.get('relative_path')}")
+            errors.append(f"missing:{relative_path}")
             continue
         if path.stat().st_size != item.get("size_bytes"):
-            errors.append(f"size:{item.get('relative_path')}")
+            errors.append(f"size:{relative_path}")
         if sha256_file(path) != item.get("sha256"):
-            errors.append(f"sha256:{item.get('relative_path')}")
-    return not errors, errors
+            errors.append(f"sha256:{relative_path}")
+
+    if root.is_dir():
+        with os.scandir(root) as entries:
+            for entry in entries:
+                name = entry.name
+                if entry.is_symlink():
+                    errors.append(f"symlink:{name}")
+                elif entry.is_dir(follow_symlinks=False):
+                    errors.append(f"subdirectory:{name}")
+                elif not entry.is_file(follow_symlinks=False):
+                    errors.append(f"special:{name}")
+                elif name not in registered and name not in control_files:
+                    errors.append(f"unregistered:{name}")
+    else:
+        errors.append("missing_directory:.")
+    return not errors, sorted(set(errors))
 
 
 def capture_tool_frozen(manifest: Mapping[str, Any], root: Path) -> bool:
@@ -520,6 +566,8 @@ def capture(args: argparse.Namespace) -> int:
     create_capture_marker(root, marker)
     manifest: dict[str, Any] = {
         "format": "ProductionGroundTruthCaptureV2",
+        "data_origin": "production_capture",
+        "formal_ground_truth": True,
         "trade_date": trade_date,
         "run_id": run_id,
         "capture_tool_sha256": marker["capture_tool_sha256"],
@@ -535,6 +583,12 @@ def capture(args: argparse.Namespace) -> int:
             "td_write_count": 0,
             "notification_count": 0,
             "network_repair_count": 0,
+        },
+        "write_isolation_evidence": {
+            "redis_write_count": "runtime_measured",
+            "td_write_count": "source_enforced",
+            "notification_count": "source_enforced",
+            "network_repair_count": "source_enforced",
         },
         "td_export_status": "pending_post_market",
         "sealed": False,
@@ -659,18 +713,22 @@ def td_export(root: Path, trade_date: str) -> list[dict[str, Any]]:
                                     max_timestamp = timestamp
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(temporary, path)
-                record = artifact_record(
-                    path,
-                    root=root,
-                    row_count=row_count,
-                    symbol_count=len(symbols),
-                    min_logical_timestamp=min_timestamp,
-                    max_logical_timestamp=max_timestamp,
-                    capture_duration_ms=int((time.monotonic() - export_started) * 1000),
-                )
-                if record["sha256"] != stream_digest.hexdigest():
+                temporary_size = temporary.stat().st_size
+                temporary_sha256 = sha256_file(temporary)
+                if temporary_sha256 != stream_digest.hexdigest():
                     raise CaptureError(f"stream hash mismatch: {name}")
+                record = {
+                    "relative_path": path.name,
+                    "size_bytes": temporary_size,
+                    "row_count": row_count,
+                    "symbol_count": len(symbols),
+                    "min_logical_timestamp": min_timestamp,
+                    "max_logical_timestamp": max_timestamp,
+                    "sha256": temporary_sha256,
+                    "capture_duration_ms": int((time.monotonic() - export_started) * 1000),
+                }
+                os.replace(temporary, path)
+                temporary = None
                 records.append(record | {
                     "source": "post_market_td_export",
                     "table": name,
@@ -683,11 +741,72 @@ def td_export(root: Path, trade_date: str) -> list[dict[str, Any]]:
             except Exception as exc:
                 records.append({"source": "post_market_td_export", "table": name, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}", "query": query})
                 if temporary and temporary.exists():
-                    temporary.unlink()
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
         cursor.close()
     finally:
         connection.close()
     return records
+
+
+def td_dry_run(args: argparse.Namespace) -> int:
+    trade_date = parse_trade_date(args.trade_date)
+    root = Path(args.output_dir).resolve()
+    if root.exists():
+        if any(root.iterdir()):
+            raise CaptureError("dry-run output directory is not empty")
+    else:
+        root.mkdir(parents=True)
+
+    started_at = now_local()
+    run_id = f"td-dry-run-{trade_date.replace('-', '')}-{int(time.time())}"
+    try:
+        records = td_export(root, trade_date)
+        export_error = None
+    except Exception as exc:
+        records = []
+        export_error = f"{type(exc).__name__}: {exc}"
+
+    artifacts = [record for record in records if record.get("relative_path")]
+    inventory_ok, inventory_errors = inventory_valid(
+        {"artifact_inventory": artifacts},
+        root,
+        control_files=frozenset({"dry_run_manifest.json"}),
+    )
+    exports_ok = len(records) == 6 and len(artifacts) == 6 and all(
+        int(record.get("row_count", 0)) > 0 for record in artifacts
+    )
+    status = "PASS" if export_error is None and exports_ok and inventory_ok else "FAIL"
+    manifest = {
+        "format": "GroundTruthTdHistoricalDryRunV1",
+        "data_origin": "post_market_td_dry_run",
+        "formal_ground_truth": False,
+        "historical_td_dry_run": status,
+        "run_id": run_id,
+        "trade_date": trade_date,
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": now_local().isoformat(timespec="seconds"),
+        "artifact_inventory": artifacts,
+        "export_records": records,
+        "final_recheck_errors": inventory_errors,
+        "export_error": export_error,
+        "write_isolation": {
+            "redis_write_count": 0,
+            "td_write_count": 0,
+            "notification_count": 0,
+            "network_repair_count": 0,
+        },
+        "write_isolation_evidence": {
+            "redis_write_count": "not_opened",
+            "td_write_count": "source_enforced",
+            "notification_count": "source_enforced",
+            "network_repair_count": "source_enforced",
+        },
+    }
+    atomic_write_json(root / "dry_run_manifest.json", manifest)
+    return 0 if status == "PASS" else 1
 
 
 def seal(args: argparse.Namespace) -> int:
@@ -702,7 +821,7 @@ def seal(args: argparse.Namespace) -> int:
     manifest = json.loads(partial_path.read_text(encoding="utf-8"))
     if manifest.get("trade_date") != trade_date:
         raise CaptureError("trade_date mismatch")
-    valid_before, errors_before = inventory_valid(manifest, root)
+    valid_before, errors_before = inventory_valid(manifest, root, require_capture_started=True)
     if errors_before:
         manifest["integrity_errors_before_seal"] = errors_before
     tool_frozen = capture_tool_frozen(manifest, root)
@@ -746,7 +865,7 @@ def seal(args: argparse.Namespace) -> int:
     )
     td_ok = bool(td_records) and all(record.get("relative_path") and record.get("row_count", 0) > 0 for record in td_records)
     manifest["td_export_status"] = "PASS" if td_ok else "PARTIAL"
-    valid_after, errors_after = inventory_valid(manifest, root)
+    valid_after, errors_after = inventory_valid(manifest, root, require_capture_started=True)
     if errors_after:
         manifest["integrity_errors_after_seal"] = errors_after
     manifest["gate_results"] = {
@@ -764,6 +883,22 @@ def seal(args: argparse.Namespace) -> int:
         "artifact_integrity": "PASS" if valid_before and valid_after else "FAIL",
         "manifest_sealed": "PASS",
         "capture_write_isolation": "PASS" if not any(manifest.get("write_isolation", {}).values()) else "FAIL",
+    }
+    start_config = manifest.get("runtime_identity_start", {}).get("effective_config_sha256")
+    end_config = manifest.get("runtime_identity_end", {}).get("effective_config_sha256")
+    manifest["config_provenance"] = "PASS" if start_config and start_config == end_config else "PARTIAL"
+    measured_expected = [
+        item for item in manifest["artifact_inventory"]
+        if item.get("relative_path") != "capture_started.json"
+    ]
+    measured = [item for item in measured_expected if isinstance(item.get("capture_duration_ms"), int)]
+    durations = [int(item["capture_duration_ms"]) for item in measured]
+    manifest["capture_performance"] = {
+        "status": "PASS" if len(measured) == len(measured_expected) and timing_ok else "WARN",
+        "artifact_count": len(manifest["artifact_inventory"]),
+        "measured_artifact_count": len(measured),
+        "total_duration_ms": sum(durations),
+        "max_duration_ms": max(durations, default=0),
     }
     complete = all(value == "PASS" for value in manifest["gate_results"].values())
     manifest.update({
@@ -786,7 +921,7 @@ def seal(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     sub = result.add_subparsers(dest="command", required=True)
-    for name, function in (("capture", capture), ("seal", seal)):
+    for name, function in (("capture", capture), ("seal", seal), ("td-dry-run", td_dry_run)):
         command = sub.add_parser(name)
         command.add_argument("--trade-date", required=True)
         command.add_argument("--output-dir", required=True, type=Path)

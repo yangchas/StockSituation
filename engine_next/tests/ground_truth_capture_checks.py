@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -69,6 +70,90 @@ def test_inventory_detects_post_capture_mutation(tmp_path: Path) -> None:
     ok, errors = inventory_valid({"artifact_inventory": [record]}, tmp_path)
     assert not ok
     assert any(error.startswith("sha256:") for error in errors)
+
+
+def test_inventory_detects_registered_missing_and_size_mismatch(tmp_path: Path) -> None:
+    missing = {
+        "relative_path": "missing.json",
+        "size_bytes": 1,
+        "sha256": "missing",
+    }
+    ok, errors = inventory_valid({"artifact_inventory": [missing]}, tmp_path)
+    assert not ok
+    assert "missing:missing.json" in errors
+
+    path = tmp_path / "rows.json"
+    path.write_bytes(b"one")
+    record = artifact_record(path, root=tmp_path)
+    record["size_bytes"] += 1
+    ok, errors = inventory_valid({"artifact_inventory": [record]}, tmp_path)
+    assert not ok
+    assert "size:rows.json" in errors
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ("", "../x", "a/../../x", "/tmp/x", r"C:\\tmp\\x"),
+)
+def test_inventory_rejects_unsafe_and_absolute_paths(tmp_path: Path, relative_path: str) -> None:
+    ok, errors = inventory_valid(
+        {"artifact_inventory": [{"relative_path": relative_path}]},
+        tmp_path,
+    )
+    assert not ok
+    assert any(error.startswith("invalid_path:") for error in errors)
+
+
+def test_inventory_rejects_duplicate_paths(tmp_path: Path) -> None:
+    path = tmp_path / "rows.json"
+    atomic_write_json(path, {"rows": 1})
+    record = artifact_record(path, root=tmp_path)
+    ok, errors = inventory_valid({"artifact_inventory": [record, record]}, tmp_path)
+    assert not ok
+    assert "duplicate:rows.json" in errors
+
+
+@pytest.mark.parametrize("unexpected_name", ("unknown.json", ".orphan.tmp"))
+def test_inventory_rejects_unregistered_regular_files(tmp_path: Path, unexpected_name: str) -> None:
+    (tmp_path / unexpected_name).write_bytes(b"orphan")
+    ok, errors = inventory_valid({"artifact_inventory": []}, tmp_path)
+    assert not ok
+    assert f"unregistered:{unexpected_name}" in errors
+
+
+def test_inventory_rejects_unexpected_subdirectory(tmp_path: Path) -> None:
+    (tmp_path / "nested").mkdir()
+    ok, errors = inventory_valid({"artifact_inventory": []}, tmp_path)
+    assert not ok
+    assert "subdirectory:nested" in errors
+
+
+def test_inventory_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.json"
+    target.write_bytes(b"target")
+    link = tmp_path / "link.json"
+    try:
+        os.symlink(target, link)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows host")
+    records = [artifact_record(target, root=tmp_path)]
+    ok, errors = inventory_valid({"artifact_inventory": records}, tmp_path)
+    assert not ok
+    assert "symlink:link.json" in errors
+
+
+def test_inventory_allows_only_control_files_and_requires_registered_marker(tmp_path: Path) -> None:
+    marker = create_capture_marker(tmp_path, {"run_id": "one"})
+    atomic_write_json(tmp_path / "capture_manifest.partial.json", {"partial": True})
+    record = artifact_record(marker, root=tmp_path)
+    assert inventory_valid(
+        {"artifact_inventory": [record]}, tmp_path, require_capture_started=True
+    ) == (True, [])
+    ok, errors = inventory_valid(
+        {"artifact_inventory": []}, tmp_path, require_capture_started=True
+    )
+    assert not ok
+    assert "missing_registration:capture_started.json" in errors
 
 
 def test_identity_change_is_not_accepted() -> None:
@@ -169,6 +254,38 @@ def test_td_export_is_streaming_canonical_and_uses_resolved_database(tmp_path: P
     assert records[-1]["row_count"] == 2
     assert records[-1]["symbol_count"] == 2
     assert records[-1]["capture_duration_ms"] is not None
+
+
+def test_td_export_failure_does_not_publish_partial_official_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeCursor:
+        description = (("ts",),)
+
+        def execute(self, _query: str) -> None:
+            self.returned = False
+
+        def fetchmany(self, _size: int) -> list[tuple[object, ...]]:
+            if self.returned:
+                return []
+            self.returned = True
+            return [(object(),)]
+
+        def close(self) -> None:
+            return None
+
+    class FakeConnection:
+        def cursor(self) -> FakeCursor:
+            return FakeCursor()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(capture_module, "_taos_connection", lambda: FakeConnection())
+    records = td_export(tmp_path, "2026-08-26")
+    assert all(record.get("status") == "FAILED" for record in records)
+    assert not list(tmp_path.glob("td_*.jsonl"))
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_resolved_database_rejects_non_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,3 +402,92 @@ def test_seal_final_recheck_catches_mutation_during_td_export(
     assert sealed["gate_results"]["artifact_integrity"] == "FAIL"
     assert sealed["seal_status"] == "FAIL"
     assert sealed["integrity_errors_after_seal"]
+    assert sealed["capture_performance"]["artifact_count"] == 3
+    assert sealed["capture_performance"]["measured_artifact_count"] == 0
+    assert sealed["capture_performance"]["status"] == "WARN"
+
+
+def test_live_capture_manifest_records_production_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = {
+        "effective_config_sha256": "config",
+        "capture_tool_sha256": "tool",
+        "release_provenance_valid": True,
+    }
+    monkeypatch.setattr(capture_module, "release_identity", lambda: identity)
+    monkeypatch.setattr(capture_module, "open_redis", lambda: type("Redis", (), {"write_attempts": 0})())
+    monkeypatch.setattr(
+        capture_module,
+        "wait_slot",
+        lambda trade_date, clock: ("MISSED", 10_000, capture_module.scheduled_at(trade_date, clock)),
+    )
+    assert capture_module.capture(
+        argparse.Namespace(trade_date="2026-08-26", output_dir=tmp_path)
+    ) == 0
+    partial = json.loads((tmp_path / "capture_manifest.partial.json").read_text(encoding="utf-8"))
+    assert partial["data_origin"] == "production_capture"
+    assert partial["formal_ground_truth"] is True
+    assert partial["write_isolation_evidence"]["redis_write_count"] == "runtime_measured"
+
+
+def test_td_dry_run_uses_formal_export_and_never_creates_sealed_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = []
+
+    def fake_export(root: Path, trade_date: str) -> list[dict[str, object]]:
+        called.append((root, trade_date))
+        records = []
+        for index in range(6):
+            path = root / f"td_export_{index}.jsonl"
+            path.write_bytes(b'{"symbol":"000001","ts":1}\n')
+            records.append(artifact_record(
+                path,
+                root=root,
+                row_count=1,
+                symbol_count=1,
+                min_logical_timestamp=1,
+                max_logical_timestamp=1,
+                capture_duration_ms=1,
+            ))
+        return records
+
+    monkeypatch.setattr(capture_module, "td_export", fake_export)
+    assert capture_module.td_dry_run(
+        argparse.Namespace(trade_date="2026-08-26", output_dir=tmp_path)
+    ) == 0
+    manifest = json.loads((tmp_path / "dry_run_manifest.json").read_text(encoding="utf-8"))
+    assert called == [(tmp_path.resolve(), "2026-08-26")]
+    assert manifest["data_origin"] == "post_market_td_dry_run"
+    assert manifest["formal_ground_truth"] is False
+    assert manifest["historical_td_dry_run"] == "PASS"
+    assert manifest["write_isolation"] == {
+        "redis_write_count": 0,
+        "td_write_count": 0,
+        "notification_count": 0,
+        "network_repair_count": 0,
+    }
+    assert not (tmp_path / "capture_started.json").exists()
+    assert not (tmp_path / "capture_manifest.sealed.json").exists()
+
+
+def test_td_dry_run_final_recheck_detects_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_export(root: Path, trade_date: str) -> list[dict[str, object]]:
+        records = []
+        for index in range(6):
+            path = root / f"td_export_{index}.jsonl"
+            path.write_bytes(b'{"symbol":"000001","ts":1}\n')
+            records.append(artifact_record(path, root=root, row_count=1, capture_duration_ms=1))
+        (root / "td_export_0.jsonl").write_bytes(b"changed\n")
+        return records
+
+    monkeypatch.setattr(capture_module, "td_export", fake_export)
+    assert capture_module.td_dry_run(
+        argparse.Namespace(trade_date="2026-08-26", output_dir=tmp_path)
+    ) == 1
+    manifest = json.loads((tmp_path / "dry_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["historical_td_dry_run"] == "FAIL"
+    assert any(error.startswith(("size:", "sha256:")) for error in manifest["final_recheck_errors"])
