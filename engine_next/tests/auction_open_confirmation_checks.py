@@ -99,6 +99,31 @@ def test_live_input_boundary_reuses_same_observation_logic(tmp_path: Path) -> No
     assert live_result["data_origin"] == "production_capture"
 
 
+def test_live_input_naive_cutoff_is_interpreted_as_shanghai(tmp_path: Path) -> None:
+    _, shadow_path, q2_path = _inputs(tmp_path)
+    shadow = json.loads(shadow_path.read_text(encoding="utf-8"))
+    shadow["data_origin"] = "production_capture"
+    shadow["plate_stats"] = {
+        "0924_to_0925": {
+            "AI": {
+                "stock_count": 2,
+                "valid_auction_stock_count": 2,
+                "auction_amount_total_yuan": 1000.0,
+                "change_pct_distribution": {"positive_count": 1, "negative_count": 1, "zero_count": 0, "count": 2, "median_pct": 1.0},
+            }
+        }
+    }
+    frames = [json.loads(line) for line in q2_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    result = build_observation_from_inputs(
+        auction_evidence={"trade_date": "2026-08-21", "market_summary": {"source": "a2_0925_summary"}},
+        plate_shadow=shadow,
+        open_q2_rows=frames,
+        observation_cutoff=datetime(2026, 8, 21, 9, 30, 30),
+    )
+    assert result["open_source"]["observation_cutoff"] == "2026-08-21T09:30:30+08:00"
+    assert result["market"]["open"]["observation_time"].startswith("2026-08-21T09:30:01")
+
+
 def test_deltas_are_exact_and_amount_ratio_is_protected(tmp_path: Path) -> None:
     paths = _inputs(tmp_path)
     result = build_observation(auction_report=paths[0], plate_shadow=paths[1], q2=paths[2])

@@ -171,7 +171,14 @@ def _open_rows_from_frames(
     latest: dict[str, dict[str, Any]] = {}
     latest_ts = 0
     frame_count = 0
-    cutoff_ms = int(observation_cutoff.timestamp() * 1000) if observation_cutoff is not None else None
+    normalized_cutoff = None
+    if observation_cutoff is not None:
+        normalized_cutoff = (
+            observation_cutoff.replace(tzinfo=SHANGHAI)
+            if observation_cutoff.tzinfo is None
+            else observation_cutoff.astimezone(SHANGHAI)
+        )
+    cutoff_ms = int(normalized_cutoff.timestamp() * 1000) if normalized_cutoff is not None else None
     for frame in frames:
         timestamp_ms = _number(frame.get("logical_ts_ms"))
         if timestamp_ms is None or timestamp_ms <= 0 or (cutoff_ms is not None and timestamp_ms > cutoff_ms):
@@ -520,7 +527,13 @@ def build_observation_from_inputs(
     )
     q2_meta = dict(q2_meta)
     q2_meta["source"] = "production_online_q2"
-    q2_meta["observation_cutoff"] = observation_cutoff.isoformat() if observation_cutoff is not None else None
+    if observation_cutoff is None:
+        normalized_cutoff = None
+    elif observation_cutoff.tzinfo is None:
+        normalized_cutoff = observation_cutoff.replace(tzinfo=SHANGHAI)
+    else:
+        normalized_cutoff = observation_cutoff.astimezone(SHANGHAI)
+    q2_meta["observation_cutoff"] = normalized_cutoff.isoformat() if normalized_cutoff is not None else None
     return _build_observation_from_payloads(
         report=report,
         shadow=shadow,
