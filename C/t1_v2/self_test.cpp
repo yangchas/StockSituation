@@ -276,6 +276,20 @@ bool run_self_test() {
         trigger.update(make_local_ts_ms(2026, 4, 29, 9, 25, 2), MarketPhase::Auction);
     if (!expect(!repeat_a25.emit_a25, "a25 emitted only once")) return false;
 
+    const SnapshotTriggerState next_day_a20 =
+        trigger.update(make_local_ts_ms(2026, 4, 30, 9, 20, 5), MarketPhase::Auction);
+    if (!expect(next_day_a20.emit_a20, "a20 resets on next input trade date")) return false;
+    const SnapshotTriggerState next_day_a24 =
+        trigger.update(make_local_ts_ms(2026, 4, 30, 9, 24, 15), MarketPhase::Auction);
+    if (!expect(next_day_a24.emit_a24, "a24 resets on next input trade date")) return false;
+    const SnapshotTriggerState next_day_a25 =
+        trigger.update(make_local_ts_ms(2026, 4, 30, 9, 25, 0), MarketPhase::Auction);
+    if (!expect(next_day_a25.emit_a25, "a25 resets on next input trade date")) return false;
+    const SnapshotTriggerState late_previous_day =
+        trigger.update(make_local_ts_ms(2026, 4, 29, 9, 25, 5), MarketPhase::Auction);
+    if (!expect(!late_previous_day.emit_a20 && !late_previous_day.emit_a24 && !late_previous_day.emit_a25,
+                "older trade date does not rewind snapshot state")) return false;
+
     ConfigV2 default_replay_config;
     if (!expect(default_replay_config.tdengine.replay_table == "stock_tick_v2", "default replay table is v2 ticks")) return false;
     if (!expect(default_replay_config.replay.write_redis, "replay writes redis by default")) return false;
@@ -857,7 +871,15 @@ bool run_self_test() {
     const auto a2_commands_for_legacy = redis_writer.build_a2_commands(engine.quote_store(), legacy_trigger, ts_0922);
     bool has_legacy_auction_key = false;
     bool has_legacy_latest_key = false;
+    bool has_a2_effective_price = false;
     for (const RedisCommand& command : a2_commands_for_legacy) {
+        if (command.key.find("a2:") == 0) {
+            for (const auto& field : command.fields) {
+                if (field.first == "top_amt" && field.second.find("\"px\":10000") != std::string::npos) {
+                    has_a2_effective_price = true;
+                }
+            }
+        }
         if (command.key.find("market:auction:") == 0 && command.key.find(":0920") != std::string::npos) {
             for (const auto& field : command.fields) {
                 if (field.first == "top_amount" && field.second.find("\"symbol\"") != std::string::npos) {
@@ -875,6 +897,7 @@ bool run_self_test() {
     }
     if (!expect(has_legacy_auction_key, "legacy market auction top_amount key")) return false;
     if (!expect(has_legacy_latest_key, "legacy market auction latest key")) return false;
+    if (!expect(has_a2_effective_price, "a2 top amount uses effective auction price")) return false;
     SnapshotTriggerState anchor_trigger;
     anchor_trigger.emit_a25 = true;
     const auto a2_commands_for_anchor = redis_writer.build_a2_commands(engine.quote_store(), anchor_trigger, ts_0922);

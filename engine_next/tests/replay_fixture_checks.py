@@ -88,6 +88,7 @@ def test_replay_runner_restores_intraday_hub_references_on_failure() -> None:
             json.dumps(
                 {
                     "fixture_id": "closure-test",
+                    "source": "tracked-test-fixture",
                     "trade_date": "2026-08-21",
                     "previous_trade_date": "2026-08-20",
                     "hashes": {"cache:hot_rank:2026-08-21": {"000001": "1"}},
@@ -114,6 +115,44 @@ def test_replay_runner_restores_intraday_hub_references_on_failure() -> None:
             )
     assert run_engine_next.context_pipeline.IntradayDataHub is original_context
     assert run_engine_next.local_decision_layer.IntradayDataHub is original_local
+
+
+def test_replay_fixture_trade_date_mismatch_fails_before_q2_execution() -> None:
+    payload = {
+        "fixture_id": "date-closure-test",
+        "source": "tracked-test-fixture",
+        "trade_date": "2026-08-21",
+        "previous_trade_date": "2026-08-20",
+        "hashes": {"cache:hot_rank:2026-08-21": {"000001": "1"}},
+        "strings": {"cache:hot_rank_meta:2026-08-21": "{}"},
+        "sets": {},
+    }
+    view = ReplayRedisView(
+        hashes=payload["hashes"], strings=payload["strings"], sets=payload["sets"]
+    )
+    with pytest.raises(RuntimeError, match="trade_date mismatch"):
+        run_engine_next._validate_fixture_date_contract(
+            {**payload, "trade_date": "2026-08-22"},
+            view,
+            trade_date="2026-08-21",
+            previous_trade_date="2026-08-20",
+        )
+
+
+def test_replay_fixture_component_date_mismatch_fails_closed() -> None:
+    payload = {
+        "trade_date": "2026-08-21",
+        "previous_trade_date": "2026-08-20",
+        "source": "tracked-test-fixture",
+        "component_dates": {"auction": "2026-08-22"},
+    }
+    with pytest.raises(RuntimeError, match="component_dates mismatch"):
+        run_engine_next._validate_fixture_date_contract(
+            payload,
+            ReplayRedisView(),
+            trade_date="2026-08-21",
+            previous_trade_date="2026-08-20",
+        )
 
 
 def test_replay_does_not_report_production_scheduler_events() -> None:

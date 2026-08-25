@@ -543,8 +543,8 @@ std::string RedisV2Writer::build_top_json(const std::vector<const QuoteState*>& 
         if (i > 0) {
             oss << ",";
         }
-        oss << "{\"s\":\"" << state.symbol << "\","
-            << "\"px\":" << state.px_milli << ","
+        oss << "{\"s\":\"" << state.symbol << "\"," 
+            << "\"px\":" << auction_price_milli(state) << ","
             << "\"chg\":" << change_bp(state) << ","
             << "\"am\":" << state.auction.match_amt_yuan << ","
             << "\"br\":" << state.auction.rest_bid_amt_yuan << ","

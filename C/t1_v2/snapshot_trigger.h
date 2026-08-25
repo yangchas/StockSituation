@@ -27,12 +27,14 @@ public:
 
 private:
     int hms_from_timestamp_ms(int64_t ts_ms) const;
+    int trade_date_from_timestamp_ms(int64_t ts_ms) const;
 
 private:
     ConfigV2 config_;
     bool emitted_a20_ = false;
     bool emitted_a24_ = false;
     bool emitted_a25_ = false;
+    int current_trade_date_ = 0;
     int64_t last_latest_auction_ts_ms_ = 0;
     int64_t last_runtime_ts_ms_ = 0;
 };

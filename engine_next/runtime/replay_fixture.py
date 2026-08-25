@@ -76,6 +76,11 @@ class ReplayRedisView:
         """Exact Redis keys read by the replay path, in deterministic order."""
         return tuple(sorted(self._accessed_keys))
 
+    @property
+    def fixture_keys(self) -> tuple[str, ...]:
+        """Keys present in the fixture without marking them as runtime reads."""
+        return tuple(sorted({*self._hashes, *self._strings, *self._sets, *self._sorted_sets}))
+
     def _record_read(self, key: str) -> None:
         self._accessed_keys.add(str(key))
 

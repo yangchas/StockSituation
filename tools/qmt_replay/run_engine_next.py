@@ -12,6 +12,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,7 @@ from engine_next.strategy_skill_layer import context_pipeline, local_decision_la
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EVIDENCE_CONTRACT_VERSION = "AuctionPhase1A"
 REPLAY_CHECKPOINTS = ((9, 20, "0920"), (9, 24, "0924"), (9, 25, "0925"), (9, 26, "0926"), (9, 30, "0930"))
+_DATE_TOKEN_RE = re.compile(r"(?<!\d)(20\d{2})-?(\d{2})(\d{2})(?!\d)")
 
 
 def _jsonable(value: Any) -> Any:
@@ -198,6 +200,88 @@ def _load_fixture(path: Path) -> tuple[dict[str, Any], ReplayRedisView]:
     return payload, ReplayRedisView(hashes=hashes, strings=strings, sets=sets)
 
 
+def _normalise_trade_date(value: Any) -> str:
+    text = str(value or "").strip().replace("-", "")
+    if len(text) != 8 or not text.isdigit():
+        return ""
+    return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+
+
+def _date_tokens(value: str) -> tuple[str, ...]:
+    return tuple(f"{year}-{month}-{day}" for year, month, day in _DATE_TOKEN_RE.findall(value))
+
+
+def _validate_fixture_date_contract(
+    payload: dict[str, Any],
+    view: ReplayRedisView,
+    *,
+    trade_date: str,
+    previous_trade_date: str,
+) -> None:
+    """Reject date-mixed static facts before strategy/network execution."""
+
+    expected_trade = _normalise_trade_date(trade_date)
+    expected_previous = _normalise_trade_date(previous_trade_date)
+    actual_trade = _normalise_trade_date(payload.get("trade_date"))
+    actual_previous = _normalise_trade_date(payload.get("previous_trade_date"))
+    if not actual_trade or actual_trade != expected_trade:
+        raise RuntimeError(
+            "replay fixture trade_date mismatch: "
+            f"fixture={payload.get('trade_date')!r}, requested={trade_date!r}"
+        )
+    if not actual_previous or actual_previous != expected_previous:
+        raise RuntimeError(
+            "replay fixture previous_trade_date mismatch: "
+            f"fixture={payload.get('previous_trade_date')!r}, requested={previous_trade_date!r}"
+        )
+    source = str(payload.get("source") or payload.get("data_origin") or "").strip()
+    if not source:
+        raise RuntimeError("replay fixture provenance source is missing")
+
+    for key in view.fixture_keys:
+        key_text = str(key)
+        tokens = _date_tokens(key_text)
+        if not tokens:
+            continue
+        if "yest_limit_pool" in key_text:
+            allowed = {expected_previous}
+        elif "hot_plates" in key_text:
+            allowed = {expected_trade, expected_previous}
+        elif "hot_rank" in key_text or "auction" in key_text or "settlement" in key_text:
+            allowed = {expected_trade}
+        else:
+            allowed = {expected_trade, expected_previous}
+        if any(token not in allowed for token in tokens):
+            raise RuntimeError(
+                "replay fixture component date mismatch: "
+                f"key={key_text!r}, dates={tokens!r}, allowed={sorted(allowed)!r}"
+            )
+
+    component_dates = payload.get("component_dates")
+    if component_dates is not None:
+        if not isinstance(component_dates, dict):
+            raise RuntimeError("replay fixture component_dates must be an object")
+        component_rules = {
+            "auction": {expected_trade},
+            "q2": {expected_trade},
+            "st_limit_metadata": {expected_trade},
+            "metadata": {expected_trade},
+            "yest_limit_pool": {expected_previous},
+            "previous_day_facts": {expected_previous},
+            "mapping": {expected_trade, expected_previous},
+            "hot_rank": {expected_trade},
+        }
+        for component, raw_date in component_dates.items():
+            component_key = str(component)
+            actual_date = _normalise_trade_date(raw_date)
+            allowed = component_rules.get(component_key, {expected_trade, expected_previous})
+            if not actual_date or actual_date not in allowed:
+                raise RuntimeError(
+                    "replay fixture component_dates mismatch: "
+                    f"component={component_key!r}, date={raw_date!r}, allowed={sorted(allowed)!r}"
+                )
+
+
 @_restore_intraday_hub_refs
 def run_replay(
     *,
@@ -211,6 +295,12 @@ def run_replay(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     fixture_payload, view = _load_fixture(static_fixture)
+    _validate_fixture_date_contract(
+        fixture_payload,
+        view,
+        trade_date=trade_date,
+        previous_trade_date=previous_trade_date,
+    )
     hot_rank_key = f"cache:hot_rank:{trade_date}"
     hot_rank_meta_key = f"cache:hot_rank_meta:{trade_date}"
     if not view.hlen(hot_rank_key) or not view.get(hot_rank_meta_key):
@@ -256,6 +346,11 @@ def run_replay(
         logical_now = datetime.fromtimestamp(frame_ts / 1000.0, SHANGHAI)
         if logical_now.tzinfo != SHANGHAI:
             raise ValueError("replay time must use Asia/Shanghai")
+        if logical_now.date().isoformat() != _normalise_trade_date(trade_date):
+            raise ValueError(
+                "Q2Frame logical trade_date mismatch: "
+                f"frame={logical_now.date().isoformat()}, requested={trade_date}"
+            )
 
         # Fixed order: validate timestamp -> advance clock -> apply frame.
         if frame_ts < view.last_q2_logical_ts_ms:
