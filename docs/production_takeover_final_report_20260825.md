@@ -8,6 +8,17 @@
 - Existing t1 service: `t1-v2-live.service`
 - This report contains no credentials and no production writes were performed.
 
+## Current execution branch
+
+- Isolated source-closure branch: `codex/production-fact-takeover`
+- Latest local commit: `7acf055b4b8f2d299faf168eca163d646463c9a2`
+- Reporting closure verification: 43 targeted tests passed
+- Production deployment: not performed
+
+The branch only closes the report/open-input source boundary and release
+provenance helpers. It does not replace the frozen replay baseline or certify
+production fact equivalence.
+
 ## Captures
 
 ### TDengine table audit
