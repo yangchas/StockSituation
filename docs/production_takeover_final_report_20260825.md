@@ -79,6 +79,8 @@ Therefore: `PRODUCTION_FACT_TAKEOVER_PARTIAL`.
 
 The current production release does not contain the local `auction_email_report.py`, auction report template, or the replay/open confirmation report path. Existing runtime scheduling and notification code is present, but a production-linked 09:26/09:32 report delivery path was not proven in this run. The service unit runs with a 180-second loop interval; exact report-slot wake-up was not accepted without a scheduler evidence run.
 
+The current release directory also has no `.git` metadata and no `build_info.json`; release provenance is therefore `NOT_EVALUATED`, not inferred from a claimed commit. A read-only check on 2026-08-25 found zero `market:auction:20260825:*` Redis keys and no production report template. No production files or data were modified.
+
 | Gate | Result |
 |---|---|
 | auction_scheduler | NOT_EVALUATED |
@@ -92,6 +94,10 @@ The current production release does not contain the local `auction_email_report.
 | decision_isolation | NOT_EVALUATED |
 
 Therefore: `PRODUCTION_EMAIL_TAKEOVER_PARTIAL`.
+
+The application-level report notification API is now available in the isolated
+reporting closure branch, but it has not been deployed to this release and is
+not a production delivery result.
 
 ## Final status
 
