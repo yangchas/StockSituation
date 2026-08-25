@@ -32,6 +32,7 @@ from engine_next.runtime.intraday_context_builder import (
 )
 from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryResult, MarketRuntimeSummaryService
 from engine_next.runtime.offline_sync_executor import OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
+from engine_next.runtime.production_reporting import ProductionReportingCoordinator
 from engine_next.runtime.original_timeline import iter_phase_events
 from engine_next.runtime.renderers.live_phase_summary_renderer import (
     LivePhaseSummaryRenderer,
@@ -249,6 +250,7 @@ class EngineApp:
     MIN_FULL_UNIVERSE_SIZE = 1000
     STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00", "17:40")
     AUCTION_FINALIZE_EARLIEST = dt_time(9, 25, 10)
+    OPENING_FACTS_EARLIEST = dt_time(9, 32, 10)
 
     def __init__(
         self,
@@ -257,11 +259,13 @@ class EngineApp:
         offline_executor: ServerOnlyOfflineSyncExecutor | None = None,
         intraday_context_builder: IntradayContextBuilder | None = None,
         redis_client: object | None = None,
+        production_reporting: ProductionReportingCoordinator | None = None,
     ) -> None:
         self._startup_coordinator = startup_coordinator or RuntimeStartupCoordinator()
         self._offline_executor = offline_executor or ServerOnlyOfflineSyncExecutor()
         self._intraday_context_builder = intraday_context_builder or IntradayContextBuilder()
         self._redis_client = redis_client
+        self._production_reporting = production_reporting
         self._intraday_hub = IntradayDataHub(redis_client=redis_client)
         self._market_runtime_summary_service = MarketRuntimeSummaryService(redis_client=self.redis)
         self._auction_runtime = AuctionRuntimeController(
@@ -1116,6 +1120,15 @@ class EngineApp:
                 scheduled_event_name="auction_followup_0926",
                 scheduled_event_label="auction follow-up event 09:26",
             )
+        if minute_tag == "09:32" and now.time() >= self.OPENING_FACTS_EARLIEST:
+            return RuntimeLoopDecision(
+                name="opening_facts_checkpoint",
+                label="opening facts checkpoint 09:32",
+                audit_token=None,
+                should_run_lifecycle_audit=False,
+                scheduled_event_name="opening_facts_0932",
+                scheduled_event_label="opening facts event 09:32",
+            )
         if (
             self._startup_bootstrap.last_audit_trade_date != trade_date
             or self._startup_bootstrap.last_audit_token is None
@@ -1645,6 +1658,38 @@ class EngineApp:
             auction_result = replay_result.auction_result
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
+            if self._production_reporting is not None and not request.historical_replay:
+                try:
+                    status, report_hash = self._production_reporting.send_auction(
+                        trade_date=request.trade_date,
+                        request=request,
+                        send_eligibility=True,
+                    )
+                    notes.append(
+                        f"auction_report | status={status} | report_hash={report_hash} | "
+                        "execution_mode=normal"
+                    )
+                except Exception as exc:
+                    logger.exception("auction facts report failed")
+                    notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+        elif loop_decision.scheduled_event_name == "opening_facts_0932":
+            if self._production_reporting is None or request.historical_replay:
+                notes.append("opening_report | status=disabled_or_historical_replay | send_eligibility=false")
+            else:
+                try:
+                    status, report_hash = self._production_reporting.send_opening(
+                        trade_date=request.trade_date,
+                        request=request,
+                        observation_cutoff=request.now,
+                        send_eligibility=True,
+                    )
+                    notes.append(
+                        f"opening_report | status={status} | report_hash={report_hash} | "
+                        f"observation_cutoff={request.now.isoformat()}"
+                    )
+                except Exception as exc:
+                    logger.exception("opening facts report failed")
+                    notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
         elif loop_decision.scheduled_event_name == "market_close_1505":
             close_result = self._postmarket_runtime.execute_close_marker(
                 trade_date=request.trade_date,

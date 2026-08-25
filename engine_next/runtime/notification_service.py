@@ -123,14 +123,66 @@ class RuntimeNotificationService:
         )
         return self._deliver_email_once(payload=payload, trade_date=trade_date)
 
+    def notify_open_confirmation_report(self, *, report, request, category: str = "opening_facts") -> bool:
+        """Send an already-built opening-facts report through the same notifier.
+
+        The notifier does not interpret facts and does not retry an ambiguous
+        provider result.  Application-level dedup remains keyed by
+        ``trade_date + category``.
+        """
+        if not self.enabled or not self._smtp_to or getattr(request, "historical_replay", False):
+            return False
+        trade_date = str(getattr(request, "trade_date", "") or "").strip()
+        metadata = getattr(report, "metadata", {}) or {}
+        if not trade_date or str(metadata.get("trade_date") or "").strip() != trade_date:
+            return False
+        if metadata.get("data_origin") not in {"production_realtime", "production_capture", "current_cache_only"}:
+            return False
+        html_body = getattr(report, "html_body", None)
+        text_body = getattr(report, "text_body", None) or getattr(report, "markdown_body", None)
+        subject = str(getattr(report, "subject", "") or "").strip()
+        if not subject or not text_body:
+            return False
+        digest = str(getattr(report, "html_sha256", "") or hashlib.sha256(str(html_body or text_body).encode("utf-8")).hexdigest())
+        payload = RuntimeNotificationPayload(
+            category=category,
+            phase_label="开盘事实",
+            subject=subject,
+            body=str(text_body),
+            digest=digest,
+            signal_digest=digest,
+            html_body=html_body,
+        )
+        return self._deliver_email_once(payload=payload, trade_date=trade_date)
+
     def _deliver_email_once(self, *, payload: RuntimeNotificationPayload, trade_date: str) -> bool:
         dedupe_key = f"{self._dedupe_prefix}:{trade_date}:{payload.category}"
-        if self._is_duplicate(dedupe_key=dedupe_key, digest=payload.signal_digest):
+        # Claim before touching SMTP.  A timeout may mean the provider accepted
+        # the message; therefore an automatic second attempt is never made.
+        if not self._claim_delivery_slot(dedupe_key=dedupe_key, digest=payload.signal_digest):
             return False
         delivered = self._send_email(payload)
         if delivered:
             self._remember_digest(dedupe_key=dedupe_key, digest=payload.signal_digest)
         return delivered
+
+    def _claim_delivery_slot(self, *, dedupe_key: str, digest: str) -> bool:
+        if dedupe_key in self._memory_dedup:
+            return False
+        marker = f"claimed:{digest}"
+        try:
+            if self._redis is not None and hasattr(self._redis, "setnx"):
+                claimed = bool(self._redis.setnx(dedupe_key, marker))
+                if claimed and hasattr(self._redis, "expire"):
+                    self._redis.expire(dedupe_key, self.DEDUPE_TTL_SECONDS)
+                if not claimed:
+                    return False
+            elif self._redis is not None and hasattr(self._redis, "get") and self._redis.get(dedupe_key):
+                return False
+        except Exception:
+            logger.debug("notification dedupe claim failed; using local claim", exc_info=True)
+        self._memory_dedup[dedupe_key] = marker
+        return True
 
     def _build_payload(self, *, result, request, summary_text: str) -> RuntimeNotificationPayload | None:
         normalized_summary = str(summary_text or "").strip()

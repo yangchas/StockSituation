@@ -664,6 +664,31 @@ def build_observation_from_inputs(
     )
 
 
+def build_open_confirmation_observation(
+    *,
+    auction_evidence: Mapping[str, Any],
+    plate_shadow: Mapping[str, Any],
+    open_q2_rows: Iterable[Mapping[str, Any]],
+    observation_cutoff: datetime | None = None,
+    data_origin: str = "production_realtime",
+    open_q2_format: str = "online_rows",
+) -> dict[str, Any]:
+    """Stable production-facing name for the existing pure transform.
+
+    This is deliberately a thin compatibility wrapper.  Production supplies
+    online Q2 rows; replay may continue calling ``build_observation_from_inputs``
+    directly with an explicit ``q2frame`` format.
+    """
+    return build_observation_from_inputs(
+        auction_evidence=auction_evidence,
+        plate_shadow=plate_shadow,
+        open_q2_rows=open_q2_rows,
+        observation_cutoff=observation_cutoff,
+        data_origin=data_origin,
+        open_q2_format=open_q2_format,
+    )
+
+
 def _fmt_count(value: Any) -> str:
     return "unavailable" if value is None else str(value)
 
