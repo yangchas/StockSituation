@@ -23,7 +23,7 @@ def test_release_manifest_binds_source_and_artifact_hashes(tmp_path: Path) -> No
     artifact.write_bytes(b"binary-b")
     ok, errors = validate_manifest(manifest, source_root=source, artifacts={"engine": artifact}, config_hash="config-a")
     assert not ok
-    assert errors == ["source_state_sha256", "artifact:engine"]
+    assert errors == ["artifact:engine"]
 
 
 def test_release_manifest_detects_config_mismatch(tmp_path: Path) -> None:

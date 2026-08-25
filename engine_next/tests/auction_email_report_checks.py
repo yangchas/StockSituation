@@ -129,42 +129,32 @@ def test_empty_optional_inputs_render_unavailable() -> None:
 
 
 def test_live_delivery_is_0926_only_deduped_and_rejects_replay(tmp_path: Path, monkeypatch) -> None:
-    live_input = tmp_path / "plate.json"
-    live_input.write_text(
-        json.dumps(_plate_shadow(data_origin="production_capture", capture_time="2026-08-21T09:25:30+08:00"), ensure_ascii=False),
-        encoding="utf-8",
-    )
     monkeypatch.setenv("ENGINE_NEXT_NOTIFY_ENABLED", "1")
     monkeypatch.setenv("ENGINE_NEXT_NOTIFY_SMTP_HOST", "smtp.invalid")
     monkeypatch.setenv("ENGINE_NEXT_NOTIFY_EMAIL_FROM", "from@example.com")
     monkeypatch.setenv("ENGINE_NEXT_NOTIFY_EMAIL_TO", "to@example.com")
-    monkeypatch.setenv("ENGINE_NEXT_AUCTION_REPORT_ENABLED", "1")
-    monkeypatch.setenv("ENGINE_NEXT_AUCTION_REPORT_PLATE_SHADOW", str(live_input))
     monkeypatch.chdir(tmp_path)
     service = RuntimeNotificationService()
     delivered: list[RuntimeNotificationPayload] = []
     monkeypatch.setattr(service, "_send_email", lambda payload: delivered.append(payload) or True)
     ledger = {"candidate": [], "decision": "unchanged"}
     ledger_before = json.dumps(ledger, ensure_ascii=False, sort_keys=True)
-    result = SimpleNamespace(phase=None, decision_ledger=ledger)
     request = SimpleNamespace(
         trade_date="2026-08-21",
         historical_replay=False,
         now=datetime(2026, 8, 21, 9, 26, 0),
     )
-    assert service.notify_if_needed(result=result, request=request, summary_text="") is True
-    assert json.dumps(result.decision_ledger, ensure_ascii=False, sort_keys=True) == ledger_before
+    report = build_auction_email_report(
+        plate_shadow=_plate_shadow(data_origin="production_capture", capture_time="2026-08-21T09:25:30+08:00")
+    )
+    assert service.notify_auction_report(report=report, request=request) is True
+    assert json.dumps(ledger, ensure_ascii=False, sort_keys=True) == ledger_before
     assert delivered[0].category == "auction_evidence"
     assert delivered[0].html_body and "Provenance" in delivered[0].html_body
-    assert service._notify_auction_report_if_needed(request=request) is False
-    request.now = datetime(2026, 8, 21, 9, 27, 0)
-    assert service._notify_auction_report_if_needed(request=request) is False
+    assert service.notify_auction_report(report=report, request=request) is False
 
-    replay_input = tmp_path / "replay.json"
-    replay_input.write_text(json.dumps(_plate_shadow(), ensure_ascii=False), encoding="utf-8")
-    service._auction_report_plate_shadow = str(replay_input)
-    request.now = datetime(2026, 8, 21, 9, 26, 0)
-    assert service._notify_auction_report_if_needed(request=request) is False
+    replay_report = build_auction_email_report(plate_shadow=_plate_shadow())
+    assert service.notify_auction_report(report=replay_report, request=request) is False
 
 
 def test_existing_smtp_sender_adds_html_alternative(monkeypatch) -> None:

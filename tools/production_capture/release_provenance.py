@@ -20,13 +20,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def sha256_tree(root: Path, *, exclude_names: Iterable[str] = ("__pycache__", ".pytest_cache")) -> str:
+def sha256_tree(
+    root: Path,
+    *,
+    exclude_names: Iterable[str] = ("__pycache__", ".pytest_cache"),
+    exclude_paths: Iterable[str] = (),
+) -> str:
     root = root.resolve()
     excluded = set(exclude_names)
+    excluded_paths = {str(item).replace("\\", "/") for item in exclude_paths}
     digest = hashlib.sha256()
     files = sorted(
         path for path in root.rglob("*")
-        if path.is_file() and not any(part in excluded for part in path.relative_to(root).parts)
+        if path.is_file()
+        and str(path.relative_to(root).as_posix()) not in excluded_paths
+        and not any(part in excluded for part in path.relative_to(root).parts)
     )
     for path in files:
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -45,10 +53,11 @@ def build_manifest(
     config_hash: str,
     toolchain: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    artifact_paths = [path.resolve().relative_to(source_root.resolve()).as_posix() for path in artifacts.values()]
     return {
         "format": "ReleaseProvenanceV1",
         "git_commit": str(git_commit),
-        "source_state_sha256": sha256_tree(source_root),
+        "source_state_sha256": sha256_tree(source_root, exclude_paths=artifact_paths),
         "artifacts": {name: sha256_file(path) for name, path in sorted(artifacts.items())},
         "config_hash": str(config_hash),
         "toolchain": dict(toolchain or {}),
@@ -59,7 +68,8 @@ def validate_manifest(manifest: Mapping[str, Any], *, source_root: Path, artifac
     errors: list[str] = []
     if manifest.get("format") != "ReleaseProvenanceV1":
         errors.append("format")
-    if manifest.get("source_state_sha256") != sha256_tree(source_root):
+    artifact_paths = [path.resolve().relative_to(source_root.resolve()).as_posix() for path in artifacts.values()]
+    if manifest.get("source_state_sha256") != sha256_tree(source_root, exclude_paths=artifact_paths):
         errors.append("source_state_sha256")
     recorded_artifacts = manifest.get("artifacts")
     if not isinstance(recorded_artifacts, Mapping):
