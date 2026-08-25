@@ -9,7 +9,7 @@ enable production reporting.
 ## Commit
 
 - Source baseline: `7af7f79c1372b956e8711e297413047434f5cb3c`
-- Closure commits: `5b1f708`, `23dceb8`, `d6029e8`
+- Closure commits: `5b1f708`, `23dceb8`, `d6029e8`, `07f7aa4`
 - Worktree: independent clean worktree
 - Production changes: none
 
@@ -28,15 +28,18 @@ enable production reporting.
 python -m pytest -q \
   engine_next/tests/replay_fixture_checks.py \
   engine_next/tests/auction_email_report_checks.py \
-  engine_next/tests/auction_open_confirmation_checks.py
+  engine_next/tests/auction_open_confirmation_checks.py \
+  engine_next/tests/release_provenance_checks.py
 
-42 passed
+43 passed
 ```
 
 The live-input test verifies that the pure input path and existing file/replay
 path produce the same open facts for the same auction shadow and Q2 frames.
 The notification test verifies that a caller-provided report is deduplicated
 without making the generic runtime notification path read stale files.
+The open-input boundary interprets a naive cutoff as Asia/Shanghai and records
+the normalized observation cutoff explicitly.
 
 ## Not evaluated
 
