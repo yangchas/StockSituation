@@ -2,9 +2,9 @@
 
 ## Baseline
 
-- Baseline commit: `5465f25226e00c503ea1bf3d7232ee0359169bb1`
-- Source branch: `codex/replay-baseline-closure-5465f25`
-- Formal checkout: `/home/exedev/repos/replay-baseline-closure-5465f25`
+- Baseline commit: `7af7f79c1372b956e8711e297413047434f5cb3c`
+- Source branch: `codex/replay-p0-fixes`
+- Formal checkout: clean checkout of the frozen replay baseline
 - Git worktree: clean
 - Production host used for verification: `cobra-ion.exe.xyz`
 
@@ -35,6 +35,10 @@
 ## Replay conclusion
 
 `REPLAY_BASELINE_PASS`.
+
+The reporting source-closure commit is intentionally separate from this frozen
+replay baseline. It must not be substituted for the baseline until its clean
+checkout and reporting tests are independently verified.
 
 Replay records only reached clock checkpoints. Production scheduled handlers and notification semantics remain `NOT_EVALUATED` by design.
 
