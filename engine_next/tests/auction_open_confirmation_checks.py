@@ -124,6 +124,40 @@ def test_live_input_naive_cutoff_is_interpreted_as_shanghai(tmp_path: Path) -> N
     assert result["market"]["open"]["observation_time"].startswith("2026-08-21T09:30:01")
 
 
+def test_production_online_q2_rows_are_not_required_to_be_q2frames(tmp_path: Path) -> None:
+    report_path, shadow_path, _ = _inputs(tmp_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    shadow = json.loads(shadow_path.read_text(encoding="utf-8"))
+    shadow["data_origin"] = "production_capture"
+    shadow["plate_stats"] = {
+        "0924_to_0925": {
+            "AI": {
+                "stock_count": 2,
+                "valid_auction_stock_count": 2,
+                "auction_amount_total_yuan": 1000.0,
+                "change_pct_distribution": {"positive_count": 1, "negative_count": 1, "zero_count": 0, "count": 2, "median_pct": 1.0},
+            }
+        }
+    }
+    online_rows = [
+        {"symbol": "000001", "timestamp": _ms((9, 30, 1)), "price": 10.3, "pre_close": 10.0, "amount_2m": 100.0, "limit_state": 1},
+        {"symbol": "000002", "ts": _ms((9, 30, 1)), "px": 9800, "pc": 10000, "amt2m": 50.0, "ls": 0},
+        {"symbol": "000001", "timestamp_ms": _ms((9, 32, 1)), "price": 10.5, "pre_close": 10.0, "amount_2m": 300.0, "limit_state": 1},
+        {"symbol": "000002", "timestamp_ms": _ms((9, 32, 1)), "price_milli": 9500, "previous_close_milli": 10000, "amount_2m_yuan": 100.0, "limit_state": -1},
+    ]
+    result = build_observation_from_inputs(
+        auction_evidence=report.get("market_overview", {}),
+        plate_shadow=shadow,
+        open_q2_rows=iter(online_rows),
+        observation_cutoff=datetime(2026, 8, 21, 9, 32, 10),
+        open_q2_format="online_rows",
+    )
+    assert result["open_source"]["input_shape"] == "online_q2_rows"
+    assert result["open_source"]["status"] == "available"
+    assert result["market"]["open"]["open_valid_count"] == 2
+    assert result["market"]["open"]["open_window_amount_yuan"] == 400.0
+
+
 def test_deltas_are_exact_and_amount_ratio_is_protected(tmp_path: Path) -> None:
     paths = _inputs(tmp_path)
     result = build_observation(auction_report=paths[0], plate_shadow=paths[1], q2=paths[2])

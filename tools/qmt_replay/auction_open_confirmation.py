@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 from datetime import datetime, time
+from itertools import chain
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Mapping
@@ -219,6 +220,105 @@ def _open_rows_from_frames(
         "observation_time": datetime.fromtimestamp(latest_ts / 1000.0, SHANGHAI).isoformat() if latest_ts else None,
         "fields": ["px", "pc", "amt2m", "ls"],
     }
+
+
+def _open_rows_from_online_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    trade_date: str,
+    observation_cutoff: datetime | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Normalize production Q2 rows returned by Redis/IntradayDataHub.
+
+    Production rows are not Q2Frame envelopes.  Accept the raw Q2 field names
+    (``ts/px/pc/amt2m/ls``) and the existing IntradayDataHub names
+    (``timestamp/price/pre_close/amount_2m/limit_state``) without changing
+    their business semantics.
+    """
+
+    first: dict[str, dict[str, Any]] = {}
+    latest: dict[str, dict[str, Any]] = {}
+    row_count = 0
+    latest_ts = 0
+    normalized_cutoff = None
+    if observation_cutoff is not None:
+        normalized_cutoff = (
+            observation_cutoff.replace(tzinfo=SHANGHAI)
+            if observation_cutoff.tzinfo is None
+            else observation_cutoff.astimezone(SHANGHAI)
+        )
+    cutoff_ms = int(normalized_cutoff.timestamp() * 1000) if normalized_cutoff is not None else None
+
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        symbol = str(raw.get("symbol") or raw.get("s") or "").strip()
+        timestamp_ms = _online_timestamp_ms(raw)
+        if not symbol or timestamp_ms is None or timestamp_ms <= 0:
+            continue
+        if cutoff_ms is not None and timestamp_ms > cutoff_ms:
+            continue
+        local = datetime.fromtimestamp(timestamp_ms / 1000.0, SHANGHAI)
+        if local.date().isoformat() != trade_date or not (OPEN_START <= local.time() <= OPEN_END):
+            continue
+        row = {
+            "symbol": symbol,
+            "timestamp_ms": timestamp_ms,
+            "price_milli": _online_price_milli(raw, ("price_milli", "px"), ("price",)),
+            "previous_close_milli": _online_price_milli(raw, ("previous_close_milli", "pc"), ("pre_close",)),
+            "amount_2m_yuan": _first_number(raw, ("amount_2m_yuan", "amount_2m", "amt2m")),
+            "limit_state": _first_number(raw, ("limit_state", "ls")),
+        }
+        row_count += 1
+        latest_ts = max(latest_ts, timestamp_ms)
+        first.setdefault(symbol, row)
+        latest[symbol] = row
+
+    latest_rows = list(latest.values())
+    amount_present = sum(_number(row.get("amount_2m_yuan")) is not None for row in latest_rows)
+    limit_present = sum(_number(row.get("limit_state")) is not None for row in latest_rows)
+    return latest, {
+        "source": "production_online_q2",
+        "status": "available" if row_count else "unavailable",
+        "observation_window": "09:30:00-09:32:59.999999 Asia/Shanghai",
+        "row_count": row_count,
+        "first_symbol_count": len(first),
+        "latest_symbol_count": len(latest),
+        "latest_amount_2m_present_count": amount_present,
+        "latest_limit_state_present_count": limit_present,
+        "latest_amount_2m_status": "available" if latest_rows and amount_present == len(latest_rows) else ("partial" if amount_present else "unavailable"),
+        "latest_limit_state_status": "available" if latest_rows and limit_present == len(latest_rows) else ("partial" if limit_present else "unavailable"),
+        "observation_time": datetime.fromtimestamp(latest_ts / 1000.0, SHANGHAI).isoformat() if latest_ts else None,
+        "fields": ["px", "pc", "amt2m", "ls"],
+        "input_shape": "online_q2_rows",
+        "observation_cutoff": normalized_cutoff.isoformat() if normalized_cutoff is not None else None,
+    }
+
+
+def _first_number(row: Mapping[str, Any], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        if name in row and row[name] is not None and str(row[name]).strip() != "":
+            return _number(row[name])
+    return None
+
+
+def _online_price_milli(
+    row: Mapping[str, Any],
+    milli_names: tuple[str, ...],
+    price_names: tuple[str, ...],
+) -> float | None:
+    value = _first_number(row, milli_names)
+    if value is not None:
+        return value
+    price = _first_number(row, price_names)
+    return round(price * 1000.0) if price is not None else None
+
+
+def _online_timestamp_ms(row: Mapping[str, Any]) -> int | None:
+    value = _first_number(row, ("timestamp_ms", "ts", "timestamp"))
+    if value is None or value < 1_000_000_000_000:
+        return None
+    return int(value)
 
 
 def _open_fact(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -505,12 +605,15 @@ def build_observation_from_inputs(
     open_q2_rows: Iterable[Mapping[str, Any]],
     observation_cutoff: datetime | None = None,
     data_origin: str = "production_capture",
+    open_q2_format: str = "auto",
 ) -> dict[str, Any]:
-    """Build the same observation from live-compatible mappings and Q2 frames.
+    """Build the same observation from live-compatible mappings and Q2 inputs.
 
     ``PlateAuctionShadowV1`` is the sole plate/symbol auction fact input.  The
     report builder is reused only to create the shared auction fact view; the
-    production path never reads a report or Q2Frame file.
+    production path never reads a report or Q2Frame file.  ``open_q2_format``
+    may be ``q2frame`` for replay envelopes or ``online_rows`` for the raw or
+    already-standardized rows returned by the production quote path.
     """
 
     from engine_next.runtime.auction_email_report import build_auction_email_report
@@ -520,13 +623,31 @@ def build_observation_from_inputs(
     trade_date = str(report.get("trade_date") or shadow.get("trade_date") or "").strip()
     if not trade_date:
         raise ValueError("trade_date is required")
-    q2_rows, q2_meta = _open_rows_from_frames(
-        open_q2_rows,
-        trade_date=trade_date,
-        observation_cutoff=observation_cutoff,
-    )
+    input_format = str(open_q2_format or "auto").strip().lower()
+    if input_format == "auto":
+        iterator = iter(open_q2_rows)
+        first_row = next(iterator, None)
+        rows = chain((first_row,), iterator) if first_row is not None else ()
+        input_format = "q2frame" if isinstance(first_row, Mapping) and ("q2_updates" in first_row or "logical_ts_ms" in first_row) else "online_rows"
+    else:
+        rows = open_q2_rows
+    if input_format == "q2frame":
+        q2_rows, q2_meta = _open_rows_from_frames(
+            rows,
+            trade_date=trade_date,
+            observation_cutoff=observation_cutoff,
+        )
+    elif input_format == "online_rows":
+        q2_rows, q2_meta = _open_rows_from_online_rows(
+            rows,
+            trade_date=trade_date,
+            observation_cutoff=observation_cutoff,
+        )
+    else:
+        raise ValueError("open_q2_format must be auto, q2frame, or online_rows")
     q2_meta = dict(q2_meta)
-    q2_meta["source"] = "production_online_q2"
+    if input_format == "online_rows":
+        q2_meta["source"] = "production_online_q2"
     if observation_cutoff is None:
         normalized_cutoff = None
     elif observation_cutoff.tzinfo is None:
