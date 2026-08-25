@@ -1120,7 +1120,7 @@ class EngineApp:
                 scheduled_event_name="auction_followup_0926",
                 scheduled_event_label="auction follow-up event 09:26",
             )
-        if minute_tag == "09:32" and now.time() >= self.OPENING_FACTS_EARLIEST:
+        if dt_time(9, 32, 10) <= now.time() < dt_time(9, 34):
             return RuntimeLoopDecision(
                 name="opening_facts_checkpoint",
                 label="opening facts checkpoint 09:32",

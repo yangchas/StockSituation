@@ -170,3 +170,5 @@ def test_engine_scheduler_declares_opening_fact_slot_after_cutoff():
     assert decision.scheduled_event_name == "opening_facts_0932"
     before = app._build_loop_decision(datetime(2026, 8, 25, 9, 32, 9), "2026-08-25")
     assert before.scheduled_event_name == ""
+    recovery = app._build_loop_decision(datetime(2026, 8, 25, 9, 33, 0), "2026-08-25")
+    assert recovery.scheduled_event_name == "opening_facts_0932"
