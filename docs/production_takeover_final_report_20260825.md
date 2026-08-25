@@ -11,13 +11,14 @@
 ## Current execution branch
 
 - Isolated source-closure branch: `codex/production-fact-takeover`
-- Latest local commit: `7acf055b4b8f2d299faf168eca163d646463c9a2`
-- Reporting closure verification: 43 targeted tests passed
+- Latest local commit: `4fd930e1d0699e968c3ebbf26f2ec2fab1a9aab1`
+- Reporting closure verification: 50 targeted tests passed
 - Production deployment: not performed
 
-The branch only closes the report/open-input source boundary and release
-provenance helpers. It does not replace the frozen replay baseline or certify
-production fact equivalence.
+The branch closes the report/open-input source boundary, accepts production-
+shaped online Q2 rows, adds a fact-only plate-shadow assembler, and tightens
+release provenance checks. It does not replace the frozen replay baseline,
+deploy to production, or certify production fact equivalence.
 
 ## Captures
 

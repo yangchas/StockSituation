@@ -9,7 +9,7 @@ enable production reporting.
 ## Commit
 
 - Source baseline: `7af7f79c1372b956e8711e297413047434f5cb3c`
-- Closure commits: `5b1f708`, `23dceb8`, `d6029e8`, `07f7aa4`
+- Closure commits: `5b1f708`, `23dceb8`, `d6029e8`, `07f7aa4`, `203c475`, `0771fa5`, `4fd930e`
 - Worktree: independent clean worktree
 - Production changes: none
 
@@ -20,7 +20,11 @@ enable production reporting.
 - Explicit `notify_auction_report(report, request)` input boundary; notification does not read report files;
 - Existing file-based OpenConfirmation wrapper preserved;
 - New pure-input OpenConfirmation boundary using the same computation;
-- Tracked closure test for live-compatible Q2 input.
+- Production online Q2 rows (`ts/px/pc/amt2m/ls` and existing hub names) are accepted without converting them to Q2Frame files;
+- Fact-only `PlateAuctionShadowV1` assembler from normalized 0924/0925 rows, with missing ask facts remaining unavailable;
+- Auction snapshot normalization preserves `ask_amount` provenance;
+- Release manifests can be checked against an externally supplied expected Git commit;
+- Tracked closure tests for live-compatible Q2 input, fact-only plate aggregation, and release provenance.
 
 ## Verification
 
@@ -31,11 +35,14 @@ python -m pytest -q \
   engine_next/tests/auction_open_confirmation_checks.py \
   engine_next/tests/release_provenance_checks.py
 
-43 passed
+50 passed
 ```
 
-The live-input test verifies that the pure input path and existing file/replay
-path produce the same open facts for the same auction shadow and Q2 frames.
+The live-input tests verify that the pure input path and existing file/replay
+path produce the same open facts for the same auction shadow, both Q2Frame
+envelopes and production-shaped online Q2 rows. The plate adapter only
+aggregates normalized facts and records multi-label ambiguity; it does not
+score, choose a theme, or write a decision bundle.
 The notification test verifies that a caller-provided report is deduplicated
 without making the generic runtime notification path read stale files.
 The open-input boundary interprets a naive cutoff as Asia/Shanghai and records
