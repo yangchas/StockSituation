@@ -75,8 +75,8 @@ int64_t AuctionCalculator::calc_match_amt_yuan(const RawTick& tick, MarketPhase 
         return order_book_amount_yuan(price_milli, tick.vol_units);
     }
 
-    const int64_t bid1_amt = order_book_amount_yuan(tick.bp_milli[0], tick.bv[0]);
-    const int64_t ask1_amt = order_book_amount_yuan(tick.ap_milli[0], tick.av[0]);
+    const int64_t bid1_amt = order_book_amount_yuan(price_milli, tick.bv[0]);
+    const int64_t ask1_amt = order_book_amount_yuan(price_milli, tick.av[0]);
     return std::max<int64_t>(0, std::min(bid1_amt, ask1_amt));
 }
 
