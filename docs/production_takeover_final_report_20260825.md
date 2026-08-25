@@ -25,7 +25,7 @@ The schema audit found:
 The production tick funnel was nevertheless present in `stock_tick_v2`:
 
 | Window | Rows | Distinct symbols | observed timestamp range |
-|---|---:|---:|
+|---|---:|---:|---|
 | 2026-08-25 09:15–09:26 | 218,338 | 5,212 | 09:15:00–09:25:04 |
 | 2026-08-25 09:30–09:32:59 | 305,002 | 5,208 | 09:30:00–09:32:59 |
 | 2026-08-24 09:15–09:26 | 218,639 | 5,210 | 09:15:00–09:25:04 |
