@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -16,10 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 
@@ -32,10 +32,7 @@ Q2_SLOTS = (
     "09:31:00", "09:31:10", "09:31:20", "09:31:30", "09:31:40", "09:31:50",
     "09:32:00", "09:32:10",
 )
-F10_CANDIDATES = (
-    Path("/home/exedev/services/engine-next/current/data/f10.csv"),
-    Path("/home/exedev/services/engine-next/releases/20260801_172200/data/f10.csv"),
-)
+F10_PATH = Path("/home/exedev/services/engine-next/current/data/f10.csv")
 
 
 class CaptureError(RuntimeError):
@@ -44,6 +41,37 @@ class CaptureError(RuntimeError):
 
 def compact(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def normalize_td_value(value: Any) -> Any:
+    """Convert only the scalar types returned by TDengine to JSON values."""
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="milliseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict")
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise CaptureError(f"non-finite TD float: {value!r}")
+        return value
+    raise CaptureError(f"unsupported TD value type: {type(value).__name__}")
+
+
+def normalize_td_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): normalize_td_value(value) for key, value in row.items()}
+
+
+def compact_td(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -182,18 +210,43 @@ def release_identity() -> dict[str, Any]:
         payload.update({
             "release_git_commit": info.get("git_commit"),
             "release_role": info.get("release_role"),
+            "declared_binary_sha256": info.get("t1_v2_binary_sha256"),
+            "source_bundle_sha256": info.get("source_bundle_sha256"),
+            "source_state_sha256": info.get("source_state_sha256"),
             "effective_config_sha256": info.get("effective_config_sha256", info.get("config_hash")),
             "config_provenance": "PASS" if info.get("effective_config_sha256") else "PARTIAL",
         })
     else:
         payload["config_provenance"] = "PARTIAL"
+    payload["release_provenance_valid"] = release_provenance_valid(payload)
     return payload
+
+
+def release_provenance_valid(identity: Mapping[str, Any]) -> bool:
+    actual = identity.get("binary_sha256")
+    declared = identity.get("declared_binary_sha256")
+    exe_path = identity.get("exe_path")
+    build_info_path = identity.get("build_info_path")
+    build_info_hash = identity.get("build_info_sha256")
+    return bool(
+        actual
+        and declared
+        and actual == declared
+        and exe_path
+        and Path(str(exe_path)).is_file()
+        and sha256_file(Path(str(exe_path))) == actual
+        and build_info_path
+        and build_info_hash
+        and Path(str(build_info_path)).is_file()
+        and sha256_file(Path(str(build_info_path))) == build_info_hash
+    )
 
 
 def identity_stable(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
     fields = (
         "main_pid", "exe_path", "binary_sha256", "systemd_exec_start", "restart_count",
-        "build_info_sha256", "release_git_commit", "effective_config_sha256", "capture_tool_sha256",
+        "build_info_sha256", "release_git_commit", "declared_binary_sha256",
+        "effective_config_sha256", "capture_tool_sha256", "release_provenance_valid",
     )
     return all(start.get(field) not in (None, "") and start.get(field) == end.get(field) for field in fields)
 
@@ -204,6 +257,10 @@ def artifact_record(
     root: Path,
     rows: Sequence[Mapping[str, Any]] | None = None,
     capture_duration_ms: int | None = None,
+    row_count: int | None = None,
+    symbol_count: int | None = None,
+    min_logical_timestamp: Any = None,
+    max_logical_timestamp: Any = None,
 ) -> dict[str, Any]:
     rows = rows or ()
     symbols = {str(row.get("symbol")) for row in rows if row.get("symbol")}
@@ -211,16 +268,21 @@ def artifact_record(
     for row in rows:
         value = row.get("ts", row.get("timestamp", row.get("logical_timestamp")))
         try:
-            timestamps.append(int(value))
+            timestamps.append((0, int(value), value))
         except (TypeError, ValueError):
-            pass
+            if value is not None:
+                timestamps.append((1, str(value), value))
+    if min_logical_timestamp is None and timestamps:
+        min_logical_timestamp = min(timestamps)[2]
+    if max_logical_timestamp is None and timestamps:
+        max_logical_timestamp = max(timestamps)[2]
     return {
         "relative_path": str(path.relative_to(root).as_posix()),
         "size_bytes": path.stat().st_size,
-        "row_count": len(rows),
-        "symbol_count": len(symbols),
-        "min_logical_timestamp": min(timestamps) if timestamps else None,
-        "max_logical_timestamp": max(timestamps) if timestamps else None,
+        "row_count": len(rows) if row_count is None else row_count,
+        "symbol_count": len(symbols) if symbol_count is None else symbol_count,
+        "min_logical_timestamp": min_logical_timestamp,
+        "max_logical_timestamp": max_logical_timestamp,
         "sha256": sha256_file(path),
         "capture_duration_ms": capture_duration_ms,
     }
@@ -240,14 +302,82 @@ def inventory_valid(manifest: Mapping[str, Any], root: Path) -> tuple[bool, list
     return not errors, errors
 
 
-def open_redis() -> Any:
+def capture_tool_frozen(manifest: Mapping[str, Any], root: Path) -> bool:
+    marker_path = root / "capture_started.json"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    current = capture_tool_sha256()
+    values = {
+        str(marker.get("capture_tool_sha256") or ""),
+        str(manifest.get("capture_tool_sha256") or ""),
+        current,
+    }
+    return len(values) == 1 and "" not in values
+
+
+class ReadOnlyRedisPipeline:
+    """Small read-only surface for the capture tool's Redis pipeline."""
+
+    _WRITE_METHODS = frozenset({"set", "setex", "hset", "hdel", "delete", "expire", "publish", "rpush", "lpush"})
+
+    def __init__(self, pipeline: Any, owner: "ReadOnlyRedis") -> None:
+        self._pipeline = pipeline
+        self._owner = owner
+
+    def hmget(self, key: str, *fields: str) -> Any:
+        return self._pipeline.hmget(key, *fields)
+
+    def execute(self) -> Any:
+        return self._pipeline.execute()
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._WRITE_METHODS:
+            self._owner.write_attempts += 1
+            raise CaptureError(f"Redis write is forbidden during capture: {name}")
+        raise AttributeError(name)
+
+
+class ReadOnlyRedis:
+    """Expose only the Redis reads used by this one-shot capture."""
+
+    _WRITE_METHODS = ReadOnlyRedisPipeline._WRITE_METHODS
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self.write_attempts = 0
+
+    def ping(self) -> Any:
+        return self._client.ping()
+
+    def hgetall(self, key: str) -> Any:
+        return self._client.hgetall(key)
+
+    def get(self, key: str) -> Any:
+        return self._client.get(key)
+
+    def scan_iter(self, **kwargs: Any) -> Any:
+        return self._client.scan_iter(**kwargs)
+
+    def pipeline(self, *, transaction: bool = False) -> ReadOnlyRedisPipeline:
+        return ReadOnlyRedisPipeline(self._client.pipeline(transaction=transaction), self)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._WRITE_METHODS:
+            self.write_attempts += 1
+            raise CaptureError(f"Redis write is forbidden during capture: {name}")
+        raise AttributeError(name)
+
+
+def open_redis() -> ReadOnlyRedis:
     try:
         import redis
     except ImportError as exc:
         raise CaptureError("redis package unavailable") from exc
     client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=False, socket_timeout=5)
     client.ping()
-    return client
+    return ReadOnlyRedis(client)
 
 
 def wait_slot(trade_date: str, clock: str) -> tuple[str, int, datetime]:
@@ -309,7 +439,7 @@ def capture_mapping_and_metadata(client: Any, root: Path) -> list[dict[str, Any]
     atomic_write_json(mapping_path, mapping_payload)
     artifacts.append(artifact_record(mapping_path, root=root))
 
-    f10_source = next((path.resolve() for path in F10_CANDIDATES if path.is_file()), None)
+    f10_source = F10_PATH.resolve() if F10_PATH.is_file() else None
     if f10_source:
         f10_path = root / "f10.csv"
         copy_atomic(f10_source, f10_path)
@@ -395,6 +525,7 @@ def capture(args: argparse.Namespace) -> int:
         "capture_tool_sha256": marker["capture_tool_sha256"],
         "runtime_identity_start": start_identity,
         "runtime_identity_end": None,
+        "release_provenance_valid": release_provenance_valid(start_identity),
         "slots": [],
         "artifact_inventory": [artifact_record(root / "capture_started.json", root=root)],
         "missing_artifacts": [],
@@ -428,7 +559,8 @@ def capture(args: argparse.Namespace) -> int:
                 records = fn()
                 elapsed_ms = int((time.monotonic() - capture_started) * 1000)
                 for record in records:
-                    record.setdefault("capture_duration_ms", elapsed_ms)
+                    if record.get("capture_duration_ms") is None:
+                        record["capture_duration_ms"] = elapsed_ms
                 slot["artifacts"] = [record["relative_path"] for record in records]
                 manifest["artifact_inventory"].extend(records)
             except Exception as exc:  # capture evidence must preserve failure state
@@ -443,13 +575,25 @@ def capture(args: argparse.Namespace) -> int:
         run_slot(f"auction_{tag}", clock, lambda tag=tag: capture_auction(client, root, trade_date, tag))
     for clock in Q2_SLOTS:
         run_slot(f"online_q2_{clock.replace(':', '')}", clock, lambda clock=clock: [q2_snapshot(client, root, clock)])
+    manifest["write_isolation"]["redis_write_count"] = client.write_attempts
     manifest["runtime_identity_end"] = release_identity()
     manifest["runtime_identity_stable"] = identity_stable(manifest["runtime_identity_start"], manifest["runtime_identity_end"])
+    manifest["release_provenance_valid"] = (
+        release_provenance_valid(manifest["runtime_identity_start"])
+        and release_provenance_valid(manifest["runtime_identity_end"])
+    )
     if not manifest["runtime_identity_stable"]:
         manifest["partial_evidence"].append("runtime_identity")
     manifest["finished_at"] = now_local().isoformat(timespec="seconds")
     write_progress(progress, manifest)
     return 0
+
+
+def resolved_td_database() -> str:
+    database = os.environ.get("TDENGINE_DATABASE", "market_data1")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
+        raise CaptureError("invalid TDENGINE_DATABASE identifier")
+    return database
 
 
 def _taos_connection() -> Any:
@@ -461,29 +605,38 @@ def _taos_connection() -> Any:
         host=os.environ.get("TDENGINE_HOST", "127.0.0.1"),
         user=os.environ.get("TDENGINE_USER", "root"),
         password=os.environ.get("TDENGINE_PASSWORD", "taosdata"),
-        database=os.environ.get("TDENGINE_DATABASE", "market_data1"),
+        database=resolved_td_database(),
     )
 
 
 def td_export(root: Path, trade_date: str) -> list[dict[str, Any]]:
+    database = resolved_td_database()
     connection = _taos_connection()
     records: list[dict[str, Any]] = []
     try:
         cursor = connection.cursor()
         exports = (
-            ("auction_summary_v2", f"SELECT * FROM market_data1.auction_summary_v2 WHERE trade_date='{trade_date.replace('-', '')}'"),
-            ("auction_snapshot_0920", f"SELECT * FROM market_data1.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0920'"),
-            ("auction_snapshot_0924", f"SELECT * FROM market_data1.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0924'"),
-            ("auction_snapshot_0925", f"SELECT * FROM market_data1.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0925'"),
-            ("stock_tick_auction", "SELECT * FROM market_data1.stock_tick_v2 WHERE ts >= '%s 09:15:00.000' AND ts < '%s 09:26:00.000'" % (trade_date, trade_date)),
-            ("stock_tick_open", "SELECT * FROM market_data1.stock_tick_v2 WHERE ts >= '%s 09:30:00.000' AND ts < '%s 09:33:00.000'" % (trade_date, trade_date)),
+            ("auction_summary_v2", f"SELECT * FROM {database}.auction_summary_v2 WHERE trade_date='{trade_date.replace('-', '')}' ORDER BY ts", "ts", None),
+            ("auction_snapshot_0920", f"SELECT * FROM {database}.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0920' ORDER BY ts, symbol", "ts", "symbol"),
+            ("auction_snapshot_0924", f"SELECT * FROM {database}.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0924' ORDER BY ts, symbol", "ts", "symbol"),
+            ("auction_snapshot_0925", f"SELECT * FROM {database}.auction_snapshot_v2 WHERE trade_date='{trade_date.replace('-', '')}' AND auction_tag='0925' ORDER BY ts, symbol", "ts", "symbol"),
+            ("stock_tick_auction", "SELECT * FROM %s.stock_tick_v2 WHERE ts >= '%s 09:15:00.000' AND ts < '%s 09:26:00.000' ORDER BY ts, symbol" % (database, trade_date, trade_date), "ts", "symbol"),
+            ("stock_tick_open", "SELECT * FROM %s.stock_tick_v2 WHERE ts >= '%s 09:30:00.000' AND ts < '%s 09:33:00.000' ORDER BY ts, symbol" % (database, trade_date, trade_date), "ts", "symbol"),
         )
-        for name, query in exports:
+        for name, query, logical_timestamp_field, symbol_field in exports:
+            temporary: Path | None = None
+            export_started = time.monotonic()
             try:
+                if not re.match(r"^\s*SELECT\b", query, re.IGNORECASE):
+                    raise CaptureError(f"non-read-only TD query: {name}")
                 cursor.execute(query)
                 columns = [str(item[0]) for item in (cursor.description or ())]
                 path = root / f"td_{name}.jsonl"
-                rows: list[dict[str, Any]] = []
+                row_count = 0
+                symbols: set[str] = set()
+                min_timestamp: Any = None
+                max_timestamp: Any = None
+                stream_digest = hashlib.sha256()
                 with tempfile.NamedTemporaryFile(dir=root, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
                     temporary = Path(handle.name)
                     while True:
@@ -491,20 +644,46 @@ def td_export(root: Path, trade_date: str) -> list[dict[str, Any]]:
                         if not batch:
                             break
                         for values in batch:
-                            row = {key: decode(value) for key, value in zip(columns, values)}
-                            rows.append(row)
-                            handle.write(compact(row) + b"\n")
+                            row = normalize_td_row(dict(zip(columns, values)))
+                            line = compact_td(row) + b"\n"
+                            handle.write(line)
+                            stream_digest.update(line)
+                            row_count += 1
+                            if symbol_field and row.get(symbol_field) is not None:
+                                symbols.add(str(row[symbol_field]))
+                            timestamp = row.get(logical_timestamp_field)
+                            if timestamp is not None:
+                                if min_timestamp is None or str(timestamp) < str(min_timestamp):
+                                    min_timestamp = timestamp
+                                if max_timestamp is None or str(timestamp) > str(max_timestamp):
+                                    max_timestamp = timestamp
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(temporary, path)
-                records.append(artifact_record(path, root=root, rows=rows) | {
+                record = artifact_record(
+                    path,
+                    root=root,
+                    row_count=row_count,
+                    symbol_count=len(symbols),
+                    min_logical_timestamp=min_timestamp,
+                    max_logical_timestamp=max_timestamp,
+                    capture_duration_ms=int((time.monotonic() - export_started) * 1000),
+                )
+                if record["sha256"] != stream_digest.hexdigest():
+                    raise CaptureError(f"stream hash mismatch: {name}")
+                records.append(record | {
                     "source": "post_market_td_export",
                     "table": name,
                     "query": query,
                     "schema_columns": columns,
+                    "logical_timestamp_field": logical_timestamp_field,
+                    "symbol_field": symbol_field,
+                    "database": database,
                 })
             except Exception as exc:
                 records.append({"source": "post_market_td_export", "table": name, "status": "FAILED", "error": f"{type(exc).__name__}: {exc}", "query": query})
+                if temporary and temporary.exists():
+                    temporary.unlink()
         cursor.close()
     finally:
         connection.close()
@@ -524,23 +703,38 @@ def seal(args: argparse.Namespace) -> int:
     if manifest.get("trade_date") != trade_date:
         raise CaptureError("trade_date mismatch")
     valid_before, errors_before = inventory_valid(manifest, root)
-    if not valid_before:
-        raise CaptureError("artifact integrity failure before seal: " + ",".join(errors_before))
-    try:
-        td_records = td_export(root, trade_date)
-    except Exception as exc:
-        td_records = [{"source": "post_market_td_export", "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}]
-        manifest["td_export_error"] = td_records[0]["error"]
+    if errors_before:
+        manifest["integrity_errors_before_seal"] = errors_before
+    tool_frozen = capture_tool_frozen(manifest, root)
+    release_valid = bool(manifest.get("release_provenance_valid")) and all(
+        release_provenance_valid(identity)
+        for identity in (
+            manifest.get("runtime_identity_start", {}),
+            manifest.get("runtime_identity_end", {}),
+        )
+    )
+    if tool_frozen and valid_before:
+        try:
+            td_records = td_export(root, trade_date)
+        except Exception as exc:
+            td_records = [{"source": "post_market_td_export", "status": "FAILED", "error": f"{type(exc).__name__}: {exc}"}]
+            manifest["td_export_error"] = td_records[0]["error"]
+    else:
+        td_records = []
+        if not tool_frozen:
+            manifest["partial_evidence"].append("capture_tool_freeze")
+        if not release_valid:
+            manifest["partial_evidence"].append("release_provenance")
     manifest["artifact_inventory"].extend(record for record in td_records if record.get("relative_path"))
     manifest["td_export_status"] = "PASS" if td_records and all(record.get("relative_path") for record in td_records) else "PARTIAL"
     manifest["runtime_identity_stable"] = bool(manifest.get("runtime_identity_stable"))
+    manifest["release_provenance_valid"] = release_valid
     slots = {slot.get("name"): slot for slot in manifest.get("slots", [])}
     timing_ok = bool(slots) and all(slot.get("status") in {"ON_TIME", "LATE"} for slot in slots.values())
     required_names = {
         "mapping_security", "auction_0920", "auction_0924", "auction_0925",
         *(f"online_q2_{clock.replace(':', '')}" for clock in Q2_SLOTS),
     }
-    observed_names = set(slots)
     required_slots_ok = all(
         name in slots and slots[name].get("status") in {"ON_TIME", "LATE"}
         and slots[name].get("artifacts")
@@ -552,9 +746,14 @@ def seal(args: argparse.Namespace) -> int:
     )
     td_ok = bool(td_records) and all(record.get("relative_path") and record.get("row_count", 0) > 0 for record in td_records)
     manifest["td_export_status"] = "PASS" if td_ok else "PARTIAL"
+    valid_after, errors_after = inventory_valid(manifest, root)
+    if errors_after:
+        manifest["integrity_errors_after_seal"] = errors_after
     manifest["gate_results"] = {
         "slot_timing_integrity": "PASS" if timing_ok and required_slots_ok else "FAIL",
         "runtime_identity_stable": "PASS" if manifest.get("runtime_identity_stable") else "FAIL",
+        "release_provenance_valid": "PASS" if release_valid else "FAIL",
+        "capture_tool_freeze": "PASS" if tool_frozen else "FAIL",
         "mapping_capture": "PASS" if slots.get("mapping_security", {}).get("status") in {"ON_TIME", "LATE"} else "FAIL",
         "auction_0920_capture": "PASS" if slots.get("auction_0920", {}).get("status") in {"ON_TIME", "LATE"} else "FAIL",
         "auction_0924_capture": "PASS" if slots.get("auction_0924", {}).get("status") in {"ON_TIME", "LATE"} else "FAIL",
@@ -562,7 +761,7 @@ def seal(args: argparse.Namespace) -> int:
         "auction_anchor_capture": "PASS" if anchor_ok else "FAIL",
         "online_q2_capture": "PASS" if required_slots_ok else "FAIL",
         "td_export": "PASS" if td_ok else "PARTIAL",
-        "artifact_integrity": "PASS",
+        "artifact_integrity": "PASS" if valid_before and valid_after else "FAIL",
         "manifest_sealed": "PASS",
         "capture_write_isolation": "PASS" if not any(manifest.get("write_isolation", {}).values()) else "FAIL",
     }
