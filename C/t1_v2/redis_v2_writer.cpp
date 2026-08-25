@@ -12,6 +12,23 @@
 
 namespace t1_v2 {
 
+namespace {
+
+int auction_price_milli(const QuoteState& state) {
+    if (state.auction.a25_px_milli > 0) {
+        return state.auction.a25_px_milli;
+    }
+    if (state.auction.a24_px_milli > 0) {
+        return state.auction.a24_px_milli;
+    }
+    if (state.auction.a20_px_milli > 0) {
+        return state.auction.a20_px_milli;
+    }
+    return state.px_milli;
+}
+
+}  // namespace
+
 RedisV2Writer::RedisV2Writer(const ConfigV2& config) : config_(config) {}
 
 bool RedisV2Writer::initialize() {
@@ -396,10 +413,11 @@ std::string RedisV2Writer::auction_tag_from_trigger(const SnapshotTriggerState& 
 }
 
 int RedisV2Writer::change_bp(const QuoteState& state) {
-    if (state.px_milli <= 0 || state.pc_milli <= 0) {
+    const int price_milli = auction_price_milli(state);
+    if (price_milli <= 0 || state.pc_milli <= 0) {
         return 0;
     }
-    return static_cast<int>(((static_cast<int64_t>(state.px_milli) - state.pc_milli) * 10000) / state.pc_milli);
+    return static_cast<int>(((static_cast<int64_t>(price_milli) - state.pc_milli) * 10000) / state.pc_milli);
 }
 
 std::string RedisV2Writer::build_open_2m_summary_json(
@@ -595,7 +613,7 @@ std::string RedisV2Writer::build_legacy_top_amount_json(const std::vector<const 
             oss << ",";
         }
         oss << "{\"symbol\":\"" << state.symbol << "\""
-            << ",\"price\":" << (state.px_milli / 1000.0)
+            << ",\"price\":" << (auction_price_milli(state) / 1000.0)
             << ",\"change_pct\":" << change_pct_string(state)
             << ",\"auction_amount_yuan\":" << state.auction.match_amt_yuan
             << ",\"bid_amount_yuan\":" << state.auction.rest_bid_amt_yuan
