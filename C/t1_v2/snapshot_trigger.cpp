@@ -4,6 +4,24 @@
 
 namespace t1_v2 {
 
+namespace {
+
+bool shanghai_tm_from_timestamp_ms(int64_t ts_ms, std::tm& out) {
+    if (ts_ms <= 0) {
+        return false;
+    }
+    // The market clock is fixed to Asia/Shanghai.  Derive it from the input
+    // epoch only; never consult the host's current date or timezone setting.
+    const std::time_t shanghai_seconds = static_cast<std::time_t>(ts_ms / 1000 + 8 * 60 * 60);
+#if defined(_WIN32)
+    return gmtime_s(&out, &shanghai_seconds) == 0;
+#else
+    return gmtime_r(&shanghai_seconds, &out) != nullptr;
+#endif
+}
+
+}  // namespace
+
 SnapshotTrigger::SnapshotTrigger(const ConfigV2& config) : config_(config) {}
 
 SnapshotTriggerState SnapshotTrigger::update(int64_t logical_ts_ms, MarketPhase phase) {
@@ -57,31 +75,19 @@ SnapshotTriggerState SnapshotTrigger::update(int64_t logical_ts_ms, MarketPhase 
 }
 
 int SnapshotTrigger::hms_from_timestamp_ms(int64_t ts_ms) const {
-    if (ts_ms <= 0) {
+    std::tm market_tm{};
+    if (!shanghai_tm_from_timestamp_ms(ts_ms, market_tm)) {
         return 0;
     }
-    const std::time_t seconds = static_cast<std::time_t>(ts_ms / 1000);
-    std::tm local_tm{};
-#if defined(_WIN32)
-    localtime_s(&local_tm, &seconds);
-#else
-    localtime_r(&seconds, &local_tm);
-#endif
-    return local_tm.tm_hour * 10000 + local_tm.tm_min * 100 + local_tm.tm_sec;
+    return market_tm.tm_hour * 10000 + market_tm.tm_min * 100 + market_tm.tm_sec;
 }
 
 int SnapshotTrigger::trade_date_from_timestamp_ms(int64_t ts_ms) const {
-    if (ts_ms <= 0) {
+    std::tm market_tm{};
+    if (!shanghai_tm_from_timestamp_ms(ts_ms, market_tm)) {
         return 0;
     }
-    const std::time_t seconds = static_cast<std::time_t>(ts_ms / 1000);
-    std::tm local_tm{};
-#if defined(_WIN32)
-    localtime_s(&local_tm, &seconds);
-#else
-    localtime_r(&seconds, &local_tm);
-#endif
-    return (local_tm.tm_year + 1900) * 10000 + (local_tm.tm_mon + 1) * 100 + local_tm.tm_mday;
+    return (market_tm.tm_year + 1900) * 10000 + (market_tm.tm_mon + 1) * 100 + market_tm.tm_mday;
 }
 
 }  // namespace t1_v2
