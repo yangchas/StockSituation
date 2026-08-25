@@ -872,11 +872,16 @@ bool run_self_test() {
     bool has_legacy_auction_key = false;
     bool has_legacy_latest_key = false;
     bool has_a2_effective_price = false;
+    bool has_a2_non_price_payload = false;
     for (const RedisCommand& command : a2_commands_for_legacy) {
         if (command.key.find("a2:") == 0) {
             for (const auto& field : command.fields) {
                 if (field.first == "top_amt" && field.second.find("\"px\":10000") != std::string::npos) {
                     has_a2_effective_price = true;
+                    has_a2_non_price_payload =
+                        field.second.find("\"am\":816000") != std::string::npos &&
+                        field.second.find("\"br\":3060000") != std::string::npos &&
+                        field.second.find("\"ar\":2040000") != std::string::npos;
                 }
             }
         }
@@ -898,6 +903,7 @@ bool run_self_test() {
     if (!expect(has_legacy_auction_key, "legacy market auction top_amount key")) return false;
     if (!expect(has_legacy_latest_key, "legacy market auction latest key")) return false;
     if (!expect(has_a2_effective_price, "a2 top amount uses effective auction price")) return false;
+    if (!expect(has_a2_non_price_payload, "a2 non-price payload remains unchanged")) return false;
     SnapshotTriggerState anchor_trigger;
     anchor_trigger.emit_a25 = true;
     const auto a2_commands_for_anchor = redis_writer.build_a2_commands(engine.quote_store(), anchor_trigger, ts_0922);
