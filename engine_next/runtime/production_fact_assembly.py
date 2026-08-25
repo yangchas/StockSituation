@@ -114,6 +114,7 @@ def normalize_td_auction_row(row: Mapping[str, Any], *, tag: str) -> dict[str, A
     px_milli = _number(row.get("px_milli", row.get("price_milli", row.get("px"))))
     chg_bp = _number(row.get("chg_bp", row.get("change_bp")))
     change_pct = (chg_bp / 100.0) if chg_bp is not None else _number(row.get("change_pct"))
+    ask_raw = row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))
     return {
         "symbol": _symbol(row.get("symbol") or row.get("code")),
         "tag": _text(tag),
@@ -127,7 +128,7 @@ def normalize_td_auction_row(row: Mapping[str, Any], *, tag: str) -> dict[str, A
         "bid_amount": _number(row.get("rest_bid_amt_yuan", row.get("bid_amount_yuan", row.get("br")))),
         "ask_amount_yuan": _number(row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))),
         "ask_amount": _number(row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))),
-        "ask_amount_present": row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar"))) is not None,
+        "ask_amount_present": ask_raw is not None and str(ask_raw).strip() != "",
         "limit_state": row.get("limit_state", row.get("ls")),
         "source": "tdengine:auction_snapshot_v2",
     }
