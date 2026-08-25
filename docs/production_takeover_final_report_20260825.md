@@ -10,6 +10,29 @@
 
 ## Captures
 
+### TDengine table audit
+
+The production connection was read-only against `market_data1` on `cobra-ion`.
+The schema audit found:
+
+- `stock_tick_v2` is the persisted raw tick supertable.
+- `auction_snapshot_v2` is the persisted auction snapshot supertable with `px_milli`, `chg_bp`, `match_amt_yuan`, `rest_bid_amt_yuan`, `rest_ask_amt_yuan`, and `limit_state`.
+- `auction_summary_v2` is the persisted market auction summary with three rows for `20260824` (0920/0924/0925).
+- Per-symbol `a2_YYYYMMDD_HHMM_<symbol>` tables exist for `20260824` only: 5,210 tables for each of 0920, 0924 and 0925.
+- There are no `q2` or `stock_tick`-named TD tables; continuous ticks are stored in `stock_tick_v2`.
+- For `20260825`, `auction_summary_v2` has 0 rows and `auction_snapshot_v2` has 0 rows; no current-day `a2_*` group was present.
+
+The production tick funnel was nevertheless present in `stock_tick_v2`:
+
+| Window | Rows | Distinct symbols |
+|---|---:|---:|
+| 2026-08-25 09:15–09:26 | 218,338 | 5,212 |
+| 2026-08-25 09:30–09:32:59 | 305,002 | 5,208 |
+| 2026-08-24 09:15–09:26 | 218,639 | 5,210 |
+| 2026-08-24 09:30–09:32:59 | 305,893 | 5,207 |
+
+The absence of current-day auction rows is a persistence/capture gap, not evidence that TDengine is empty.
+
 ### 09:25 auction context
 
 - Read-only snapshot: `/tmp/production_capture_20260825/context_0925_latest.json`
@@ -19,6 +42,8 @@
 - Missing: `0920`, `0924`, `0925` keys and `market:auction:anchor:20260825`
 - Mapping: current cache only; no historical source date was captured
 - Snapshot status: incomplete (9/15 required keys)
+
+The Redis `latest` snapshot is not substituted for the missing three anchors. It is recorded only as a current-day partial fact.
 
 ### 09:30–09:32 open window
 
