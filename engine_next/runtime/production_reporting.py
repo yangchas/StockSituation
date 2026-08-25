@@ -92,8 +92,38 @@ class ProductionReportingCoordinator:
             market_context={"data_origin": bundle.data_origin, "trade_date": trade_date},
         )
 
+    @staticmethod
+    def _unavailable_shadow(*, trade_date: str) -> dict[str, Any]:
+        return {
+            "format": "PlateAuctionShadowV1",
+            "contract_version": "PlateAuctionShadowV1",
+            "trade_date": trade_date,
+            "data_origin": "production_realtime",
+            "historical_valid": False,
+            "mapping_origin": {"canonical": "market:stock_plate", "status": "unavailable"},
+            "status": "unavailable",
+            "plate_stats": {"0924_to_0925": {}},
+            "symbol_details": {"0924_to_0925": {"detail_rows": []}},
+            "source_provenance": {"status": "DATA_UNAVAILABLE"},
+            "strategy_impact": "none",
+            "decision_bundle": None,
+        }
+
+    def build_unavailable_auction(self, *, trade_date: str) -> AuctionEmailReport:
+        return build_auction_email_report(
+            plate_shadow=self._unavailable_shadow(trade_date=trade_date),
+            auction_evidence={"data_origin": "production_realtime"},
+        )
+
     def send_auction(self, *, trade_date: str, request: Any, send_eligibility: bool) -> tuple[str, str]:
         report = self.build_auction(trade_date=trade_date)
+        if not send_eligibility or self._notification_service is None:
+            return "built", report.html_sha256
+        delivered = self._notification_service.notify_auction_report(report=report, request=request)
+        return ("sent" if delivered else "not_sent"), report.html_sha256
+
+    def send_auction_unavailable(self, *, trade_date: str, request: Any, send_eligibility: bool) -> tuple[str, str]:
+        report = self.build_unavailable_auction(trade_date=trade_date)
         if not send_eligibility or self._notification_service is None:
             return "built", report.html_sha256
         delivered = self._notification_service.notify_auction_report(report=report, request=request)
@@ -107,6 +137,26 @@ class ProductionReportingCoordinator:
 
     def send_opening(self, *, trade_date: str, request: Any, observation_cutoff: datetime, send_eligibility: bool) -> tuple[str, str]:
         report = self.build_opening(trade_date=trade_date, observation_cutoff=observation_cutoff)
+        if not send_eligibility or self._notification_service is None:
+            return "built", report.html_sha256
+        delivered = self._notification_service.notify_open_confirmation_report(report=report, request=request)
+        return ("sent" if delivered else "not_sent"), report.html_sha256
+
+    def send_opening_unavailable(self, *, trade_date: str, request: Any, observation_cutoff: datetime, send_eligibility: bool) -> tuple[str, str]:
+        observation = {
+            "format": "OpenConfirmationObservationV1",
+            "trade_date": trade_date,
+            "data_origin": "production_realtime",
+            "historical_valid": False,
+            "mapping_consistency": "unavailable",
+            "market": {"auction": {}, "open": {"status": "DATA_UNAVAILABLE", "observation_time": observation_cutoff.isoformat()}},
+            "plates": [],
+            "observations": [{"text": "开盘事实不可用，未使用替代数据。"}],
+            "open_source": {"observation_cutoff": observation_cutoff.isoformat(), "status": "DATA_UNAVAILABLE"},
+            "strategy_impact": "none",
+            "decision_bundle": None,
+        }
+        report = build_opening_facts_report(observation)
         if not send_eligibility or self._notification_service is None:
             return "built", report.html_sha256
         delivered = self._notification_service.notify_open_confirmation_report(report=report, request=request)

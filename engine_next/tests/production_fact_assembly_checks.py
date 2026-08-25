@@ -13,6 +13,7 @@ from engine_next.runtime.production_fact_assembly import (
 from engine_next.runtime.notification_service import RuntimeNotificationService
 from engine_next.runtime.reporting_lifecycle import decide_report_execution
 from engine_next.app_main import EngineApp
+from engine_next.runtime.production_reporting import ProductionReportingCoordinator
 
 
 class FakeRedis:
@@ -172,3 +173,10 @@ def test_engine_scheduler_declares_opening_fact_slot_after_cutoff():
     assert before.scheduled_event_name == ""
     recovery = app._build_loop_decision(datetime(2026, 8, 25, 9, 33, 0), "2026-08-25")
     assert recovery.scheduled_event_name == "opening_facts_0932"
+
+
+def test_unavailable_reports_are_explicit_and_strategy_free():
+    coordinator = ProductionReportingCoordinator(auction_fact_loader=lambda _: None)
+    auction = coordinator.build_unavailable_auction(trade_date="2026-08-25")
+    assert auction.metadata["market_overview"]["status"] == "unavailable"
+    assert auction.metadata["strategy_impact"] == "none"

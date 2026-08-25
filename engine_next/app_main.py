@@ -1671,7 +1671,22 @@ class EngineApp:
                     )
                 except Exception as exc:
                     logger.exception("auction facts report failed")
-                    notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                    if self._production_reporting is not None:
+                        try:
+                            status, report_hash = self._production_reporting.send_auction_unavailable(
+                                trade_date=request.trade_date,
+                                request=request,
+                                send_eligibility=True,
+                            )
+                            notes.append(
+                                f"auction_report | status=DATA_UNAVAILABLE | delivery={status} | "
+                                f"report_hash={report_hash} | error={type(exc).__name__}"
+                            )
+                        except Exception:
+                            logger.exception("auction unavailable report failed")
+                            notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                    else:
+                        notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
         elif loop_decision.scheduled_event_name == "opening_facts_0932":
             if self._production_reporting is None or request.historical_replay:
                 notes.append("opening_report | status=disabled_or_historical_replay | send_eligibility=false")
@@ -1689,7 +1704,23 @@ class EngineApp:
                     )
                 except Exception as exc:
                     logger.exception("opening facts report failed")
-                    notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                    if self._production_reporting is not None:
+                        try:
+                            status, report_hash = self._production_reporting.send_opening_unavailable(
+                                trade_date=request.trade_date,
+                                request=request,
+                                observation_cutoff=request.now,
+                                send_eligibility=True,
+                            )
+                            notes.append(
+                                f"opening_report | status=DATA_UNAVAILABLE | delivery={status} | "
+                                f"report_hash={report_hash} | error={type(exc).__name__}"
+                            )
+                        except Exception:
+                            logger.exception("opening unavailable report failed")
+                            notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                    else:
+                        notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
         elif loop_decision.scheduled_event_name == "market_close_1505":
             close_result = self._postmarket_runtime.execute_close_marker(
                 trade_date=request.trade_date,
