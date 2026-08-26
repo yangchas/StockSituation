@@ -362,6 +362,7 @@ class ProductionReportingCoordinator:
         mapping_sha: str | None,
         notification_status: str,
         fact_status: str | None = None,
+        execution_mode: str | None = None,
     ) -> ReportingOutcome:
         return ReportingOutcome(
             event_name=event.event_name,
@@ -373,7 +374,7 @@ class ProductionReportingCoordinator:
             notification_status=notification_status,
             trade_date=event.trade_date,
             fact_status=fact_status or ProductionReportingCoordinator._fact_status(report_status),
-            execution_mode=event.execution_mode,
+            execution_mode=execution_mode or event.execution_mode,
             observation_cutoff=event.actual_time.isoformat() if event.event_name == "opening_facts_0932" else None,
         )
 
@@ -385,14 +386,36 @@ class ProductionReportingCoordinator:
         mapping = None
         mapping_sha = None
         try:
+            effective_mode = self._lifecycle.execution_mode(
+                event_name=event.event_name,
+                actual_time=event.actual_time,
+                requested_mode=event.execution_mode,
+            )
+        except Exception as exc:
+            logger.exception(
+                "reporting execution mode resolution failed; isolated from engine loop | event=%s | trade_date=%s | error=%s",
+                event.event_name,
+                event.trade_date,
+                exc,
+            )
+            return self._outcome(
+                event,
+                report_status="FAILED",
+                delivery_status="NOT_ATTEMPTED",
+                report_hash=None,
+                dedupe_key=key,
+                mapping_sha=None,
+                notification_status="NOT_ATTEMPTED",
+                fact_status="failed",
+                execution_mode=event.execution_mode,
+            )
+        try:
             mapping = self._mapping_for_event(event)
             mapping_sha = str(mapping.get("sha256")) if mapping else None
             if event.event_name == "auction_facts_0926":
                 report, report_status = self._build_auction_for_event(event, mapping)
-                notify = self._notification_service.notify_auction_report if self._notification_service else None
             elif event.event_name == "opening_facts_0932":
                 report, report_status = self._build_opening_for_event(event, mapping)
-                notify = self._notification_service.notify_open_confirmation_report if self._notification_service else None
             else:
                 return self._outcome(
                     event,
@@ -403,6 +426,7 @@ class ProductionReportingCoordinator:
                     mapping_sha=mapping_sha,
                     notification_status="unsupported_event",
                     fact_status="failed",
+                    execution_mode=effective_mode,
                 )
         except Exception as exc:
             logger.exception(
@@ -421,7 +445,27 @@ class ProductionReportingCoordinator:
                 mapping_sha=mapping_sha,
                 notification_status="NOT_ATTEMPTED",
                 fact_status="failed",
+                execution_mode=effective_mode,
             )
+        # Building is independent from delivery capability.  Manual audits and
+        # recovery runs may render a report even when no notifier is configured;
+        # they must never inspect notifier availability or claim the live key.
+        if effective_mode in {"manual_audit", "recovery"}:
+            status = "SKIP_" + effective_mode.upper()
+            return self._outcome(
+                event,
+                report_status=report_status,
+                delivery_status=status,
+                report_hash=report.html_sha256,
+                dedupe_key=key,
+                mapping_sha=mapping_sha,
+                notification_status=status,
+                execution_mode=effective_mode,
+            )
+        if event.event_name == "auction_facts_0926":
+            notify = self._notification_service.notify_auction_report if self._notification_service else None
+        else:
+            notify = self._notification_service.notify_open_confirmation_report if self._notification_service else None
         # A disabled/unconfigured delivery path must not consume the day's
         # claim.  Otherwise a later runtime reconfiguration could be blocked
         # by a claim created before any notification was possible.
@@ -434,6 +478,7 @@ class ProductionReportingCoordinator:
                 dedupe_key=key,
                 mapping_sha=mapping_sha,
                 notification_status="notification_unavailable",
+                execution_mode=effective_mode,
             )
         try:
             claim = self._lifecycle.claim(event, report_digest=report.html_sha256)
@@ -448,6 +493,7 @@ class ProductionReportingCoordinator:
                 mapping_sha=mapping_sha,
                 notification_status="NOT_ATTEMPTED",
                 fact_status="failed",
+                execution_mode=effective_mode,
             )
         if not claim.allowed:
             return self._outcome(
@@ -458,6 +504,7 @@ class ProductionReportingCoordinator:
                 dedupe_key=claim.dedupe_key,
                 mapping_sha=mapping_sha,
                 notification_status=claim.status,
+                execution_mode=effective_mode,
             )
         try:
             delivered = notify(report=report, request=request, preclaimed=True)
@@ -477,6 +524,7 @@ class ProductionReportingCoordinator:
                 dedupe_key=claim.dedupe_key,
                 mapping_sha=mapping_sha,
                 notification_status="FAILED",
+                execution_mode=effective_mode,
             )
         status = "ACCEPTED" if delivered else "FAILED"
         self._lifecycle.record_delivery(event, status=status)
@@ -488,4 +536,5 @@ class ProductionReportingCoordinator:
             dedupe_key=claim.dedupe_key,
             mapping_sha=mapping_sha,
             notification_status=status,
+            execution_mode=effective_mode,
         )

@@ -7,6 +7,7 @@ import html
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -314,6 +315,53 @@ def _locked_order_rows(shadow: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _locked_detail_status(source: Mapping[str, Any], direction: str) -> str:
+    """Return completeness of one locked-order direction from source evidence."""
+    values = source.get(direction)
+    if not isinstance(values, list):
+        return "unavailable"
+    if any(
+        not isinstance(row, Mapping)
+        or str(row.get("status") or "").lower() not in {"available", "complete"}
+        for row in values
+    ):
+        return "unavailable"
+    marker = source.get(f"{direction}_complete")
+    if marker is True:
+        return "available"
+    marker = source.get(f"{direction}_status")
+    if str(marker or "").lower() in {"available", "complete"}:
+        return "available"
+    completeness = source.get("completeness")
+    if isinstance(completeness, Mapping):
+        marker = completeness.get(direction)
+        if str(marker or "").lower() in {"available", "complete"}:
+            return "available"
+    unavailable = source.get("unavailable")
+    if isinstance(unavailable, list):
+        for row in unavailable:
+            if not isinstance(row, Mapping):
+                return "unavailable"
+            row_direction = str(row.get("direction") or "").strip()
+            if not row_direction or row_direction == direction:
+                return "unavailable"
+        return "available"
+    return "unavailable"
+
+
+def _integer_yuan(value: Any) -> int | None:
+    """Convert an explicitly integral yuan value without tolerance/rounding."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not number.is_finite() or number != number.to_integral_value():
+        return None
+    return int(number)
+
+
 def _locked_summary(
     rows: list[Mapping[str, Any]],
     overview: Mapping[str, Any],
@@ -323,18 +371,50 @@ def _locked_summary(
     source = source or {}
     up = [row for row in rows if row.get("direction") == "limit_up"]
     down = [row for row in rows if row.get("direction") == "limit_down"]
-    up_source_present = "limit_up" in source and isinstance(source.get("limit_up"), list)
-    down_source_present = "limit_down" in source and isinstance(source.get("limit_down"), list)
+    up_status = _locked_detail_status(source, "limit_up")
+    down_status = _locked_detail_status(source, "limit_down")
     known_up_amounts = [float(row["seal_amount_yuan"]) for row in up if _number(row.get("seal_amount_yuan")) is not None]
-    amounts_complete = up_source_present and len(known_up_amounts) == len(up)
+    amounts_complete = up_status == "available" and len(known_up_amounts) == len(up)
     total = sum(known_up_amounts) if amounts_complete else None
     overview_up_count = overview.get("limit_up_count")
     overview_down_count = overview.get("limit_down_count")
     overview_total = overview.get("limit_up_seal_amount_yuan")
-    up_count = overview_up_count if overview_up_count is not None else (len(up) if up_source_present else None)
-    down_count = overview_down_count if overview_down_count is not None else (len(down) if down_source_present else None)
-    seal_total = overview_total if overview_total is not None else total
+    overview_up_count_int = _integer_yuan(overview_up_count)
+    overview_down_count_int = _integer_yuan(overview_down_count)
+    up_count = overview_up_count_int if overview_up_count is not None else (len(up) if up_status == "available" else None)
+    down_count = overview_down_count_int if overview_down_count is not None else (len(down) if down_status == "available" else None)
+    seal_total = _number(overview_total) if overview_total is not None else total
+    conflict = False
+    if up_status == "available" and overview_up_count_int is not None and overview_up_count_int != len(up):
+        conflict = True
+    if down_status == "available" and overview_down_count_int is not None and overview_down_count_int != len(down):
+        conflict = True
+    detail_amounts = [_integer_yuan(row.get("seal_amount_yuan")) for row in up]
+    overview_amount = _integer_yuan(overview_total)
+    if up_status == "available" and all(value is not None for value in detail_amounts) and overview_amount is not None:
+        if sum(value for value in detail_amounts if value is not None) != overview_amount:
+            conflict = True
+    if conflict:
+        return {
+            "locked_order_status": "conflict",
+            "limit_up_count": None,
+            "limit_down_count": None,
+            "limit_up_seal_amount_yuan": None,
+            "top1_ratio": None,
+            "top3_ratio": None,
+        }
+    locked_status = "available" if up_status == "available" and down_status == "available" else "unavailable"
+    if locked_status == "unavailable":
+        return {
+            "locked_order_status": "unavailable",
+            "limit_up_count": None,
+            "limit_down_count": None,
+            "limit_up_seal_amount_yuan": None,
+            "top1_ratio": None,
+            "top3_ratio": None,
+        }
     return {
+        "locked_order_status": locked_status,
         "limit_up_count": up_count,
         "limit_down_count": down_count,
         "limit_up_seal_amount_yuan": seal_total,
@@ -548,7 +628,7 @@ def _render_html(template: str, report: Mapping[str, Any]) -> str:
         "{{MARKET_RISE_FALL_FLAT}}": html.escape(f"{_display(overview.get('positive_count'))} / {_display(overview.get('negative_count'))} / {_display(overview.get('flat_count'))}"), "{{MARKET_AMOUNT}}": _money_yi(overview.get("auction_amount_yuan")),
         "{{MARKET_LIMITS}}": html.escape(f"{_display(overview.get('limit_up_count'))} / {_display(overview.get('limit_down_count'))}"), "{{MARKET_SEAL}}": _money_yi(overview.get("limit_up_seal_amount_yuan")),
         "{{CORE_OBSERVATIONS}}": "".join(f"<li>{html.escape(item['text'])}</li>" for item in report.get("core_observations", report["observations"][:CORE_OBSERVATION_LIMIT])) or "<li>unavailable</li>",
-        "{{PLATE_ROWS}}": "".join(plate_rows) or "<tr><td colspan='13'>unavailable</td></tr>", "{{LOCKED_COUNTS}}": html.escape(f"{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}"),
+        "{{PLATE_ROWS}}": "".join(plate_rows) or "<tr><td colspan='13'>unavailable</td></tr>", "{{LOCKED_STATUS}}": html.escape(str(locked.get("locked_order_status", "unavailable"))), "{{LOCKED_COUNTS}}": html.escape(f"{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}"),
         "{{LOCKED_TOTAL}}": _money_yi(locked.get("limit_up_seal_amount_yuan")), "{{LOCKED_TOP}}": html.escape(f"Top1 {_ratio(locked.get('top1_ratio'))} · Top3 {_ratio(locked.get('top3_ratio'))}"),
         "{{LOCKED_ROWS}}": "".join(locked_rows) or "<tr><td colspan='5'>unavailable</td></tr>", "{{ANCHOR_STATUS}}": html.escape(str(report["anchor_changes"].get("status", "unavailable"))),
         "{{ANCHOR_ROWS}}": "".join(f"<li>{html.escape(str(row))}</li>" for row in report["anchor_changes"].get("rows", [])) or "<li>unavailable</li>", "{{APPENDIX}}": "".join(appendix) or "<p>unavailable</p>",
@@ -573,7 +653,7 @@ def _render_text(report: Mapping[str, Any]) -> str:
     for row in report["plate_rows"][:MAIN_PLATE_LIMIT]:
         contributors = ", ".join(f"{item['symbol']} {_ratio(item['amount_share'])}" for item in row["contributors"]) or "unavailable"
         lines.append(f"|{row['plate']}|{row['valid_price_count']}|{row['up_count']}/{row['down_count']}/{row['flat_count']}|{_ratio(row['positive_ratio'])}|{_ratio(row['negative_ratio'])}|{_pct(row['median_change_pct'])}|{_money_yi(row['auction_amount_yuan'])}|{_ratio(row['top1_amount_ratio'])}|{_ratio(row['top3_amount_ratio'])}|{_money_yi(row['pressure_yuan']) if row['pressure_yuan'] is not None else 'unavailable'}|{_money_yi(row['withdrawal_yuan']) if row['withdrawal_yuan'] is not None else 'unavailable'}|{contributors}|")
-    lines.extend(["", "## 涨跌停封单", f"- 涨停/跌停：{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}", f"- 涨停封单总额：{_money_yi(locked.get('limit_up_seal_amount_yuan'))}；Top1/Top3：{_ratio(locked.get('top1_ratio'))} / {_ratio(locked.get('top3_ratio'))}", "", "## 三锚点变化", f"- 状态：{report['anchor_changes'].get('status', 'unavailable')}"])
+    lines.extend(["", "## 涨跌停封单", f"- 状态：{_display(locked.get('locked_order_status'))}", f"- 涨停/跌停：{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}", f"- 涨停封单总额：{_money_yi(locked.get('limit_up_seal_amount_yuan'))}；Top1/Top3：{_ratio(locked.get('top1_ratio'))} / {_ratio(locked.get('top3_ratio'))}", "", "## 三锚点变化", f"- 状态：{report['anchor_changes'].get('status', 'unavailable')}"])
     lines.extend(f"- {row}" for row in report["anchor_changes"].get("rows", []))
     lines.extend(["", "## 附录：其他客观排序", ""])
     for name, rows in report["appendix"].items():
@@ -603,11 +683,19 @@ def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evide
     }
     raw_plate_rows = _plate_rows(shadow)
     plate_rows = raw_plate_rows if resolved_component_statuses["plate_facts"] in {"available", "partial"} else []
-    locked_rows = _locked_order_rows(shadow)
     locked_source = _mapping(_mapping(shadow.get("automatic_analysis")).get("auction_locked_orders"))
+    locked_rows = _locked_order_rows(shadow)
     locked, anchor_changes = _locked_summary(locked_rows, overview, locked_source), _anchor_changes(evidence)
     resolved_status = str(report_status or context.get("report_status") or evidence.get("report_status") or resolve_auction_report_status(resolved_component_statuses))
     reasons = list(unavailable_reasons or context.get("unavailable_reasons") or evidence.get("unavailable_reasons") or [])
+    if locked.get("locked_order_status") in {"conflict", "unavailable"}:
+        locked_rows = []
+    if locked.get("locked_order_status") == "conflict":
+        conflict_reason = "A2 summary conflicts with locked-order detail"
+        if conflict_reason not in reasons:
+            reasons.append(conflict_reason)
+        if resolved_status in {"COMPLETE", "PARTIAL"}:
+            resolved_status = "PARTIAL"
     context_summary = _market_context_summary(context, trade_date)
     capture_time = shadow.get("capture_time") or context_summary.get("capture_time")
     observations = _core_observations(plate_rows, overview, locked)
