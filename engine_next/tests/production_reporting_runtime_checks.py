@@ -39,6 +39,10 @@ class FakeRedis:
     def expire(self, key, ttl):
         return True
 
+    def set(self, key, value, ex=None):
+        self.claims[key] = value
+        return True
+
 
 class FakeNotifier:
     def __init__(self, redis):
@@ -110,6 +114,7 @@ def test_coordinator_owns_claim_and_passes_preclaimed_notification(tmp_path: Pat
     assert first.delivery_status == "ACCEPTED"
     assert second.delivery_status == "SKIP_ALREADY_CLAIMED"
     assert notifier.sent == [("auction", True)]
+    assert redis.claims["2026-08-25:auction_facts_0926"] == "ACCEPTED"
 
 
 def test_online_q2_path_does_not_fallback_to_legacy_quotes():

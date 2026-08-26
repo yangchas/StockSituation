@@ -79,6 +79,27 @@ class ReportingLifecycle:
             logger.exception("reporting dedupe claim failed closed | key=%s", key)
             return DeliveryClaim(False, "FAILED", key)
 
+    def record_delivery(self, event: ReportingEvent, *, status: str) -> None:
+        """Persist the terminal application delivery state on the same key.
+
+        The claim remains present, so a terminal FAILED/UNKNOWN state cannot
+        be mistaken for permission to submit a second automatic message.
+        """
+        if status not in {"ACCEPTED", "FAILED", "UNKNOWN"}:
+            return
+        key = self._key(event)
+        if self._redis is None or not hasattr(self._redis, "set"):
+            return
+        try:
+            self._redis.set(key, status, ex=self.DEDUPE_TTL_SECONDS)
+        except TypeError:
+            try:
+                self._redis.set(key, status)
+            except Exception:
+                logger.exception("reporting delivery state write failed | key=%s", key)
+        except Exception:
+            logger.exception("reporting delivery state write failed | key=%s", key)
+
 
 def decide_report_execution(
     *,

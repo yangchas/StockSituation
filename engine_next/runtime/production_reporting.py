@@ -292,6 +292,7 @@ class ProductionReportingCoordinator:
         except TypeError:
             delivered = notify(report=report, request=request)
         status = "ACCEPTED" if delivered else "FAILED"
+        self._lifecycle.record_delivery(event, status=status)
         return ReportingOutcome(event.event_name, report_status, status, report.html_sha256, claim.dedupe_key, mapping_sha, status)
 
     def send_opening(self, *, trade_date: str, request: Any, observation_cutoff: datetime, send_eligibility: bool) -> tuple[str, str]:
