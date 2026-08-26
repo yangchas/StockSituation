@@ -444,10 +444,20 @@ def test_missing_limit_facts_do_not_render_as_zero() -> None:
 
 def test_explicit_empty_limit_lists_render_zero() -> None:
     shadow = _plate_shadow()
-    shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": []}}
+    shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": [], "unavailable": []}}
     report = build_auction_email_report(plate_shadow=shadow)
     assert "涨停/跌停：0 / 0" in report.text_body
     assert "涨停封单总额：0.00亿" in report.text_body
+
+
+def test_empty_lists_without_completeness_proof_remain_unavailable() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": []}}
+    report = build_auction_email_report(plate_shadow=shadow)
+    section = report.text_body.split("## 涨跌停封单", 1)[1].split("## 三锚点变化", 1)[0]
+    assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
+    assert "涨停/跌停：unavailable / unavailable" in section
+    assert "涨停封单总额：unavailable" in section
 
 
 def test_explicit_zero_a2_limit_facts_are_preserved() -> None:
@@ -464,3 +474,89 @@ def test_explicit_zero_a2_limit_facts_are_preserved() -> None:
     report = build_auction_email_report(plate_shadow=shadow, market_context=context)
     assert "涨停/跌停：0 / 0" in report.text_body
     assert "涨停封单：0.00亿" in report.text_body
+
+
+def test_complete_locked_detail_conflict_degrades_only_locked_order_domain() -> None:
+    shadow = _plate_shadow()
+    locked = shadow["automatic_analysis"]["auction_locked_orders"]
+    locked["unavailable"] = []
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        auction_evidence={
+            "data_origin": "replay_fixture_only",
+            "market_summary": {
+                "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+                "positive_count": 1, "negative_count": 1, "flat_count": 0,
+                "auction_amount_yuan": 12_000_000, "limit_up_count": 0,
+                "limit_down_count": 0, "limit_up_seal_amount_yuan": 0,
+            },
+        },
+    )
+    locked_section = report.text_body.split("## 涨跌停封单", 1)[1].split("## 三锚点变化", 1)[0]
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert report.metadata["locked_summary"]["locked_order_status"] == "conflict"
+    assert report.metadata["locked_order_rows"] == []
+    assert report.metadata["market_overview"]["limit_up_count"] == 0
+    assert "000001" not in locked_section
+    assert "unavailable" in locked_section
+    assert "100.00%" not in locked_section
+    assert "A2 summary conflicts with locked-order detail" in report.text_body
+
+
+def test_matching_complete_locked_detail_remains_available() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"]["unavailable"] = []
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        auction_evidence={
+            "data_origin": "replay_fixture_only",
+            "market_summary": {
+                "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+                "positive_count": 1, "negative_count": 1, "flat_count": 0,
+                "auction_amount_yuan": 12_000_000, "limit_up_count": 1,
+                "limit_down_count": 0, "limit_up_seal_amount_yuan": 8_000_000,
+            },
+        },
+    )
+    assert report.metadata["report_status"] == "COMPLETE"
+    assert report.metadata["locked_summary"]["locked_order_status"] == "available"
+    assert report.metadata["locked_summary"]["limit_up_count"] == 1
+    assert report.metadata["locked_order_rows"]
+
+
+def test_complete_locked_amount_compares_integer_yuan_exactly() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"]["unavailable"] = []
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        auction_evidence={
+            "data_origin": "replay_fixture_only",
+            "market_summary": {
+                "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+                "positive_count": 1, "negative_count": 1, "flat_count": 0,
+                "auction_amount_yuan": 12_000_000, "limit_up_count": 1,
+                "limit_down_count": 0, "limit_up_seal_amount_yuan": 8_000_001,
+            },
+        },
+    )
+    assert report.metadata["locked_summary"]["locked_order_status"] == "conflict"
+    assert report.metadata["report_status"] == "PARTIAL"
+
+
+def test_nonempty_locked_detail_without_completeness_proof_is_unavailable_not_conflict() -> None:
+    shadow = _plate_shadow()
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        auction_evidence={
+            "data_origin": "replay_fixture_only",
+            "market_summary": {
+                "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+                "positive_count": 1, "negative_count": 1, "flat_count": 0,
+                "auction_amount_yuan": 12_000_000, "limit_up_count": 0,
+                "limit_down_count": 0, "limit_up_seal_amount_yuan": 0,
+            },
+        },
+    )
+    assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
+    assert report.metadata["locked_order_rows"] == []
+    assert report.metadata["report_status"] == "COMPLETE"

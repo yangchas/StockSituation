@@ -123,6 +123,40 @@ class RaisingNotifier(FakeNotifier):
         raise RuntimeError("notification failure")
 
 
+class ExplodingAvailabilityNotifier(FakeNotifier):
+    def __init__(self, redis):
+        self._redis = redis
+        self.sent = []
+
+    @property
+    def enabled(self):
+        raise AssertionError("build-only path must not inspect notifier availability")
+
+
+def _opening_observation() -> dict:
+    return {
+        "format": "OpenConfirmationObservationV1",
+        "trade_date": "2026-08-25",
+        "data_origin": "production_realtime",
+        "mapping_consistency": "consistent",
+        "market": {
+            "auction": {"positive_count": 1, "negative_count": 0, "flat_count": 0},
+            "open": {
+                "status": "available",
+                "observation_time": "2026-08-25T09:32:10",
+                "open_up_count": 1,
+                "open_down_count": 0,
+                "open_flat_count": 0,
+                "open_valid_count": 1,
+                "open_window_amount_yuan": 100.0,
+            },
+        },
+        "plates": [],
+        "observations": [],
+        "open_source": {"status": "available", "observation_cutoff": "2026-08-25T09:32:10"},
+    }
+
+
 def _auction_event(actual_time: datetime | None = None) -> ReportingEvent:
     actual = actual_time or datetime(2026, 8, 25, 9, 26, 1)
     return ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), actual)
@@ -412,5 +446,95 @@ def test_disabled_notification_does_not_consume_dedup_claim(tmp_path: Path):
     )
     event = ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), datetime(2026, 8, 25, 9, 26, 1))
     outcome = coordinator.handle(event)
+    assert outcome.delivery_status == "FAILED"
+    assert outcome.report_status == "COMPLETE"
+    assert redis.claims == {}
+
+
+def test_manual_audit_builds_without_inspecting_notifier_or_claiming() -> None:
+    redis = FakeRedis()
+    notifier = ExplodingAvailabilityNotifier(redis)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: _bundle(),
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+    )
+    event = ReportingEvent(
+        "2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26),
+        datetime(2026, 8, 25, 9, 26, 1), "manual_audit",
+    )
+    outcome = coordinator.handle(event)
+    assert outcome.report_status == "COMPLETE"
+    assert outcome.delivery_status == "SKIP_MANUAL_AUDIT"
+    assert outcome.execution_mode == "manual_audit"
+    assert redis.claims == {}
+    assert notifier.sent == []
+
+
+def test_recovery_builds_without_inspecting_notifier_or_claiming() -> None:
+    redis = FakeRedis()
+    notifier = ExplodingAvailabilityNotifier(redis)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: _bundle(),
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+    )
+    event = ReportingEvent(
+        "2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26),
+        datetime(2026, 8, 25, 9, 30),
+    )
+    outcome = coordinator.handle(event)
+    assert outcome.report_status == "COMPLETE"
+    assert outcome.delivery_status == "SKIP_RECOVERY"
+    assert outcome.execution_mode == "recovery"
+    assert redis.claims == {}
+    assert notifier.sent == []
+
+
+@pytest.mark.parametrize("event_name", ["auction_facts_0926", "opening_facts_0932"])
+def test_build_only_modes_are_notifier_independent_for_opening_and_auction(tmp_path: Path, event_name: str) -> None:
+    redis = FakeRedis()
+    notifier = ExplodingAvailabilityNotifier(redis)
+    _ready_mapping(tmp_path)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda *args: _bundle(),
+        opening_fact_loader=lambda *args: _opening_observation(),
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+        mapping_directory=tmp_path,
+    )
+    event = ReportingEvent(
+        "2026-08-25", event_name,
+        datetime(2026, 8, 25, 9, 26) if event_name == "auction_facts_0926" else datetime(2026, 8, 25, 9, 32, 10),
+        datetime(2026, 8, 25, 9, 26, 1) if event_name == "auction_facts_0926" else datetime(2026, 8, 25, 9, 32, 11),
+        "manual_audit",
+    )
+    outcome = coordinator.handle(event)
+    assert outcome.delivery_status == "SKIP_MANUAL_AUDIT"
+    assert outcome.report_status == "COMPLETE"
+    assert redis.claims == {}
+    assert notifier.sent == []
+
+
+def test_normal_notifier_unavailable_preserves_partial_report_status(tmp_path: Path) -> None:
+    redis = FakeRedis()
+    notifier = FakeNotifier(redis)
+    notifier.enabled = False
+    _ready_mapping(tmp_path)
+    bundle = _bundle()
+    bundle.component_statuses = {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable"}
+    bundle.market_summary_status = "available"
+    bundle.plate_facts_status = "unavailable"
+    bundle.mapping_status = "unavailable"
+    bundle.unavailable_reasons = ("frozen mapping unavailable",)
+    bundle.report_status = "PARTIAL"
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda *args: bundle,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+        mapping_directory=tmp_path,
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert outcome.report_status == "PARTIAL"
     assert outcome.delivery_status == "FAILED"
     assert redis.claims == {}
