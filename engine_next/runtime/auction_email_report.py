@@ -7,7 +7,6 @@ import html
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -151,7 +150,13 @@ def resolve_auction_report_status(
     statuses.update(status_kwargs)
     market_status = str(statuses.get("market_overview", statuses.get("market_overview_status")) or "unavailable").lower()
     plate_status = str(statuses.get("plate_facts", statuses.get("plate_facts_status")) or "unavailable").lower()
-    factual = (market_status, plate_status)
+    factual = [market_status, plate_status]
+    # Locked-order detail is an independent factual domain when the builder
+    # has evaluated it.  Keep backwards compatibility for direct callers of
+    # this resolver that predate the component, while the production builder
+    # always supplies the component explicitly.
+    if "locked_order" in statuses or "locked_order_status" in statuses:
+        factual.append(str(statuses.get("locked_order", statuses.get("locked_order_status")) or "unavailable").lower())
     if all(status == "available" for status in factual):
         return "COMPLETE"
     if any(status in {"available", "partial"} for status in factual):
@@ -227,11 +232,11 @@ def _market_overview(shadow: Mapping[str, Any], evidence: Mapping[str, Any], con
     for payload in payloads:
         summary = _market_summary_from_payload(payload, trade_date)
         if summary and summary.get("source") != "q2_observation":
-            return summary
+            return _sanitize_a2_locked_fields(summary)
     for payload in payloads:
         summary = _market_summary_from_payload(payload, trade_date)
         if summary and summary.get("source") == "q2_observation":
-            return summary
+            return _sanitize_a2_locked_fields(summary)
     return {"status": "unavailable", "source": "unavailable", "observation_time": "unavailable"}
 
 
@@ -305,13 +310,20 @@ def _locked_order_rows(shadow: Mapping[str, Any]) -> list[dict[str, Any]]:
         source_rows = locked.get(direction)
         for raw in _rows(source_rows):
             row = _mapping(raw)
+            raw_amount = row.get("anchor_locked_amount_yuan")
+            # Official JSON yields primitive values.  Keep those for the
+            # contract validator; unsupported objects are simply unavailable
+            # rather than making report hashing/rendering fail.
+            safe_amount = raw_amount if isinstance(raw_amount, (int, float, str)) and not isinstance(raw_amount, bool) else None
             rows.append({
                 "direction": direction, "symbol": str(row.get("symbol") or "unavailable"),
                 "name": str(row.get("name") or "").strip(), "plate": str(row.get("plate") or "unavailable"),
-                "change_pct": _number(row.get("change_pct")), "seal_amount_yuan": _number(row.get("anchor_locked_amount_yuan")),
+                # Keep the source representation intact.  Exact locked-order
+                # comparisons must not pass through float conversion.
+                "change_pct": _number(row.get("change_pct")), "seal_amount_yuan": safe_amount,
                 "status": str(row.get("status") or "unavailable"),
             })
-    rows.sort(key=lambda row: (row.get("seal_amount_yuan") is None, -(row.get("seal_amount_yuan") or 0.0), row["direction"], row["symbol"]))
+    rows.sort(key=lambda row: (row.get("seal_amount_yuan") is None, -(_a2_amount(row.get("seal_amount_yuan")) or 0), row["direction"], row["symbol"]))
     return rows
 
 
@@ -349,17 +361,40 @@ def _locked_detail_status(source: Mapping[str, Any], direction: str) -> str:
     return "unavailable"
 
 
-def _integer_yuan(value: Any) -> int | None:
-    """Convert an explicitly integral yuan value without tolerance/rounding."""
-    if value is None or isinstance(value, bool):
+_A2_COUNT_MAX = 2_147_483_647
+_A2_AMOUNT_MAX = 9_223_372_036_854_775_807
+
+
+def _a2_integer(value: Any, *, maximum: int) -> int | None:
+    """Validate the JSON-native integer representation emitted by A2.
+
+    Release A serializes these fields as unquoted C++ integers.  Deliberately
+    reject strings, floats, Decimal instances, booleans, fractions and values
+    outside the producer's declared range instead of inventing a new parser.
+    """
+    if type(value) is not int or value < 0 or value > maximum:
         return None
-    try:
-        number = Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-    if not number.is_finite() or number != number.to_integral_value():
-        return None
-    return int(number)
+    return value
+
+
+def _a2_count(value: Any) -> int | None:
+    return _a2_integer(value, maximum=_A2_COUNT_MAX)
+
+
+def _a2_amount(value: Any) -> int | None:
+    return _a2_integer(value, maximum=_A2_AMOUNT_MAX)
+
+
+def _sanitize_a2_locked_fields(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose invalid A2 locked fields as unavailable, never as facts."""
+    normalized = dict(summary)
+    if "limit_up_count" in normalized and _a2_count(normalized["limit_up_count"]) is None:
+        normalized["limit_up_count"] = None
+    if "limit_down_count" in normalized and _a2_count(normalized["limit_down_count"]) is None:
+        normalized["limit_down_count"] = None
+    if "limit_up_seal_amount_yuan" in normalized and _a2_amount(normalized["limit_up_seal_amount_yuan"]) is None:
+        normalized["limit_up_seal_amount_yuan"] = None
+    return normalized
 
 
 def _locked_summary(
@@ -373,27 +408,55 @@ def _locked_summary(
     down = [row for row in rows if row.get("direction") == "limit_down"]
     up_status = _locked_detail_status(source, "limit_up")
     down_status = _locked_detail_status(source, "limit_down")
-    known_up_amounts = [float(row["seal_amount_yuan"]) for row in up if _number(row.get("seal_amount_yuan")) is not None]
-    amounts_complete = up_status == "available" and len(known_up_amounts) == len(up)
-    total = sum(known_up_amounts) if amounts_complete else None
     overview_up_count = overview.get("limit_up_count")
     overview_down_count = overview.get("limit_down_count")
     overview_total = overview.get("limit_up_seal_amount_yuan")
-    overview_up_count_int = _integer_yuan(overview_up_count)
-    overview_down_count_int = _integer_yuan(overview_down_count)
-    up_count = overview_up_count_int if overview_up_count is not None else (len(up) if up_status == "available" else None)
-    down_count = overview_down_count_int if overview_down_count is not None else (len(down) if down_status == "available" else None)
-    seal_total = _number(overview_total) if overview_total is not None else total
+    overview_up_count_int = _a2_count(overview_up_count)
+    overview_down_count_int = _a2_count(overview_down_count)
+    overview_amount = _a2_amount(overview_total)
+
+    # A2 is the authoritative source for locked-order counts and total.  A
+    # complete detail list can validate A2, but can never fill a missing or
+    # invalid A2 field.
+    if (
+        str(overview.get("status") or "").lower() != "available"
+        or overview_up_count_int is None
+        or overview_down_count_int is None
+        or overview_amount is None
+        or up_status != "available"
+        or down_status != "available"
+    ):
+        return {
+            "locked_order_status": "unavailable",
+            "limit_up_count": None,
+            "limit_down_count": None,
+            "limit_up_seal_amount_yuan": None,
+            "top1_ratio": None,
+            "top3_ratio": None,
+        }
+
+    up_amounts = [_a2_amount(row.get("seal_amount_yuan")) for row in up]
+    down_amounts = [_a2_amount(row.get("seal_amount_yuan")) for row in down]
+    # A completeness marker only proves the collection boundary; every
+    # amount participating in an exact comparison must also satisfy the
+    # existing integer-yuan source contract.
+    if any(value is None for value in (*up_amounts, *down_amounts)):
+        return {
+            "locked_order_status": "unavailable",
+            "limit_up_count": None,
+            "limit_down_count": None,
+            "limit_up_seal_amount_yuan": None,
+            "top1_ratio": None,
+            "top3_ratio": None,
+        }
+
     conflict = False
-    if up_status == "available" and overview_up_count_int is not None and overview_up_count_int != len(up):
+    if overview_up_count_int != len(up):
         conflict = True
-    if down_status == "available" and overview_down_count_int is not None and overview_down_count_int != len(down):
+    if overview_down_count_int != len(down):
         conflict = True
-    detail_amounts = [_integer_yuan(row.get("seal_amount_yuan")) for row in up]
-    overview_amount = _integer_yuan(overview_total)
-    if up_status == "available" and all(value is not None for value in detail_amounts) and overview_amount is not None:
-        if sum(value for value in detail_amounts if value is not None) != overview_amount:
-            conflict = True
+    if sum(value for value in up_amounts if value is not None) != overview_amount:
+        conflict = True
     if conflict:
         return {
             "locked_order_status": "conflict",
@@ -403,23 +466,14 @@ def _locked_summary(
             "top1_ratio": None,
             "top3_ratio": None,
         }
-    locked_status = "available" if up_status == "available" and down_status == "available" else "unavailable"
-    if locked_status == "unavailable":
-        return {
-            "locked_order_status": "unavailable",
-            "limit_up_count": None,
-            "limit_down_count": None,
-            "limit_up_seal_amount_yuan": None,
-            "top1_ratio": None,
-            "top3_ratio": None,
-        }
+    total = overview_amount
     return {
-        "locked_order_status": locked_status,
-        "limit_up_count": up_count,
-        "limit_down_count": down_count,
-        "limit_up_seal_amount_yuan": seal_total,
-        "top1_ratio": known_up_amounts[0] / total if amounts_complete and known_up_amounts and total and total > 0 else None,
-        "top3_ratio": sum(known_up_amounts[:3]) / total if amounts_complete and known_up_amounts and total and total > 0 else None,
+        "locked_order_status": "available",
+        "limit_up_count": overview_up_count_int,
+        "limit_down_count": overview_down_count_int,
+        "limit_up_seal_amount_yuan": overview_amount,
+        "top1_ratio": float(up_amounts[0]) / float(total) if up_amounts and total > 0 else None,
+        "top3_ratio": float(sum(up_amounts[:3])) / float(total) if up_amounts and total > 0 else None,
     }
 
 
@@ -615,6 +669,7 @@ def _render_html(template: str, report: Mapping[str, Any]) -> str:
                 f"报告状态={report.get('report_status', 'DATA_UNAVAILABLE')} · "
                 f"事实域：market={report.get('component_statuses', {}).get('market_overview', 'unavailable')} · "
                 f"plate={report.get('component_statuses', {}).get('plate_facts', 'unavailable')} · "
+                f"locked_order={report.get('component_statuses', {}).get('locked_order', 'unavailable')} · "
                 f"mapping={report.get('component_statuses', {}).get('mapping', 'unavailable')} · "
                 f"不可用原因={'；'.join(str(item) for item in report.get('unavailable_reasons', [])) or '无'}"
             )
@@ -646,7 +701,7 @@ def _render_text(report: Mapping[str, Any]) -> str:
     reasons = "；".join(str(item) for item in report.get("unavailable_reasons", [])) or "无"
     lines = [f"# {report['subject']}", f"数据状态：{_display(overview.get('status'))}；来源：{_display(overview.get('source'))}；观察时间：{_display(overview.get('observation_time'))}"]
     if report.get("report_status") != "COMPLETE":
-        lines.extend([f"报告状态：{report.get('report_status', 'DATA_UNAVAILABLE')}", f"事实域：市场概览={statuses.get('market_overview', 'unavailable')}；板块聚合={statuses.get('plate_facts', 'unavailable')}；当日映射={statuses.get('mapping', 'unavailable')}", f"不可用原因：{reasons}"])
+        lines.extend([f"报告状态：{report.get('report_status', 'DATA_UNAVAILABLE')}", f"事实域：市场概览={statuses.get('market_overview', 'unavailable')}；板块聚合={statuses.get('plate_facts', 'unavailable')}；封单={statuses.get('locked_order', 'unavailable')}；当日映射={statuses.get('mapping', 'unavailable')}", f"不可用原因：{reasons}"])
     lines.extend(["", "## 09:25市场概览", f"- 有效价格股票：{_valid_price_display(overview)}", f"- 上涨/下跌/平盘：{_display(overview.get('positive_count'))} / {_display(overview.get('negative_count'))} / {_display(overview.get('flat_count'))}", f"- 总预撮合金额：{_money_yi(overview.get('auction_amount_yuan'))}", f"- 涨停/跌停：{_display(overview.get('limit_up_count'))} / {_display(overview.get('limit_down_count'))}", f"- 涨停封单：{_money_yi(overview.get('limit_up_seal_amount_yuan'))}", "", "## 核心事实观察"])
     lines.extend(f"- {item['text']}" for item in report.get("core_observations", report["observations"][:CORE_OBSERVATION_LIMIT]))
     lines.extend(["", "## 重点板块事实Top10", "", "|板块|有效|涨/跌/平|上涨覆盖|下跌覆盖|中位涨幅|金额|Top1|Top3|pressure|withdrawal|Top3贡献|", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"])
@@ -686,7 +741,11 @@ def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evide
     locked_source = _mapping(_mapping(shadow.get("automatic_analysis")).get("auction_locked_orders"))
     locked_rows = _locked_order_rows(shadow)
     locked, anchor_changes = _locked_summary(locked_rows, overview, locked_source), _anchor_changes(evidence)
-    resolved_status = str(report_status or context.get("report_status") or evidence.get("report_status") or resolve_auction_report_status(resolved_component_statuses))
+    # The Auction builder/resolver is the sole source of the final report
+    # status.  Legacy callers may still pass ``report_status``; it is ignored
+    # so a stale pre-build status cannot diverge from the rendered report.
+    resolved_component_statuses["locked_order"] = locked.get("locked_order_status", "unavailable")
+    resolved_status = resolve_auction_report_status(resolved_component_statuses)
     reasons = list(unavailable_reasons or context.get("unavailable_reasons") or evidence.get("unavailable_reasons") or [])
     if locked.get("locked_order_status") in {"conflict", "unavailable"}:
         locked_rows = []
@@ -694,8 +753,10 @@ def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evide
         conflict_reason = "A2 summary conflicts with locked-order detail"
         if conflict_reason not in reasons:
             reasons.append(conflict_reason)
-        if resolved_status in {"COMPLETE", "PARTIAL"}:
-            resolved_status = "PARTIAL"
+    if locked.get("locked_order_status") == "unavailable":
+        unavailable_reason = "locked-order detail unavailable"
+        if unavailable_reason not in reasons:
+            reasons.append(unavailable_reason)
     context_summary = _market_context_summary(context, trade_date)
     capture_time = shadow.get("capture_time") or context_summary.get("capture_time")
     observations = _core_observations(plate_rows, overview, locked)

@@ -29,6 +29,7 @@ from engine_next.runtime.startup_static_loader import StartupStaticDataLoader
 
 
 logger = logging.getLogger(__name__)
+_AUCTION_REPORT_STATUSES = {"COMPLETE", "PARTIAL", "DATA_UNAVAILABLE"}
 
 
 @dataclass(frozen=True)
@@ -265,16 +266,18 @@ class ProductionReportingCoordinator:
             "mapping": getattr(bundle, "mapping_status", None) or ("available" if mapping else "unavailable"),
         }
         reasons = list(getattr(bundle, "unavailable_reasons", ()) or ())
-        bundle_status = str(getattr(bundle, "status", "") or "")
-        resolved_status = str(getattr(bundle, "report_status", "") or {
-            "normal": "COMPLETE", "partial": "PARTIAL", "unavailable": "DATA_UNAVAILABLE",
-        }.get(bundle_status, "DATA_UNAVAILABLE"))
         report = build_auction_email_report(
             plate_shadow=bundle.plate_shadow,
-            auction_evidence={"market_summary": market_summary, "data_origin": bundle.data_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons, "report_status": resolved_status},
-            market_context={"data_origin": bundle.data_origin, "trade_date": event.trade_date, "mapping_origin": bundle.mapping_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons, "report_status": resolved_status},
+            auction_evidence={"market_summary": market_summary, "data_origin": bundle.data_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons},
+            market_context={"data_origin": bundle.data_origin, "trade_date": event.trade_date, "mapping_origin": bundle.mapping_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons},
         )
-        return report, resolved_status
+        # The builder/resolver is the sole Auction report-status authority.
+        # Coordinator only validates and forwards the final rendered value;
+        # it must never resurrect a stale bundle/pre-build status.
+        final_status = report.metadata.get("report_status")
+        if final_status not in _AUCTION_REPORT_STATUSES:
+            raise ValueError(f"invalid auction report_status from builder: {final_status!r}")
+        return report, str(final_status)
 
     @staticmethod
     def _unavailable_shadow(*, trade_date: str) -> dict[str, Any]:
