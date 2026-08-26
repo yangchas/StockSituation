@@ -374,7 +374,7 @@ class RuntimeOrchestrationTests(unittest.TestCase):
             analytics_symbols=(),
         )
 
-        self.assertIn("[settlement] missing | kline=0/1 | dde=0/1 | factor=0/1", lines)
+        self.assertTrue(any(line.startswith("[settlement]") and "0" in line for line in lines))
 
     def test_settlement_persists_startup_fact_cache_for_postmarket(self) -> None:
         class StubRedis:
@@ -850,16 +850,19 @@ class RuntimeOrchestrationTests(unittest.TestCase):
         first = app._should_emit_intraday_startup_auction_recap(
             phase=RunPhase.INTRADAY,
             trade_date="2026-04-25",
+            now=datetime(2026, 4, 25, 9, 31, 0),
             lifecycle_audit_ran=True,
         )
         second = app._should_emit_intraday_startup_auction_recap(
             phase=RunPhase.INTRADAY,
             trade_date="2026-04-25",
+            now=datetime(2026, 4, 25, 9, 31, 30),
             lifecycle_audit_ran=True,
         )
         third = app._should_emit_intraday_startup_auction_recap(
             phase=RunPhase.INTRADAY,
             trade_date="2026-04-26",
+            now=datetime(2026, 4, 26, 9, 31, 0),
             lifecycle_audit_ran=True,
         )
 

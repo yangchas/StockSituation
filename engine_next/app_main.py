@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -32,7 +33,11 @@ from engine_next.runtime.intraday_context_builder import (
 )
 from engine_next.runtime.market_runtime_summary import MarketRuntimeSummaryResult, MarketRuntimeSummaryService
 from engine_next.runtime.offline_sync_executor import OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
+from engine_next.runtime.production_fact_assembly import build_production_auction_facts, build_readonly_td_auction_query
 from engine_next.runtime.production_reporting import ProductionReportingCoordinator
+from engine_next.runtime.reporting_lifecycle import ReportingEvent, ReportingLifecycle
+from engine_next.runtime.notification_service import RuntimeNotificationService
+from engine_next.runtime.open_confirmation import build_open_confirmation_observation
 from engine_next.runtime.original_timeline import iter_phase_events
 from engine_next.runtime.renderers.live_phase_summary_renderer import (
     LivePhaseSummaryRenderer,
@@ -184,6 +189,7 @@ class EngineAppRequest:
     cached_structural_factor_gap: dict[str, bool] | None = None
     historical_replay: bool = False
     run_integrated_sync: bool = True
+    execution_mode: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -260,13 +266,18 @@ class EngineApp:
         intraday_context_builder: IntradayContextBuilder | None = None,
         redis_client: object | None = None,
         production_reporting: ProductionReportingCoordinator | None = None,
+        intraday_hub: IntradayDataHub | None = None,
+        notification_service: RuntimeNotificationService | None = None,
     ) -> None:
         self._startup_coordinator = startup_coordinator or RuntimeStartupCoordinator()
         self._offline_executor = offline_executor or ServerOnlyOfflineSyncExecutor()
         self._intraday_context_builder = intraday_context_builder or IntradayContextBuilder()
         self._redis_client = redis_client
         self._production_reporting = production_reporting
-        self._intraday_hub = IntradayDataHub(redis_client=redis_client)
+        self._intraday_hub = intraday_hub or IntradayDataHub(redis_client=redis_client)
+        self._notification_service = notification_service or (
+            production_reporting.notification_service if production_reporting is not None else None
+        ) or RuntimeNotificationService(redis_client=self.redis)
         self._market_runtime_summary_service = MarketRuntimeSummaryService(redis_client=self.redis)
         self._auction_runtime = AuctionRuntimeController(
             intraday_hub=self._intraday_hub,
@@ -1659,68 +1670,47 @@ class EngineApp:
             market_runtime_summary_result = replay_result.market_runtime_summary_result
             notes.extend(replay_result.notes)
             if self._production_reporting is not None and not request.historical_replay:
-                try:
-                    status, report_hash = self._production_reporting.send_auction(
-                        trade_date=request.trade_date,
-                        request=request,
-                        send_eligibility=True,
-                    )
-                    notes.append(
-                        f"auction_report | status={status} | report_hash={report_hash} | "
-                        "execution_mode=normal"
-                    )
-                except Exception as exc:
-                    logger.exception("auction facts report failed")
-                    if self._production_reporting is not None:
-                        try:
-                            status, report_hash = self._production_reporting.send_auction_unavailable(
-                                trade_date=request.trade_date,
-                                request=request,
-                                send_eligibility=True,
-                            )
-                            notes.append(
-                                f"auction_report | status=DATA_UNAVAILABLE | delivery={status} | "
-                                f"report_hash={report_hash} | error={type(exc).__name__}"
-                            )
-                        except Exception:
-                            logger.exception("auction unavailable report failed")
-                            notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
-                    else:
-                        notes.append(f"auction_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                event_mode = request.execution_mode
+                if event_mode not in {"manual_audit", "recovery"} and not (
+                    dt_time(9, 26) <= request.now.time() < dt_time(9, 27)
+                ):
+                    event_mode = "recovery"
+                event = ReportingEvent(
+                    trade_date=request.trade_date,
+                    event_name="auction_facts_0926",
+                    scheduled_time=datetime.combine(request.now.date(), dt_time(9, 26)),
+                    actual_time=request.now,
+                    execution_mode=event_mode,
+                )
+                outcome = self._production_reporting.handle(event, request=request)
+                notes.append(
+                    f"auction_report | report_status={outcome.report_status} | "
+                    f"delivery_status={outcome.delivery_status} | report_hash={outcome.report_hash} | "
+                    f"dedupe_key={outcome.dedupe_key} | execution_mode={event_mode}"
+                )
         elif loop_decision.scheduled_event_name == "opening_facts_0932":
             if self._production_reporting is None or request.historical_replay:
-                notes.append("opening_report | status=disabled_or_historical_replay | send_eligibility=false")
+                notes.append("opening_report | status=disabled_or_historical_replay")
             else:
-                try:
-                    status, report_hash = self._production_reporting.send_opening(
-                        trade_date=request.trade_date,
-                        request=request,
-                        observation_cutoff=request.now,
-                        send_eligibility=True,
-                    )
-                    notes.append(
-                        f"opening_report | status={status} | report_hash={report_hash} | "
-                        f"observation_cutoff={request.now.isoformat()}"
-                    )
-                except Exception as exc:
-                    logger.exception("opening facts report failed")
-                    if self._production_reporting is not None:
-                        try:
-                            status, report_hash = self._production_reporting.send_opening_unavailable(
-                                trade_date=request.trade_date,
-                                request=request,
-                                observation_cutoff=request.now,
-                                send_eligibility=True,
-                            )
-                            notes.append(
-                                f"opening_report | status=DATA_UNAVAILABLE | delivery={status} | "
-                                f"report_hash={report_hash} | error={type(exc).__name__}"
-                            )
-                        except Exception:
-                            logger.exception("opening unavailable report failed")
-                            notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
-                    else:
-                        notes.append(f"opening_report | status=DATA_UNAVAILABLE | error={type(exc).__name__}")
+                event_mode = request.execution_mode
+                if event_mode not in {"manual_audit", "recovery"} and not (
+                    dt_time(9, 32, 10) <= request.now.time() < dt_time(9, 33)
+                ):
+                    event_mode = "recovery"
+                event = ReportingEvent(
+                    trade_date=request.trade_date,
+                    event_name="opening_facts_0932",
+                    scheduled_time=datetime.combine(request.now.date(), dt_time(9, 32, 10)),
+                    actual_time=request.now,
+                    execution_mode=event_mode,
+                )
+                outcome = self._production_reporting.handle(event, request=request)
+                notes.append(
+                    f"opening_report | report_status={outcome.report_status} | "
+                    f"delivery_status={outcome.delivery_status} | report_hash={outcome.report_hash} | "
+                    f"dedupe_key={outcome.dedupe_key} | observation_cutoff={request.now.isoformat()} | "
+                    f"execution_mode={event_mode}"
+                )
         elif loop_decision.scheduled_event_name == "market_close_1505":
             close_result = self._postmarket_runtime.execute_close_marker(
                 trade_date=request.trade_date,
@@ -1907,6 +1897,10 @@ class EngineApp:
         )
 
         phase = infer_run_phase(request.now)
+        if self._production_reporting is not None and not request.historical_replay:
+            # Mapping is frozen once during the pre-09:25 window and only
+            # reloaded thereafter; event handlers never re-freeze it.
+            self._production_reporting.prepare_mapping(trade_date=request.trade_date, now=request.now)
         scheduled_event_result = self._execute_scheduled_event(
             loop_decision=loop_decision,
             request=request,
@@ -2262,6 +2256,12 @@ class EngineApp:
             request = request_builder()
             result = self.run(request)
             if result.should_render:
+                if result.phase == RunPhase.POSTMARKET:
+                    self._notification_service.notify_if_needed(
+                        result=result,
+                        request=request,
+                        summary_text=render_result_summary(result),
+                    )
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{timestamp}]", flush=True)
                 print(render_result_summary(result), flush=True)
@@ -2765,6 +2765,76 @@ def _build_request_from_args(args) -> tuple[EngineAppRequest, str | None]:
     return request, symbols_file
 
 
+def _build_production_app() -> EngineApp:
+    """Construct the production reporting graph once at the application root."""
+    import redis
+
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+        db=int(os.getenv("REDIS_DB", "0")),
+        decode_responses=True,
+    )
+    intraday_hub = IntradayDataHub(redis_client=redis_client)
+    notification_service = RuntimeNotificationService(redis_client=redis_client)
+    mapping_dir_value = os.getenv("ENGINE_NEXT_MAPPING_STATE_DIR", "").strip()
+    mapping_directory = Path(mapping_dir_value) if mapping_dir_value else (
+        Path("/home/exedev/services/engine-next/shared/runtime_state")
+        if os.name != "nt" else Path.cwd() / "runtime_state"
+    )
+    td_query = build_readonly_td_auction_query()
+
+    def auction_loader(trade_date: str, mapping_snapshot=None):
+        return build_production_auction_facts(
+            trade_date=trade_date,
+            redis_client=redis_client,
+            td_query=td_query,
+            mapping_snapshot=mapping_snapshot,
+            data_origin="production_realtime",
+        )
+
+    def opening_loader(trade_date: str, observation_cutoff: datetime, mapping_snapshot=None):
+        auction_facts = auction_loader(trade_date, mapping_snapshot)
+        q2_result = intraday_hub.fetch_online_q2_rows(trade_date, observation_cutoff)
+        return build_open_confirmation_observation(
+            auction_evidence={
+                "market_summary": auction_facts.market_summary,
+                "data_origin": auction_facts.data_origin,
+            },
+            plate_shadow=auction_facts.plate_shadow,
+            open_q2_rows=q2_result.rows,
+            observation_cutoff=observation_cutoff,
+            data_origin="production_realtime",
+            open_q2_format="online_rows",
+        )
+
+    lifecycle = ReportingLifecycle(
+        redis_client=redis_client,
+        enabled=os.getenv("ENGINE_NEXT_REPORTING_ENABLED", "1").strip().lower() not in {"0", "false", "off"},
+    )
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=auction_loader,
+        opening_fact_loader=opening_loader,
+        notification_service=notification_service,
+        lifecycle=lifecycle,
+        mapping_directory=mapping_directory,
+        redis_client=redis_client,
+    )
+    startup_coordinator = RuntimeStartupCoordinator(
+        intraday_hub=intraday_hub,
+        market_runtime_summary_service=MarketRuntimeSummaryService(redis_client=redis_client),
+    )
+    context_builder = IntradayContextBuilder(intraday_hub=intraday_hub)
+    return EngineApp(
+        startup_coordinator=startup_coordinator,
+        intraday_context_builder=context_builder,
+        redis_client=redis_client,
+        intraday_hub=intraday_hub,
+        notification_service=notification_service,
+        production_reporting=coordinator,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the minimal engine_next stage orchestrator.")
     parser.add_argument("--now", dest="now", default=None)
@@ -2785,11 +2855,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    app = EngineApp()
+    app = _build_production_app()
 
     if args.once:
         request, symbols_file = _build_request_from_args(args)
+        request = EngineAppRequest(**{**request.__dict__, "execution_mode": "manual_audit"})
         result = app.run(request)
+        if result.should_render and result.phase == RunPhase.POSTMARKET:
+            app._notification_service.notify_if_needed(
+                result=result,
+                request=request,
+                summary_text=render_result_summary(result),
+            )
         print(render_result_summary(result))
         if symbols_file and not args.symbols and not args.symbols_file:
             print(f"symbols_file={symbols_file}")

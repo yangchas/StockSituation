@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +49,57 @@ def _number(value: Any) -> float | None:
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def build_readonly_td_auction_query() -> Callable[[str, str], Iterable[Mapping[str, Any]]]:
+    """Build the small read-only TD adapter used by production reporting.
+
+    A connection is opened only when a reporting event needs it and is closed
+    after that tag.  The adapter executes the existing snapshot query shape;
+    it does not create tables, write rows, or provide a fallback source.
+    """
+
+    def query(trade_date: str, tag: str) -> Iterable[Mapping[str, Any]]:
+        database = os.environ.get("TDENGINE_DATABASE", "market_data1")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", database):
+            raise ValueError("invalid TDENGINE_DATABASE identifier")
+        normalized_date = str(trade_date or "").replace("-", "")
+        normalized_tag = str(tag or "").strip()
+        if not re.fullmatch(r"\d{8}", normalized_date) or normalized_tag not in {"0920", "0924", "0925"}:
+            raise ValueError("invalid auction query arguments")
+        try:
+            import taos
+        except ImportError:
+            return ()
+        connection = taos.connect(
+            host=os.environ.get("TDENGINE_HOST", "127.0.0.1"),
+            user=os.environ.get("TDENGINE_USER", "root"),
+            password=os.environ.get("TDENGINE_PASSWORD", "taosdata"),
+            database=database,
+        )
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"SELECT * FROM {database}.auction_snapshot_v2 "
+                f"WHERE trade_date='{normalized_date}' AND auction_tag='{normalized_tag}' "
+                "ORDER BY ts, symbol"
+            )
+            columns = [str(item[0]) for item in (cursor.description or ())]
+            rows: list[dict[str, Any]] = []
+            while True:
+                batch = cursor.fetchmany(5000)
+                if not batch:
+                    break
+                rows.extend(dict(zip(columns, values)) for values in batch)
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            return rows
+        finally:
+            connection.close()
+
+    return query
 
 
 def _sha256(value: Any) -> str:

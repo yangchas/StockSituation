@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 from engine_next.connectors import KaipanConnector, ThsHotConnector, WencaiConnector
 from engine_next.domain.enums import FetchIntent, RunPhase
@@ -1065,6 +1066,79 @@ class IntradayDataHub:
             rows=rows,
             source="redis",
             notes=("Redis quote path is the main intraday low-latency market data source.",),
+        )
+
+    def fetch_online_q2_rows(
+        self,
+        trade_date: str,
+        observation_cutoff: datetime,
+        symbols: Iterable[str] = (),
+    ) -> IntradayFetchResult:
+        """Read the production Q2 view in one batched, time-bounded operation.
+
+        This path is intentionally separate from :meth:`fetch_redis_quotes`:
+        it never falls back to ``stock:quote`` and therefore cannot silently
+        replace the authoritative online-Q2 source with a legacy quote.
+        """
+        normalized_date = str(trade_date or "").strip()
+        if len(normalized_date) != 10:
+            raise ValueError("trade_date must be YYYY-MM-DD")
+        if observation_cutoff.tzinfo is None:
+            cutoff = observation_cutoff.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        else:
+            cutoff = observation_cutoff.astimezone(ZoneInfo("Asia/Shanghai"))
+        cutoff_ms = int(cutoff.timestamp() * 1000)
+        normalized_symbols = tuple(
+            dict.fromkeys(
+                _normalize_symbol(raw_symbol)
+                for raw_symbol in symbols
+                if _normalize_symbol(raw_symbol)
+            )
+        )
+        if not normalized_symbols:
+            active_key = f"q2:active:{normalized_date.replace('-', '')}"
+            try:
+                if hasattr(self.redis, "smembers"):
+                    normalized_symbols = tuple(
+                        dict.fromkeys(
+                            _normalize_symbol(value)
+                            for value in (self.redis.smembers(active_key) or ())
+                            if _normalize_symbol(value)
+                        )
+                    )
+                if not normalized_symbols and hasattr(self.redis, "scan_iter"):
+                    normalized_symbols = tuple(
+                        dict.fromkeys(
+                            _normalize_symbol(str(key).removeprefix(self._redis_q2_prefix))
+                            for key in self.redis.scan_iter(match=f"{self._redis_q2_prefix}*", count=512)
+                            if str(key) != active_key
+                            and _normalize_symbol(str(key).removeprefix(self._redis_q2_prefix))
+                        )
+                    )
+            except Exception:
+                normalized_symbols = ()
+        keys = [f"{self._redis_q2_prefix}{symbol}" for symbol in normalized_symbols]
+        rows: list[dict[str, Any]] = []
+        for symbol, raw_quote in zip(normalized_symbols, self._batch_hgetall(keys)):
+            if not raw_quote or not _is_q2_equity_quote(symbol, raw_quote):
+                continue
+            row = self._standardize_q2_quote(symbol, raw_quote)
+            logical_timestamp = _safe_int(row.get("timestamp", 0))
+            if logical_timestamp <= 0 or logical_timestamp > cutoff_ms:
+                continue
+            local = datetime.fromtimestamp(logical_timestamp / 1000.0, ZoneInfo("Asia/Shanghai"))
+            if local.strftime("%Y-%m-%d") != normalized_date:
+                continue
+            row["logical_timestamp"] = logical_timestamp
+            rows.append(row)
+        return IntradayFetchResult(
+            dataset="online_q2",
+            trade_date=normalized_date,
+            rows=rows,
+            source="production_online_q2",
+            notes=(
+                "Online Q2 was read from the q2 Redis view in a batch; legacy quotes and replay files are not fallbacks.",
+            ),
         )
 
     def load_runtime_cache_views(

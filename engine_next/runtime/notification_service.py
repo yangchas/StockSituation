@@ -87,6 +87,10 @@ class RuntimeNotificationService:
             return False
         if request.now.strftime("%Y-%m-%d") != str(getattr(request, "trade_date", "") or "").strip():
             return False
+        # Auction/opening mail is owned by ProductionReportingCoordinator;
+        # the generic notifier retains only the existing postmarket path.
+        if getattr(result, "phase", None) != RunPhase.POSTMARKET:
+            return False
         payload = self._build_payload(result=result, request=request, summary_text=summary_text)
         if payload is None:
             return False
@@ -102,7 +106,7 @@ class RuntimeNotificationService:
             self._remember_digest(dedupe_key=dedupe_key, digest=payload.signal_digest)
         return delivered
 
-    def notify_auction_report(self, *, report, request, category: str = "auction_evidence") -> bool:
+    def notify_auction_report(self, *, report, request, category: str = "auction_evidence", preclaimed: bool = False) -> bool:
         """Send an already-built report; the caller owns fact provenance."""
 
         if not self.enabled or not self._smtp_to or getattr(request, "historical_replay", False):
@@ -121,9 +125,9 @@ class RuntimeNotificationService:
             signal_digest=report.html_sha256,
             html_body=report.html_body,
         )
-        return self._deliver_email_once(payload=payload, trade_date=trade_date)
+        return self._send_email(payload) if preclaimed else self._deliver_email_once(payload=payload, trade_date=trade_date)
 
-    def notify_open_confirmation_report(self, *, report, request, category: str = "opening_facts") -> bool:
+    def notify_open_confirmation_report(self, *, report, request, category: str = "opening_facts", preclaimed: bool = False) -> bool:
         """Send an already-built opening-facts report through the same notifier.
 
         The notifier does not interpret facts and does not retry an ambiguous
@@ -153,7 +157,7 @@ class RuntimeNotificationService:
             signal_digest=digest,
             html_body=html_body,
         )
-        return self._deliver_email_once(payload=payload, trade_date=trade_date)
+        return self._send_email(payload) if preclaimed else self._deliver_email_once(payload=payload, trade_date=trade_date)
 
     def _deliver_email_once(self, *, payload: RuntimeNotificationPayload, trade_date: str) -> bool:
         dedupe_key = f"{self._dedupe_prefix}:{trade_date}:{payload.category}"
