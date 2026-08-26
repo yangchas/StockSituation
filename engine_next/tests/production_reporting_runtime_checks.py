@@ -91,6 +91,20 @@ def test_reporting_lifecycle_claim_is_fail_closed_without_redis():
     assert claim.status == "FAILED"
 
 
+def test_reporting_lifecycle_relabels_late_default_event_as_recovery():
+    redis = FakeRedis()
+    event = ReportingEvent(
+        "2026-08-25",
+        "auction_facts_0926",
+        datetime(2026, 8, 25, 9, 26),
+        datetime(2026, 8, 25, 9, 30),
+    )
+    claim = ReportingLifecycle(redis_client=redis).claim(event, report_digest="late")
+    assert claim.allowed is False
+    assert claim.status == "SKIP_RECOVERY"
+    assert redis.claims == {}
+
+
 def test_coordinator_owns_claim_and_passes_preclaimed_notification(tmp_path: Path):
     redis = FakeRedis()
     notifier = FakeNotifier(redis)

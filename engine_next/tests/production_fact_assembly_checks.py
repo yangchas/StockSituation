@@ -24,12 +24,18 @@ class FakeRedis:
                 "summary": '{"total_stocks":2,"valid_stock_count":2,"high_open_count":2,"low_open_count":0,"flat_open_count":0,"total_auction_amount_yuan":3000000,"limit_up_count":0,"limit_down_count":0,"observation_time":"2026-08-25T09:25:00+08:00"}'
             },
         }
+        self.strings = {
+            "market:auction:anchor:20260825": '{"000001":{"tag":"0925"},"000002":{"tag":"0925"}}',
+        }
 
     def hgetall(self, key):
         return self.hashes.get(key, {})
 
     def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
+
+    def get(self, key):
+        return self.strings.get(key)
 
 
 def _td_rows(trade_date: str, tag: str):
@@ -73,6 +79,30 @@ def test_missing_snapshot_tag_is_partial_and_does_not_fallback():
     assert facts.status == "partial"
     assert "0920" in facts.provenance["missing_tags"]
     assert facts.plate_shadow["status"] == "partial"
+
+
+def test_td_effective_universe_must_match_0925_anchor():
+    redis = FakeRedis()
+
+    def truncated(date, tag):
+        rows = _td_rows(date, tag)
+        return rows[:1] if tag == "0925" else rows
+
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=redis, td_query=truncated
+    )
+    assert facts.provenance["effective_universe_status"] == "mismatch"
+    assert facts.status == "partial"
+
+
+def test_missing_0925_anchor_does_not_claim_full_market():
+    redis = FakeRedis()
+    redis.strings.clear()
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=redis, td_query=_td_rows
+    )
+    assert facts.provenance["effective_universe_status"] == "unavailable"
+    assert facts.status == "partial"
 
 
 def test_mapping_snapshot_is_atomic_and_hash_bound(tmp_path):

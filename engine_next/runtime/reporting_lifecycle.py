@@ -63,8 +63,17 @@ class ReportingLifecycle:
         key = self._key(event)
         if event.event_name not in self.ALLOWED_EVENTS:
             return DeliveryClaim(False, "FAILED", key)
-        if not self._enabled or event.execution_mode != "normal":
-            return DeliveryClaim(False, "SKIP_" + event.execution_mode.upper(), key)
+        # Recompute the effective mode at the lifecycle boundary.  Scheduler
+        # callers may request the default ``normal`` mode, but a late/replayed
+        # event must never become send-eligible merely because its caller did
+        # not relabel it as recovery.
+        effective_mode = self.execution_mode(
+            event_name=event.event_name,
+            actual_time=event.actual_time,
+            requested_mode=event.execution_mode,
+        )
+        if not self._enabled or effective_mode != "normal":
+            return DeliveryClaim(False, "SKIP_" + effective_mode.upper(), key)
         if self._redis is None or not hasattr(self._redis, "setnx"):
             # A local-memory claim cannot survive restart and is therefore not
             # safe for production reporting.  Fail closed before SMTP.

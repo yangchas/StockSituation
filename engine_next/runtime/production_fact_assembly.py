@@ -120,6 +120,27 @@ def _hgetall(redis_client: Any, key: str) -> dict[str, Any]:
     return {str(k): v for k, v in raw.items()} if isinstance(raw, Mapping) else {}
 
 
+def _anchor_symbols(redis_client: Any, *, trade_date: str) -> set[str]:
+    """Return the symbol universe declared by the frozen 09:25 anchor.
+
+    The anchor is a Redis JSON string written by the existing production
+    auction path.  It is used only for an availability/effective-universe
+    check; no values are copied into the TD fact rows.
+    """
+    if redis_client is None or not hasattr(redis_client, "get"):
+        return set()
+    raw = redis_client.get(f"market:auction:anchor:{trade_date.replace('-', '')}")
+    payload = _json(raw)
+    if not isinstance(payload, Mapping):
+        return set()
+    return {
+        normalized
+        for value in payload.keys()
+        for normalized in (_symbol(value),)
+        if normalized
+    }
+
+
 def _load_mapping(redis_client: Any, *, key: str = "market:stock_plate") -> dict[str, str]:
     raw = _hgetall(redis_client, key)
     result: dict[str, str] = {}
@@ -238,16 +259,31 @@ def build_production_auction_facts(
     rows = [row for row in rows if row.get("symbol")]
     tags = {str(row.get("tag")) for row in rows}
     missing_tags = sorted({"0920", "0924", "0925"} - tags)
+    anchor_symbols = _anchor_symbols(redis_client, trade_date=normalized_date)
+    td_effective_symbols = {
+        str(row.get("symbol"))
+        for row in rows
+        if str(row.get("tag")) == "0925" and str(row.get("symbol"))
+    }
+    if not anchor_symbols:
+        effective_universe_status = "unavailable"
+    elif td_effective_symbols == anchor_symbols:
+        effective_universe_status = "match"
+    else:
+        effective_universe_status = "mismatch"
     provenance = {
         "market_summary_source": "redis:market:auction:0925" if summary else "unavailable",
         "snapshot_source": "tdengine:auction_snapshot_v2" if rows else "unavailable",
         "snapshot_rows": len(rows),
         "snapshot_tags": sorted(tags),
         "missing_tags": missing_tags,
-        "effective_universe_status": "candidate_pending_ground_truth",
+        "anchor_universe_count": len(anchor_symbols),
+        "td_effective_universe_count": len(td_effective_symbols),
+        "effective_universe_status": effective_universe_status,
         "historical_valid": bool(historical_valid),
     }
-    if not rows or not mapping or missing_tags:
+    universe_valid = effective_universe_status == "match"
+    if not rows or not mapping or missing_tags or not universe_valid:
         shadow = {
             "format": "PlateAuctionShadowV1",
             "contract_version": "PlateAuctionShadowV1",
@@ -275,7 +311,7 @@ def build_production_auction_facts(
             observation_time=str(summary.get("observation_time") or summary.get("ts") or "") or None,
             change_pct_unit="percent",
         )
-        status = "normal" if summary else "partial"
+        status = "normal" if summary and universe_valid else "partial"
     return ProductionAuctionFacts(
         trade_date=normalized_date,
         data_origin=data_origin,
