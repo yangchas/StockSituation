@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from engine_next.runtime.auction_email_report import resolve_auction_report_status
 from engine_next.runtime.auction_shadow import build_plate_shadow_from_snapshot_rows
 
 
@@ -228,6 +229,19 @@ class ProductionAuctionFacts:
     plate_shadow: dict[str, Any]
     status: str
     provenance: dict[str, Any]
+    market_summary_status: str = "unavailable"
+    plate_facts_status: str = "unavailable"
+    mapping_status: str = "unavailable"
+    unavailable_reasons: tuple[str, ...] = ()
+    report_status: str = "DATA_UNAVAILABLE"
+
+    @property
+    def component_statuses(self) -> dict[str, str]:
+        return {
+            "market_overview": self.market_summary_status,
+            "plate_facts": self.plate_facts_status,
+            "mapping": self.mapping_status,
+        }
 
 
 def build_production_auction_facts(
@@ -252,19 +266,28 @@ def build_production_auction_facts(
     if data_origin not in {"production_realtime", "production_capture", "current_cache_only"}:
         raise ValueError("production fact assembly rejects replay origins")
 
+    mapping_supplied = mapping_snapshot is not None
     mapping_payload = dict(mapping_snapshot or {})
-    mapping = dict(mapping_payload.get("mapping") or {}) if mapping_payload else _load_mapping(redis_client, key=mapping_key)
+    # Production reporting is deliberately bound to the runtime-owned frozen
+    # artifact.  A missing snapshot must not silently refreeze live
+    # ``market:stock_plate`` after the cutoff (or during an audit preview).
+    mapping = dict(mapping_payload.get("mapping") or {}) if mapping_supplied else {}
+    mapping_status = "available" if mapping else "unavailable"
     mapping_origin = {
         "canonical": mapping_key,
-        "status": "runtime_owned_snapshot" if mapping_snapshot else "production_realtime",
-        "trade_date": mapping_payload.get("trade_date") if mapping_payload else normalized_date,
-        "effective_time": mapping_payload.get("effective_time", "unavailable") if mapping_payload else "unavailable",
-        "sha256": mapping_payload.get("sha256") if mapping_payload else _sha256(mapping),
+        "status": "runtime_owned_snapshot" if mapping_supplied and mapping else "unavailable",
+        "trade_date": mapping_payload.get("trade_date") if mapping_supplied else normalized_date,
+        "effective_time": mapping_payload.get("effective_time", "unavailable") if mapping_supplied else "unavailable",
+        "sha256": mapping_payload.get("sha256") if mapping_supplied and mapping else None,
     }
     summary = _summary(redis_client, trade_date=normalized_date)
     rows: list[dict[str, Any]] = []
-    for tag in ("0920", "0924", "0925"):
-        rows.extend(normalize_td_auction_row(row, tag=tag) for row in td_query(normalized_date, tag))
+    # These TD rows exist solely to form mapping-dependent plate facts and the
+    # effective-universe check.  Do not spend a full-market TD read when the
+    # authoritative mapping itself is unavailable.
+    if mapping:
+        for tag in ("0920", "0924", "0925"):
+            rows.extend(normalize_td_auction_row(row, tag=tag) for row in td_query(normalized_date, tag))
     rows = [row for row in rows if row.get("symbol")]
     tags = {str(row.get("tag")) for row in rows}
     missing_tags = sorted({"0920", "0924", "0925"} - tags)
@@ -292,6 +315,18 @@ def build_production_auction_facts(
         "historical_valid": bool(historical_valid),
     }
     universe_valid = effective_universe_status == "match"
+    reasons: list[str] = []
+    if not summary:
+        reasons.append("A2 summary unavailable")
+    if not mapping:
+        reasons.append("frozen mapping unavailable")
+    if mapping and not rows:
+        reasons.append("auction snapshot rows unavailable")
+    if mapping and missing_tags:
+        reasons.append("auction snapshot anchor tag unavailable")
+    if mapping and not universe_valid:
+        reasons.append("effective auction universe mismatch or unavailable")
+
     if not rows or not mapping or missing_tags or not universe_valid:
         shadow = {
             "format": "PlateAuctionShadowV1",
@@ -321,6 +356,19 @@ def build_production_auction_facts(
             change_pct_unit="percent",
         )
         status = "normal" if summary and universe_valid else "partial"
+    market_summary_status = "available" if summary else "unavailable"
+    # A plate shadow is only authoritative when the mapping-dependent rows
+    # passed the existing completeness/universe contract.
+    plate_facts_status = "available" if rows and mapping and not missing_tags and universe_valid else "unavailable"
+    component_statuses = {
+        "market_overview": market_summary_status,
+        "plate_facts": plate_facts_status,
+        "mapping": mapping_status,
+    }
+    resolved_report_status = resolve_auction_report_status(component_statuses)
+    if resolved_report_status == "PARTIAL" and not reasons:
+        reasons.append("one factual component unavailable")
+    status = {"COMPLETE": "normal", "PARTIAL": "partial", "DATA_UNAVAILABLE": "unavailable"}[resolved_report_status]
     return ProductionAuctionFacts(
         trade_date=normalized_date,
         data_origin=data_origin,
@@ -331,6 +379,11 @@ def build_production_auction_facts(
         plate_shadow=shadow,
         status=status,
         provenance=provenance,
+        market_summary_status=market_summary_status,
+        plate_facts_status=plate_facts_status,
+        mapping_status=mapping_status,
+        unavailable_reasons=tuple(reasons),
+        report_status=resolved_report_status,
     )
 
 
@@ -343,6 +396,13 @@ def report_inputs(bundle: ProductionAuctionFacts) -> dict[str, Any]:
         "plate_shadow": bundle.plate_shadow,
         "mapping_origin": bundle.mapping_origin,
         "status": bundle.status,
+        "report_status": bundle.report_status,
+        "component_statuses": {
+            "market_overview": bundle.market_summary_status,
+            "plate_facts": bundle.plate_facts_status,
+            "mapping": bundle.mapping_status,
+        },
+        "unavailable_reasons": list(bundle.unavailable_reasons),
         "provenance": bundle.provenance,
     }
 

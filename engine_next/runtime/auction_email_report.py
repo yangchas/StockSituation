@@ -57,6 +57,11 @@ def _number(value: Any) -> float | None:
     return result if result == result and result not in {float("inf"), float("-inf")} else None
 
 
+def _int_or_none(value: Any) -> int | None:
+    number = _number(value)
+    return int(number) if number is not None else None
+
+
 def _origin(value: Any) -> str:
     text = str(value or "").strip()
     if text in ALLOWED_DATA_ORIGINS:
@@ -131,6 +136,28 @@ def _report_settings() -> dict[str, Any]:
     }
 
 
+def resolve_auction_report_status(
+    component_statuses: Mapping[str, Any] | None = None,
+    **status_kwargs: Any,
+) -> str:
+    """Resolve Auction report availability from factual component statuses.
+
+    ``mapping`` is provenance/readiness metadata, not an independent factual
+    domain.  A2 market facts therefore remain reportable when only the frozen
+    mapping is unavailable; plate facts are the component that degrades.
+    """
+    statuses = dict(component_statuses or {})
+    statuses.update(status_kwargs)
+    market_status = str(statuses.get("market_overview", statuses.get("market_overview_status")) or "unavailable").lower()
+    plate_status = str(statuses.get("plate_facts", statuses.get("plate_facts_status")) or "unavailable").lower()
+    factual = (market_status, plate_status)
+    if all(status == "available" for status in factual):
+        return "COMPLETE"
+    if any(status in {"available", "partial"} for status in factual):
+        return "PARTIAL"
+    return "DATA_UNAVAILABLE"
+
+
 def _market_summary_from_payload(payload: Mapping[str, Any], trade_date: str) -> dict[str, Any] | None:
     """Read an explicitly supplied A2 summary; never infer one from plate rows."""
     date_tag = trade_date.replace("-", "")
@@ -145,11 +172,25 @@ def _market_summary_from_payload(payload: Mapping[str, Any], trade_date: str) ->
         if direct.get("format") == "AuctionMarketSummaryV1":
             row = _mapping(_mapping(direct.get("anchors")).get("0925"))
             if row:
-                return {**row, "status": "available", "source": "a2_0925_summary", "source_table": direct.get("source_table") or "unavailable", "observation_time": direct.get("observation_time") or "unavailable"}
+                return {
+                    **row,
+                    "auction_amount_yuan": row.get("auction_amount_yuan", row.get("total_auction_amount_yuan")),
+                    "limit_up_seal_amount_yuan": row.get("limit_up_seal_amount_yuan", row.get("total_limit_up_bid_amount_yuan")),
+                    "status": "available", "source": "a2_0925_summary",
+                    "source_table": direct.get("source_table") or "unavailable",
+                    "observation_time": direct.get("observation_time") or "unavailable",
+                }
     if payload.get("format") == "AuctionMarketSummaryV1":
         row = _mapping(_mapping(payload.get("anchors")).get("0925"))
         if row:
-            return {**row, "status": "available", "source": "a2_0925_summary", "source_table": payload.get("source_table") or "unavailable", "observation_time": payload.get("observation_time") or "unavailable"}
+            return {
+                **row,
+                "auction_amount_yuan": row.get("auction_amount_yuan", row.get("total_auction_amount_yuan")),
+                "limit_up_seal_amount_yuan": row.get("limit_up_seal_amount_yuan", row.get("total_limit_up_bid_amount_yuan")),
+                "status": "available", "source": "a2_0925_summary",
+                "source_table": payload.get("source_table") or "unavailable",
+                "observation_time": payload.get("observation_time") or "unavailable",
+            }
     facts = payload.get("facts")
     if isinstance(facts, list):
         for item in facts:
@@ -236,7 +277,10 @@ def _plate_rows(shadow: Mapping[str, Any]) -> list[dict[str, Any]]:
             "pressure_yuan": pressure if pressure_status != "unavailable" else None, "pressure_status": pressure_status,
             "withdrawal_yuan": _number(stats.get("withdrawal_yuan")) if pressure_status != "unavailable" else None,
             "withdrawal_status": pressure_status,
-            "limit_up_count": int(stats.get("limit_up_count") or 0), "limit_down_count": int(stats.get("limit_down_count") or 0),
+            # ``None`` means the source did not provide the fact.  Preserve it
+            # so the renderer cannot turn unknown limit counts into a factual
+            # zero; explicit numeric zero remains zero.
+            "limit_up_count": _int_or_none(stats.get("limit_up_count")), "limit_down_count": _int_or_none(stats.get("limit_down_count")),
             "limit_up_seal_amount_yuan": _number(stats.get("limit_up_seal_amount_yuan")),
             "limit_down_sell_pressure_yuan": _number(stats.get("limit_down_sell_pressure_yuan")),
             "multi_theme_conflict_count": int(stats.get("multi_theme_conflict_count") or 0),
@@ -257,28 +301,45 @@ def _locked_order_rows(shadow: Mapping[str, Any]) -> list[dict[str, Any]]:
     locked = _mapping(_mapping(shadow.get("automatic_analysis")).get("auction_locked_orders"))
     rows: list[dict[str, Any]] = []
     for direction in ("limit_up", "limit_down"):
-        for raw in _rows(locked.get(direction)):
+        source_rows = locked.get(direction)
+        for raw in _rows(source_rows):
             row = _mapping(raw)
             rows.append({
                 "direction": direction, "symbol": str(row.get("symbol") or "unavailable"),
                 "name": str(row.get("name") or "").strip(), "plate": str(row.get("plate") or "unavailable"),
-                "change_pct": _number(row.get("change_pct")), "seal_amount_yuan": _number(row.get("anchor_locked_amount_yuan")) or 0.0,
+                "change_pct": _number(row.get("change_pct")), "seal_amount_yuan": _number(row.get("anchor_locked_amount_yuan")),
                 "status": str(row.get("status") or "unavailable"),
             })
-    rows.sort(key=lambda row: (-row["seal_amount_yuan"], row["direction"], row["symbol"]))
+    rows.sort(key=lambda row: (row.get("seal_amount_yuan") is None, -(row.get("seal_amount_yuan") or 0.0), row["direction"], row["symbol"]))
     return rows
 
 
-def _locked_summary(rows: list[Mapping[str, Any]], overview: Mapping[str, Any]) -> dict[str, Any]:
+def _locked_summary(
+    rows: list[Mapping[str, Any]],
+    overview: Mapping[str, Any],
+    source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep missing locked-order facts distinct from explicit zero values."""
+    source = source or {}
     up = [row for row in rows if row.get("direction") == "limit_up"]
     down = [row for row in rows if row.get("direction") == "limit_down"]
-    total = sum(float(row.get("seal_amount_yuan") or 0.0) for row in up)
+    up_source_present = "limit_up" in source and isinstance(source.get("limit_up"), list)
+    down_source_present = "limit_down" in source and isinstance(source.get("limit_down"), list)
+    known_up_amounts = [float(row["seal_amount_yuan"]) for row in up if _number(row.get("seal_amount_yuan")) is not None]
+    amounts_complete = up_source_present and len(known_up_amounts) == len(up)
+    total = sum(known_up_amounts) if amounts_complete else None
+    overview_up_count = overview.get("limit_up_count")
+    overview_down_count = overview.get("limit_down_count")
+    overview_total = overview.get("limit_up_seal_amount_yuan")
+    up_count = overview_up_count if overview_up_count is not None else (len(up) if up_source_present else None)
+    down_count = overview_down_count if overview_down_count is not None else (len(down) if down_source_present else None)
+    seal_total = overview_total if overview_total is not None else total
     return {
-        "limit_up_count": overview.get("limit_up_count") if overview.get("limit_up_count") is not None else len(up),
-        "limit_down_count": overview.get("limit_down_count") if overview.get("limit_down_count") is not None else len(down),
-        "limit_up_seal_amount_yuan": overview.get("limit_up_seal_amount_yuan") if overview.get("limit_up_seal_amount_yuan") is not None else total,
-        "top1_ratio": float(up[0].get("seal_amount_yuan") or 0.0) / total if up and total > 0 else None,
-        "top3_ratio": sum(float(row.get("seal_amount_yuan") or 0.0) for row in up[:3]) / total if total > 0 else None,
+        "limit_up_count": up_count,
+        "limit_down_count": down_count,
+        "limit_up_seal_amount_yuan": seal_total,
+        "top1_ratio": known_up_amounts[0] / total if amounts_complete and known_up_amounts and total and total > 0 else None,
+        "top3_ratio": sum(known_up_amounts[:3]) / total if amounts_complete and known_up_amounts and total and total > 0 else None,
     }
 
 
@@ -469,12 +530,25 @@ def _render_html(template: str, report: Mapping[str, Any]) -> str:
             appendix.append(_appendix_html_rows(name, rows))
     replacements = {
         "{{SUBJECT}}": html.escape(report["subject"]), "{{TRADE_DATE}}": html.escape(report["trade_date"]), "{{DATA_ORIGIN}}": html.escape(report["data_origin"]),
+        "{{REPORT_STATUS_LINE}}": html.escape(
+            "" if report.get("report_status") == "COMPLETE" else (
+                f"报告状态={report.get('report_status', 'DATA_UNAVAILABLE')} · "
+                f"事实域：market={report.get('component_statuses', {}).get('market_overview', 'unavailable')} · "
+                f"plate={report.get('component_statuses', {}).get('plate_facts', 'unavailable')} · "
+                f"mapping={report.get('component_statuses', {}).get('mapping', 'unavailable')} · "
+                f"不可用原因={'；'.join(str(item) for item in report.get('unavailable_reasons', [])) or '无'}"
+            )
+        ),
         "{{MARKET_STATUS}}": html.escape(str(overview.get("status", "unavailable"))), "{{MARKET_SOURCE}}": html.escape(str(overview.get("source", "unavailable"))), "{{MARKET_OBSERVATION_TIME}}": html.escape(str(overview.get("observation_time", "unavailable"))),
+        "{{MARKET_FACT_STATUS}}": html.escape(str(report.get("component_statuses", {}).get("market_overview", "unavailable"))),
+        "{{PLATE_FACT_STATUS}}": html.escape(str(report.get("component_statuses", {}).get("plate_facts", "unavailable"))),
+        "{{MAPPING_STATUS}}": html.escape(str(report.get("component_statuses", {}).get("mapping", "unavailable"))),
+        "{{UNAVAILABLE_REASONS}}": html.escape("；".join(str(item) for item in report.get("unavailable_reasons", [])) or "无"),
         "{{MARKET_STOCK_COUNT}}": html.escape(_display(overview.get("stock_count"))), "{{MARKET_VALID_COUNT}}": html.escape(_valid_price_display(overview)),
         "{{MARKET_RISE_FALL_FLAT}}": html.escape(f"{_display(overview.get('positive_count'))} / {_display(overview.get('negative_count'))} / {_display(overview.get('flat_count'))}"), "{{MARKET_AMOUNT}}": _money_yi(overview.get("auction_amount_yuan")),
         "{{MARKET_LIMITS}}": html.escape(f"{_display(overview.get('limit_up_count'))} / {_display(overview.get('limit_down_count'))}"), "{{MARKET_SEAL}}": _money_yi(overview.get("limit_up_seal_amount_yuan")),
         "{{CORE_OBSERVATIONS}}": "".join(f"<li>{html.escape(item['text'])}</li>" for item in report.get("core_observations", report["observations"][:CORE_OBSERVATION_LIMIT])) or "<li>unavailable</li>",
-        "{{PLATE_ROWS}}": "".join(plate_rows) or "<tr><td colspan='13'>unavailable</td></tr>", "{{LOCKED_COUNTS}}": html.escape(f"{locked.get('limit_up_count', 'unavailable')} / {locked.get('limit_down_count', 'unavailable')}"),
+        "{{PLATE_ROWS}}": "".join(plate_rows) or "<tr><td colspan='13'>unavailable</td></tr>", "{{LOCKED_COUNTS}}": html.escape(f"{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}"),
         "{{LOCKED_TOTAL}}": _money_yi(locked.get("limit_up_seal_amount_yuan")), "{{LOCKED_TOP}}": html.escape(f"Top1 {_ratio(locked.get('top1_ratio'))} · Top3 {_ratio(locked.get('top3_ratio'))}"),
         "{{LOCKED_ROWS}}": "".join(locked_rows) or "<tr><td colspan='5'>unavailable</td></tr>", "{{ANCHOR_STATUS}}": html.escape(str(report["anchor_changes"].get("status", "unavailable"))),
         "{{ANCHOR_ROWS}}": "".join(f"<li>{html.escape(str(row))}</li>" for row in report["anchor_changes"].get("rows", [])) or "<li>unavailable</li>", "{{APPENDIX}}": "".join(appendix) or "<p>unavailable</p>",
@@ -488,13 +562,18 @@ def _render_html(template: str, report: Mapping[str, Any]) -> str:
 
 def _render_text(report: Mapping[str, Any]) -> str:
     overview, locked = report["market_overview"], report["locked_summary"]
-    lines = [f"# {report['subject']}", f"数据状态：{_display(overview.get('status'))}；来源：{_display(overview.get('source'))}；观察时间：{_display(overview.get('observation_time'))}", "", "## 09:25市场概览", f"- 有效价格股票：{_valid_price_display(overview)}", f"- 上涨/下跌/平盘：{_display(overview.get('positive_count'))} / {_display(overview.get('negative_count'))} / {_display(overview.get('flat_count'))}", f"- 总预撮合金额：{_money_yi(overview.get('auction_amount_yuan'))}", f"- 涨停/跌停：{_display(overview.get('limit_up_count'))} / {_display(overview.get('limit_down_count'))}", f"- 涨停封单：{_money_yi(overview.get('limit_up_seal_amount_yuan'))}", "", "## 核心事实观察"]
+    statuses = report.get("component_statuses", {})
+    reasons = "；".join(str(item) for item in report.get("unavailable_reasons", [])) or "无"
+    lines = [f"# {report['subject']}", f"数据状态：{_display(overview.get('status'))}；来源：{_display(overview.get('source'))}；观察时间：{_display(overview.get('observation_time'))}"]
+    if report.get("report_status") != "COMPLETE":
+        lines.extend([f"报告状态：{report.get('report_status', 'DATA_UNAVAILABLE')}", f"事实域：市场概览={statuses.get('market_overview', 'unavailable')}；板块聚合={statuses.get('plate_facts', 'unavailable')}；当日映射={statuses.get('mapping', 'unavailable')}", f"不可用原因：{reasons}"])
+    lines.extend(["", "## 09:25市场概览", f"- 有效价格股票：{_valid_price_display(overview)}", f"- 上涨/下跌/平盘：{_display(overview.get('positive_count'))} / {_display(overview.get('negative_count'))} / {_display(overview.get('flat_count'))}", f"- 总预撮合金额：{_money_yi(overview.get('auction_amount_yuan'))}", f"- 涨停/跌停：{_display(overview.get('limit_up_count'))} / {_display(overview.get('limit_down_count'))}", f"- 涨停封单：{_money_yi(overview.get('limit_up_seal_amount_yuan'))}", "", "## 核心事实观察"])
     lines.extend(f"- {item['text']}" for item in report.get("core_observations", report["observations"][:CORE_OBSERVATION_LIMIT]))
     lines.extend(["", "## 重点板块事实Top10", "", "|板块|有效|涨/跌/平|上涨覆盖|下跌覆盖|中位涨幅|金额|Top1|Top3|pressure|withdrawal|Top3贡献|", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"])
     for row in report["plate_rows"][:MAIN_PLATE_LIMIT]:
         contributors = ", ".join(f"{item['symbol']} {_ratio(item['amount_share'])}" for item in row["contributors"]) or "unavailable"
         lines.append(f"|{row['plate']}|{row['valid_price_count']}|{row['up_count']}/{row['down_count']}/{row['flat_count']}|{_ratio(row['positive_ratio'])}|{_ratio(row['negative_ratio'])}|{_pct(row['median_change_pct'])}|{_money_yi(row['auction_amount_yuan'])}|{_ratio(row['top1_amount_ratio'])}|{_ratio(row['top3_amount_ratio'])}|{_money_yi(row['pressure_yuan']) if row['pressure_yuan'] is not None else 'unavailable'}|{_money_yi(row['withdrawal_yuan']) if row['withdrawal_yuan'] is not None else 'unavailable'}|{contributors}|")
-    lines.extend(["", "## 涨跌停封单", f"- 涨停/跌停：{locked.get('limit_up_count', 'unavailable')} / {locked.get('limit_down_count', 'unavailable')}", f"- 涨停封单总额：{_money_yi(locked.get('limit_up_seal_amount_yuan'))}；Top1/Top3：{_ratio(locked.get('top1_ratio'))} / {_ratio(locked.get('top3_ratio'))}", "", "## 三锚点变化", f"- 状态：{report['anchor_changes'].get('status', 'unavailable')}"])
+    lines.extend(["", "## 涨跌停封单", f"- 涨停/跌停：{_display(locked.get('limit_up_count'))} / {_display(locked.get('limit_down_count'))}", f"- 涨停封单总额：{_money_yi(locked.get('limit_up_seal_amount_yuan'))}；Top1/Top3：{_ratio(locked.get('top1_ratio'))} / {_ratio(locked.get('top3_ratio'))}", "", "## 三锚点变化", f"- 状态：{report['anchor_changes'].get('status', 'unavailable')}"])
     lines.extend(f"- {row}" for row in report["anchor_changes"].get("rows", []))
     lines.extend(["", "## 附录：其他客观排序", ""])
     for name, rows in report["appendix"].items():
@@ -506,7 +585,7 @@ def _render_text(report: Mapping[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evidence: Mapping[str, Any] | None = None, market_context: Mapping[str, Any] | None = None, open_confirmation: Mapping[str, Any] | None = None, template_path: Path = DEFAULT_TEMPLATE) -> AuctionEmailReport:
+def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evidence: Mapping[str, Any] | None = None, market_context: Mapping[str, Any] | None = None, open_confirmation: Mapping[str, Any] | None = None, component_statuses: Mapping[str, Any] | None = None, unavailable_reasons: list[str] | tuple[str, ...] | None = None, report_status: str | None = None, template_path: Path = DEFAULT_TEMPLATE) -> AuctionEmailReport:
     shadow = _mapping(plate_shadow)
     if shadow.get("format") != "PlateAuctionShadowV1":
         raise ValueError("auction email requires PlateAuctionShadowV1")
@@ -516,8 +595,19 @@ def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evide
     data_origin = _origin(shadow.get("data_origin"))
     evidence, context = _mapping(auction_evidence), _mapping(market_context)
     overview = _market_overview(shadow, evidence, context, trade_date)
-    plate_rows, locked_rows = _plate_rows(shadow), _locked_order_rows(shadow)
-    locked, anchor_changes = _locked_summary(locked_rows, overview), _anchor_changes(evidence)
+    supplied_statuses = _mapping(component_statuses) or _mapping(context.get("component_statuses")) or _mapping(evidence.get("component_statuses"))
+    resolved_component_statuses = {
+        "market_overview": str(supplied_statuses.get("market_overview") or ("available" if overview.get("status") == "available" else "unavailable")),
+        "plate_facts": str(supplied_statuses.get("plate_facts") or ("available" if _plate_rows(shadow) else "unavailable")),
+        "mapping": str(supplied_statuses.get("mapping") or ("unavailable" if str(_mapping(shadow.get("mapping_origin")).get("status")) == "unavailable" else "available")),
+    }
+    raw_plate_rows = _plate_rows(shadow)
+    plate_rows = raw_plate_rows if resolved_component_statuses["plate_facts"] in {"available", "partial"} else []
+    locked_rows = _locked_order_rows(shadow)
+    locked_source = _mapping(_mapping(shadow.get("automatic_analysis")).get("auction_locked_orders"))
+    locked, anchor_changes = _locked_summary(locked_rows, overview, locked_source), _anchor_changes(evidence)
+    resolved_status = str(report_status or context.get("report_status") or evidence.get("report_status") or resolve_auction_report_status(resolved_component_statuses))
+    reasons = list(unavailable_reasons or context.get("unavailable_reasons") or evidence.get("unavailable_reasons") or [])
     context_summary = _market_context_summary(context, trade_date)
     capture_time = shadow.get("capture_time") or context_summary.get("capture_time")
     observations = _core_observations(plate_rows, overview, locked)
@@ -531,6 +621,13 @@ def build_auction_email_report(*, plate_shadow: Mapping[str, Any], auction_evide
     report: dict[str, Any] = {
         "format": "AuctionEmailReportV1", "report_id": f"auction-market-facts:{trade_date}:0925", "subject": f"【竞价市场事实观察】{trade_date} 09:25", "trade_date": trade_date, "data_origin": data_origin,
         "capture_time": capture_time,
+        "report_status": resolved_status,
+        "fact_status": {"COMPLETE": "available", "PARTIAL": "partial", "DATA_UNAVAILABLE": "unavailable", "FAILED": "failed"}.get(resolved_status, "unavailable"),
+        "component_statuses": resolved_component_statuses,
+        "market_overview_status": resolved_component_statuses["market_overview"],
+        "plate_facts_status": resolved_component_statuses["plate_facts"],
+        "mapping_status": resolved_component_statuses["mapping"],
+        "unavailable_reasons": reasons,
         "market_overview": overview, "plate_rows": plate_rows, "locked_order_rows": locked_rows, "locked_summary": locked,
         "observations": observations, "core_observations": observations[:CORE_OBSERVATION_LIMIT], "appendix": _appendix(plate_rows), "anchor_changes": anchor_changes,
         "market_context": context_summary, "open_confirmation": _mapping(open_confirmation) or {"status": "unavailable"},

@@ -251,18 +251,30 @@ class ProductionReportingCoordinator:
         )
 
     def _build_auction_for_event(self, event: ReportingEvent, mapping: Mapping[str, Any] | None) -> tuple[AuctionEmailReport, str]:
-        if self._mapping_directory is not None and mapping is None:
-            return self.build_unavailable_auction(trade_date=event.trade_date), "DATA_UNAVAILABLE"
+        # Mapping is authoritative only for plate facts.  The loader still
+        # gets one chance to assemble an independent A2 market overview when
+        # the frozen snapshot is unavailable; it must not refreeze live Redis
+        # mapping after the cutoff.
         bundle = self._call_loader(self._auction_fact_loader, event.trade_date, mapping)
         if bundle is None:
             return self.build_unavailable_auction(trade_date=event.trade_date), "DATA_UNAVAILABLE"
+        market_summary = getattr(bundle, "market_summary", None) or {}
+        component_statuses = getattr(bundle, "component_statuses", None) or {
+            "market_overview": getattr(bundle, "market_summary_status", None) or ("available" if market_summary.get("status") == "available" else "unavailable"),
+            "plate_facts": getattr(bundle, "plate_facts_status", None) or ("available" if getattr(bundle, "status", "") == "normal" else "unavailable"),
+            "mapping": getattr(bundle, "mapping_status", None) or ("available" if mapping else "unavailable"),
+        }
+        reasons = list(getattr(bundle, "unavailable_reasons", ()) or ())
+        bundle_status = str(getattr(bundle, "status", "") or "")
+        resolved_status = str(getattr(bundle, "report_status", "") or {
+            "normal": "COMPLETE", "partial": "PARTIAL", "unavailable": "DATA_UNAVAILABLE",
+        }.get(bundle_status, "DATA_UNAVAILABLE"))
         report = build_auction_email_report(
             plate_shadow=bundle.plate_shadow,
-            auction_evidence={"market_summary": bundle.market_summary, "data_origin": bundle.data_origin},
-            market_context={"data_origin": bundle.data_origin, "trade_date": event.trade_date, "mapping_origin": bundle.mapping_origin},
+            auction_evidence={"market_summary": market_summary, "data_origin": bundle.data_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons, "report_status": resolved_status},
+            market_context={"data_origin": bundle.data_origin, "trade_date": event.trade_date, "mapping_origin": bundle.mapping_origin, "component_statuses": component_statuses, "unavailable_reasons": reasons, "report_status": resolved_status},
         )
-        status = "COMPLETE" if getattr(bundle, "status", "") == "normal" else "PARTIAL"
-        return report, status
+        return report, resolved_status
 
     @staticmethod
     def _unavailable_shadow(*, trade_date: str) -> dict[str, Any]:
@@ -367,12 +379,14 @@ class ProductionReportingCoordinator:
 
     def handle(self, event: ReportingEvent, *, request: Any | None = None) -> ReportingOutcome:
         """唯一 production reporting entry for auction/open events."""
-        mapping = self._mapping_for_event(event)
-        mapping_sha = str(mapping.get("sha256")) if mapping else None
         if request is None:
             request = SimpleNamespace(trade_date=event.trade_date, now=event.actual_time, historical_replay=False)
         key = f"{event.trade_date}:{event.event_name}"
+        mapping = None
+        mapping_sha = None
         try:
+            mapping = self._mapping_for_event(event)
+            mapping_sha = str(mapping.get("sha256")) if mapping else None
             if event.event_name == "auction_facts_0926":
                 report, report_status = self._build_auction_for_event(event, mapping)
                 notify = self._notification_service.notify_auction_report if self._notification_service else None
