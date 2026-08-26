@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
-from engine_next.runtime.production_fact_assembly import write_mapping_snapshot
+from engine_next.runtime.production_fact_assembly import load_mapping_snapshot, write_mapping_snapshot
 from engine_next.runtime.production_reporting import ProductionReportingCoordinator
 from engine_next.runtime.reporting_lifecycle import ReportingEvent, ReportingLifecycle
 from engine_next.domain.enums import RunPhase
@@ -84,6 +87,194 @@ def _shadow():
     }
 
 
+def _ready_mapping(tmp_path: Path, trade_date: str = "2026-08-25") -> dict:
+    mapping = {f"{index:06d}": "AI" for index in range(1, 1001)}
+    write_mapping_snapshot(
+        mapping=mapping,
+        trade_date=trade_date,
+        effective_time="09:10:00",
+        source="market:stock_plate",
+        directory=tmp_path,
+    )
+    return mapping
+
+
+def _bundle():
+    return SimpleNamespace(
+        plate_shadow=_shadow(),
+        market_summary={"source": "a2_0925_summary", "status": "available", "trade_date": "2026-08-25", "positive_count": 1},
+        data_origin="production_realtime",
+        mapping_origin={"canonical": "market:stock_plate"},
+        status="normal",
+    )
+
+
+class MappingRedis:
+    def __init__(self, count: int):
+        self.mapping = {f"{index:06d}": "AI" for index in range(1, count + 1)}
+
+    def hgetall(self, key):
+        return self.mapping if key == "market:stock_plate" else {}
+
+
+class RaisingNotifier(FakeNotifier):
+    def notify_auction_report(self, **kwargs):
+        self.sent.append(("auction", kwargs.get("preclaimed")))
+        raise RuntimeError("notification failure")
+
+
+def _auction_event(actual_time: datetime | None = None) -> ReportingEvent:
+    actual = actual_time or datetime(2026, 8, 25, 9, 26, 1)
+    return ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), actual)
+
+
+def test_mapping_below_readiness_does_not_freeze(tmp_path: Path):
+    redis = MappingRedis(999)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: None,
+        redis_client=redis,
+        mapping_directory=tmp_path,
+    )
+    assert coordinator.prepare_mapping(trade_date="2026-08-25", now=datetime(2026, 8, 25, 9, 10)) is None
+    assert not (tmp_path / "2026-08-25" / "stock_plate_snapshot.json").exists()
+
+
+def test_mapping_at_readiness_freezes_and_restart_reuses_sha(tmp_path: Path):
+    redis = MappingRedis(1000)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: None,
+        redis_client=redis,
+        mapping_directory=tmp_path,
+    )
+    first = coordinator.prepare_mapping(trade_date="2026-08-25", now=datetime(2026, 8, 25, 9, 10))
+    assert first is not None and first["record_count"] == 1000
+    restarted = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: None,
+        redis_client=MappingRedis(2000),
+        mapping_directory=tmp_path,
+    )
+    second = restarted.prepare_mapping(trade_date="2026-08-25", now=datetime(2026, 8, 25, 9, 11))
+    assert second["sha256"] == first["sha256"]
+    assert load_mapping_snapshot(directory=tmp_path, trade_date="2026-08-25", minimum_record_count=1000)["sha256"] == first["sha256"]
+
+
+@pytest.mark.parametrize("mutation", ["trade_date", "sha256", "record_count"])
+def test_existing_invalid_mapping_snapshot_fails_closed_without_refreeze(tmp_path: Path, mutation: str):
+    _ready_mapping(tmp_path)
+    path = tmp_path / "2026-08-25" / "stock_plate_snapshot.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "trade_date":
+        payload["trade_date"] = "2026-08-24"
+    elif mutation == "sha256":
+        payload["sha256"] = "invalid"
+    else:
+        payload["record_count"] = 999
+    path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: None,
+        redis_client=MappingRedis(2000),
+        mapping_directory=tmp_path,
+    )
+    assert coordinator.prepare_mapping(trade_date="2026-08-25", now=datetime(2026, 8, 25, 9, 10)) is None
+    assert json.loads(path.read_text(encoding="utf-8"))["trade_date"] == payload["trade_date"]
+
+
+def test_existing_mapping_below_readiness_fails_closed_without_refreeze(tmp_path: Path):
+    write_mapping_snapshot(
+        mapping={f"{index:06d}": "AI" for index in range(1, 1000)},
+        trade_date="2026-08-25",
+        effective_time="09:10:00",
+        source="market:stock_plate",
+        directory=tmp_path,
+    )
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: None,
+        redis_client=MappingRedis(2000),
+        mapping_directory=tmp_path,
+    )
+    assert coordinator.prepare_mapping(trade_date="2026-08-25", now=datetime(2026, 8, 25, 9, 10)) is None
+
+
+def test_auction_loader_exception_is_failed_before_claim_or_notification():
+    redis = FakeRedis()
+    notifier = FakeNotifier(redis)
+    calls = []
+
+    def boom(trade_date):
+        calls.append(trade_date)
+        raise RuntimeError("auction loader failure")
+
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=boom,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert outcome.report_status == "FAILED"
+    assert outcome.delivery_status == "NOT_ATTEMPTED"
+    assert outcome.fact_status == "failed"
+    assert calls == ["2026-08-25"]
+    assert redis.claims == {}
+    assert notifier.sent == []
+
+
+def test_opening_loader_exception_is_failed_before_claim_or_notification(tmp_path: Path):
+    redis = FakeRedis()
+    notifier = FakeNotifier(redis)
+    _ready_mapping(tmp_path)
+
+    def boom(*args):
+        raise RuntimeError("opening loader failure")
+
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: _bundle(),
+        opening_fact_loader=boom,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+        mapping_directory=tmp_path,
+    )
+    event = ReportingEvent("2026-08-25", "opening_facts_0932", datetime(2026, 8, 25, 9, 32, 10), datetime(2026, 8, 25, 9, 32, 11))
+    outcome = coordinator.handle(event)
+    assert outcome.report_status == "FAILED"
+    assert outcome.delivery_status == "NOT_ATTEMPTED"
+    assert redis.claims == {}
+    assert notifier.sent == []
+
+
+def test_loader_internal_typeerror_is_not_retried():
+    redis = FakeRedis()
+    notifier = FakeNotifier(redis)
+    calls = []
+
+    def boom(trade_date, mapping=None):
+        calls.append((trade_date, mapping))
+        raise TypeError("argument conversion failed")
+
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=boom,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert outcome.report_status == "FAILED"
+    assert calls == [("2026-08-25", None)]
+    assert redis.claims == {}
+
+
+def test_notification_exception_keeps_claim_and_is_not_retried():
+    redis = FakeRedis()
+    notifier = RaisingNotifier(redis)
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda _: _bundle(),
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert outcome.report_status == "COMPLETE"
+    assert outcome.delivery_status == "FAILED"
+    assert outcome.notification_status == "FAILED"
+    assert notifier.sent == [("auction", True)]
+    assert redis.claims["2026-08-25:auction_facts_0926"] == "FAILED"
 def test_reporting_lifecycle_claim_is_fail_closed_without_redis():
     event = ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), datetime(2026, 8, 25, 9, 26, 1))
     claim = ReportingLifecycle(redis_client=None).claim(event, report_digest="x")
@@ -108,14 +299,8 @@ def test_reporting_lifecycle_relabels_late_default_event_as_recovery():
 def test_coordinator_owns_claim_and_passes_preclaimed_notification(tmp_path: Path):
     redis = FakeRedis()
     notifier = FakeNotifier(redis)
-    write_mapping_snapshot(mapping={"000001": "AI"}, trade_date="2026-08-25", effective_time="09:10:00", source="market:stock_plate", directory=tmp_path)
-    bundle = SimpleNamespace(
-        plate_shadow=_shadow(),
-        market_summary={"source": "a2_0925_summary", "status": "available", "trade_date": "2026-08-25", "positive_count": 1},
-        data_origin="production_realtime",
-        mapping_origin={"canonical": "market:stock_plate"},
-        status="normal",
-    )
+    _ready_mapping(tmp_path)
+    bundle = _bundle()
     coordinator = ProductionReportingCoordinator(
         auction_fact_loader=lambda trade_date, mapping=None: bundle,
         notification_service=notifier,
@@ -186,14 +371,8 @@ def test_disabled_notification_does_not_consume_dedup_claim(tmp_path: Path):
     redis = FakeRedis()
     notifier = FakeNotifier(redis)
     notifier.enabled = False
-    write_mapping_snapshot(mapping={"000001": "AI"}, trade_date="2026-08-25", effective_time="09:10:00", source="market:stock_plate", directory=tmp_path)
-    bundle = SimpleNamespace(
-        plate_shadow=_shadow(),
-        market_summary={"source": "a2_0925_summary", "status": "available", "trade_date": "2026-08-25"},
-        data_origin="production_realtime",
-        mapping_origin={"canonical": "market:stock_plate"},
-        status="normal",
-    )
+    _ready_mapping(tmp_path)
+    bundle = _bundle()
     coordinator = ProductionReportingCoordinator(
         auction_fact_loader=lambda trade_date, mapping=None: bundle,
         notification_service=notifier,
