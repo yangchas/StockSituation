@@ -20,6 +20,15 @@ from typing import Any, Callable, Iterable, Mapping
 from engine_next.runtime.auction_shadow import build_plate_shadow_from_snapshot_rows
 
 
+class MappingNotReadyError(RuntimeError):
+    """Raised when the canonical mapping is readable but below readiness."""
+
+    def __init__(self, actual_record_count: int, required_min_count: int) -> None:
+        self.actual_record_count = int(actual_record_count)
+        self.required_min_count = int(required_min_count)
+        super().__init__(f"mapping_ready=false: {self.actual_record_count} < {self.required_min_count}")
+
+
 def _json(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("utf-8", errors="replace")
@@ -366,7 +375,12 @@ def write_mapping_snapshot(
     return target
 
 
-def load_mapping_snapshot(*, directory: Path, trade_date: str) -> dict[str, Any] | None:
+def load_mapping_snapshot(
+    *,
+    directory: Path,
+    trade_date: str,
+    minimum_record_count: int = 0,
+) -> dict[str, Any] | None:
     """Load and verify the runtime-owned snapshot for exactly ``trade_date``."""
     target = directory / str(trade_date) / "stock_plate_snapshot.json"
     if not target.exists():
@@ -377,6 +391,10 @@ def load_mapping_snapshot(*, directory: Path, trade_date: str) -> dict[str, Any]
     mapping = payload.get("mapping")
     if not isinstance(mapping, Mapping) or payload.get("sha256") != _sha256(mapping):
         raise ValueError("mapping snapshot sha256 mismatch")
+    if int(payload.get("record_count") or 0) != len(mapping):
+        raise ValueError("mapping snapshot record_count mismatch")
+    if len(mapping) < int(minimum_record_count or 0):
+        raise ValueError("mapping snapshot is below readiness threshold")
     return dict(payload)
 
 
@@ -387,12 +405,19 @@ def freeze_mapping_snapshot(
     trade_date: str,
     effective_time: str,
     source: str = "market:stock_plate",
+    minimum_record_count: int = 0,
 ) -> dict[str, Any]:
     """Create once, then reuse the same daily mapping snapshot after restart."""
-    existing = load_mapping_snapshot(directory=directory, trade_date=trade_date)
+    existing = load_mapping_snapshot(
+        directory=directory,
+        trade_date=trade_date,
+        minimum_record_count=minimum_record_count,
+    )
     if existing is not None:
         return existing
     mapping = _load_mapping(redis_client, key=source)
+    if len(mapping) < int(minimum_record_count or 0):
+        raise MappingNotReadyError(len(mapping), int(minimum_record_count or 0))
     if not mapping:
         raise RuntimeError("runtime mapping snapshot unavailable")
     path = write_mapping_snapshot(

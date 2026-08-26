@@ -1684,9 +1684,11 @@ class EngineApp:
                 )
                 outcome = self._production_reporting.handle(event, request=request)
                 notes.append(
-                    f"auction_report | report_status={outcome.report_status} | "
+                    f"auction_report | trade_date={outcome.trade_date} | fact_status={outcome.fact_status} | "
+                    f"mapping_sha={outcome.mapping_sha} | report_status={outcome.report_status} | "
                     f"delivery_status={outcome.delivery_status} | report_hash={outcome.report_hash} | "
-                    f"dedupe_key={outcome.dedupe_key} | execution_mode={event_mode}"
+                    f"dedupe_key={outcome.dedupe_key} | notification_status={outcome.notification_status} | "
+                    f"execution_mode={outcome.execution_mode}"
                 )
         elif loop_decision.scheduled_event_name == "opening_facts_0932":
             if self._production_reporting is None or request.historical_replay:
@@ -1706,10 +1708,12 @@ class EngineApp:
                 )
                 outcome = self._production_reporting.handle(event, request=request)
                 notes.append(
-                    f"opening_report | report_status={outcome.report_status} | "
+                    f"opening_report | trade_date={outcome.trade_date} | fact_status={outcome.fact_status} | "
+                    f"mapping_sha={outcome.mapping_sha} | report_status={outcome.report_status} | "
                     f"delivery_status={outcome.delivery_status} | report_hash={outcome.report_hash} | "
-                    f"dedupe_key={outcome.dedupe_key} | observation_cutoff={request.now.isoformat()} | "
-                    f"execution_mode={event_mode}"
+                    f"dedupe_key={outcome.dedupe_key} | notification_status={outcome.notification_status} | "
+                    f"observation_cutoff={outcome.observation_cutoff or request.now.isoformat()} | "
+                    f"execution_mode={outcome.execution_mode}"
                 )
         elif loop_decision.scheduled_event_name == "market_close_1505":
             close_result = self._postmarket_runtime.execute_close_marker(
