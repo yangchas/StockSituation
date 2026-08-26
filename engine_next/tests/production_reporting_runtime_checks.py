@@ -123,6 +123,16 @@ class RaisingNotifier(FakeNotifier):
         raise RuntimeError("notification failure")
 
 
+class CapturingNotifier(FakeNotifier):
+    def __init__(self, redis):
+        super().__init__(redis)
+        self.reports = []
+
+    def notify_auction_report(self, **kwargs):
+        self.reports.append(kwargs["report"])
+        return super().notify_auction_report(**kwargs)
+
+
 class ExplodingAvailabilityNotifier(FakeNotifier):
     def __init__(self, redis):
         self._redis = redis
@@ -304,11 +314,31 @@ def test_notification_exception_keeps_claim_and_is_not_retried():
         lifecycle=ReportingLifecycle(redis_client=redis),
     )
     outcome = coordinator.handle(_auction_event())
-    assert outcome.report_status == "COMPLETE"
+    assert outcome.report_status == "PARTIAL"
     assert outcome.delivery_status == "FAILED"
     assert outcome.notification_status == "FAILED"
     assert notifier.sent == [("auction", True)]
     assert redis.claims["2026-08-25:auction_facts_0926"] == "FAILED"
+
+
+def test_coordinator_forwards_builder_final_status_not_stale_bundle_status(tmp_path: Path):
+    redis = FakeRedis()
+    notifier = CapturingNotifier(redis)
+    _ready_mapping(tmp_path)
+    bundle = _bundle()
+    # Deliberately stale: the builder must resolve status from its factual
+    # components, including the unavailable locked-order domain.
+    bundle.report_status = "COMPLETE"
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=lambda trade_date, mapping=None: bundle,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+        mapping_directory=tmp_path,
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert notifier.reports
+    assert outcome.report_status == notifier.reports[0].metadata["report_status"] == "PARTIAL"
+    assert outcome.fact_status == "partial"
 def test_reporting_lifecycle_claim_is_fail_closed_without_redis():
     event = ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), datetime(2026, 8, 25, 9, 26, 1))
     claim = ReportingLifecycle(redis_client=None).claim(event, report_digest="x")
@@ -447,7 +477,7 @@ def test_disabled_notification_does_not_consume_dedup_claim(tmp_path: Path):
     event = ReportingEvent("2026-08-25", "auction_facts_0926", datetime(2026, 8, 25, 9, 26), datetime(2026, 8, 25, 9, 26, 1))
     outcome = coordinator.handle(event)
     assert outcome.delivery_status == "FAILED"
-    assert outcome.report_status == "COMPLETE"
+    assert outcome.report_status == "PARTIAL"
     assert redis.claims == {}
 
 
@@ -464,7 +494,7 @@ def test_manual_audit_builds_without_inspecting_notifier_or_claiming() -> None:
         datetime(2026, 8, 25, 9, 26, 1), "manual_audit",
     )
     outcome = coordinator.handle(event)
-    assert outcome.report_status == "COMPLETE"
+    assert outcome.report_status == "PARTIAL"
     assert outcome.delivery_status == "SKIP_MANUAL_AUDIT"
     assert outcome.execution_mode == "manual_audit"
     assert redis.claims == {}
@@ -484,7 +514,7 @@ def test_recovery_builds_without_inspecting_notifier_or_claiming() -> None:
         datetime(2026, 8, 25, 9, 30),
     )
     outcome = coordinator.handle(event)
-    assert outcome.report_status == "COMPLETE"
+    assert outcome.report_status == "PARTIAL"
     assert outcome.delivery_status == "SKIP_RECOVERY"
     assert outcome.execution_mode == "recovery"
     assert redis.claims == {}
@@ -511,7 +541,7 @@ def test_build_only_modes_are_notifier_independent_for_opening_and_auction(tmp_p
     )
     outcome = coordinator.handle(event)
     assert outcome.delivery_status == "SKIP_MANUAL_AUDIT"
-    assert outcome.report_status == "COMPLETE"
+    assert outcome.report_status == ("PARTIAL" if event_name == "auction_facts_0926" else "COMPLETE")
     assert redis.claims == {}
     assert notifier.sent == []
 

@@ -4,8 +4,11 @@ import hashlib
 import json
 from copy import deepcopy
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import engine_next.runtime.auction_email_report as auction_email_report
 from engine_next.runtime.auction_email_report import build_auction_email_report
@@ -393,7 +396,7 @@ def test_a2_market_overview_survives_missing_mapping_as_partial() -> None:
         },
     )
     assert report.metadata["report_status"] == "PARTIAL"
-    assert report.metadata["component_statuses"] == {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable"}
+    assert report.metadata["component_statuses"] == {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable", "locked_order": "unavailable"}
     assert report.metadata["market_overview"]["positive_count"] == 8
     assert report.metadata["plate_rows"] == []
     assert "PARTIAL" in report.text_body
@@ -403,8 +406,10 @@ def test_a2_market_overview_survives_missing_mapping_as_partial() -> None:
 
 
 def test_complete_render_keeps_status_line_compact() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": [], "unavailable": []}}
     report = build_auction_email_report(
-        plate_shadow=_plate_shadow(),
+        plate_shadow=shadow,
         market_context={
             "data_origin": "production_realtime",
             "trade_date": "2026-08-21",
@@ -418,7 +423,7 @@ def test_complete_render_keeps_status_line_compact() -> None:
                 "auction_amount_yuan": 1_000_000,
                 "limit_up_count": 0,
                 "limit_down_count": 0,
-                "limit_up_seal_amount_yuan": 0.0,
+                "limit_up_seal_amount_yuan": 0,
             },
         },
     )
@@ -445,7 +450,10 @@ def test_missing_limit_facts_do_not_render_as_zero() -> None:
 def test_explicit_empty_limit_lists_render_zero() -> None:
     shadow = _plate_shadow()
     shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": [], "unavailable": []}}
-    report = build_auction_email_report(plate_shadow=shadow)
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        auction_evidence={"market_summary": {"status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21", "positive_count": 1, "negative_count": 1, "flat_count": 0, "auction_amount_yuan": 1_000_000, "limit_up_count": 0, "limit_down_count": 0, "limit_up_seal_amount_yuan": 0}},
+    )
     assert "涨停/跌停：0 / 0" in report.text_body
     assert "涨停封单总额：0.00亿" in report.text_body
 
@@ -466,7 +474,7 @@ def test_explicit_zero_a2_limit_facts_are_preserved() -> None:
         "anchors": {"0925": {
             "total_stocks": 2, "high_open_count": 1, "low_open_count": 1, "flat_open_count": 0,
             "total_auction_amount_yuan": 1_000_000, "limit_up_count": 0,
-            "limit_down_count": 0, "total_limit_up_bid_amount_yuan": 0.0,
+            "limit_down_count": 0, "total_limit_up_bid_amount_yuan": 0,
         }},
     }
     shadow = _plate_shadow()
@@ -559,4 +567,110 @@ def test_nonempty_locked_detail_without_completeness_proof_is_unavailable_not_co
     )
     assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
     assert report.metadata["locked_order_rows"] == []
+    assert report.metadata["report_status"] == "PARTIAL"
+
+
+def _complete_locked_shadow() -> dict:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"]["unavailable"] = []
+    return shadow
+
+
+def _a2_context(*, limit_up_count: object = 1, limit_down_count: object = 0, amount: object = 8_000_000) -> dict:
+    return {
+        "data_origin": "replay_fixture_only",
+        "market_summary": {
+            "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+            "positive_count": 1, "negative_count": 1, "flat_count": 0,
+            "auction_amount_yuan": 12_000_000, "limit_up_count": limit_up_count,
+            "limit_down_count": limit_down_count, "limit_up_seal_amount_yuan": amount,
+        },
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("limit_up_count", None), ("limit_down_count", None), ("limit_up_seal_amount_yuan", None),
+    ("limit_up_count", "1"), ("limit_down_count", 0.0), ("limit_up_seal_amount_yuan", "8000000"),
+    ("limit_up_count", -1), ("limit_up_count", 1.5), ("limit_up_count", 2_147_483_648),
+    ("limit_up_seal_amount_yuan", -1), ("limit_up_seal_amount_yuan", 8_000_000.5),
+    ("limit_up_seal_amount_yuan", 9_223_372_036_854_775_808),
+])
+def test_invalid_or_missing_a2_locked_fields_never_fall_back_to_detail(field: str, value: object) -> None:
+    kwargs = {"limit_up_count": 1, "limit_down_count": 0, "amount": 8_000_000}
+    if field == "limit_up_count":
+        kwargs["limit_up_count"] = value
+    elif field == "limit_down_count":
+        kwargs["limit_down_count"] = value
+    else:
+        kwargs["amount"] = value
+    report = build_auction_email_report(
+        plate_shadow=_complete_locked_shadow(), auction_evidence=_a2_context(**kwargs),
+    )
+    assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert "A2 summary conflicts" not in report.text_body
+    if field == "limit_up_count" and value == "1":
+        assert "涨停/跌停：unavailable / 0" in report.text_body
+
+
+def test_exact_integer_yuan_comparison_does_not_round_large_values() -> None:
+    amount = 9_000_000_000_000_001
+    shadow = _complete_locked_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"]["limit_up"][0]["anchor_locked_amount_yuan"] = amount
+    report = build_auction_email_report(
+        plate_shadow=shadow, auction_evidence=_a2_context(amount=amount),
+    )
+    assert report.metadata["locked_summary"]["locked_order_status"] == "available"
+    assert report.metadata["locked_summary"]["limit_up_seal_amount_yuan"] == amount
     assert report.metadata["report_status"] == "COMPLETE"
+
+
+def test_a2_contract_rejects_decimal_and_non_json_integer_representations() -> None:
+    assert auction_email_report._a2_count(Decimal("1")) is None
+    assert auction_email_report._a2_amount(Decimal("8000000")) is None
+    assert auction_email_report._a2_count(True) is None
+    assert auction_email_report._a2_amount(float("nan")) is None
+
+
+def test_production_bare_locked_lists_remain_unavailable_and_lower_final_status() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"] = {"limit_up": [], "limit_down": []}
+    report = build_auction_email_report(
+        plate_shadow=shadow, auction_evidence=_a2_context(),
+    )
+    assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert "locked-order detail unavailable" in report.text_body
+
+
+def test_html_text_and_metadata_share_one_final_report_status() -> None:
+    report = build_auction_email_report(
+        plate_shadow=_complete_locked_shadow(), auction_evidence=_a2_context(limit_up_count=0), report_status="COMPLETE",
+    )
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert "报告状态：PARTIAL" in report.text_body
+    assert "报告状态=PARTIAL" in report.html_body
+    assert report.metadata["fact_status"] == "partial"
+
+
+@pytest.mark.parametrize("detail_amount", [None, "8000000", 8_000_000.0])
+def test_locked_detail_amount_without_existing_integer_contract_is_unavailable(detail_amount: object) -> None:
+    shadow = _complete_locked_shadow()
+    shadow["automatic_analysis"]["auction_locked_orders"]["limit_up"][0]["anchor_locked_amount_yuan"] = detail_amount
+    report = build_auction_email_report(plate_shadow=shadow, auction_evidence=_a2_context())
+    assert report.metadata["locked_summary"]["locked_order_status"] == "unavailable"
+    assert report.metadata["report_status"] == "PARTIAL"
+
+
+def test_locked_order_degradation_is_local_to_locked_domain() -> None:
+    available = build_auction_email_report(
+        plate_shadow=_complete_locked_shadow(), auction_evidence=_a2_context(),
+    )
+    conflict_shadow = _complete_locked_shadow()
+    conflict_shadow["automatic_analysis"]["auction_locked_orders"]["limit_up"][0]["anchor_locked_amount_yuan"] = 8_000_001
+    conflict = build_auction_email_report(plate_shadow=conflict_shadow, auction_evidence=_a2_context())
+    for key in ("market_overview", "plate_rows", "anchor_changes"):
+        assert conflict.metadata[key] == available.metadata[key]
+    assert available.metadata["locked_summary"]["locked_order_status"] == "available"
+    assert conflict.metadata["locked_summary"]["locked_order_status"] == "conflict"
+    assert conflict.metadata["report_status"] == "PARTIAL"
