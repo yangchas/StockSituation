@@ -231,10 +231,9 @@ class RuntimeNotificationService:
         )
 
     def _resolve_category(self, *, result, summary_text: str) -> str:
-        if result.phase == RunPhase.AUCTION and "当前阶段：竞价" in summary_text:
-            return "auction"
-        if result.phase == RunPhase.INTRADAY and "当前阶段：开盘确认" in summary_text:
-            return "open_confirm"
+        # Auction/opening reporting is owned by ProductionReportingCoordinator
+        # and never enters the generic notification resolver.  The generic
+        # path retains only its pre-existing postmarket responsibility.
         if result.phase == RunPhase.POSTMARKET and "当前阶段：盘后" in summary_text:
             return "postmarket"
         return ""

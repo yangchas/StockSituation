@@ -8,6 +8,7 @@ from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.runtime.production_fact_assembly import write_mapping_snapshot
 from engine_next.runtime.production_reporting import ProductionReportingCoordinator
 from engine_next.runtime.reporting_lifecycle import ReportingEvent, ReportingLifecycle
+from engine_next.domain.enums import RunPhase
 
 
 class FakeRedis:
@@ -125,6 +126,14 @@ def test_coordinator_rejects_unsupported_event_before_notification():
     outcome = coordinator.handle(event)
     assert outcome.delivery_status == "SKIPPED"
     assert notifier.sent == []
+
+
+def test_generic_notifier_resolver_has_no_auction_or_open_ownership():
+    from engine_next.runtime.notification_service import RuntimeNotificationService
+
+    service = RuntimeNotificationService.__new__(RuntimeNotificationService)
+    assert service._resolve_category(result=SimpleNamespace(phase=RunPhase.AUCTION), summary_text="当前阶段：竞价") == ""
+    assert service._resolve_category(result=SimpleNamespace(phase=RunPhase.INTRADAY), summary_text="当前阶段：开盘确认") == ""
 
 
 def test_missing_same_day_mapping_after_cutoff_is_unavailable_without_loader_call(tmp_path: Path):
