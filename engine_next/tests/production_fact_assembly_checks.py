@@ -45,6 +45,18 @@ def _td_rows(trade_date: str, tag: str):
     ]
 
 
+def _mapping_snapshot(trade_date: str = "2026-08-25") -> dict:
+    mapping = {"000001": "AI", "000002": "AI"}
+    from engine_next.runtime.production_fact_assembly import _sha256
+    return {
+        "trade_date": trade_date,
+        "effective_time": f"{trade_date}T09:10:00+08:00",
+        "mapping": mapping,
+        "record_count": len(mapping),
+        "sha256": _sha256(mapping),
+    }
+
+
 def test_normalize_td_row_preserves_existing_units():
     row = normalize_td_auction_row({"symbol": "SZ.000001", "px_milli": 10123, "chg_bp": 125, "match_amt_yuan": 10, "rest_bid_amt_yuan": 2, "rest_ask_amt_yuan": 3, "limit_state": 1}, tag="0925")
     assert row["symbol"] == "000001"
@@ -60,6 +72,7 @@ def test_production_fact_assembly_uses_redis_summary_and_td_full_rows():
         redis_client=FakeRedis(),
         td_query=_td_rows,
         data_origin="production_realtime",
+        mapping_snapshot=_mapping_snapshot(),
     )
     assert facts.status == "normal"
     assert facts.market_summary["source"] == "a2_0925_summary"
@@ -67,6 +80,41 @@ def test_production_fact_assembly_uses_redis_summary_and_td_full_rows():
     assert facts.plate_shadow["format"] == "PlateAuctionShadowV1"
     assert facts.plate_shadow["mapping_origin"]["canonical"] == "market:stock_plate"
     assert facts.plate_shadow["strategy_impact"] == "none"
+    assert facts.component_statuses == {"market_overview": "available", "plate_facts": "available", "mapping": "available"}
+    assert facts.report_status == "COMPLETE"
+
+
+def test_missing_mapping_keeps_independent_a2_and_skips_plate_td_reads():
+    calls = []
+
+    def should_not_read_td(*args):
+        calls.append(args)
+        raise AssertionError("mapping-dependent TD rows must not be read without frozen mapping")
+
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=FakeRedis(), td_query=should_not_read_td,
+        data_origin="production_realtime", mapping_snapshot=None,
+    )
+    assert calls == []
+    assert facts.market_summary_status == "available"
+    assert facts.plate_facts_status == "unavailable"
+    assert facts.mapping_status == "unavailable"
+    assert facts.mapping == {}
+    assert facts.report_status == "PARTIAL"
+    assert facts.market_summary["auction_amount_yuan"] == 3_000_000
+    assert facts.plate_shadow["status"] == "unavailable"
+
+
+def test_missing_a2_and_mapping_is_data_unavailable_without_fake_limit_zero():
+    redis = FakeRedis()
+    redis.hashes.pop("market:auction:20260825:0925")
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=redis, td_query=lambda *args: (_ for _ in ()).throw(AssertionError()),
+        data_origin="production_realtime", mapping_snapshot=None,
+    )
+    assert facts.report_status == "DATA_UNAVAILABLE"
+    assert facts.market_summary_status == "unavailable"
+    assert facts.plate_facts_status == "unavailable"
 
 
 def test_missing_snapshot_tag_is_partial_and_does_not_fallback():
@@ -74,7 +122,7 @@ def test_missing_snapshot_tag_is_partial_and_does_not_fallback():
         return _td_rows(date, tag) if tag != "0920" else []
 
     facts = build_production_auction_facts(
-        trade_date="2026-08-25", redis_client=FakeRedis(), td_query=incomplete
+        trade_date="2026-08-25", redis_client=FakeRedis(), td_query=incomplete, mapping_snapshot=_mapping_snapshot()
     )
     assert facts.status == "partial"
     assert "0920" in facts.provenance["missing_tags"]
@@ -89,7 +137,7 @@ def test_td_effective_universe_must_match_0925_anchor():
         return rows[:1] if tag == "0925" else rows
 
     facts = build_production_auction_facts(
-        trade_date="2026-08-25", redis_client=redis, td_query=truncated
+        trade_date="2026-08-25", redis_client=redis, td_query=truncated, mapping_snapshot=_mapping_snapshot()
     )
     assert facts.provenance["effective_universe_status"] == "mismatch"
     assert facts.status == "partial"
@@ -99,7 +147,7 @@ def test_missing_0925_anchor_does_not_claim_full_market():
     redis = FakeRedis()
     redis.strings.clear()
     facts = build_production_auction_facts(
-        trade_date="2026-08-25", redis_client=redis, td_query=_td_rows
+        trade_date="2026-08-25", redis_client=redis, td_query=_td_rows, mapping_snapshot=_mapping_snapshot()
     )
     assert facts.provenance["effective_universe_status"] == "unavailable"
     assert facts.status == "partial"

@@ -340,7 +340,7 @@ def test_generic_notifier_resolver_has_no_auction_or_open_ownership():
     assert service._resolve_category(result=SimpleNamespace(phase=RunPhase.INTRADAY), summary_text="当前阶段：开盘确认") == ""
 
 
-def test_missing_same_day_mapping_after_cutoff_is_unavailable_without_loader_call(tmp_path: Path):
+def test_missing_same_day_mapping_after_cutoff_calls_loader_once_without_refreeze(tmp_path: Path):
     redis = FakeRedis()
     notifier = FakeNotifier(redis)
     calls = []
@@ -363,8 +363,39 @@ def test_missing_same_day_mapping_after_cutoff_is_unavailable_without_loader_cal
     )
     outcome = coordinator.handle(event)
     assert outcome.report_status == "DATA_UNAVAILABLE"
-    assert calls == []
+    assert calls == [("2026-08-25",)]
     assert notifier.sent == [("auction", True)]
+
+
+def test_a2_available_without_mapping_sends_truthful_partial_report(tmp_path: Path):
+    redis = FakeRedis()
+    notifier = FakeNotifier(redis)
+    bundle = _bundle()
+    bundle.component_statuses = {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable"}
+    bundle.market_summary_status = "available"
+    bundle.plate_facts_status = "unavailable"
+    bundle.mapping_status = "unavailable"
+    bundle.unavailable_reasons = ("frozen mapping unavailable",)
+    bundle.report_status = "PARTIAL"
+    calls = []
+
+    def auction_loader(*args):
+        calls.append(args)
+        assert args == ("2026-08-25",)
+        return bundle
+
+    coordinator = ProductionReportingCoordinator(
+        auction_fact_loader=auction_loader,
+        notification_service=notifier,
+        lifecycle=ReportingLifecycle(redis_client=redis),
+        mapping_directory=tmp_path,
+    )
+    outcome = coordinator.handle(_auction_event())
+    assert outcome.report_status == "PARTIAL"
+    assert outcome.delivery_status == "ACCEPTED"
+    assert calls == [("2026-08-25",)]
+    assert notifier.sent == [("auction", True)]
+    assert redis.claims["2026-08-25:auction_facts_0926"] == "ACCEPTED"
 
 
 def test_disabled_notification_does_not_consume_dedup_claim(tmp_path: Path):

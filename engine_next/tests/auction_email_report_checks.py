@@ -374,3 +374,93 @@ def test_core_display_limit_does_not_change_full_observation_semantics(monkeypat
     assert second.metadata["observations"] == first.metadata["observations"]
     assert second.metadata["observations_sha256"] == first.metadata["observations_sha256"]
     assert len(second.metadata["core_observations"]) == 1
+
+
+def test_a2_market_overview_survives_missing_mapping_as_partial() -> None:
+    report = build_auction_email_report(
+        plate_shadow=_plate_shadow(),
+        auction_evidence={
+            "data_origin": "production_realtime",
+            "market_summary": {
+                "status": "available", "source": "a2_0925_summary", "trade_date": "2026-08-21",
+                "positive_count": 8, "negative_count": 3, "flat_count": 1,
+                "auction_amount_yuan": 123_000_000, "limit_up_count": 2,
+                "limit_down_count": 1, "limit_up_seal_amount_yuan": 45_000_000,
+            },
+            "component_statuses": {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable"},
+            "report_status": "PARTIAL",
+            "unavailable_reasons": ["frozen mapping unavailable"],
+        },
+    )
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert report.metadata["component_statuses"] == {"market_overview": "available", "plate_facts": "unavailable", "mapping": "unavailable"}
+    assert report.metadata["market_overview"]["positive_count"] == 8
+    assert report.metadata["plate_rows"] == []
+    assert "PARTIAL" in report.text_body
+    assert "123000000" not in report.text_body
+    assert "1.23亿" in report.text_body
+    assert "frozen mapping unavailable" in report.html_body
+
+
+def test_complete_render_keeps_status_line_compact() -> None:
+    report = build_auction_email_report(
+        plate_shadow=_plate_shadow(),
+        market_context={
+            "data_origin": "production_realtime",
+            "trade_date": "2026-08-21",
+            "market_summary": {
+                "status": "available",
+                "source": "a2_0925_summary",
+                "trade_date": "2026-08-21",
+                "positive_count": 1,
+                "negative_count": 1,
+                "flat_count": 0,
+                "auction_amount_yuan": 1_000_000,
+                "limit_up_count": 0,
+                "limit_down_count": 0,
+                "limit_up_seal_amount_yuan": 0.0,
+            },
+        },
+    )
+    assert report.metadata["report_status"] == "COMPLETE"
+    assert "报告状态：" not in report.text_body
+    assert "报告状态=" not in report.html_body
+
+
+def test_missing_limit_facts_do_not_render_as_zero() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"] = {"auction_locked_orders": {}}
+    report = build_auction_email_report(
+        plate_shadow=shadow,
+        component_statuses={"market_overview": "unavailable", "plate_facts": "unavailable", "mapping": "unavailable"},
+        report_status="DATA_UNAVAILABLE",
+    )
+    assert report.metadata["report_status"] == "DATA_UNAVAILABLE"
+    assert "涨停/跌停：unavailable / unavailable" in report.text_body
+    assert "涨停封单总额：unavailable" in report.text_body
+    assert "涨停/跌停：unavailable / unavailable" in report.html_body
+    assert "0.00亿" not in report.text_body
+
+
+def test_explicit_empty_limit_lists_render_zero() -> None:
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"] = {"auction_locked_orders": {"limit_up": [], "limit_down": []}}
+    report = build_auction_email_report(plate_shadow=shadow)
+    assert "涨停/跌停：0 / 0" in report.text_body
+    assert "涨停封单总额：0.00亿" in report.text_body
+
+
+def test_explicit_zero_a2_limit_facts_are_preserved() -> None:
+    context = {
+        "format": "AuctionMarketSummaryV1", "trade_date": "2026-08-21",
+        "anchors": {"0925": {
+            "total_stocks": 2, "high_open_count": 1, "low_open_count": 1, "flat_open_count": 0,
+            "total_auction_amount_yuan": 1_000_000, "limit_up_count": 0,
+            "limit_down_count": 0, "total_limit_up_bid_amount_yuan": 0.0,
+        }},
+    }
+    shadow = _plate_shadow()
+    shadow["automatic_analysis"] = {"auction_locked_orders": {}}
+    report = build_auction_email_report(plate_shadow=shadow, market_context=context)
+    assert "涨停/跌停：0 / 0" in report.text_body
+    assert "涨停封单：0.00亿" in report.text_body
