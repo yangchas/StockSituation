@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 
 sys.modules.setdefault("talib", types.ModuleType("talib"))
@@ -10,7 +11,7 @@ holidays_stub = types.ModuleType("holidays")
 holidays_stub.CN = lambda: set()
 sys.modules.setdefault("holidays", holidays_stub)
 
-from engine_next.app_main import EngineApp
+from engine_next.app_main import EngineApp, EngineAppResult
 from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult, WatermarkSnapshot
 from engine_next.domain.enums import ExecutionEnvironment, RunPhase
 from engine_next.runtime.controllers.settlement_controller import SettlementController
@@ -19,6 +20,61 @@ from engine_next.runtime.production_reporting import ReportingOutcome
 
 
 class RuntimeOrchestrationTests(unittest.TestCase):
+    @staticmethod
+    def _minimal_result(*, should_render: bool = False, notes: tuple[str, ...] = ()) -> EngineAppResult:
+        return EngineAppResult(
+            phase=RunPhase.INTRADAY,
+            startup_bundle=None,
+            watermark_snapshot=None,
+            integrated_sync_results=(),
+            intraday_context=None,
+            phase_events=(),
+            should_render=should_render,
+            notes=notes,
+        )
+
+    def test_run_forever_rediscovers_due_event_with_fresh_request_after_run(self) -> None:
+        app = EngineApp.__new__(EngineApp)
+        initial = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 9, 25, 37),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        fresh = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 9, 26, 30),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        requests = iter((initial, fresh))
+        due_times = []
+        rendered_notes = []
+        app.run = lambda request: self._minimal_result(notes=("run-note",))
+        app._execute_due_reporting_events = lambda *, request: due_times.append(request.now) or ("auction_due",)
+        with patch("engine_next.app_main.render_result_summary", side_effect=lambda result: rendered_notes.append(result.notes) or "ok"), patch("builtins.print"):
+            app.run_forever(lambda: next(requests), max_cycles=1)
+        self.assertEqual(due_times, [fresh.now])
+        self.assertEqual(rendered_notes, [("auction_due", "run-note")])
+
+    def test_run_forever_sleep_uses_post_run_fresh_time(self) -> None:
+        app = EngineApp.__new__(EngineApp)
+        requests = iter(
+            (
+                types.SimpleNamespace(now=datetime(2026, 8, 27, 9, 25, 37), trade_date="2026-08-27", execution_mode="normal", historical_replay=False),
+                types.SimpleNamespace(now=datetime(2026, 8, 27, 9, 26, 30), trade_date="2026-08-27", execution_mode="normal", historical_replay=False),
+                types.SimpleNamespace(now=datetime(2026, 8, 27, 9, 26, 40), trade_date="2026-08-27", execution_mode="normal", historical_replay=False),
+                types.SimpleNamespace(now=datetime(2026, 8, 27, 9, 27, 10), trade_date="2026-08-27", execution_mode="normal", historical_replay=False),
+            )
+        )
+        sleep_times = []
+        app.run = lambda request: self._minimal_result()
+        app._execute_due_reporting_events = lambda *, request: ()
+        app._resolve_loop_sleep_seconds = lambda *, now, phase, default_interval_seconds: sleep_times.append(now) or 1
+        with patch("engine_next.app_main.time.sleep"):
+            app.run_forever(lambda: next(requests), max_cycles=2)
+        self.assertEqual(sleep_times, [datetime(2026, 8, 27, 9, 26, 30)])
+
     def _due_app(self, handler):
         app = EngineApp.__new__(EngineApp)
         app._production_reporting = types.SimpleNamespace(handle=handler)

@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Iterable
@@ -2345,6 +2345,19 @@ class EngineApp:
         while max_cycles is None or cycles < max_cycles:
             request = request_builder()
             result = self.run(request)
+            # ``run`` may contain a legitimate long-running task (for
+            # example, the 09:25 finalize work).  Refresh the request after it
+            # returns so an event that became due during that work is resolved
+            # before output/sleep.  The existing process-level resolution set
+            # makes this post-run check idempotent with the in-run discovery.
+            fresh_request = request_builder()
+            post_run_reporting_notes = self._execute_due_reporting_events(request=fresh_request)
+            if post_run_reporting_notes:
+                result = replace(
+                    result,
+                    should_render=True,
+                    notes=tuple(post_run_reporting_notes) + tuple(result.notes),
+                )
             if result.should_render:
                 if result.phase == RunPhase.POSTMARKET:
                     self._notification_service.notify_if_needed(
@@ -2360,7 +2373,7 @@ class EngineApp:
             if max_cycles is not None and cycles >= max_cycles:
                 break
             sleep_seconds = self._resolve_loop_sleep_seconds(
-                now=request.now,
+                now=fresh_request.now,
                 phase=result.phase,
                 default_interval_seconds=interval_seconds,
             )
