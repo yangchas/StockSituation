@@ -198,6 +198,9 @@ def normalize_td_auction_row(row: Mapping[str, Any], *, tag: str) -> dict[str, A
     px_milli = _number(row.get("px_milli", row.get("price_milli", row.get("px"))))
     chg_bp = _number(row.get("chg_bp", row.get("change_bp")))
     change_pct = (chg_bp / 100.0) if chg_bp is not None else _number(row.get("change_pct"))
+    match_amt_yuan = _number(row.get("match_amt_yuan", row.get("auction_amount_yuan", row.get("amount"))))
+    rest_bid_amt_yuan = _number(row.get("rest_bid_amt_yuan", row.get("bid_amount_yuan", row.get("br"))))
+    rest_ask_amt_yuan = _number(row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar"))))
     ask_raw = row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))
     return {
         "symbol": _symbol(row.get("symbol") or row.get("code")),
@@ -206,16 +209,39 @@ def normalize_td_auction_row(row: Mapping[str, Any], *, tag: str) -> dict[str, A
         "price_milli": px_milli,
         "price": (px_milli / 1000.0) if px_milli is not None else _number(row.get("price")),
         "change_pct": change_pct,
-        "auction_amount_yuan": _number(row.get("match_amt_yuan", row.get("auction_amount_yuan", row.get("amount")))),
-        "amount": _number(row.get("match_amt_yuan", row.get("auction_amount_yuan", row.get("amount")))),
-        "bid_amount_yuan": _number(row.get("rest_bid_amt_yuan", row.get("bid_amount_yuan", row.get("br")))),
-        "bid_amount": _number(row.get("rest_bid_amt_yuan", row.get("bid_amount_yuan", row.get("br")))),
-        "ask_amount_yuan": _number(row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))),
-        "ask_amount": _number(row.get("rest_ask_amt_yuan", row.get("ask_amount_yuan", row.get("ar")))),
+        "auction_amount_yuan": match_amt_yuan,
+        "amount": match_amt_yuan,
+        "bid_amount_yuan": rest_bid_amt_yuan,
+        "bid_amount": rest_bid_amt_yuan,
+        "ask_amount_yuan": rest_ask_amt_yuan,
+        "ask_amount": rest_ask_amt_yuan,
+        # Preserve the source-contract fields needed to classify TD-only
+        # rows.  They are diagnostics only; auction formulas remain owned by
+        # the existing producer.
+        "match_amt_yuan": match_amt_yuan,
+        "chg_bp": chg_bp,
+        "rest_bid_amt_yuan": rest_bid_amt_yuan,
+        "rest_ask_amt_yuan": rest_ask_amt_yuan,
         "ask_amount_present": ask_raw is not None and str(ask_raw).strip() != "",
         "limit_state": row.get("limit_state", row.get("ls")),
         "source": "tdengine:auction_snapshot_v2",
     }
+
+
+_TD_INACTIVITY_FIELDS = ("match_amt_yuan", "chg_bp", "rest_bid_amt_yuan", "rest_ask_amt_yuan")
+
+
+def _classify_td_inactivity(row: Mapping[str, Any]) -> str:
+    """Classify one TD-only row using the existing effective-universe contract.
+
+    The producer's zero-valued activity fields are the only evidence that a
+    raw TD row is inactive.  Unknown or malformed fields must stay in the
+    effective universe so an unexplained difference remains fail-closed.
+    """
+    values = [_number(row.get(field)) for field in _TD_INACTIVITY_FIELDS]
+    if any(value is None for value in values):
+        return "unknown"
+    return "inactive" if all(value == 0.0 for value in values) else "non_inactive"
 
 
 @dataclass(frozen=True)
@@ -292,11 +318,27 @@ def build_production_auction_facts(
     tags = {str(row.get("tag")) for row in rows}
     missing_tags = sorted({"0920", "0924", "0925"} - tags)
     anchor_symbols = _anchor_symbols(redis_client, trade_date=normalized_date)
-    td_effective_symbols = {
+    td_raw_symbols = {
         str(row.get("symbol"))
         for row in rows
         if str(row.get("tag")) == "0925" and str(row.get("symbol"))
     }
+    td_rows_0925 = {
+        str(row.get("symbol")): row
+        for row in rows
+        if str(row.get("tag")) == "0925" and str(row.get("symbol"))
+    }
+    td_only_symbols = td_raw_symbols - anchor_symbols if anchor_symbols else set()
+    td_only_classification = {
+        symbol: _classify_td_inactivity(td_rows_0925[symbol])
+        for symbol in sorted(td_only_symbols)
+        if symbol in td_rows_0925
+    }
+    inactive_symbols = {
+        symbol for symbol, classification in td_only_classification.items() if classification == "inactive"
+    }
+    td_effective_symbols = td_raw_symbols - inactive_symbols
+    anchor_only_symbols = anchor_symbols - td_raw_symbols if anchor_symbols else set()
     if not anchor_symbols:
         effective_universe_status = "unavailable"
     elif td_effective_symbols == anchor_symbols:
@@ -310,7 +352,18 @@ def build_production_auction_facts(
         "snapshot_tags": sorted(tags),
         "missing_tags": missing_tags,
         "anchor_universe_count": len(anchor_symbols),
+        "td_raw_universe_count": len(td_raw_symbols),
+        "td_inactive_universe_count": len(inactive_symbols),
         "td_effective_universe_count": len(td_effective_symbols),
+        "td_only_count": len(td_only_symbols),
+        "td_only_inactive_count": sum(value == "inactive" for value in td_only_classification.values()),
+        "td_only_unknown_count": sum(value == "unknown" for value in td_only_classification.values()),
+        "td_only_non_inactive_count": sum(value == "non_inactive" for value in td_only_classification.values()),
+        "td_only_inactive_sample": sorted(symbol for symbol, value in td_only_classification.items() if value == "inactive")[:10],
+        "td_only_unknown_sample": sorted(symbol for symbol, value in td_only_classification.items() if value == "unknown")[:10],
+        "td_only_non_inactive_sample": sorted(symbol for symbol, value in td_only_classification.items() if value == "non_inactive")[:10],
+        "anchor_only_count": len(anchor_only_symbols),
+        "anchor_only_sample": sorted(anchor_only_symbols)[:10],
         "effective_universe_status": effective_universe_status,
         "historical_valid": bool(historical_valid),
     }
@@ -327,6 +380,7 @@ def build_production_auction_facts(
     if mapping and not universe_valid:
         reasons.append("effective auction universe mismatch or unavailable")
 
+    effective_rows = [row for row in rows if str(row.get("symbol")) in td_effective_symbols]
     if not rows or not mapping or missing_tags or not universe_valid:
         shadow = {
             "format": "PlateAuctionShadowV1",
@@ -345,7 +399,7 @@ def build_production_auction_facts(
         status = "unavailable" if not rows else "partial"
     else:
         shadow = build_plate_shadow_from_snapshot_rows(
-            rows,
+            effective_rows,
             trade_date=normalized_date,
             stock_plate=mapping,
             data_origin=data_origin,

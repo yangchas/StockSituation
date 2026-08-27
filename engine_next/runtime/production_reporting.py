@@ -30,6 +30,51 @@ from engine_next.runtime.startup_static_loader import StartupStaticDataLoader
 
 logger = logging.getLogger(__name__)
 _AUCTION_REPORT_STATUSES = {"COMPLETE", "PARTIAL", "DATA_UNAVAILABLE"}
+_OPENING_REPORT_STATUSES = {"COMPLETE", "PARTIAL", "DATA_UNAVAILABLE"}
+
+
+def _opening_component_statuses(observation: Mapping[str, Any]) -> dict[str, str]:
+    """Read opening component states without changing OpenConfirmation facts."""
+    open_source = dict(observation.get("open_source") or {})
+    market = dict(observation.get("market") or {})
+    opening = dict(market.get("open") or {})
+    q2_status = str(
+        observation.get("q2_status")
+        or open_source.get("status")
+        or opening.get("status")
+        or "unavailable"
+    ).lower()
+    if q2_status not in {"available", "partial"}:
+        q2_status = "unavailable"
+    plate_status = str(observation.get("plate_facts_status") or "available").lower()
+    if plate_status not in {"available", "partial", "unavailable"}:
+        plate_status = "unavailable"
+    mapping_status = str(observation.get("mapping_status") or "available").lower()
+    if mapping_status not in {"available", "partial", "unavailable"}:
+        mapping_status = "unavailable"
+    market_status = "available" if opening.get("status") == "available" or q2_status == "available" else "unavailable"
+    return {
+        "market_overview": market_status,
+        "plate_facts": plate_status,
+        "online_q2": q2_status,
+        "mapping": mapping_status,
+    }
+
+
+def _resolve_opening_report_status(statuses: Mapping[str, Any]) -> str:
+    """Resolve one final Opening report status from factual components."""
+    if str(statuses.get("online_q2") or "unavailable") == "unavailable":
+        return "DATA_UNAVAILABLE"
+    if (
+        str(statuses.get("online_q2")) == "available"
+        and str(statuses.get("plate_facts")) == "available"
+    ):
+        return "COMPLETE"
+    return "PARTIAL"
+
+
+def _opening_status_label(value: Any) -> str:
+    return {"available": "可用", "partial": "部分可用", "unavailable": "不可用"}.get(str(value), "不可用")
 
 
 @dataclass(frozen=True)
@@ -57,7 +102,7 @@ class ReportingOutcome:
 
 
 def build_opening_facts_report(observation: Mapping[str, Any]) -> OpeningFactsReport:
-    """Render the existing OpenConfirmation observation without strategy text."""
+    """Render OpenConfirmation facts with explicit component availability."""
     trade_date = str(observation.get("trade_date") or "").strip()
     if len(trade_date) != 10:
         raise ValueError("opening observation trade_date is required")
@@ -66,10 +111,31 @@ def build_opening_facts_report(observation: Mapping[str, Any]) -> OpeningFactsRe
     opening = dict(market.get("open") or {})
     open_source = dict(observation.get("open_source") or {})
     cutoff = str(open_source.get("observation_cutoff") or "unavailable")
+    component_statuses = _opening_component_statuses(observation)
+    report_status = _resolve_opening_report_status(component_statuses)
+    reasons = [str(item) for item in (observation.get("unavailable_reasons") or []) if str(item).strip()]
+    if component_statuses["plate_facts"] != "available" and not reasons:
+        reasons.append("板块事实不可用：竞价有效股票集合校验未通过")
+    if component_statuses["online_q2"] == "unavailable" and not reasons:
+        reasons.append("实时Q2不可用")
     lines = [
         f"# 【开盘事实观察】{trade_date}",
         f"截至：{cutoff}",
         f"数据来源：{observation.get('data_origin', 'unavailable')}；映射一致性：{observation.get('mapping_consistency', 'unavailable')}",
+        f"报告状态：{report_status}",
+        "事实域：" + "；".join(
+            f"{name}={_opening_status_label(value)}"
+            for name, value in (
+                ("全市场", component_statuses["market_overview"]),
+                ("板块", component_statuses["plate_facts"]),
+                ("实时Q2", component_statuses["online_q2"]),
+                ("映射", component_statuses["mapping"]),
+            )
+        ),
+    ]
+    if reasons:
+        lines.append("降级原因：" + "；".join(reasons))
+    lines.extend([
         "",
         "## 全市场事实",
         f"- 09:25 上涨/下跌/平盘：{auction.get('positive_count', 'unavailable')} / {auction.get('negative_count', 'unavailable')} / {auction.get('flat_count', 'unavailable')}",
@@ -78,26 +144,42 @@ def build_opening_facts_report(observation: Mapping[str, Any]) -> OpeningFactsRe
         f"- 开盘窗口成交金额（amt2m）：{opening.get('open_window_amount_yuan', 'unavailable')}",
         "",
         "## 板块事实变化",
-        "|板块|竞价上涨覆盖|开盘上涨覆盖|变化|竞价中位涨幅|开盘中位涨幅|变化|",
-        "|---|---:|---:|---|---:|---:|---|",
-    ]
-    for row in observation.get("plates") or []:
-        row = dict(row)
-        lines.append(
-            f"|{row.get('plate', 'unavailable')}|{row.get('auction_positive_ratio', 'unavailable')}|"
-            f"{row.get('open_positive_ratio', 'unavailable')}|{row.get('positive_ratio_delta', 'unavailable')}|"
-            f"{row.get('auction_median_change_pct', 'unavailable')}|{row.get('open_median_change_pct', 'unavailable')}|"
-            f"{row.get('median_change_pct_delta', 'unavailable')}|"
-        )
+    ])
+    plate_rows = [dict(row) for row in (observation.get("plates") or []) if isinstance(row, Mapping)]
+    if component_statuses["plate_facts"] == "available" and plate_rows:
+        lines.extend([
+            "|板块|竞价上涨覆盖|开盘上涨覆盖|变化|竞价中位涨幅|开盘中位涨幅|变化|",
+            "|---|---:|---:|---|---:|---:|---|",
+        ])
+        for row in plate_rows:
+            lines.append(
+                f"|{row.get('plate', 'unavailable')}|{row.get('auction_positive_ratio', 'unavailable')}|"
+                f"{row.get('open_positive_ratio', 'unavailable')}|{row.get('positive_ratio_delta', 'unavailable')}|"
+                f"{row.get('auction_median_change_pct', 'unavailable')}|{row.get('open_median_change_pct', 'unavailable')}|"
+                f"{row.get('median_change_pct_delta', 'unavailable')}|"
+            )
+    else:
+        lines.append(f"- 板块事实：{_opening_status_label(component_statuses['plate_facts'])}")
+        if reasons:
+            lines.append(f"- 原因：{reasons[0]}")
     lines.extend(["", "## 变化观察"])
-    observations = observation.get("observations") or [{"text": "unavailable"}]
-    lines.extend(f"- {dict(row).get('text', 'unavailable')}" for row in observations)
+    observations = [dict(row) for row in (observation.get("observations") or []) if isinstance(row, Mapping)]
+    if not observations:
+        observations = [{"text": reasons[0] if reasons else "unavailable"}]
+    lines.extend(f"- {row.get('text', 'unavailable')}" for row in observations)
     text_body = "\n".join(lines).strip() + "\n"
     subject = f"【开盘事实观察】{trade_date} 截至 {cutoff}"
     html_body = "<html><body><pre>" + text_body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre></body></html>"
     digest = hashlib.sha256(html_body.encode("utf-8")).hexdigest()
     metadata = dict(observation)
-    metadata.update({"format": "OpeningFactsReportV1", "subject": subject, "html_sha256": digest, "strategy_impact": "none", "decision_bundle": None})
+    metadata.update({
+        "format": "OpeningFactsReportV1", "subject": subject, "html_sha256": digest,
+        "report_status": report_status,
+        "fact_status": observation.get("fact_status") or ("available" if report_status == "COMPLETE" else "partial" if report_status == "PARTIAL" else "unavailable"),
+        "component_statuses": component_statuses,
+        "unavailable_reasons": reasons,
+        "strategy_impact": "none", "decision_bundle": None,
+    })
     return OpeningFactsReport(subject=subject, text_body=text_body, html_body=html_body, html_sha256=digest, metadata=metadata)
 
 
@@ -310,11 +392,14 @@ class ProductionReportingCoordinator:
 
     def _build_opening_for_event(self, event: ReportingEvent, mapping: Mapping[str, Any] | None) -> tuple[OpeningFactsReport, str]:
         if self._opening_fact_loader is None or mapping is None:
-            return self.build_opening_unavailable_report(trade_date=event.trade_date, observation_cutoff=event.actual_time), "DATA_UNAVAILABLE"
+            report = self.build_opening_unavailable_report(trade_date=event.trade_date, observation_cutoff=event.actual_time)
+            return report, str(report.metadata.get("report_status", "DATA_UNAVAILABLE"))
         observation = self._call_opening_loader(self._opening_fact_loader, event.trade_date, event.actual_time, mapping)
         report = build_opening_facts_report(observation)
-        status = "COMPLETE" if str(observation.get("open_source", {}).get("status")) == "available" else "PARTIAL"
-        return report, status
+        status = report.metadata.get("report_status")
+        if status not in _OPENING_REPORT_STATUSES:
+            raise ValueError(f"invalid opening report_status from builder: {status!r}")
+        return report, str(status)
 
     def build_opening_unavailable_report(self, *, trade_date: str, observation_cutoff: datetime) -> OpeningFactsReport:
         observation = {
@@ -327,6 +412,9 @@ class ProductionReportingCoordinator:
             "plates": [],
             "observations": [{"text": "开盘事实不可用，未使用替代数据。"}],
             "open_source": {"observation_cutoff": observation_cutoff.isoformat(), "status": "DATA_UNAVAILABLE"},
+            "mapping_status": "unavailable",
+            "plate_facts_status": "unavailable",
+            "unavailable_reasons": ["实时Q2不可用"],
             "strategy_impact": "none",
             "decision_bundle": None,
         }
