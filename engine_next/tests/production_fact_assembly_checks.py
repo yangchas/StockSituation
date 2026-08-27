@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
+
 from engine_next.runtime.production_fact_assembly import (
     build_production_auction_facts,
     freeze_mapping_snapshot,
@@ -141,6 +143,77 @@ def test_td_effective_universe_must_match_0925_anchor():
     )
     assert facts.provenance["effective_universe_status"] == "mismatch"
     assert facts.status == "partial"
+
+
+def test_td_only_explicit_zero_activity_is_excluded_from_effective_universe():
+    redis = FakeRedis()
+    mapping = {"000001": "AI", "000002": "AI", "000003": "AI"}
+    snapshot = _mapping_snapshot()
+    snapshot["mapping"] = mapping
+    snapshot["record_count"] = len(mapping)
+    from engine_next.runtime.production_fact_assembly import _sha256
+    snapshot["sha256"] = _sha256(mapping)
+
+    def rows(date, tag):
+        result = list(_td_rows(date, tag))
+        result.append({
+            "symbol": "000003", "px_milli": 0, "chg_bp": 0,
+            "match_amt_yuan": 0, "rest_bid_amt_yuan": 0,
+            "rest_ask_amt_yuan": 0, "limit_state": 0,
+            "ts": f"{date} {tag}",
+        })
+        return result
+
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=redis, td_query=rows,
+        mapping_snapshot=snapshot,
+    )
+    assert facts.report_status == "COMPLETE"
+    assert facts.provenance["td_raw_universe_count"] == 3
+    assert facts.provenance["td_inactive_universe_count"] == 1
+    assert facts.provenance["td_effective_universe_count"] == 2
+    assert facts.provenance["td_only_inactive_count"] == 1
+    assert facts.provenance["td_only_unknown_count"] == 0
+    assert facts.provenance["td_only_non_inactive_count"] == 0
+    assert "000003" not in {row.get("symbol") for row in facts.plate_shadow["symbol_details"]["0924_to_0925"]["detail_rows"]}
+
+
+@pytest.mark.parametrize(
+    "field_update, expected_classification",
+    [
+        ({"rest_bid_amt_yuan": None}, "unknown"),
+        ({"match_amt_yuan": 1}, "non_inactive"),
+    ],
+)
+def test_td_only_unknown_or_nonzero_activity_remains_fail_closed(field_update, expected_classification):
+    redis = FakeRedis()
+    mapping = {"000001": "AI", "000002": "AI", "000003": "AI"}
+    snapshot = _mapping_snapshot()
+    snapshot["mapping"] = mapping
+    snapshot["record_count"] = len(mapping)
+    from engine_next.runtime.production_fact_assembly import _sha256
+    snapshot["sha256"] = _sha256(mapping)
+
+    def rows(date, tag):
+        result = list(_td_rows(date, tag))
+        row = {
+            "symbol": "000003", "px_milli": 0, "chg_bp": 0,
+            "match_amt_yuan": 0, "rest_bid_amt_yuan": 0,
+            "rest_ask_amt_yuan": 0, "limit_state": 0,
+            "ts": f"{date} {tag}",
+        }
+        row.update(field_update)
+        result.append(row)
+        return result
+
+    facts = build_production_auction_facts(
+        trade_date="2026-08-25", redis_client=redis, td_query=rows,
+        mapping_snapshot=snapshot,
+    )
+    assert facts.provenance[f"td_only_{expected_classification}_count"] == 1
+    assert facts.provenance["effective_universe_status"] == "mismatch"
+    assert facts.plate_facts_status == "unavailable"
+    assert facts.report_status == "PARTIAL"
 
 
 def test_missing_0925_anchor_does_not_claim_full_market():

@@ -9,7 +9,7 @@ import pytest
 
 from engine_next.runtime.intraday_data_hub import IntradayDataHub
 from engine_next.runtime.production_fact_assembly import load_mapping_snapshot, write_mapping_snapshot
-from engine_next.runtime.production_reporting import ProductionReportingCoordinator
+from engine_next.runtime.production_reporting import ProductionReportingCoordinator, build_opening_facts_report
 from engine_next.runtime.reporting_lifecycle import ReportingEvent, ReportingLifecycle
 from engine_next.domain.enums import RunPhase
 
@@ -568,3 +568,37 @@ def test_normal_notifier_unavailable_preserves_partial_report_status(tmp_path: P
     assert outcome.report_status == "PARTIAL"
     assert outcome.delivery_status == "FAILED"
     assert redis.claims == {}
+
+
+def test_opening_renderer_exposes_plate_degradation_without_empty_table() -> None:
+    observation = _opening_observation()
+    observation.update(
+        {
+            "mapping_status": "available",
+            "plate_facts_status": "unavailable",
+            "unavailable_reasons": ["竞价有效股票集合校验未通过"],
+        }
+    )
+    report = build_opening_facts_report(observation)
+    assert report.metadata["report_status"] == "PARTIAL"
+    assert report.metadata["component_statuses"] == {
+        "market_overview": "available",
+        "plate_facts": "unavailable",
+        "online_q2": "available",
+        "mapping": "available",
+    }
+    assert "板块事实：不可用" in report.text_body
+    assert "|板块|竞价上涨覆盖|" not in report.text_body
+    assert "竞价有效股票集合校验未通过" in report.text_body
+    assert report.metadata["report_status"] in report.html_body
+
+
+def test_opening_renderer_marks_q2_unavailable_as_data_unavailable() -> None:
+    observation = _opening_observation()
+    observation["open_source"] = {"status": "unavailable", "observation_cutoff": "2026-08-25T09:32:10"}
+    observation["market"]["open"] = {"status": "unavailable"}
+    observation["plate_facts_status"] = "available"
+    report = build_opening_facts_report(observation)
+    assert report.metadata["report_status"] == "DATA_UNAVAILABLE"
+    assert report.metadata["component_statuses"]["online_q2"] == "unavailable"
+    assert "报告状态：DATA_UNAVAILABLE" in report.text_body

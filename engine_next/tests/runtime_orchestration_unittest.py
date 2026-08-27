@@ -15,9 +15,134 @@ from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult, W
 from engine_next.domain.enums import ExecutionEnvironment, RunPhase
 from engine_next.runtime.controllers.settlement_controller import SettlementController
 from engine_next.runtime.offline_sync_executor import OfflineSyncDecision, OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
+from engine_next.runtime.production_reporting import ReportingOutcome
 
 
 class RuntimeOrchestrationTests(unittest.TestCase):
+    def _due_app(self, handler):
+        app = EngineApp.__new__(EngineApp)
+        app._production_reporting = types.SimpleNamespace(handle=handler)
+        app._resolved_reporting_event_keys = set()
+        return app
+
+    def test_due_discovery_returns_all_crossed_reporting_slots_in_schedule_order(self) -> None:
+        app = self._due_app(lambda event, request=None: ReportingOutcome(
+            event_name=event.event_name,
+            trade_date=event.trade_date,
+            report_status="PARTIAL",
+            delivery_status="SKIP_RECOVERY",
+            report_hash="hash",
+            dedupe_key=f"{event.trade_date}:{event.event_name}",
+            mapping_sha=None,
+            notification_status="SKIP_RECOVERY",
+            fact_status="partial",
+            execution_mode="recovery",
+        ))
+        events = app._collect_due_reporting_events(
+            now=datetime(2026, 8, 27, 9, 33, 0),
+            trade_date="2026-08-27",
+        )
+        self.assertEqual(
+            [event.event_name for event in events],
+            ["auction_facts_0926", "opening_facts_0932"],
+        )
+        notes = app._execute_due_reporting_events(
+            request=types.SimpleNamespace(
+                now=datetime(2026, 8, 27, 9, 33, 0),
+                trade_date="2026-08-27",
+                execution_mode="normal",
+                historical_replay=False,
+            )
+        )
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(
+            [event.event_name for event in app._collect_due_reporting_events(
+                now=datetime(2026, 8, 27, 9, 33, 1),
+                trade_date="2026-08-27",
+            )],
+            [],
+        )
+
+    def test_due_discovery_is_wall_clock_based_not_exact_minute_tag(self) -> None:
+        app = self._due_app(lambda event, request=None: ReportingOutcome(
+            event_name=event.event_name,
+            trade_date=event.trade_date,
+            report_status="PARTIAL",
+            delivery_status="SKIP_RECOVERY",
+            report_hash="hash",
+            dedupe_key=f"{event.trade_date}:{event.event_name}",
+            mapping_sha=None,
+            notification_status="SKIP_RECOVERY",
+            fact_status="partial",
+            execution_mode="recovery",
+        ))
+        events = app._collect_due_reporting_events(
+            now=datetime(2026, 8, 27, 9, 26, 30),
+            trade_date="2026-08-27",
+        )
+        self.assertEqual([event.event_name for event in events], ["auction_facts_0926"])
+        self.assertEqual(events[0].actual_time, datetime(2026, 8, 27, 9, 26, 30))
+        self.assertEqual(
+            [event.event_name for event in app._collect_due_reporting_events(
+                now=datetime(2026, 8, 27, 9, 25, 59),
+                trade_date="2026-08-27",
+            )],
+            [],
+        )
+
+    def test_due_event_is_not_marked_resolved_when_coordinator_does_not_return_outcome(self) -> None:
+        calls = []
+
+        def interrupted(event, request=None):
+            calls.append(event.event_name)
+            raise RuntimeError("interrupted")
+
+        app = self._due_app(interrupted)
+        request = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 9, 27, 0),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        app._execute_due_reporting_events(request=request)
+        self.assertEqual(calls, ["auction_facts_0926"])
+        self.assertEqual(
+            [event.event_name for event in app._collect_due_reporting_events(
+                now=datetime(2026, 8, 27, 9, 27, 1),
+                trade_date="2026-08-27",
+            )],
+            ["auction_facts_0926"],
+        )
+
+    def test_due_event_is_terminal_only_after_valid_outcome(self) -> None:
+        app = self._due_app(lambda event, request=None: ReportingOutcome(
+            event_name=event.event_name,
+            trade_date=event.trade_date,
+            report_status="DATA_UNAVAILABLE",
+            delivery_status="ACCEPTED",
+            report_hash="hash",
+            dedupe_key=f"{event.trade_date}:{event.event_name}",
+            mapping_sha=None,
+            notification_status="ACCEPTED",
+            fact_status="unavailable",
+            execution_mode="normal",
+        ))
+        notes = app._execute_due_reporting_events(
+            request=types.SimpleNamespace(
+                now=datetime(2026, 8, 27, 9, 26, 30),
+                trade_date="2026-08-27",
+                execution_mode="normal",
+                historical_replay=False,
+            )
+        )
+        self.assertIn("terminal=true", notes[0])
+        self.assertEqual(
+            app._collect_due_reporting_events(
+                now=datetime(2026, 8, 27, 9, 26, 40),
+                trade_date="2026-08-27",
+            ),
+            (),
+        )
     def test_safe_keys_prefers_scan_iter_to_avoid_blocking_keys_scan(self) -> None:
         class StubRedis:
             def __init__(self) -> None:
