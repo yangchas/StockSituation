@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
-from datetime import datetime
+from datetime import datetime, time as dt_time
+from pathlib import Path
 
 sys.modules.setdefault("talib", types.ModuleType("talib"))
 holidays_stub = types.ModuleType("holidays")
 holidays_stub.CN = lambda: set()
 sys.modules.setdefault("holidays", holidays_stub)
 
-from engine_next.app_main import EngineApp, EngineAppResult
+from engine_next.app_main import (
+    EngineApp,
+    EngineAppResult,
+    POSTMARKET_SETTLEMENT_EVENT_NAME,
+    _load_postmarket_settlement_time,
+)
 from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult, WatermarkSnapshot
 from engine_next.domain.enums import ExecutionEnvironment, RunPhase
+from engine_next.runtime.controllers.night_recap_controller import NightRecapController
 from engine_next.runtime.controllers.settlement_controller import SettlementController
 from engine_next.runtime.offline_sync_executor import OfflineSyncDecision, OfflineSyncRequest, ServerOnlyOfflineSyncExecutor
 from engine_next.runtime.production_reporting import ReportingOutcome
@@ -74,6 +84,181 @@ class RuntimeOrchestrationTests(unittest.TestCase):
         with patch("engine_next.app_main.time.sleep"):
             app.run_forever(lambda: next(requests), max_cycles=2)
         self.assertEqual(sleep_times, [datetime(2026, 8, 27, 9, 26, 30)])
+
+    def test_schedule_config_loads_postmarket_settlement_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            config_path = Path(temp_directory) / "engine_next_schedule.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "timezone": "Asia/Shanghai",
+                        "events": {
+                            POSTMARKET_SETTLEMENT_EVENT_NAME: {
+                                "scheduled_at": "19:42:00",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"ENGINE_NEXT_SCHEDULE_CONFIG": str(config_path)}):
+                scheduled_at, loaded_path = _load_postmarket_settlement_time()
+        self.assertEqual(scheduled_at, dt_time(19, 42))
+        self.assertEqual(loaded_path, config_path)
+
+    def test_schedule_config_rejects_time_before_formal_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_directory:
+            config_path = Path(temp_directory) / "engine_next_schedule.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "events": {
+                            POSTMARKET_SETTLEMENT_EVENT_NAME: {
+                                "scheduled_at": "17:39:59",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"ENGINE_NEXT_SCHEDULE_CONFIG": str(config_path)}):
+                with self.assertRaises(ValueError):
+                    _load_postmarket_settlement_time()
+
+    def test_configured_settlement_clock_gates_integrated_sync(self) -> None:
+        controller = SettlementController(postmarket_settlement_time=dt_time(19, 42))
+        before = controller.should_audit_integrated_sync(
+            phase=RunPhase.POSTMARKET,
+            now=datetime(2026, 8, 27, 19, 41, 59),
+            lifecycle_audit_ran=False,
+            scheduled_event_name="",
+            scheduled_event_executed=False,
+        )
+        at_event = controller.should_audit_integrated_sync(
+            phase=RunPhase.POSTMARKET,
+            now=datetime(2026, 8, 27, 19, 42, 0),
+            lifecycle_audit_ran=False,
+            scheduled_event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+            scheduled_event_executed=True,
+        )
+        self.assertFalse(before)
+        self.assertTrue(at_event)
+
+    def test_configured_settlement_clock_gates_night_recap(self) -> None:
+        controller = NightRecapController(
+            ingestion_service=types.SimpleNamespace(),
+            postmarket_settlement_time=dt_time(19, 42),
+        )
+        self.assertFalse(
+            controller.should_run(
+                phase=RunPhase.POSTMARKET,
+                now=datetime(2026, 8, 27, 19, 41, 59),
+            )
+        )
+        self.assertTrue(
+            controller.should_run(
+                phase=RunPhase.POSTMARKET,
+                now=datetime(2026, 8, 27, 19, 42, 0),
+            )
+        )
+
+    def _postmarket_schedule_app(self, scheduled_at: dt_time = dt_time(19, 42)):
+        app = EngineApp.__new__(EngineApp)
+        app._postmarket_settlement_time = scheduled_at
+        app._resolved_scheduled_event_keys = set()
+        app._startup_bootstrap = types.SimpleNamespace(
+            last_audit_trade_date="2026-08-27",
+            last_audit_token="checkpoint:2026-08-27:09:00",
+        )
+        return app
+
+    def test_configured_postmarket_event_precedes_checkpoint_and_is_due_once(self) -> None:
+        app = self._postmarket_schedule_app()
+        decision = app._build_loop_decision(
+            datetime(2026, 8, 27, 19, 42, 0),
+            "2026-08-27",
+        )
+        self.assertEqual(decision.scheduled_event_name, POSTMARKET_SETTLEMENT_EVENT_NAME)
+        self.assertEqual(decision.name, "postmarket_settlement_checkpoint")
+
+        app._resolved_scheduled_event_keys.add(
+            app._scheduled_event_key(
+                trade_date="2026-08-27",
+                event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+            )
+        )
+        repeated = app._build_loop_decision(
+            datetime(2026, 8, 27, 19, 42, 30),
+            "2026-08-27",
+        )
+        self.assertEqual(repeated.scheduled_event_name, "")
+
+    def test_postmarket_sleep_targets_configured_settlement_clock(self) -> None:
+        app = self._postmarket_schedule_app()
+        sleep_seconds = app._resolve_loop_sleep_seconds(
+            now=datetime(2026, 8, 27, 19, 12, 0),
+            phase=RunPhase.POSTMARKET,
+            default_interval_seconds=30,
+        )
+        self.assertEqual(sleep_seconds, 30 * 60)
+
+    def test_run_forever_rediscovers_crossed_postmarket_settlement(self) -> None:
+        app = self._postmarket_schedule_app()
+        initial = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 19, 41, 50),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        fresh = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 19, 42, 20),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        after_event = types.SimpleNamespace(
+            now=datetime(2026, 8, 27, 19, 42, 21),
+            trade_date="2026-08-27",
+            execution_mode="normal",
+            historical_replay=False,
+        )
+        requests = iter((initial, fresh, after_event))
+        run_times = []
+        notification_requests = []
+
+        def fake_run(request):
+            run_times.append(request.now)
+            if request.now >= fresh.now:
+                app._resolved_scheduled_event_keys.add(
+                    app._scheduled_event_key(
+                        trade_date=request.trade_date,
+                        event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+                    )
+                )
+                return EngineAppResult(
+                    phase=RunPhase.POSTMARKET,
+                    startup_bundle=None,
+                    watermark_snapshot=None,
+                    integrated_sync_results=(),
+                    intraday_context=None,
+                    phase_events=(),
+                    should_render=True,
+                    notes=("settlement",),
+                )
+            return self._minimal_result()
+
+        app.run = fake_run
+        app._execute_due_reporting_events = lambda *, request: ()
+        app._notification_service = types.SimpleNamespace(
+            notify_if_needed=lambda **kwargs: notification_requests.append(kwargs["request"]) or True
+        )
+        with patch("engine_next.app_main.render_result_summary", return_value="ok"), patch("builtins.print"):
+            app.run_forever(lambda: next(requests), max_cycles=1)
+
+        self.assertEqual(run_times, [initial.now, fresh.now])
+        self.assertEqual([request.now for request in notification_requests], [fresh.now])
 
     def _due_app(self, handler):
         app = EngineApp.__new__(EngineApp)

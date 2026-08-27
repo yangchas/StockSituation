@@ -254,6 +254,7 @@ web/data/*
 web/tests/
 tools/replay_audit/
 *.json
+!config/engine_next_schedule.json
 *.md
 !.codex/skills/continuous-code-improvement-audit/SKILL.md
 !docs/audit/continuous-code-improvement.md

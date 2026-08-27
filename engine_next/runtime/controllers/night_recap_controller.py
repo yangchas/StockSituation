@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 from engine_next.audit.recap_pipeline import (
     RecapCollisionResult,
@@ -43,8 +43,10 @@ class NightRecapController:
         self,
         *,
         ingestion_service: RecapIngestionService | None = None,
+        postmarket_settlement_time: dt_time = dt_time(17, 40),
     ) -> None:
         self._ingestion_service = ingestion_service or RecapIngestionService()
+        self._postmarket_settlement_time = postmarket_settlement_time
         self._last_trade_date: str | None = None
         self._last_result: NightRecapExecutionResult | None = None
         self._last_failure_attempt_token: str | None = None
@@ -116,7 +118,7 @@ class NightRecapController:
             logger.exception("night recap summary persist failed | trade_date=%s", result.trade_date)
 
     def should_run(self, *, phase: RunPhase, now: datetime) -> bool:
-        return phase == RunPhase.POSTMARKET and now.strftime("%H:%M") >= "17:40"
+        return phase == RunPhase.POSTMARKET and now.time() >= self._postmarket_settlement_time
 
     def execute(
         self,

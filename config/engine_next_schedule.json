@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "timezone": "Asia/Shanghai",
+  "events": {
+    "postmarket_settlement_1740": {
+      "scheduled_at": "17:40:00"
+    }
+  }
+}

@@ -59,6 +59,63 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_POSTMARKET_SETTLEMENT_TIME = dt_time(17, 40)
+POSTMARKET_SETTLEMENT_EVENT_NAME = "postmarket_settlement_1740"
+SCHEDULE_CONFIG_ENV = "ENGINE_NEXT_SCHEDULE_CONFIG"
+
+
+def _parse_schedule_clock(value: object, *, field: str) -> dt_time:
+    text = str(value or "").strip()
+    for format_text in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, format_text).time()
+        except ValueError:
+            continue
+    raise ValueError(f"Invalid schedule clock for {field}: {text!r}")
+
+
+def _load_postmarket_settlement_time() -> tuple[dt_time, Path | None]:
+    explicit = os.getenv(SCHEDULE_CONFIG_ENV, "").strip()
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    else:
+        candidates.extend(
+            (
+                Path("/home/exedev/services/engine-next/shared/config/engine_next_schedule.json"),
+                Path.cwd() / "config" / "engine_next_schedule.json",
+                Path(__file__).resolve().parent.parent / "config" / "engine_next_schedule.json",
+            )
+        )
+
+    config_path = next((path for path in candidates if path.is_file()), None)
+    if config_path is None:
+        if explicit:
+            raise FileNotFoundError(f"Schedule config does not exist: {explicit}")
+        return DEFAULT_POSTMARKET_SETTLEMENT_TIME, None
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or int(payload.get("schema_version", 0) or 0) != 1:
+        raise ValueError(f"Unsupported schedule config schema: {config_path}")
+    timezone_name = str(payload.get("timezone", "Asia/Shanghai") or "").strip()
+    if timezone_name != "Asia/Shanghai":
+        raise ValueError(f"Unsupported schedule timezone {timezone_name!r}: {config_path}")
+    events = payload.get("events")
+    event_payload = events.get(POSTMARKET_SETTLEMENT_EVENT_NAME) if isinstance(events, dict) else None
+    if not isinstance(event_payload, dict):
+        raise ValueError(f"Missing {POSTMARKET_SETTLEMENT_EVENT_NAME} schedule: {config_path}")
+    scheduled_at = _parse_schedule_clock(
+        event_payload.get("scheduled_at"),
+        field=f"events.{POSTMARKET_SETTLEMENT_EVENT_NAME}.scheduled_at",
+    )
+    if scheduled_at < DEFAULT_POSTMARKET_SETTLEMENT_TIME:
+        raise ValueError(
+            f"{POSTMARKET_SETTLEMENT_EVENT_NAME} cannot run before the formal 17:40 window: "
+            f"{scheduled_at.strftime('%H:%M:%S')}"
+        )
+    return scheduled_at, config_path
+
+
 def _normalize_symbol(value: str) -> str:
     text = str(value or "").strip()
     if "." in text:
@@ -254,7 +311,7 @@ class EngineApp:
     DEFAULT_LOOP_INTERVAL_SECONDS = 30
     MIN_STOCK_PLATE_MAPPING_COUNT = 1000
     MIN_FULL_UNIVERSE_SIZE = 1000
-    STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00", "17:40")
+    STARTUP_AUDIT_CHECKPOINTS = ("08:30", "09:00")
     AUCTION_FINALIZE_EARLIEST = dt_time(9, 25, 10)
     OPENING_FACTS_EARLIEST = dt_time(9, 32, 10)
 
@@ -268,6 +325,7 @@ class EngineApp:
         production_reporting: ProductionReportingCoordinator | None = None,
         intraday_hub: IntradayDataHub | None = None,
         notification_service: RuntimeNotificationService | None = None,
+        postmarket_settlement_time: dt_time = DEFAULT_POSTMARKET_SETTLEMENT_TIME,
     ) -> None:
         self._startup_coordinator = startup_coordinator or RuntimeStartupCoordinator()
         self._offline_executor = offline_executor or ServerOnlyOfflineSyncExecutor()
@@ -278,6 +336,7 @@ class EngineApp:
         self._notification_service = notification_service or (
             production_reporting.notification_service if production_reporting is not None else None
         ) or RuntimeNotificationService(redis_client=self.redis)
+        self._postmarket_settlement_time = postmarket_settlement_time
         self._market_runtime_summary_service = MarketRuntimeSummaryService(redis_client=self.redis)
         self._auction_runtime = AuctionRuntimeController(
             intraday_hub=self._intraday_hub,
@@ -300,14 +359,16 @@ class EngineApp:
             offline_executor=self._offline_executor,
             auto_discovered_sync_limit=self.AUTO_DISCOVERED_SYNC_LIMIT,
             redis_client=self.redis,
+            postmarket_settlement_time=postmarket_settlement_time,
         )
-        self._night_recap = NightRecapController()
+        self._night_recap = NightRecapController(postmarket_settlement_time=postmarket_settlement_time)
         self._live_summary_renderer = LivePhaseSummaryRenderer()
         self._last_scheduled_event_token: str | None = None
         # Reporting delivery dedupe is owned by ReportingLifecycle/Redis.  This
         # set only prevents the scheduler from resolving the same event twice
         # in one process; it is populated only after a terminal Outcome.
         self._resolved_reporting_event_keys: set[str] = set()
+        self._resolved_scheduled_event_keys: set[str] = set()
         self._last_render_token: str | None = None
         self._last_auction_cleanup_trade_date: str | None = None
         self._last_intraday_auction_recap_trade_date: str | None = None
@@ -1097,14 +1158,54 @@ class EngineApp:
 
     def _current_audit_token(self, now: datetime, trade_date: str) -> str | None:
         minute_tag = now.strftime("%H:%M")
+        audit_checkpoints = self._startup_audit_checkpoints()
         if (
             self._startup_bootstrap.last_audit_trade_date != trade_date
             or self._startup_bootstrap.last_audit_token is None
         ):
             return f"startup:{trade_date}:{minute_tag}"
-        if minute_tag in self.STARTUP_AUDIT_CHECKPOINTS:
+        if minute_tag in audit_checkpoints:
             return f"checkpoint:{trade_date}:{minute_tag}"
         return None
+
+    def _effective_postmarket_settlement_time(self) -> dt_time:
+        return getattr(self, "_postmarket_settlement_time", DEFAULT_POSTMARKET_SETTLEMENT_TIME)
+
+    def _startup_audit_checkpoints(self) -> tuple[str, ...]:
+        settlement_checkpoint = self._effective_postmarket_settlement_time().strftime("%H:%M")
+        return self.STARTUP_AUDIT_CHECKPOINTS + (settlement_checkpoint,)
+
+    @staticmethod
+    def _scheduled_event_key(*, trade_date: str, event_name: str) -> str:
+        return f"{trade_date}:{event_name}"
+
+    def _postmarket_settlement_is_due(
+        self,
+        *,
+        now: datetime,
+        trade_date: str,
+        historical_replay: bool = False,
+    ) -> bool:
+        if historical_replay or infer_run_phase(now) != RunPhase.POSTMARKET:
+            return False
+        if now.strftime("%Y-%m-%d") != str(trade_date or "").strip():
+            return False
+        scheduled_at = datetime.combine(now.date(), self._effective_postmarket_settlement_time())
+        if now < scheduled_at:
+            return False
+        resolved = getattr(self, "_resolved_scheduled_event_keys", set())
+        key = self._scheduled_event_key(
+            trade_date=trade_date,
+            event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+        )
+        return key not in resolved
+
+    def _postmarket_settlement_is_due_request(self, request: EngineAppRequest) -> bool:
+        return self._postmarket_settlement_is_due(
+            now=request.now,
+            trade_date=request.trade_date,
+            historical_replay=request.historical_replay,
+        )
 
     def _build_loop_decision(self, now: datetime, trade_date: str) -> RuntimeLoopDecision:
         minute_tag = now.strftime("%H:%M")
@@ -1154,7 +1255,17 @@ class EngineApp:
                 audit_token=audit_token,
                 should_run_lifecycle_audit=bool(audit_token),
             )
-        if minute_tag in self.STARTUP_AUDIT_CHECKPOINTS:
+        if self._postmarket_settlement_is_due(now=now, trade_date=trade_date):
+            settlement_label = self._effective_postmarket_settlement_time().strftime("%H:%M:%S")
+            return RuntimeLoopDecision(
+                name="postmarket_settlement_checkpoint",
+                label=f"postmarket settlement checkpoint {settlement_label}",
+                audit_token=audit_token,
+                should_run_lifecycle_audit=bool(audit_token and audit_token != self._startup_bootstrap.last_audit_token),
+                scheduled_event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+                scheduled_event_label=f"postmarket settlement event {settlement_label}",
+            )
+        if minute_tag in self._startup_audit_checkpoints():
             return RuntimeLoopDecision(
                 name=f"startup_checkpoint_{minute_tag.replace(':', '')}",
                 label=f"startup checkpoint {minute_tag}",
@@ -1169,15 +1280,6 @@ class EngineApp:
                 should_run_lifecycle_audit=False,
                 scheduled_event_name="market_close_1505",
                 scheduled_event_label="market close event 15:05",
-            )
-        if minute_tag == "17:40":
-            return RuntimeLoopDecision(
-                name="postmarket_settlement_checkpoint",
-                label="postmarket settlement checkpoint 17:40",
-                audit_token=audit_token,
-                should_run_lifecycle_audit=bool(audit_token and audit_token != self._startup_bootstrap.last_audit_token),
-                scheduled_event_name="postmarket_settlement_1740",
-                scheduled_event_label="postmarket settlement event 17:40",
             )
         if phase == RunPhase.INTRADAY:
             return RuntimeLoopDecision(
@@ -1713,8 +1815,8 @@ class EngineApp:
         elif phase == RunPhase.POSTMARKET:
             if now.time() < dt_time(15, 5):
                 target = datetime.combine(now.date(), dt_time(15, 5))
-            elif now.time() < dt_time(17, 40):
-                target = datetime.combine(now.date(), dt_time(17, 40))
+            elif now.time() < self._effective_postmarket_settlement_time():
+                target = datetime.combine(now.date(), self._effective_postmarket_settlement_time())
             else:
                 target = self._next_trade_day_checkpoint(now, dt_time(8, 30))
         elif phase == RunPhase.NIGHT:
@@ -1742,7 +1844,7 @@ class EngineApp:
 
         if request.historical_replay and loop_decision.scheduled_event_name in {
             "market_close_1505",
-            "postmarket_settlement_1740",
+            POSTMARKET_SETTLEMENT_EVENT_NAME,
         }:
             return RuntimeScheduledEventResult(
                 name=loop_decision.scheduled_event_name,
@@ -1802,7 +1904,7 @@ class EngineApp:
                 trade_date=request.trade_date,
             )
             notes.extend(close_result.notes)
-        elif loop_decision.scheduled_event_name == "postmarket_settlement_1740":
+        elif loop_decision.scheduled_event_name == POSTMARKET_SETTLEMENT_EVENT_NAME:
             settlement_result = self._postmarket_runtime.execute_settlement_window(
                 trade_date=request.trade_date,
                 previous_trade_date=request.previous_trade_date,
@@ -1814,6 +1916,17 @@ class EngineApp:
             notes.extend(settlement_result.notes)
 
         self._last_scheduled_event_token = event_token
+        if loop_decision.scheduled_event_name == POSTMARKET_SETTLEMENT_EVENT_NAME:
+            resolved = getattr(self, "_resolved_scheduled_event_keys", None)
+            if resolved is None:
+                resolved = set()
+                self._resolved_scheduled_event_keys = resolved
+            resolved.add(
+                self._scheduled_event_key(
+                    trade_date=request.trade_date,
+                    event_name=POSTMARKET_SETTLEMENT_EVENT_NAME,
+                )
+            )
         return RuntimeScheduledEventResult(
             name=loop_decision.scheduled_event_name,
             label=loop_decision.scheduled_event_label,
@@ -2345,12 +2458,17 @@ class EngineApp:
         while max_cycles is None or cycles < max_cycles:
             request = request_builder()
             result = self.run(request)
+            result_request = request
             # ``run`` may contain a legitimate long-running task (for
             # example, the 09:25 finalize work).  Refresh the request after it
             # returns so an event that became due during that work is resolved
             # before output/sleep.  The existing process-level resolution set
             # makes this post-run check idempotent with the in-run discovery.
             fresh_request = request_builder()
+            if self._postmarket_settlement_is_due_request(fresh_request):
+                result = self.run(fresh_request)
+                result_request = fresh_request
+                fresh_request = request_builder()
             post_run_reporting_notes = self._execute_due_reporting_events(request=fresh_request)
             if post_run_reporting_notes:
                 result = replace(
@@ -2362,7 +2480,7 @@ class EngineApp:
                 if result.phase == RunPhase.POSTMARKET:
                     self._notification_service.notify_if_needed(
                         result=result,
-                        request=request,
+                        request=result_request,
                         summary_text=render_result_summary(result),
                     )
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2880,6 +2998,13 @@ def _build_production_app() -> EngineApp:
     )
     intraday_hub = IntradayDataHub(redis_client=redis_client)
     notification_service = RuntimeNotificationService(redis_client=redis_client)
+    postmarket_settlement_time, schedule_config_path = _load_postmarket_settlement_time()
+    logger.info(
+        "runtime schedule loaded | event=%s | scheduled_at=%s | source=%s",
+        POSTMARKET_SETTLEMENT_EVENT_NAME,
+        postmarket_settlement_time.strftime("%H:%M:%S"),
+        str(schedule_config_path) if schedule_config_path is not None else "built_in_default",
+    )
     mapping_dir_value = os.getenv("ENGINE_NEXT_MAPPING_STATE_DIR", "").strip()
     mapping_directory = Path(mapping_dir_value) if mapping_dir_value else (
         Path("/home/exedev/services/engine-next/shared/runtime_state")
@@ -2948,6 +3073,7 @@ def _build_production_app() -> EngineApp:
         intraday_hub=intraday_hub,
         notification_service=notification_service,
         production_reporting=coordinator,
+        postmarket_settlement_time=postmarket_settlement_time,
     )
 
 

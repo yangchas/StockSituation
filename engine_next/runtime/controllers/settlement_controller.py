@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 from engine_next.contracts.offline_sync_contracts import IntegratedSyncResult, WatermarkSnapshot
 from engine_next.domain.enums import RunPhase
@@ -46,10 +46,12 @@ class SettlementController:
         offline_executor: ServerOnlyOfflineSyncExecutor | None = None,
         auto_discovered_sync_limit: int = 50,
         redis_client: object | None = None,
+        postmarket_settlement_time: dt_time = dt_time(17, 40),
     ) -> None:
         self._offline_executor = offline_executor or ServerOnlyOfflineSyncExecutor()
         self._auto_discovered_sync_limit = auto_discovered_sync_limit
         self._redis_client = redis_client
+        self._postmarket_settlement_time = postmarket_settlement_time
 
     @property
     def redis(self):
@@ -509,7 +511,7 @@ class SettlementController:
         if phase == RunPhase.POSTMARKET:
             if scheduled_event_name == "postmarket_settlement_1740" and scheduled_event_executed:
                 return True
-            return now.strftime("%H:%M") >= "17:40"
+            return now.time() >= self._postmarket_settlement_time
         return False
 
     def execute(
